@@ -285,6 +285,8 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 - ~~Read-only web UI: browse library, view covers/metadata, read books in-browser~~
 - ~~Adjustable reading typography in the web reader (font size, line spacing, font family incl. OpenDyslexic, column width) for EPUB/MOBI — embedded fonts, reflow-preserving, remembered across books~~
 - ~~Table of contents in the web reader for EPUB/MOBI — Contents panel replacing the numeric chapter slider, tap-to-jump with current-chapter highlight, plain-label fallback for degenerate TOCs~~
+- ~~Bookmarks in the web reader (all formats) — 🔖 drawer to add/list/jump/rename/delete, shared with the desktop app~~
+- ~~Text highlighting in the web reader for EPUB/MOBI — selection popup with 5 colors and notes, 🖍 drawer to jump/recolor/edit/delete, shared with the desktop app; online-only (not available in offline-saved books)~~
 - ~~Display the access URL + QR code in settings for easy connection from phones/tablets~~
 - ~~LAN only (no internet tunneling or port forwarding)~~
 
@@ -307,7 +309,7 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 
 **Out of scope (for now):**
 - Internet/WAN access (port forwarding, tunnels, relay servers)
-- Write operations from remote (importing books, editing metadata, syncing progress)
+- Library-mutating writes from remote (importing books, editing metadata, editing collections). Reading-state writes **are** supported: reading progress, the want-to-read flag, bookmarks, and highlights
 - User accounts or multi-user auth (single shared PIN is sufficient for LAN)
 
 ## Phase 8: Reader & Library Enhancements
@@ -655,8 +657,9 @@ Lower priority features — high effort, niche audience, or dependent on other w
   running → run) — **done**
 - Cross-platform — no dependency on OS-specific dictionary APIs — **done**
 - Deferred to a later version: online API fallback (Wiktionary / Free
-  Dictionary API) and user-loaded StarDict dictionaries. Web reader has no
-  selection popup, so it has no Define action (no parity gap).
+  Dictionary API) and user-loaded StarDict dictionaries. The web reader gained
+  a selection popup in 2.9.0 (highlighting) but still has no Define action —
+  a parity gap now, not a structural limitation.
 
 ### 42. Vocabulary Builder — **Done (2026-07-11)**
 - Opt-in ("Build my vocabulary list", off by default); every word Defined is
@@ -687,7 +690,8 @@ Lower priority features — high effort, niche audience, or dependent on other w
   theme; live preview~~
 - ~~Copy the card image to the clipboard or save it as a PNG file~~
 - ~~Available from the reader selection popup and per-highlight in the Highlights
-  panel; desktop reader only (the web reader has no selection popup)~~
+  panel; desktop reader only~~ (the web reader's own selection popup, added in
+  2.9.0, offers highlight actions but no quote card)
 - Frontend Canvas 2D rendering (no server-side image work); design spec
   `docs/superpowers/specs/2026-07-12-highlight-quote-cards-design.md`
 

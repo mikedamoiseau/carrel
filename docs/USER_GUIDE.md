@@ -954,7 +954,7 @@ The system tray shows the same two toggles (Web UI: ON/OFF, OPDS: ON/OFF). Click
 - Web sessions expire after 24 hours
 - Login attempts are rate-limited (5 tries per 5 minutes per device)
 - Login attempts are recorded to an audit trail (see below)
-- The server is read-only — nobody can modify your library from the web interface
+- The server only accepts reading-state changes — reading progress, the "want to read" flag, bookmarks, and highlights. Nobody can import, delete, or edit books, metadata, or collections from the web interface
 - All served content is sanitized to prevent malicious scripts in EPUB files
 
 ### Login audit trail

@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-07-25
+
 ### Added
 - **Text highlighting in the web reader.** Select text while reading an EPUB
   or MOBI to highlight it in one of 5 colors, add notes, and manage everything
@@ -79,6 +81,21 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   and the series-stack cards said "1 books" (and "1 livres" in French) when a
   section or series held a single book; they now use the correct singular in
   both languages.
+
+### Security
+- **Second sanitization layer in the desktop reader.** EPUB chapter HTML was
+  already sanitized in Rust (ammonia) before reaching the UI; the desktop
+  reader now also runs it through DOMPurify in the renderer, so a gap in
+  either layer alone can't put script into the page. Documented as a
+  defence-in-depth measure — the server-side pass remains the primary one.
+- **Fixed an EPUB image-rewriting edge case that could drop sanitization.**
+  The `<img>` `src` rewriter that runs after sanitization scanned for tag
+  boundaries without accounting for quoted attribute values, so a `>`
+  inside an attribute could end a tag early and corrupt the surrounding
+  markup. The scan is now quote-aware.
+- **Documented the libmobi trust boundary.** MOBI/AZW parsing goes through
+  libmobi (C) over `unsafe` FFI on untrusted input; `folio-core/src/mobi/mod.rs`
+  now states the boundary, the pinned version per build, and the bump process.
 
 ## [2.8.0] - 2026-07-17
 
