@@ -86,6 +86,17 @@ If no PIN is configured, all endpoints are accessible without authentication.
 | PUT | `/api/books/:id/bookmarks/:bookmark_id` | Rename a bookmark. Body: `{ "name": string \| null }` (empty/whitespace clears the name; truncated to 100 chars). 404 if the bookmark isn't in this book |
 | DELETE | `/api/books/:id/bookmarks/:bookmark_id` | Soft-delete a bookmark (idempotent; 204). Scoped to the book, so it can't delete another book's bookmark |
 
+### Highlights
+
+Bodies and responses are **camelCase** (matching the `Highlight` model's serialization), unlike the snake_case bookmark bodies. Offsets are UTF-16 code-unit offsets into the chapter's plain text. EPUB/MOBI only in the web reader.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/books/:id/highlights` | List a book's live (not soft-deleted) highlights. 404 if the book is unknown |
+| POST | `/api/books/:id/highlights` | Create a highlight. Body: `{ "chapterIndex": N, "text": string, "color": string, "startOffset": N, "endOffset": N, "note"?: string }`. Returns the created highlight (201). `400` on a malformed body, empty `text`, `endOffset <= startOffset`, an unknown `color`, or a `note` over 2000 characters. Colors are limited to the five reader swatches (`#f6c445`, `#7bc47f`, `#6ba3d6`, `#e88baf`, `#e8a55d`). Persisted regardless of private mode; emits the same `HighlightCreated` event as the desktop app |
+| PUT | `/api/books/:id/highlights/:highlight_id` | Update a highlight's note and/or color. Body must contain at least one of `note` (string, or `null` to clear) and `color`. Absent keys are left unchanged. 404 if the highlight isn't a live highlight of this book |
+| DELETE | `/api/books/:id/highlights/:highlight_id` | Soft-delete a highlight (idempotent; 204). Scoped to the book, so it can't delete another book's highlight |
+
 ### Want to Read
 
 | Method | Endpoint | Description |
