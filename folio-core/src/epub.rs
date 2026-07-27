@@ -15,6 +15,11 @@ pub enum EpubError {
     MissingFile(String),
     ParseError(String),
     Io(std::io::Error),
+    /// An archive-bounds limit was hit: too many entries, or an entry whose
+    /// declared or actual decompressed size exceeds the cap. Distinct from
+    /// `InvalidFormat` so callers (and tests) can tell a resource-exhaustion
+    /// rejection apart from a malformed-zip rejection.
+    LimitExceeded(String),
 }
 
 impl std::fmt::Display for EpubError {
@@ -24,6 +29,7 @@ impl std::fmt::Display for EpubError {
             EpubError::MissingFile(path) => write!(f, "Missing file in EPUB: {path}"),
             EpubError::ParseError(msg) => write!(f, "Parse error: {msg}"),
             EpubError::Io(e) => write!(f, "IO error: {e}"),
+            EpubError::LimitExceeded(msg) => write!(f, "Archive limit exceeded: {msg}"),
         }
     }
 }
@@ -52,6 +58,9 @@ impl From<EpubError> for crate::error::FolioError {
             EpubError::Io(err) => FolioError::from(err),
             EpubError::InvalidFormat(s) => FolioError::invalid(format!("Invalid EPUB format: {s}")),
             EpubError::ParseError(s) => FolioError::invalid(format!("Parse error: {s}")),
+            EpubError::LimitExceeded(s) => {
+                FolioError::invalid(format!("Archive limit exceeded: {s}"))
+            }
         }
     }
 }
@@ -96,6 +105,15 @@ unsafe impl Send for CachedEpubArchive {}
 pub const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 /// Maximum decompressed size per archive entry (100 MB).
 pub const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
+/// Maximum decompressed size for a *text* archive entry — OPF, container.xml,
+/// XHTML chapters, NCX/nav documents, CSS (16 MB).
+///
+/// Real-world text entries are kilobytes to low single-digit megabytes: the
+/// largest single-file XHTML in a Gutenberg-scale EPUB is a few MB, and OPF /
+/// NCX documents are far smaller. 16 MB leaves roughly an order of magnitude of
+/// headroom over anything legitimate while capping the peak allocation a hostile
+/// entry can force to 16 MB instead of the 100 MB the binary path allows.
+pub const MAX_TEXT_ENTRY_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Validate archive bounds: entry count and per-entry decompressed size.
 ///
@@ -105,10 +123,13 @@ pub const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
 ///    single entry exceeds `MAX_ENTRY_SIZE` (100 MB). This is a fast O(n) scan over
 ///    metadata and catches honest or accidental oversized files without decompressing.
 ///
-/// 2. **Runtime protection (zip crate internals):** When entries are actually read via
-///    `ZipFile::read()`, the zip crate validates that decompressed output matches the
-///    declared size. A malicious archive that lies in its headers will trigger an error
-///    during decompression, not silently produce oversized output.
+/// 2. **Runtime protection (`read_entry_capped`):** The pre-filter only sees what the
+///    headers *claim*. The zip crate bounds a read by the entry's **compressed** size and
+///    only notices a size/CRC mismatch once the entry has been fully decompressed — too
+///    late to bound the allocation. Entry reads therefore go through `Read::take` with a
+///    hard cap (`MAX_TEXT_ENTRY_SIZE` for text, `MAX_ENTRY_SIZE` for binary), so an entry
+///    that understates its decompressed size is rejected at the cap instead of expanding
+///    at deflate's full ratio.
 ///
 /// We use `by_index()` rather than `by_index_raw()` so that sizes are read from the
 /// central directory (which the zip crate cross-checks against local headers) instead
@@ -118,7 +139,7 @@ pub const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
 /// prohibitively slow for large archives with many entries.
 pub fn validate_archive(archive: &mut ZipArchive<std::fs::File>) -> Result<(), EpubError> {
     if archive.len() > MAX_ARCHIVE_ENTRIES {
-        return Err(EpubError::MissingFile(format!(
+        return Err(EpubError::LimitExceeded(format!(
             "Archive has {} entries (maximum {})",
             archive.len(),
             MAX_ARCHIVE_ENTRIES
@@ -127,7 +148,7 @@ pub fn validate_archive(archive: &mut ZipArchive<std::fs::File>) -> Result<(), E
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index(i) {
             if entry.size() > MAX_ENTRY_SIZE {
-                return Err(EpubError::MissingFile(format!(
+                return Err(EpubError::LimitExceeded(format!(
                     "Archive entry '{}' decompressed size ({} MB) exceeds limit ({} MB)",
                     entry.name(),
                     entry.size() / (1024 * 1024),
@@ -139,11 +160,23 @@ pub fn validate_archive(archive: &mut ZipArchive<std::fs::File>) -> Result<(), E
     Ok(())
 }
 
+/// Open an EPUB from disk with archive bounds enforced before any parsing.
+///
+/// Every path-based entry point in this module funnels through here, so bounds
+/// validation is a property of the API boundary rather than of each caller's
+/// diligence. The `*_from_archive` / `*_from_cache` variants deliberately do
+/// *not* validate: their caller already owns an archive it validated once, and
+/// must not pay for the O(n) scan again per chapter read.
+fn open_validated(file_path: &str) -> Result<ZipArchive<std::fs::File>, EpubError> {
+    let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
+    let mut archive = ZipArchive::new(file)?;
+    validate_archive(&mut archive)?;
+    Ok(archive)
+}
+
 impl CachedEpubArchive {
     pub fn open(file_path: &str) -> Result<Self, EpubError> {
-        let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
-        let mut archive = ZipArchive::new(file)?;
-        validate_archive(&mut archive)?;
+        let mut archive = open_validated(file_path)?;
         let opf_path = find_opf_path(&mut archive)?;
         let opf = read_zip_entry(&mut archive, &opf_path)?;
         let base_dir = opf_base_dir(&opf_path).to_string();
@@ -169,47 +202,76 @@ struct ManifestItem {
 
 // ---- Internal helpers ----
 
-/// Read a file from a zip archive by name (case-insensitive path matching).
+/// Read an entry through a hard byte cap.
+///
+/// [`validate_archive`]'s pre-scan only sees the size the central directory
+/// *declares*, and the zip crate bounds a read by the entry's **compressed**
+/// size (`ZipFile::get_reader` wraps the source in `take(compressed_size)`), not
+/// by its decompressed size. An entry that understates its size therefore
+/// decompresses to whatever the deflate ratio allows (~1032:1) before the CRC
+/// check at EOF notices. Reading through `take(cap + 1)` bounds the buffer to
+/// `cap` bytes regardless of what the headers claim; one byte over the cap is
+/// enough to know the entry is too big.
+fn read_entry_capped(entry: impl Read, cap: u64, name: &str) -> Result<Vec<u8>, EpubError> {
+    let mut buf = Vec::new();
+    entry
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .map_err(EpubError::Io)?;
+    if buf.len() as u64 > cap {
+        return Err(EpubError::LimitExceeded(format!(
+            "Archive entry '{name}' decompresses past the {cap}-byte limit"
+        )));
+    }
+    Ok(buf)
+}
+
+/// Capped read of a text entry, decoded as UTF-8. Invalid UTF-8 yields the same
+/// `Io(InvalidData)` error the previous `read_to_string` produced.
+fn read_entry_capped_string(entry: impl Read, cap: u64, name: &str) -> Result<String, EpubError> {
+    let buf = read_entry_capped(entry, cap, name)?;
+    String::from_utf8(buf)
+        .map_err(|e| EpubError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+/// Read a text file from a zip archive by name (case-insensitive path matching),
+/// bounded by [`MAX_TEXT_ENTRY_SIZE`].
 fn read_zip_entry(
     archive: &mut ZipArchive<std::fs::File>,
     name: &str,
 ) -> Result<String, EpubError> {
     // Try exact match first
-    if let Ok(mut entry) = archive.by_name(name) {
-        let mut buf = String::new();
-        entry.read_to_string(&mut buf).map_err(EpubError::Io)?;
-        return Ok(buf);
+    if let Ok(entry) = archive.by_name(name) {
+        return read_entry_capped_string(entry, MAX_TEXT_ENTRY_SIZE, name);
     }
     // Try case-insensitive match
     let lower = name.to_lowercase();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+        let entry = archive.by_index(i)?;
         if entry.name().to_lowercase() == lower {
-            let mut buf = String::new();
-            entry.read_to_string(&mut buf).map_err(EpubError::Io)?;
-            return Ok(buf);
+            let entry_name = entry.name().to_string();
+            return read_entry_capped_string(entry, MAX_TEXT_ENTRY_SIZE, &entry_name);
         }
     }
     Err(EpubError::MissingFile(name.to_string()))
 }
 
-/// Read a file from a zip archive by name as raw bytes.
+/// Read a file from a zip archive by name as raw bytes, bounded by
+/// [`MAX_ENTRY_SIZE`] — binary entries (cover art, inline images) legitimately
+/// dwarf text entries, so they keep the wider per-entry allowance.
 fn read_zip_entry_bytes(
     archive: &mut ZipArchive<std::fs::File>,
     name: &str,
 ) -> Result<Vec<u8>, EpubError> {
-    if let Ok(mut entry) = archive.by_name(name) {
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf).map_err(EpubError::Io)?;
-        return Ok(buf);
+    if let Ok(entry) = archive.by_name(name) {
+        return read_entry_capped(entry, MAX_ENTRY_SIZE, name);
     }
     let lower = name.to_lowercase();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+        let entry = archive.by_index(i)?;
         if entry.name().to_lowercase() == lower {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(EpubError::Io)?;
-            return Ok(buf);
+            let entry_name = entry.name().to_string();
+            return read_entry_capped(entry, MAX_ENTRY_SIZE, &entry_name);
         }
     }
     Err(EpubError::MissingFile(name.to_string()))
@@ -514,8 +576,7 @@ pub fn parse_epub_metadata_from_archive(
 
 /// Parse metadata from the OPF file inside the EPUB.
 pub fn parse_epub_metadata(file_path: &str) -> Result<BookMetadata, EpubError> {
-    let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
-    let mut archive = ZipArchive::new(file)?;
+    let mut archive = open_validated(file_path)?;
     parse_epub_metadata_from_archive(&mut archive)
 }
 
@@ -625,8 +686,7 @@ pub fn extract_cover_from_archive(
 
 /// Extract cover image bytes from an EPUB file on disk.
 pub fn extract_cover(file_path: &str) -> Result<Option<ExtractedCover>, EpubError> {
-    let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
-    let mut archive = ZipArchive::new(file)?;
+    let mut archive = open_validated(file_path)?;
     extract_cover_from_archive(&mut archive)
 }
 
@@ -657,8 +717,7 @@ pub fn get_chapter_list_from_archive(
 
 /// Get ordered list of chapters (spine order).
 pub fn get_chapter_list(file_path: &str) -> Result<Vec<ChapterInfo>, EpubError> {
-    let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
-    let mut archive = ZipArchive::new(file)?;
+    let mut archive = open_validated(file_path)?;
     get_chapter_list_from_archive(&mut archive)
 }
 
@@ -672,8 +731,7 @@ pub fn get_chapter_content(
     storage: &dyn crate::storage::Storage,
     book_id: &str,
 ) -> Result<String, EpubError> {
-    let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
-    let mut archive = ZipArchive::new(file)?;
+    let mut archive = open_validated(file_path)?;
 
     let opf_path = find_opf_path(&mut archive)?;
     let opf = read_zip_entry(&mut archive, &opf_path)?;
@@ -1174,8 +1232,7 @@ fn rewrite_img_srcs_to_asset_urls(
 
 /// Get table of contents from NCX (EPUB 2) or nav document (EPUB 3).
 pub fn get_toc(file_path: &str) -> Result<Vec<TocEntry>, EpubError> {
-    let file = std::fs::File::open(file_path).map_err(EpubError::Io)?;
-    let mut archive = ZipArchive::new(file)?;
+    let mut archive = open_validated(file_path)?;
 
     let opf_path = find_opf_path(&mut archive)?;
     let opf = read_zip_entry(&mut archive, &opf_path)?;
@@ -2275,5 +2332,281 @@ mod tests {
             snippet.contains("中文"),
             "snippet should contain CJK match: {snippet}"
         );
+    }
+
+    // ---- Archive bounds at the path-based API boundary ----
+    //
+    // The `*_from_archive` / `*_from_cache` variants trust their caller to have
+    // validated already; the path-based wrappers own the file handle, so bounds
+    // enforcement is their job. These tests drive the wrappers only.
+
+    const BOUNDS_CONTAINER_XML: &[u8] = br#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#;
+
+    const BOUNDS_CONTENT_OPF: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Bounds Test</dc:title>
+    <dc:creator>Bounds Author</dc:creator>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item id="ch0" href="ch0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch0"/>
+  </spine>
+</package>"#;
+
+    fn bounds_chapter(body: &str) -> Vec<u8> {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Ch0</title></head><body>{body}</body></html>"#
+        )
+        .into_bytes()
+    }
+
+    /// Build a structurally valid single-chapter EPUB on disk, with `ch0` as the
+    /// chapter body bytes and `extra` appended as additional archive entries.
+    fn build_bounds_epub(
+        dir: &std::path::Path,
+        name: &str,
+        ch0: Vec<u8>,
+        extra: Vec<(String, Vec<u8>)>,
+    ) -> String {
+        let zip_path = dir.join(name);
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let deflated = zip::write::SimpleFileOptions::default();
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        writer.start_file("mimetype", stored).unwrap();
+        std::io::Write::write_all(&mut writer, b"application/epub+zip").unwrap();
+
+        for (entry_name, bytes) in [
+            ("META-INF/container.xml", BOUNDS_CONTAINER_XML.to_vec()),
+            ("OEBPS/content.opf", BOUNDS_CONTENT_OPF.to_vec()),
+            ("OEBPS/ch0.xhtml", ch0),
+        ] {
+            writer.start_file(entry_name, deflated).unwrap();
+            std::io::Write::write_all(&mut writer, &bytes).unwrap();
+        }
+        for (entry_name, bytes) in extra {
+            writer.start_file(entry_name, deflated).unwrap();
+            std::io::Write::write_all(&mut writer, &bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        zip_path.to_string_lossy().into_owned()
+    }
+
+    /// Overwrite the declared uncompressed size of `entry` in *both* the local
+    /// file header and the central directory, producing an archive whose
+    /// metadata lies about how much data an entry decompresses to. Patching both
+    /// keeps the two consistent, so the zip crate's header cross-check passes and
+    /// the lie actually reaches our code.
+    fn forge_declared_size(zip_path: &str, entry: &str, declared: u32) {
+        let mut bytes = std::fs::read(zip_path).unwrap();
+        let name = entry.as_bytes();
+        let mut patched = 0;
+        let mut i = 0;
+        while i + 46 <= bytes.len() {
+            if &bytes[i..i + 4] == b"PK\x03\x04" {
+                let nlen = u16::from_le_bytes([bytes[i + 26], bytes[i + 27]]) as usize;
+                if bytes.get(i + 30..i + 30 + nlen) == Some(name) {
+                    bytes[i + 22..i + 26].copy_from_slice(&declared.to_le_bytes());
+                    patched += 1;
+                }
+            } else if &bytes[i..i + 4] == b"PK\x01\x02" {
+                let nlen = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+                if bytes.get(i + 46..i + 46 + nlen) == Some(name) {
+                    bytes[i + 24..i + 28].copy_from_slice(&declared.to_le_bytes());
+                    patched += 1;
+                }
+            }
+            i += 1;
+        }
+        assert_eq!(
+            patched, 2,
+            "expected to patch the local and central header for {entry}"
+        );
+        std::fs::write(zip_path, bytes).unwrap();
+    }
+
+    /// Highly compressible filler — a deflate bomb's payload. `len` bytes on
+    /// read, a few KB on disk.
+    fn filler(len: usize) -> Vec<u8> {
+        vec![b'A'; len]
+    }
+
+    #[test]
+    fn test_parse_epub_metadata_rejects_entry_over_max_entry_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = build_bounds_epub(
+            tmp.path(),
+            "oversized.epub",
+            bounds_chapter("<p>hello</p>"),
+            vec![("OEBPS/big.bin".to_string(), b"tiny".to_vec())],
+        );
+        forge_declared_size(&path, "OEBPS/big.bin", MAX_ENTRY_SIZE as u32 + 1);
+
+        let err = parse_epub_metadata(&path).unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_chapter_content_rejects_entry_over_max_entry_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = build_bounds_epub(
+            tmp.path(),
+            "oversized.epub",
+            bounds_chapter("<p>hello</p>"),
+            vec![("OEBPS/big.bin".to_string(), b"tiny".to_vec())],
+        );
+        forge_declared_size(&path, "OEBPS/big.bin", MAX_ENTRY_SIZE as u32 + 1);
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let err = get_chapter_content(&path, 0, &storage, "book1").unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_epub_metadata_rejects_too_many_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra: Vec<(String, Vec<u8>)> = (0..=MAX_ARCHIVE_ENTRIES)
+            .map(|i| (format!("OEBPS/pad{i:05}.txt"), b"x".to_vec()))
+            .collect();
+        let path = build_bounds_epub(
+            tmp.path(),
+            "many.epub",
+            bounds_chapter("<p>hello</p>"),
+            extra,
+        );
+
+        let err = parse_epub_metadata(&path).unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_chapter_content_rejects_too_many_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra: Vec<(String, Vec<u8>)> = (0..=MAX_ARCHIVE_ENTRIES)
+            .map(|i| (format!("OEBPS/pad{i:05}.txt"), b"x".to_vec()))
+            .collect();
+        let path = build_bounds_epub(
+            tmp.path(),
+            "many.epub",
+            bounds_chapter("<p>hello</p>"),
+            extra,
+        );
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let err = get_chapter_content(&path, 0, &storage, "book1").unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_chapter_content_rejects_text_entry_over_text_cap() {
+        // Honest declaration: the chapter really is this big, and it stays under
+        // MAX_ENTRY_SIZE, so only the tighter text cap can reject it. Peak
+        // allocation stays at the cap — the test OOMing is the failure mode.
+        let tmp = tempfile::tempdir().unwrap();
+        let oversize = (MAX_TEXT_ENTRY_SIZE as usize) + 1024;
+        let path = build_bounds_epub(tmp.path(), "bomb.epub", filler(oversize), Vec::new());
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let err = get_chapter_content(&path, 0, &storage, "book1").unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_get_chapter_content_rejects_entry_lying_about_decompressed_size() {
+        // Declares 1 KB, decompresses to well over the text cap. The central
+        // directory pre-scan cannot catch this — only the bounded read can.
+        let tmp = tempfile::tempdir().unwrap();
+        let oversize = (MAX_TEXT_ENTRY_SIZE as usize) + 1024;
+        let path = build_bounds_epub(tmp.path(), "liar.epub", filler(oversize), Vec::new());
+        forge_declared_size(&path, "OEBPS/ch0.xhtml", 1024);
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let err = get_chapter_content(&path, 0, &storage, "book1").unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_valid_epub_still_parses_after_bounds_enforcement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = build_bounds_epub(
+            tmp.path(),
+            "good.epub",
+            bounds_chapter("<p>hello bounds</p>"),
+            Vec::new(),
+        );
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let meta = parse_epub_metadata(&path).unwrap();
+        assert_eq!(meta.title, "Bounds Test");
+        assert_eq!(meta.author, "Bounds Author");
+
+        let html = get_chapter_content(&path, 0, &storage, "book1").unwrap();
+        assert!(
+            html.contains("hello bounds"),
+            "chapter content should be unchanged: {html}"
+        );
+
+        assert_eq!(get_chapter_list(&path).unwrap().len(), 1);
+        assert!(extract_cover(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remaining_path_entry_points_enforce_archive_bounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let extra: Vec<(String, Vec<u8>)> = (0..=MAX_ARCHIVE_ENTRIES)
+            .map(|i| (format!("OEBPS/pad{i:05}.txt"), b"x".to_vec()))
+            .collect();
+        let path = build_bounds_epub(
+            tmp.path(),
+            "many.epub",
+            bounds_chapter("<p>hello</p>"),
+            extra,
+        );
+
+        // `ExtractedCover` is not `Debug`, so unwrap_err() is unavailable for it.
+        let cover_err = match extract_cover(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("extract_cover accepted an over-limit archive"),
+        };
+        for err in [
+            get_chapter_list(&path).unwrap_err(),
+            cover_err,
+            get_toc(&path).unwrap_err(),
+        ] {
+            assert!(
+                matches!(err, EpubError::LimitExceeded(_)),
+                "expected LimitExceeded, got {err:?}"
+            );
+        }
     }
 }

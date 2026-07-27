@@ -5,6 +5,23 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **EPUB archive limits now apply at the crate's API boundary.** The
+  entry-count and per-entry size caps were only enforced by
+  `CachedEpubArchive::open` and by callers that invoked `validate_archive`
+  themselves, so the path-based helpers in `folio_core::epub`
+  (`parse_epub_metadata`, `get_chapter_content`, `get_chapter_list`,
+  `extract_cover`, `get_toc`) parsed hostile archives unchecked — including the
+  LAN web server's chapter route. All of them now validate before parsing.
+- **Bounded archive entry reads.** Entry contents are read through a hard byte
+  cap (16 MB for text entries such as the OPF, XHTML, and NCX; 100 MB for
+  binary entries) instead of growing a buffer to whatever the entry
+  decompresses to. The zip crate bounds reads by an entry's *compressed* size
+  only, so an entry that understated its decompressed size could previously
+  expand at deflate's full ratio.
+- Archive-limit rejections now surface as a dedicated `EpubError::LimitExceeded`
+  variant instead of being reported as a missing file.
+
 ## [2.9.0] - 2026-07-25
 
 ### Added
