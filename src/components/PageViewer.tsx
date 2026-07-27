@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getSpreadPages } from "../lib/utils";
 import { friendlyError } from "../lib/errors";
 import { blobUrlFromBytes } from "../lib/pageWire";
+import { computeRenderWidth } from "../lib/pageRenderWidth";
 import { glyphToPx, highlightBands, selectionOffsets, selectedOffsets, imageLayerActive, type Glyph, type ImageId } from "../lib/pdfText";
 import { HIGHLIGHT_COLORS } from "./HighlightsPanel";
 import { useToast } from "./Toast";
@@ -20,6 +21,11 @@ export interface PdfSelection {
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 4;
 const ZOOM_STEP = 0.25;
+// Max blob URLs kept alive at once. ~±12 pages around the current one, so
+// backtracking through a chapter stays a cache hit. Coarse render-width
+// quantization (see pageRenderWidth) keeps a window resize from churning
+// these keys and blowing the window on every drag.
+const BLOB_CACHE_MAX = 24;
 
 // Enable with: localStorage.setItem("folio-debug-pages", "1")
 // Disable with: localStorage.removeItem("folio-debug-pages")
@@ -240,11 +246,9 @@ export default function PageViewer({
     [bookId, isPdf]
   );
 
-  // Render-target width — quantized to the nearest 100 px so that small
-  // window-size jitter doesn't invalidate the cache or trigger redundant
-  // backend renders. Multiplied by DPR for Retina sharpness and by
-  // `max(renderZoom, 1)` so zoomed-in views request a higher-resolution
-  // source instead of upscaling a blurry low-res blob.
+  // Render-target width. Measured container width × DPR (Retina sharpness) ×
+  // zoom, then quantized/clamped by `computeRenderWidth` — see that module for
+  // the coarse-quantization (cache-key stability) rationale.
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
   const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
@@ -258,16 +262,11 @@ export default function PageViewer({
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
-  const renderWidth = (() => {
-    // Default to a reasonable fallback before the container measures so
-    // the very first page request still gets a sane width.
-    const base = containerWidth > 0 ? containerWidth : 1600;
-    const perPage = dualPage ? base / 2 : base;
-    const raw = perPage * Math.max(renderZoom, 1) * dpr;
-    // Quantize and clamp. The backend clamps to 9600 too — match it.
-    const quantized = Math.round(raw / 100) * 100;
-    return Math.min(9600, Math.max(400, quantized));
-  })();
+  const renderWidth = computeRenderWidth(containerWidth, {
+    dualPage,
+    zoom: renderZoom,
+    dpr,
+  });
 
   // Blob URL cache keyed by `{pageIndex}:{renderWidth}`. URLs evicted
   // here MUST be revoked or the renderer keeps the blob alive
@@ -328,7 +327,7 @@ export default function PageViewer({
           }
           pageCacheRef.current.set(key, url);
           inflightRef.current.delete(key);
-          while (pageCacheRef.current.size > 10) {
+          while (pageCacheRef.current.size > BLOB_CACHE_MAX) {
             const oldest = pageCacheRef.current.keys().next().value;
             if (oldest === undefined) break;
             evictUrl(oldest);

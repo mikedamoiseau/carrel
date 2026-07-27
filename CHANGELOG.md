@@ -6,6 +6,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Performance
+- **Fewer redundant page re-renders after a window resize.** The desktop reader
+  now quantizes the requested render width coarsely, so small window-size
+  changes no longer produce a new cache key and invalidate every already-loaded
+  page. The in-memory page-image cache also holds more pages, keeping
+  back-and-forth navigation within a chapter instant.
 - **Rendered-page cache retains more books, for longer.** The on-disk page cache
   now keeps up to 20 books (was 5) for 30 days (was 7), so cycling through a
   comic series no longer evicts an album's rendered pages between sittings. The
