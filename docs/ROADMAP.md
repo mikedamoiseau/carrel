@@ -501,8 +501,8 @@ Improvements identified via codebase audit (April 2026). Security and stability 
 #### 51. Archive Decompression Limits (Zip Bomb Protection) — **Done**
 - ~~Add `MAX_ARCHIVE_ENTRIES` constant (e.g., 10,000 entries)~~
 - ~~Limit decompressed size per entry (e.g., 100 MB)~~
-- ~~Stop reading entries if total decompressed size exceeds threshold~~
-- ~~Prevents memory/disk exhaustion from maliciously crafted EPUB/CBZ/CBR archives~~
+- ~~Stop reading entries if total decompressed size exceeds threshold~~ — per-entry only; there is no *total* decompressed-size threshold, and the caps are enforced per read rather than cumulatively
+- ~~Prevents memory/disk exhaustion from maliciously crafted EPUB/CBZ/CBR archives~~ — corrected 2.10.0: the central-directory pre-scan only checks *declared* sizes, so entry reads are additionally capped via `Read::take` (`MAX_TEXT_ENTRY_SIZE` = 16 MB for text, `MAX_ENTRY_SIZE` = 100 MB for binary). Covers EPUB (`epub.rs`) and CBZ (`cbz.rs`). CBR needs no cap: unrar truncates output at the header's `unpacked_size` (`Unpack::UnpWriteData`, vendored `unpack50.cpp`), which `cbr::validate_archive` pre-checks. MOBI has no archive structure — its bounds live inside libmobi (see the trust-boundary note atop `folio-core/src/mobi/mod.rs`)
 
 #### 52. PDF Cache Memory Limits — **Done**
 - ~~Current LRU cache evicts by count (20 entries) but not by memory~~

@@ -9,7 +9,12 @@ use crate::models::{ChapterMeta, SearchResult, TocEntry};
 
 // ---- Error type ----
 
+/// `#[non_exhaustive]`: adding `LimitExceeded` broke every downstream exhaustive
+/// match, which is why this release is a minor bump. Marking the enum here means
+/// the next variant is additive instead — downstream matches must already carry a
+/// wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EpubError {
     InvalidFormat(String),
     MissingFile(String),
@@ -113,6 +118,18 @@ pub const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
 /// NCX documents are far smaller. 16 MB leaves roughly an order of magnitude of
 /// headroom over anything legitimate while capping the peak allocation a hostile
 /// entry can force to 16 MB instead of the 100 MB the binary path allows.
+///
+/// **This number is a concurrency budget, not a parser limit.** What it bounds is
+/// per-entry allocation for server-side readers handling many cold requests at
+/// once: the worst case is roughly this cap × concurrent chapter reads, so 16 MB
+/// keeps 50 concurrent readers' text path under 1 GB resident, where 32 MB would
+/// put it at 1.6 GB. Raising it multiplies that ceiling — do not raise it to
+/// accommodate one book.
+///
+/// **Known cost:** a fixed-layout EPUB that inlines its images as base64 data
+/// URIs inside a single XHTML file can legitimately exceed 16 MB, and is
+/// rejected with [`EpubError::LimitExceeded`]. That trade is deliberate. The
+/// boundary is pinned by tests on both sides (15 MB parses, 17 MB is refused).
 pub const MAX_TEXT_ENTRY_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Validate archive bounds: entry count and per-entry decompressed size.
@@ -212,7 +229,11 @@ struct ManifestItem {
 /// check at EOF notices. Reading through `take(cap + 1)` bounds the buffer to
 /// `cap` bytes regardless of what the headers claim; one byte over the cap is
 /// enough to know the entry is too big.
-fn read_entry_capped(entry: impl Read, cap: u64, name: &str) -> Result<Vec<u8>, EpubError> {
+pub(crate) fn read_entry_capped(
+    entry: impl Read,
+    cap: u64,
+    name: &str,
+) -> Result<Vec<u8>, EpubError> {
     let mut buf = Vec::new();
     entry
         .take(cap + 1)
@@ -1565,7 +1586,7 @@ fn parse_ncx_toc(ncx: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2409,7 +2430,7 @@ mod tests {
     /// metadata lies about how much data an entry decompresses to. Patching both
     /// keeps the two consistent, so the zip crate's header cross-check passes and
     /// the lie actually reaches our code.
-    fn forge_declared_size(zip_path: &str, entry: &str, declared: u32) {
+    pub(crate) fn forge_declared_size(zip_path: &str, entry: &str, declared: u32) {
         let mut bytes = std::fs::read(zip_path).unwrap();
         let name = entry.as_bytes();
         let mut patched = 0;
@@ -2546,6 +2567,48 @@ mod tests {
         let oversize = (MAX_TEXT_ENTRY_SIZE as usize) + 1024;
         let path = build_bounds_epub(tmp.path(), "liar.epub", filler(oversize), Vec::new());
         forge_declared_size(&path, "OEBPS/ch0.xhtml", 1024);
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let err = get_chapter_content(&path, 0, &storage, "book1").unwrap_err();
+        assert!(
+            matches!(err, EpubError::LimitExceeded(_)),
+            "expected LimitExceeded, got {err:?}"
+        );
+    }
+
+    /// Body text of roughly `target` bytes, shaped like a real chapter rather
+    /// than a run of one byte, so `ammonia::clean` does representative work.
+    fn chapter_body_of_size(target: usize) -> String {
+        let para = "<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+                    eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>";
+        let mut body = String::with_capacity(target + para.len());
+        while body.len() < target {
+            body.push_str(para);
+        }
+        body
+    }
+
+    #[test]
+    fn test_single_xhtml_book_just_under_text_cap_parses() {
+        // Documents the MAX_TEXT_ENTRY_SIZE boundary from below: a 15 MB
+        // single-chapter book — the shape a fixed-layout EPUB with base64-inlined
+        // images takes — still reads.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = chapter_body_of_size(15 * 1024 * 1024);
+        let path = build_bounds_epub(tmp.path(), "big15.epub", bounds_chapter(&body), Vec::new());
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let html = get_chapter_content(&path, 0, &storage, "book1").unwrap();
+        assert!(html.contains("Lorem ipsum"), "chapter should have parsed");
+    }
+
+    #[test]
+    fn test_single_xhtml_book_over_text_cap_is_rejected() {
+        // The same boundary from above: 17 MB is refused. Deliberate cost of the
+        // cap — see the note on `MAX_TEXT_ENTRY_SIZE`.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = chapter_body_of_size(17 * 1024 * 1024);
+        let path = build_bounds_epub(tmp.path(), "big17.epub", bounds_chapter(&body), Vec::new());
         let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
 
         let err = get_chapter_content(&path, 0, &storage, "book1").unwrap_err();
