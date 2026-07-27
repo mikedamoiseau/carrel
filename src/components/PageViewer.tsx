@@ -5,6 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getSpreadPages } from "../lib/utils";
 import { friendlyError } from "../lib/errors";
 import { blobUrlFromBytes } from "../lib/pageWire";
+import { computeRenderWidth } from "../lib/pageRenderWidth";
+import { computePreloadTargets } from "../lib/preloadTargets";
 import { glyphToPx, highlightBands, selectionOffsets, selectedOffsets, imageLayerActive, type Glyph, type ImageId } from "../lib/pdfText";
 import { HIGHLIGHT_COLORS } from "./HighlightsPanel";
 import { useToast } from "./Toast";
@@ -20,6 +22,38 @@ export interface PdfSelection {
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 4;
 const ZOOM_STEP = 0.25;
+// Max blob URLs kept alive at once. ~±12 pages around the current one, so
+// backtracking through a chapter stays a cache hit. Coarse render-width
+// quantization (see pageRenderWidth) keeps a window resize from churning
+// these keys and blowing the window on every drag.
+const BLOB_CACHE_MAX = 24;
+// Preload window: pages on each side of the visible one warmed once the reader
+// settles. Radius 2 covers a forward turn plus the one after it.
+const PRELOAD_RADIUS = 2;
+// Never render more than this many preloads at once — a network-mounted
+// library (NAS) can't absorb a burst of parallel page renders without the
+// foreground turn getting starved.
+const MAX_PRELOAD_INFLIGHT = 2;
+// Debounce before a settled page triggers preloading. Short enough to be
+// invisible between reading-paced turns, long enough to coalesce a fast flip
+// burst so mid-burst pages are never preloaded.
+const PRELOAD_DEBOUNCE_MS = 250;
+// Upper bound on how long the browser may defer the idle callback.
+const PRELOAD_IDLE_TIMEOUT_MS = 600;
+
+/**
+ * Schedule `cb` to run when the browser is idle, falling back to a microtask
+ * timer where requestIdleCallback is unavailable (not verified present in
+ * every WebView this ships to). Returns a canceller.
+ */
+function scheduleWhenIdle(cb: () => void): () => void {
+  if (typeof requestIdleCallback === "function") {
+    const id = requestIdleCallback(cb, { timeout: PRELOAD_IDLE_TIMEOUT_MS });
+    return () => cancelIdleCallback(id);
+  }
+  const id = setTimeout(cb, 0);
+  return () => clearTimeout(id);
+}
 
 // Enable with: localStorage.setItem("folio-debug-pages", "1")
 // Disable with: localStorage.removeItem("folio-debug-pages")
@@ -240,11 +274,9 @@ export default function PageViewer({
     [bookId, isPdf]
   );
 
-  // Render-target width — quantized to the nearest 100 px so that small
-  // window-size jitter doesn't invalidate the cache or trigger redundant
-  // backend renders. Multiplied by DPR for Retina sharpness and by
-  // `max(renderZoom, 1)` so zoomed-in views request a higher-resolution
-  // source instead of upscaling a blurry low-res blob.
+  // Render-target width. Measured container width × DPR (Retina sharpness) ×
+  // zoom, then quantized/clamped by `computeRenderWidth` — see that module for
+  // the coarse-quantization (cache-key stability) rationale.
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
   const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
@@ -258,22 +290,25 @@ export default function PageViewer({
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
-  const renderWidth = (() => {
-    // Default to a reasonable fallback before the container measures so
-    // the very first page request still gets a sane width.
-    const base = containerWidth > 0 ? containerWidth : 1600;
-    const perPage = dualPage ? base / 2 : base;
-    const raw = perPage * Math.max(renderZoom, 1) * dpr;
-    // Quantize and clamp. The backend clamps to 9600 too — match it.
-    const quantized = Math.round(raw / 100) * 100;
-    return Math.min(9600, Math.max(400, quantized));
-  })();
+  const renderWidth = computeRenderWidth(containerWidth, {
+    dualPage,
+    zoom: renderZoom,
+    dpr,
+  });
 
   // Blob URL cache keyed by `{pageIndex}:{renderWidth}`. URLs evicted
   // here MUST be revoked or the renderer keeps the blob alive
   // indefinitely — a 4 MB page leaks once per page turn otherwise.
   const pageCacheRef = useRef<Map<string, string>>(new Map());
   const inflightRef = useRef<Map<string, Promise<string>>>(new Map());
+  // Count of preload renders currently in flight, to cap concurrency
+  // (MAX_PRELOAD_INFLIGHT). Foreground page loads are never gated by this.
+  const preloadActiveRef = useRef(0);
+  // The current preload effect's pump. Freeing a slot must resume the LATEST
+  // effect's queue, not the (now-cancelled) closure that started the finishing
+  // preload — otherwise a page turn that interrupts saturated preloads leaves
+  // the counter pinned and the new settle's preloads never start.
+  const preloadPumpRef = useRef<() => void>(() => {});
   // Generation counter — bumps on bookId change/unmount cleanup. Each
   // in-flight `loadPage` snapshots the generation at start; when the
   // promise resolves we compare against the live counter to reject and
@@ -328,7 +363,7 @@ export default function PageViewer({
           }
           pageCacheRef.current.set(key, url);
           inflightRef.current.delete(key);
-          while (pageCacheRef.current.size > 10) {
+          while (pageCacheRef.current.size > BLOB_CACHE_MAX) {
             const oldest = pageCacheRef.current.keys().next().value;
             if (oldest === undefined) break;
             evictUrl(oldest);
@@ -470,38 +505,56 @@ export default function PageViewer({
     };
   }, [spread.left, spread.right, loadPageCached, renderWidth, retryCount]);
 
-  // Preload adjacent spreads in the background after current spread renders.
-  // Debounced by 500ms to prevent queue buildup during fast navigation.
+  // Preload neighbor pages once the reader settles on the current one.
+  //
+  // Idle-triggered so it never competes with the foreground turn: a short
+  // debounce coalesces a fast flip burst (mid-burst pages are never preloaded),
+  // then requestIdleCallback waits for the browser to be free before rendering
+  // begins. Targets are ordered forward-first (see computePreloadTargets) and
+  // pulled with a concurrency cap so a network-mounted library can't be flooded
+  // with parallel renders that starve the page the user is waiting on.
   useEffect(() => {
     if (loading) return;
-    const timerId = setTimeout(() => {
-      const toPreload: number[] = [];
-      if (dualPage) {
-        // Previous spread
-        if (spread.left > 0) {
-          const prevLeft = spread.left <= 2 ? 0 : spread.left - 2;
-          toPreload.push(prevLeft);
-          const { right } = getSpreadPages(prevLeft, totalPages);
-          if (right !== null) toPreload.push(right);
-        }
-        // Next spread
-        const nextLeft = spread.right !== null ? spread.right + 1 : spread.left + 1;
-        if (nextLeft < totalPages) {
-          toPreload.push(nextLeft);
-          const { right } = getSpreadPages(nextLeft, totalPages);
-          if (right !== null) toPreload.push(right);
-        }
-      } else {
-        if (spread.left > 0) toPreload.push(spread.left - 1);
-        if (spread.left < totalPages - 1) toPreload.push(spread.left + 1);
-      }
-      // Fire-and-forget — don't block on preloads
-      for (const idx of toPreload) {
-        dbg(`preload page=${idx}`);
-        loadPageCached(idx, renderWidth);
-      }
-    }, 500);
-    return () => clearTimeout(timerId);
+    let cancelIdle = () => {};
+    let cancelled = false;
+
+    const debounceId = setTimeout(() => {
+      cancelIdle = scheduleWhenIdle(() => {
+        const targets = computePreloadTargets({
+          visibleLeft: spread.left,
+          visibleRight: dualPage ? spread.right : null,
+          totalPages,
+          radius: PRELOAD_RADIUS,
+        });
+        let next = 0;
+        const pump = () => {
+          while (
+            !cancelled &&
+            preloadActiveRef.current < MAX_PRELOAD_INFLIGHT &&
+            next < targets.length
+          ) {
+            const idx = targets[next++];
+            preloadActiveRef.current++;
+            dbg(`preload page=${idx}`);
+            loadPageCached(idx, renderWidth)
+              .catch(() => {}) // preloads are best-effort
+              .finally(() => {
+                preloadActiveRef.current--;
+                // Resume whichever effect run is current now, not this one.
+                preloadPumpRef.current();
+              });
+          }
+        };
+        preloadPumpRef.current = pump;
+        pump();
+      });
+    }, PRELOAD_DEBOUNCE_MS);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(debounceId);
+      cancelIdle();
+    };
   }, [loading, spread.left, spread.right, dualPage, totalPages, loadPageCached, renderWidth]);
 
   const goTo = useCallback(
