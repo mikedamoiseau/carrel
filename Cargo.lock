@@ -1862,7 +1862,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "folio"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "ammonia",
  "axum",
@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "folio-core"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "ammonia",
  "argon2",
