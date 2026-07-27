@@ -26,9 +26,9 @@ macro_rules! page_dbg {
 
 pub use page_dbg;
 
-const MAX_CACHED_BOOKS: usize = 5;
+const MAX_CACHED_BOOKS: usize = 20;
 pub const DEFAULT_MAX_CACHE_SIZE_MB: u64 = 500;
-const MAX_AGE_DAYS: u64 = 7;
+const MAX_AGE_DAYS: u64 = 30;
 
 /// Top-level key prefix under which every page-cache artifact lives.
 /// `{CACHE_PREFIX}{book_hash}/manifest.json` + `{CACHE_PREFIX}{book_hash}/{NNN}.{ext}`.
@@ -1527,9 +1527,12 @@ mod tests {
     fn lru_count_eviction() {
         let (_d, storage) = temp_storage();
 
-        // Create 7 books with increasing last_accessed timestamps (recent, within MAX_AGE_DAYS)
+        // Create MAX_CACHED_BOOKS + 2 books with increasing last_accessed
+        // timestamps (all recent, within MAX_AGE_DAYS). Derived from the
+        // constant so bumping MAX_CACHED_BOOKS doesn't require touching the test.
+        let n = MAX_CACHED_BOOKS + 2;
         let base = chrono::Utc::now();
-        for i in 0..7 {
+        for i in 0..n {
             let ts = base + chrono::Duration::seconds(i as i64);
             create_fake_cache(
                 &storage,
@@ -1542,19 +1545,37 @@ mod tests {
         }
 
         let before = collect_cached_books(&storage);
-        assert_eq!(before.len(), 7);
+        assert_eq!(before.len(), n);
 
-        // Run eviction — should trim to MAX_CACHED_BOOKS (5)
+        // Run eviction — should trim to MAX_CACHED_BOOKS.
         run_eviction(&storage, DEFAULT_MAX_CACHE_SIZE_MB).unwrap();
 
         let after = collect_cached_books(&storage);
-        assert_eq!(after.len(), 5);
+        assert_eq!(after.len(), MAX_CACHED_BOOKS);
 
-        // The two oldest (hash0, hash1) should have been evicted
+        // The two oldest (hash0, hash1) should have been evicted.
         assert!(read_manifest(&storage, "hash0").is_none());
         assert!(read_manifest(&storage, "hash1").is_none());
-        // The newest should remain
-        assert!(read_manifest(&storage, "hash6").is_some());
+        // The newest should remain.
+        assert!(read_manifest(&storage, &format!("hash{}", n - 1)).is_some());
+    }
+
+    #[test]
+    fn age_expiry_retains_within_window() {
+        let (_d, storage) = temp_storage();
+
+        // A book last accessed 20 days ago must survive: inside the 30-day
+        // retention window, outside the old 7-day one. Guards the
+        // MAX_AGE_DAYS bump — fails if the window regresses below 20 days.
+        let twenty_days_ago = (chrono::Utc::now() - chrono::Duration::days(20)).to_rfc3339();
+        create_fake_cache(&storage, "recent", "hash_recent", 1, 100, &twenty_days_ago);
+
+        run_eviction(&storage, DEFAULT_MAX_CACHE_SIZE_MB).unwrap();
+
+        assert!(
+            read_manifest(&storage, "hash_recent").is_some(),
+            "a 20-day-old book must survive the {MAX_AGE_DAYS}-day retention window"
+        );
     }
 
     #[test]

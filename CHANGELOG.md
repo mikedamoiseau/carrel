@@ -5,6 +5,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+- **Rendered-page cache retains more books, for longer.** The on-disk page cache
+  now keeps up to 20 books (was 5) for 30 days (was 7), so cycling through a
+  comic series no longer evicts an album's rendered pages between sittings. The
+  500 MB size cap (`page_cache_max_size_mb`) remains the effective limiter, so
+  disk use is unchanged in the steady state.
+
 ## [2.10.0] - 2026-07-27
 
 ### Security
