@@ -68,6 +68,7 @@ This is added to Mike's `~/.zshrc`. If builds fail with `fatal error: 'new' file
 - CSP configured in `tauri.conf.json`
 - Asset protocol scoped to `$APPDATA/**`
 - File deduplication uses SHA-256 hash (`file_hash` column in `books` table)
+- Archive bounds are enforced at `folio-core`'s API boundary, not by caller diligence: every path-based EPUB entry point opens via `epub::open_validated` (entry-count + declared-size pre-scan), and entry reads are capped through `Read::take` — `MAX_TEXT_ENTRY_SIZE` (16 MB) for text entries, `MAX_ENTRY_SIZE` (100 MB) for binary ones. The pre-scan alone is not a bound: the zip crate limits a read by an entry's *compressed* size, so a size-understating entry needs the read cap. Covers EPUB and CBZ. CBR relies on unrar truncating output at the declared `unpacked_size`; MOBI has no archive layer and is bounded inside libmobi. Callers of the `*_from_archive` / `*_from_cache` variants must validate themselves
 - MOBI/AZW parsing uses libmobi (C) via `unsafe` FFI on untrusted input; the from-source builds (Windows + arm64-macOS release) pin `LIBMOBI_VERSION` (tag v0.12, drift-enforced by `release_workflow_test.rs`) while package-manager builds (Linux/macOS CI, local dev) track the distro version — see the security note atop `folio-core/src/mobi/mod.rs` for the trust boundary and bump process
 
 ## CI

@@ -5,6 +5,53 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-07-27
+
+### Security
+- **EPUB archive limits now apply at the crate's API boundary.** The entry-count
+  and per-entry size caps were only enforced by `CachedEpubArchive::open` and by
+  callers that invoked `validate_archive` themselves, so the five path-based
+  helpers in `folio_core::epub` — `parse_epub_metadata`, `get_chapter_content`,
+  `get_chapter_list`, `extract_cover`, `get_toc` — parsed hostile archives
+  unchecked, including the LAN web server's chapter and chapter-list routes. All
+  five now open through one internal `open_validated` helper that validates
+  before parsing. The `*_from_archive` / `*_from_cache` variants still expect
+  their caller to have validated, so cached readers do not re-scan per chapter.
+- **Bounded archive entry reads (EPUB and CBZ).** Entry contents are read through
+  a hard byte cap via `Read::take` — 16 MB for text entries (OPF,
+  `container.xml`, XHTML, NCX/nav) and 100 MB for binary ones (cover art, inline
+  images, comic pages) — instead of growing a buffer to whatever the entry
+  decompresses to. The central-directory pre-scan only sees *declared* sizes, and
+  the zip crate bounds a read by an entry's **compressed** size, so an entry that
+  understated its decompressed size could previously expand at deflate's full
+  ratio (~1032:1) before the trailing CRC check noticed.
+- **CBZ page and ComicInfo reads capped.** `cbz.rs` pre-scanned the archive but
+  then read `ComicInfo.xml` and page bytes unbounded — reachable from the web
+  server's comic routes and from the page cache. Both now go through the capped
+  reader; a non-UTF-8 `ComicInfo.xml` remains non-fatal as before.
+- CBR needed no change: unrar truncates decompressed output at the header's
+  `unpacked_size`, which `cbr::validate_archive` already pre-checks. MOBI has no
+  archive layer; its bounds live inside libmobi (see the trust-boundary note atop
+  `folio-core/src/mobi/mod.rs`).
+- Corrected an inaccurate claim in `validate_archive`'s documentation (and in
+  ROADMAP #51): the zip crate does **not** bound decompressed output during a
+  read, so the pre-scan was never a second line of defence. The capped reads now
+  are.
+
+### Changed
+- **Breaking (`folio-core` API):** `EpubError` gained a `LimitExceeded(String)`
+  variant and is now marked `#[non_exhaustive]`. Adding the variant breaks any
+  exhaustive `match` on `EpubError`, hence the minor bump; the attribute makes
+  future variants additive. Downstream matches need a wildcard arm.
+- Archive-limit rejections use `EpubError::LimitExceeded` instead of
+  `MissingFile`, so they map to invalid-input (HTTP 400) rather than not-found
+  (404).
+- New public item `folio_core::epub::MAX_TEXT_ENTRY_SIZE` (16 MB). The value is a
+  concurrency budget rather than a parser limit — worst-case allocation is the cap
+  times concurrent chapter reads. Known cost: fixed-layout EPUBs that inline
+  base64 images inside a single XHTML file over 16 MB are now rejected; tests pin
+  the boundary at 15 MB (parses) and 17 MB (refused).
+
 ## [2.9.0] - 2026-07-25
 
 ### Added

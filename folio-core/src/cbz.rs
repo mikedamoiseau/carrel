@@ -1,5 +1,4 @@
 use base64::{engine::general_purpose, Engine as _};
-use std::io::Read;
 use std::path::Path;
 use zip::ZipArchive;
 
@@ -37,6 +36,23 @@ fn open_archive(path: &str) -> FolioResult<ZipArchive<std::fs::File>> {
         .map_err(|e| FolioError::invalid(format!("Not a valid ZIP/CBZ archive: {e}")))?;
     crate::epub::validate_archive(&mut archive)?;
     Ok(archive)
+}
+
+/// Read one page entry, bounded by [`crate::epub::MAX_ENTRY_SIZE`].
+///
+/// Shared by [`get_page_image`] and [`get_page_image_bytes`] so both page
+/// readers are capped identically. The cap is what stops a page that understates
+/// its decompressed size in the central directory — which `open_archive`'s
+/// pre-scan cannot detect — from expanding at deflate's full ratio.
+fn read_page_bytes(archive: &mut ZipArchive<std::fs::File>, name: &str) -> FolioResult<Vec<u8>> {
+    let entry = archive
+        .by_name(name)
+        .map_err(|e| FolioError::not_found(format!("Cannot read page '{name}': {e}")))?;
+    Ok(crate::epub::read_entry_capped(
+        entry,
+        crate::epub::MAX_ENTRY_SIZE,
+        name,
+    )?)
 }
 
 #[derive(Debug)]
@@ -79,9 +95,17 @@ pub fn import_cbz(path: &str) -> FolioResult<CbzMeta> {
     let mut publisher = None;
     let mut summary = None;
     let mut genre = None;
-    if let Ok(mut entry) = archive.by_name("ComicInfo.xml") {
-        let mut xml = String::new();
-        if std::io::Read::read_to_string(&mut entry, &mut xml).is_ok() {
+    if let Ok(entry) = archive.by_name("ComicInfo.xml") {
+        // Bounded read: `open_archive`'s pre-scan only sees the size the central
+        // directory declares, so an entry that understates it would otherwise
+        // decompress unbounded. A limit breach is fatal; a non-UTF-8 ComicInfo
+        // stays non-fatal (import proceeds without its metadata), as before.
+        let bytes = crate::epub::read_entry_capped(
+            entry,
+            crate::epub::MAX_TEXT_ENTRY_SIZE,
+            "ComicInfo.xml",
+        )?;
+        if let Ok(xml) = String::from_utf8(bytes) {
             if let Some(writer) = crate::epub::extract_tag_text_decoded(&xml, "Writer") {
                 author = Some(writer);
             }
@@ -147,14 +171,7 @@ pub fn get_page_image(path: &str, page_index: u32) -> FolioResult<String> {
         })?
         .clone();
 
-    let mut entry = archive
-        .by_name(&name)
-        .map_err(|e| FolioError::not_found(format!("Cannot read page '{name}': {e}")))?;
-
-    let mut data = Vec::new();
-    entry
-        .read_to_end(&mut data)
-        .map_err(|e| FolioError::io(format!("Cannot read image data: {e}")))?;
+    let data = read_page_bytes(&mut archive, &name)?;
 
     let lower = name.to_lowercase();
     let mime = if lower.ends_with(".png") {
@@ -196,14 +213,7 @@ pub fn get_page_image_bytes(
         })?
         .clone();
 
-    let mut entry = archive
-        .by_name(&name)
-        .map_err(|e| FolioError::not_found(format!("Cannot read page '{name}': {e}")))?;
-
-    let mut data = Vec::new();
-    entry
-        .read_to_end(&mut data)
-        .map_err(|e| FolioError::io(format!("Cannot read image data: {e}")))?;
+    let data = read_page_bytes(&mut archive, &name)?;
 
     let lower = name.to_lowercase();
     let mime = if lower.ends_with(".png") {
@@ -410,5 +420,104 @@ mod tests {
 
         let meta = import_cbz(cbz_path.to_str().unwrap()).unwrap();
         assert_eq!(meta.page_count, 2);
+    }
+
+    // ---- Entry-read caps ----
+    //
+    // `open_archive` pre-scans the central directory, which only sees *declared*
+    // sizes. An entry that understates its decompressed size passes that scan,
+    // so the reads themselves have to be capped as well.
+
+    /// Build a CBZ with the given entries. Bytes are deflated, so a highly
+    /// compressible payload stays small on disk.
+    fn build_cbz(dir: &std::path::Path, name: &str, entries: &[(&str, Vec<u8>)]) -> String {
+        let cbz_path = dir.join(name);
+        let file = std::fs::File::create(&cbz_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (entry_name, bytes) in entries {
+            zip.start_file(*entry_name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        cbz_path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn import_cbz_rejects_comicinfo_lying_about_decompressed_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversize = crate::epub::MAX_TEXT_ENTRY_SIZE as usize + 1024;
+        let path = build_cbz(
+            dir.path(),
+            "liar.cbz",
+            &[
+                ("page01.jpg", b"fake jpg".to_vec()),
+                ("ComicInfo.xml", vec![b'A'; oversize]),
+            ],
+        );
+        crate::epub::tests::forge_declared_size(&path, "ComicInfo.xml", 1024);
+
+        let err = match import_cbz(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("import_cbz accepted a size-understating ComicInfo.xml"),
+        };
+        assert!(
+            matches!(err, FolioError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn page_reads_reject_entry_lying_about_decompressed_size() {
+        // One fixture, both page readers: the payload has to exceed
+        // MAX_ENTRY_SIZE to prove the cap, so building it twice is wasteful.
+        let dir = tempfile::tempdir().unwrap();
+        let oversize = crate::epub::MAX_ENTRY_SIZE as usize + 1024;
+        let path = build_cbz(
+            dir.path(),
+            "liar.cbz",
+            &[("page01.jpg", vec![b'A'; oversize])],
+        );
+        crate::epub::tests::forge_declared_size(&path, "page01.jpg", 1024);
+
+        let bytes_err = match get_page_image_bytes(&path, 0, None) {
+            Err(e) => e,
+            Ok(_) => panic!("get_page_image_bytes accepted a size-understating page"),
+        };
+        assert!(
+            matches!(bytes_err, FolioError::InvalidInput(_)),
+            "expected InvalidInput, got {bytes_err:?}"
+        );
+
+        let uri_err = match get_page_image(&path, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("get_page_image accepted a size-understating page"),
+        };
+        assert!(
+            matches!(uri_err, FolioError::InvalidInput(_)),
+            "expected InvalidInput, got {uri_err:?}"
+        );
+    }
+
+    #[test]
+    fn import_cbz_still_reads_normal_comicinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_cbz(
+            dir.path(),
+            "good.cbz",
+            &[
+                ("page01.jpg", b"fake jpg".to_vec()),
+                (
+                    "ComicInfo.xml",
+                    br#"<ComicInfo><Title>Capped Comic</Title><Writer>A Writer</Writer><Year>2026</Year></ComicInfo>"#
+                        .to_vec(),
+                ),
+            ],
+        );
+
+        let meta = import_cbz(&path).unwrap();
+        assert_eq!(meta.title, "Capped Comic");
+        assert_eq!(meta.author.as_deref(), Some("A Writer"));
+        assert_eq!(meta.year, Some(2026));
     }
 }
