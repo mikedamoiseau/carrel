@@ -251,7 +251,10 @@ export default function PageViewer({
   // owns the URL and must `URL.revokeObjectURL` it when no longer in use
   // (handled here by the cache eviction + unmount paths below).
   const loadPage = useCallback(
-    async (index: number, renderWidth: number): Promise<string> => {
+    // `cachedOnly` asks the backend to serve the page only if it's already
+    // cached; a miss comes back as an empty payload and resolves to `null`
+    // (the caller skips it) rather than triggering a cold render.
+    async (index: number, renderWidth: number, cachedOnly = false): Promise<string | null> => {
       const command = isPdf ? "get_pdf_page_bytes" : "get_comic_page_bytes";
       // Tauri auto-converts snake_case Rust params to camelCase JS keys.
       // `get_pdf_page_bytes` exposes `width`; `get_comic_page_bytes`
@@ -261,9 +264,15 @@ export default function PageViewer({
         if (isPdf) params.width = renderWidth;
         else params.targetWidth = renderWidth;
       }
-      dbg(`invoke ${command} page=${index} width=${renderWidth}`);
+      if (cachedOnly) params.cachedOnly = true;
+      dbg(`invoke ${command} page=${index} width=${renderWidth}${cachedOnly ? " cachedOnly" : ""}`);
       const t0 = performance.now();
       const payload = await invoke<ArrayBuffer>(command, params);
+      if (payload.byteLength === 0) {
+        // cachedOnly miss: page isn't on disk, nothing to promote.
+        dbg(`invoke ${command} page=${index} not cached (skip)`);
+        return null;
+      }
       const { url, mime } = blobUrlFromBytes(payload);
       dbg(
         `invoke ${command} page=${index} done in ${(performance.now() - t0).toFixed(0)}ms ` +
@@ -301,6 +310,11 @@ export default function PageViewer({
   // indefinitely — a 4 MB page leaks once per page turn otherwise.
   const pageCacheRef = useRef<Map<string, string>>(new Map());
   const inflightRef = useRef<Map<string, Promise<string>>>(new Map());
+  // In-flight cached-only preloads, kept separate from `inflightRef` because a
+  // preload can resolve to null (page not cached) and must never be handed back
+  // as a foreground result. A foreground load coalesces with one of these
+  // (awaits it) and only starts a real render if it resolves null.
+  const preloadInflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
   // Count of preload renders currently in flight, to cap concurrency
   // (MAX_PRELOAD_INFLIGHT). Foreground page loads are never gated by this.
   const preloadActiveRef = useRef(0);
@@ -339,10 +353,39 @@ export default function PageViewer({
         dbg(`frontend cache PENDING page=${index}, reusing in-flight request`);
         return inflight;
       }
+      // Coalesce with an in-flight cached-only preload of the same page instead
+      // of starting a duplicate cache read + resize. If the preload resolves a
+      // URL, use it; if it resolves null (not cached) or fails, fall through to
+      // a real render below.
+      const preloadInflight = preloadInflightRef.current.get(key);
+      if (preloadInflight) {
+        let preloaded: string | null = null;
+        try {
+          preloaded = await preloadInflight;
+        } catch {
+          preloaded = null;
+        }
+        if (preloaded) {
+          dbg(`frontend preload adopted page=${index}`);
+          return preloaded;
+        }
+        // The preload populated the cache or a real fetch started while we
+        // awaited — re-check both before starting our own.
+        const nowCached = pageCacheRef.current.get(key);
+        if (nowCached) return nowCached;
+        const nowInflight = inflightRef.current.get(key);
+        if (nowInflight) return nowInflight;
+      }
       dbg(`frontend cache MISS page=${index}, fetching...`);
       const myGen = generationRef.current;
       const promise = loadPage(index, width)
         .then((url) => {
+          // Foreground loads never pass cachedOnly, so a null (not-cached)
+          // result is impossible here; guard defensively for the type.
+          if (url === null) {
+            inflightRef.current.delete(key);
+            throw new Error("page load returned no data");
+          }
           // Stale: bookId changed (or component unmounted) while the
           // backend was rendering. Revoke immediately so the blob does
           // NOT enter the cache (where the new book might pick it up
@@ -376,6 +419,46 @@ export default function PageViewer({
         });
       inflightRef.current.set(key, promise);
       return promise;
+    },
+    [loadPage, evictUrl]
+  );
+
+  // Preload variant used only for warming neighbor pages: it asks the backend
+  // for the page ONLY if it's already cached (cachedOnly), so preloading never
+  // triggers a cold render that would contend with the foreground page over a
+  // network-mounted library. A not-cached page resolves to null and is skipped.
+  // Registered in `preloadInflightRef` (not `inflightRef`) so a foreground load
+  // for the same page can coalesce with it, retrying for real only if it
+  // resolves null.
+  const preloadPageIfCached = useCallback(
+    async (index: number, width: number): Promise<void> => {
+      const key = `${index}:${width}`;
+      if (pageCacheRef.current.has(key)) return; // already warm
+      if (inflightRef.current.has(key)) return; // a foreground load is already fetching it
+      if (preloadInflightRef.current.has(key)) return; // another preload is already trying
+      const myGen = generationRef.current;
+      const promise = loadPage(index, width, true).then((url) => {
+        if (url === null) return null; // not on disk — leave it to on-demand load
+        // Stale (book changed / unmounted) or raced into the cache meanwhile:
+        // revoke rather than leak or cross-contaminate the next book.
+        if (myGen !== generationRef.current || pageCacheRef.current.has(key)) {
+          URL.revokeObjectURL(url);
+          return null;
+        }
+        pageCacheRef.current.set(key, url);
+        while (pageCacheRef.current.size > BLOB_CACHE_MAX) {
+          const oldest = pageCacheRef.current.keys().next().value;
+          if (oldest === undefined) break;
+          evictUrl(oldest);
+        }
+        return url;
+      });
+      preloadInflightRef.current.set(key, promise);
+      try {
+        await promise;
+      } finally {
+        preloadInflightRef.current.delete(key);
+      }
     },
     [loadPage, evictUrl]
   );
@@ -536,7 +619,7 @@ export default function PageViewer({
             const idx = targets[next++];
             preloadActiveRef.current++;
             dbg(`preload page=${idx}`);
-            loadPageCached(idx, renderWidth)
+            preloadPageIfCached(idx, renderWidth)
               .catch(() => {}) // preloads are best-effort
               .finally(() => {
                 preloadActiveRef.current--;
@@ -555,7 +638,7 @@ export default function PageViewer({
       clearTimeout(debounceId);
       cancelIdle();
     };
-  }, [loading, spread.left, spread.right, dualPage, totalPages, loadPageCached, renderWidth]);
+  }, [loading, spread.left, spread.right, dualPage, totalPages, preloadPageIfCached, renderWidth]);
 
   const goTo = useCallback(
     (index: number) => {

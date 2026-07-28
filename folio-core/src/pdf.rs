@@ -2,7 +2,7 @@ use base64::Engine;
 use pdfium_render::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
 use crate::epub;
 use crate::error::{FolioError, FolioResult};
@@ -50,7 +50,44 @@ pub fn is_available() -> bool {
 
 // ---- Internal helpers ----
 
-fn bind_pdfium() -> FolioResult<Pdfium> {
+/// Global lock serializing every pdfium operation. pdfium (the C library) is
+/// not thread-safe, and folio links the crate's default single-threaded
+/// bindings, so two renders touching pdfium's global state concurrently is
+/// undefined behavior. Renders run on the blocking pool (foreground page loads
+/// and the background prerender pass), which can overlap — so each pdfium user
+/// holds this for the full bind → use → drop lifetime. The guard protects only
+/// `()`, so a panicking holder leaves nothing inconsistent: poison is recovered
+/// rather than propagated.
+static PDFIUM_RENDER_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// A bound `Pdfium` together with the render lock it holds. Deref lets callers
+/// use it exactly like a `Pdfium`.
+///
+/// Field order is load-bearing: Rust drops struct fields in DECLARATION order,
+/// so `pdfium` (and its `FPDF_DestroyLibrary` in `Drop`) runs BEFORE `_guard`
+/// releases the lock. Reversing them would unlock before destruction, letting
+/// another thread's `FPDF_InitLibrary` overlap this one's teardown — exactly
+/// the race the lock exists to prevent.
+struct PdfiumSession {
+    pdfium: Pdfium,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for PdfiumSession {
+    type Target = Pdfium;
+    fn deref(&self) -> &Pdfium {
+        &self.pdfium
+    }
+}
+
+/// Bind pdfium AND acquire the global render lock, returned together as a
+/// [`PdfiumSession`] so the lock is held for the full lifetime of the `Pdfium`
+/// (and any documents/pages derived from it), including its destructor. This is
+/// the single choke point that serializes all pdfium access.
+fn bind_pdfium() -> FolioResult<PdfiumSession> {
+    let guard = PDFIUM_RENDER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let bindings = match PDFIUM_LIBRARY_PATH.get().and_then(|p| p.as_deref()) {
         Some(path) => {
             let path_str = path
@@ -69,7 +106,10 @@ fn bind_pdfium() -> FolioResult<Pdfium> {
             ))
         })?,
     };
-    Ok(Pdfium::new(bindings))
+    Ok(PdfiumSession {
+        pdfium: Pdfium::new(bindings),
+        _guard: guard,
+    })
 }
 
 fn filename_stem(path: &str) -> String {
@@ -282,6 +322,15 @@ pub struct PdfTextIndex {
 /// and, in a later milestone, glyph bounds both index into this
 /// `chars()`-built string, so it must be the single source of truth for
 /// page text (see the PDF text epic design doc's "Global Constraints").
+///
+/// KNOWN LIMITATION: this holds the global pdfium render lock for the whole
+/// book (the document borrows the session, so the lock can't be released
+/// between pages without reopening the file per page — prohibitively slow over
+/// a network mount). A foreground page render can therefore wait for a full
+/// text-index build. It's bounded (text extraction is far cheaper than
+/// rasterization, runs once per book, and only after the prerender pass), so
+/// it's accepted for now; a proper fix would decouple the document lifetime
+/// from the lock or throttle the build against foreground renders.
 fn extract_all_page_texts(path: &str) -> FolioResult<Vec<String>> {
     let pdfium = bind_pdfium()?;
     let document = pdfium

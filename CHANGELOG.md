@@ -5,11 +5,37 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **PDF pages render one at a time, preventing rare crashes.** The underlying
+  PDF library isn't safe to call from multiple threads at once; with background
+  and foreground rendering now able to overlap, PDF page rendering is serialized
+  behind a lock. This also completes the fix above — a foreground page never
+  renders at the same time as a background one, so it can't be slowed by it.
+- **Reading a large PDF no longer bogs down mid-session.** After opening a PDF,
+  the app renders the remaining pages into its cache in the background. That
+  pass now pauses whenever you're actively viewing or turning a page, so it
+  yields the disk/network and CPU to the page you're waiting on instead of
+  competing with it — previously, on a large PDF over a network drive, the two
+  fought for the file and a page could exceed the reader's load timeout.
+- **The reader stays responsive while a page renders.** Comic and PDF page
+  renders now run on a background thread instead of the request handler, so a
+  slow page — a large PDF page fetched over a network drive can take a few
+  seconds — no longer blocks other actions (navigation, menus, the page you're
+  waiting on) until it finishes.
+- **Opening a large PDF no longer freezes the reader.** `prepare_pdf` used to
+  render the first 10 pages synchronously before the reader could show anything
+  — tens of seconds on a large PDF stored on a network drive. It now renders
+  only the page you're opening on, then hands the rest to the existing
+  background pass (and on-demand rendering as you navigate), so the reader opens
+  promptly instead of stalling on pages you may never see.
+
 ### Performance
 - **Smoother comic/PDF page turns.** The desktop reader now warms neighboring
   pages (two on each side, next pages first) as soon as you settle on a page,
   during browser idle time and without flooding a network-mounted library, so a
   forward turn lands on an already-rendered page instead of waiting for one.
+  Preloading only promotes pages that are already cached — it never starts a
+  cold render in the background, so it can't slow down the page you're on.
 - **Fewer redundant page re-renders after a window resize.** The desktop reader
   now quantizes the requested render width coarsely, so small window-size
   changes no longer produce a new cache key and invalidate every already-loaded

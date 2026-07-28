@@ -185,6 +185,9 @@ pub fn run() {
                 // exists yet (B-M2), so main stays shippable with tracking
                 // behaving exactly as before this feature landed.
                 private_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_foreground_renders: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
                 profile_lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 db: pool,
                 profile_state: std::sync::Mutex::new(ProfileState {

@@ -93,6 +93,12 @@ pub struct AppState {
     /// exists yet — B-M2); any future ambiguity in a *derived* read (not
     /// this direct atomic load) should still resolve to "suppress".
     pub private_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Count of foreground page renders (`get_pdf_page_bytes` /
+    /// `get_comic_page_bytes`) currently in flight. The background PDF
+    /// prerender pass pauses while this is non-zero so it yields the source
+    /// file and CPU to the page the user is waiting on. Leaf counter — no lock
+    /// ordering constraint.
+    pub active_foreground_renders: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Serializes the profile-lifecycle commands (`set_profile_lock`,
     /// `remove_profile_lock`, `unlock_profile`, `delete_profile`) so two
     /// concurrent IPC calls on the same profile can't interleave across the
@@ -2512,61 +2518,140 @@ pub async fn get_comic_page_bytes(
     book_id: String,
     page_index: u32,
     target_width: Option<u32>,
+    // When true, only serve an already-cached page: a cache miss returns an
+    // empty response instead of decoding the archive. The reader's background
+    // preloader sets this so warming neighbor pages never triggers a cold
+    // decode (which, on a network-mounted library, would contend with the
+    // foreground page the user is waiting on). Foreground reads leave it unset.
+    cached_only: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> FolioResult<tauri::ipc::Response> {
     let _t = state.ipc_metrics.time("get_comic_page_bytes");
-    let start = std::time::Instant::now();
     let target_width = target_width.filter(|&w| w > 0).map(|w| w.min(9600));
+    let cached_only = cached_only.unwrap_or(false);
 
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
             .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
     };
+
+    // A cached_only probe touches ONLY the local page cache — never the source
+    // archive — so it must skip resolve_book_path / validate_file_exists, which
+    // stat the (possibly network-mounted) file and would defeat the point of a
+    // no-contention preload.
+    if cached_only {
+        return serve_cached_only(
+            app,
+            book.file_hash.clone(),
+            page_index,
+            target_width,
+            "comic",
+        )
+        .await;
+    }
+
     let file_path = state.resolve_book_path(&book)?;
     validate_file_exists(&file_path)?;
 
-    // Cache-first path. Cached pages are full-resolution archive bytes;
-    // run them through the same resize helper the cold path uses so the
-    // wire-level promise (≤ target_width) holds either way.
-    if let Ok(storage) = page_cache_storage(&app) {
-        if let Some(ref book_hash) = book.file_hash {
-            if let Ok((data, mime)) = page_cache::get_cached_page(&storage, book_hash, page_index) {
-                let (bytes, out_mime) =
-                    crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
-                page_cache::page_dbg!(
-                    "bytes cache HIT: page={} size={}KB total={:?}",
-                    page_index,
-                    bytes.len() / 1024,
-                    start.elapsed()
-                );
-                return Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
-                    bytes, &out_mime,
-                )));
-            }
-        }
-    }
+    // Mark a foreground render in flight so a still-running PDF prerender pass
+    // (e.g. from a book opened just before this comic) yields to this page
+    // instead of competing for the same network-mounted storage / CPU.
+    let _fg_guard = ForegroundRenderGuard::new(state.active_foreground_renders.clone());
 
-    let (bytes, mime) = match book.format {
-        BookFormat::Cbz => cbz::get_page_image_bytes(&file_path, page_index, target_width)?,
-        BookFormat::Cbr => cbr::get_page_image_bytes(&file_path, page_index, target_width)?,
-        _ => {
-            return Err(FolioError::invalid(format!(
-                "get_comic_page_bytes is not supported for {:?}",
-                book.format
-            )));
-        }
-    };
-    page_cache::page_dbg!(
-        "bytes archive read: page={} size={}KB total={:?}",
-        page_index,
-        bytes.len() / 1024,
-        start.elapsed()
-    );
+    // The archive decode + optional resize is CPU-bound and, on a
+    // network-mounted library, I/O-bound for seconds. Run it on the blocking
+    // pool so it never pins a Tauri async worker (which would stall other IPC —
+    // including the page the user is actually waiting on).
+    let book_hash = book.file_hash.clone();
+    let format = book.format;
+    let (bytes, mime) =
+        tauri::async_runtime::spawn_blocking(move || -> FolioResult<(Vec<u8>, String)> {
+            let start = std::time::Instant::now();
+
+            // Cache-first path. Cached pages are full-resolution archive bytes;
+            // run them through the same resize helper the cold path uses so the
+            // wire-level promise (≤ target_width) holds either way.
+            if let Ok(storage) = page_cache_storage(&app) {
+                if let Some(ref book_hash) = book_hash {
+                    if let Ok((data, mime)) =
+                        page_cache::get_cached_page(&storage, book_hash, page_index)
+                    {
+                        let (bytes, out_mime) =
+                            crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+                        page_cache::page_dbg!(
+                            "bytes cache HIT: page={} size={}KB total={:?}",
+                            page_index,
+                            bytes.len() / 1024,
+                            start.elapsed()
+                        );
+                        return Ok((bytes, out_mime));
+                    }
+                }
+            }
+
+            let (bytes, mime) = match format {
+                BookFormat::Cbz => cbz::get_page_image_bytes(&file_path, page_index, target_width)?,
+                BookFormat::Cbr => cbr::get_page_image_bytes(&file_path, page_index, target_width)?,
+                _ => {
+                    return Err(FolioError::invalid(format!(
+                        "get_comic_page_bytes is not supported for {format:?}"
+                    )));
+                }
+            };
+            page_cache::page_dbg!(
+                "bytes archive read: page={} size={}KB total={:?}",
+                page_index,
+                bytes.len() / 1024,
+                start.elapsed()
+            );
+            Ok((bytes, mime.to_string()))
+        })
+        .await
+        .map_err(|e| FolioError::internal(format!("comic page render task failed: {e}")))??;
+
     Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
         bytes, &mime,
     )))
+}
+
+/// Serve a page ONLY if it's already in the local page cache, without touching
+/// the source file. Used by the reader's preloader (`cached_only`): a hit is
+/// returned as normal wire bytes, a miss as an empty response the client skips.
+/// Runs the cache read + resize on the blocking pool (I/O + CPU).
+async fn serve_cached_only(
+    app: AppHandle,
+    book_hash: Option<String>,
+    page_index: u32,
+    target_width: Option<u32>,
+    label: &'static str,
+) -> FolioResult<tauri::ipc::Response> {
+    let rendered =
+        tauri::async_runtime::spawn_blocking(move || -> FolioResult<Option<(Vec<u8>, String)>> {
+            if let Ok(storage) = page_cache_storage(&app) {
+                if let Some(ref hash) = book_hash {
+                    if let Ok((data, mime)) =
+                        page_cache::get_cached_page(&storage, hash, page_index)
+                    {
+                        let (bytes, out_mime) =
+                            crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+                        return Ok(Some((bytes, out_mime)));
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| FolioError::internal(format!("{label} cache probe failed: {e}")))??;
+
+    match rendered {
+        Some((bytes, mime)) => Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
+            bytes, &mime,
+        ))),
+        // cached_only miss: empty response signals "not cached, skip".
+        None => Ok(tauri::ipc::Response::new(Vec::new())),
+    }
 }
 
 #[tauri::command]
@@ -2704,11 +2789,18 @@ impl Drop for TextIndexBuildGuard {
 #[tauri::command]
 pub async fn prepare_pdf(
     book_id: String,
+    start_page: Option<u32>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> FolioResult<page_cache::CacheManifest> {
     let _t = state.ipc_metrics.time("prepare_pdf");
-    const PDF_PREWARM_PAGES: u32 = 10;
+    // Establish the cache manifest but render NOTHING synchronously: every
+    // page is rendered by the background prerender pass below. Rendering pages
+    // here blocked the reader's `await invoke("prepare_pdf")` for the full
+    // render cost — on a large PDF over a network-mounted library that was tens
+    // of seconds (10 cold pages × several seconds each), freezing the open.
+    // Zero prewarm returns as soon as the page count is known.
+    const PDF_PREWARM_PAGES: u32 = 0;
 
     let (book, max_size_mb) = {
         let conn = state.active_db()?.get()?;
@@ -2753,6 +2845,21 @@ pub async fn prepare_pdf(
         prep_start.elapsed()
     );
 
+    // Reserve the first page the reader will show (the resume/initial page,
+    // else page 0): render and cache it synchronously so it is a cache hit by
+    // the time the frontend requests it. Without this, the background pass
+    // below starts at page 0 exactly as the foreground requests the visible
+    // page, and — because cold renders don't coalesce — the same page can be
+    // rendered twice concurrently, doubling expensive I/O on a network-mounted
+    // PDF and delaying the very page the user is waiting on. One reserved page
+    // costs a single render (vs. the 10 this milestone removed). Skipped in
+    // private mode, where nothing is persisted anyway (the write is suppressed,
+    // so it would neither cache nor spare the background pass).
+    if !state.is_private() && manifest.page_count > 0 {
+        let reserve = start_page.unwrap_or(0).min(manifest.page_count - 1);
+        let _ = page_cache::get_or_render_pdf_page(&storage, book_hash, &file_path, reserve);
+    }
+
     // Background (F-4-5): render the remaining pages into the disk cache so
     // later go-to-page / thumbnail scrubbing is instant, emitting progress,
     // then run eviction. The pass is bounded by the whole-cache size cap so a
@@ -2779,10 +2886,26 @@ pub async fn prepare_pdf(
         // session" switch — matching the on-demand read path's write
         // suppression (`get_pdf_page_bytes`).
         let bg_private = state.private_mode.clone();
+        // Foreground-priority throttle: pause before each background page while
+        // the reader is rendering a page, so the pass yields the source file
+        // and CPU to the page the user is waiting on (otherwise both contend
+        // over a network-mounted library and foreground renders can exceed the
+        // reader's load timeout).
+        let bg_foreground = state.active_foreground_renders.clone();
         tauri::async_runtime::spawn_blocking(move || {
             use std::sync::atomic::Ordering;
             let emit_private = bg_private.clone();
             let abort_private = bg_private.clone();
+            let throttle_private = bg_private.clone();
+            let throttle = move || {
+                // Block while a foreground render is in flight; give up promptly
+                // if private mode aborts the pass so it can stop.
+                while bg_foreground.load(Ordering::SeqCst) > 0
+                    && !throttle_private.load(Ordering::SeqCst)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            };
             let outcome = page_cache::prerender_pdf_remaining(
                 &bg_storage,
                 &bg_hash,
@@ -2808,6 +2931,7 @@ pub async fn prepare_pdf(
                     }
                 },
                 move || abort_private.load(Ordering::SeqCst),
+                throttle,
             );
             // Guaranteed terminal event: settle the frontend bar at true
             // coverage (100% normally, or the partial value when the size
@@ -5233,6 +5357,25 @@ pub async fn get_pdf_page_text(
 /// `prepare_pdf`: a disk hit reads canonical-width bytes and resizes
 /// down to the viewport target. On miss with a PDF manifest present,
 /// renders at the canonical width and writes best-effort to disk
+/// RAII counter for in-flight foreground page renders. While any exist, the
+/// background PDF prerender pass pauses (M4) so it doesn't contend with the
+/// page the user is waiting on. Drop decrements on every exit path — normal
+/// return, `?` early return, or future cancellation.
+struct ForegroundRenderGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ForegroundRenderGuard {
+    fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ForegroundRenderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// (eviction is coalesced via a callback). Without a manifest (no
 /// hash, storage error, or `prepare_pdf` never ran) the function
 /// falls back to a direct render at the viewport width so uncacheable
@@ -5242,11 +5385,18 @@ pub async fn get_pdf_page_bytes(
     book_id: String,
     page_index: u32,
     width: Option<u32>,
+    // When true, only serve an already-cached page: a cache miss returns an
+    // empty response instead of rendering. The reader's background preloader
+    // sets this so warming neighbor pages never triggers a cold pdfium render
+    // (which, on a network-mounted library, would contend with the foreground
+    // page the user is waiting on). Foreground reads leave it unset.
+    cached_only: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> FolioResult<tauri::ipc::Response> {
     let _t = state.ipc_metrics.time("get_pdf_page_bytes");
     let render_width = width.filter(|&w| w > 0).map(|w| w.min(9600));
+    let cached_only = cached_only.unwrap_or(false);
 
     let book = {
         let conn = state.active_db()?.get()?;
@@ -5258,82 +5408,108 @@ pub async fn get_pdf_page_bytes(
             "get_pdf_page_bytes only supports PDF format",
         ));
     }
+
+    // A cached_only probe touches ONLY the local page cache — never the source
+    // PDF — so it must skip resolve_book_path / validate_file_exists, which stat
+    // the (possibly network-mounted) file and would defeat the point of a
+    // no-contention preload.
+    if cached_only {
+        return serve_cached_only(app, book.file_hash.clone(), page_index, render_width, "pdf")
+            .await;
+    }
+
     let file_path = state.resolve_book_path(&book)?;
     validate_file_exists(&file_path)?;
 
-    // Cache-first path. Cached pages live at the canonical render
-    // width; resize on read clamps them to the viewport-derived
-    // target.
-    if let Ok(storage) = page_cache_storage(&app) {
-        if let Some(ref book_hash) = book.file_hash {
-            if let Ok((data, mime)) = page_cache::get_cached_page(&storage, book_hash, page_index) {
-                let (bytes, out_mime) =
-                    crate::image_util::maybe_resize_to_jpeg(data, mime, render_width)?;
-                return Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
-                    bytes, &out_mime,
-                )));
-            }
-        }
-    }
+    // Pulled from State before the blocking hop below (State isn't Send).
+    let max_size_mb = {
+        let conn = state.active_db()?.get()?;
+        db::get_setting(&conn, "page_cache_max_size_mb")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(page_cache::DEFAULT_MAX_CACHE_SIZE_MB)
+    };
+    let is_private = state.is_private();
+    let book_hash = book.file_hash.clone();
 
-    // Miss path. Use the cached-render code path (canonical 2400 px
-    // render + best-effort disk write) only when a PDF manifest is
-    // already in place — otherwise the higher render cost has no
-    // cache benefit. No manifest → render at viewport width directly,
-    // matching pre-spec behavior.
-    let (bytes, mime) = if let Some(book_hash) = book.file_hash.clone() {
-        if let Ok(storage) = page_cache_storage(&app) {
-            let has_pdf_manifest = page_cache::read_manifest(&storage, &book_hash)
-                .map(|m| m.format == BookFormat::Pdf)
-                .unwrap_or(false);
-            if has_pdf_manifest {
-                let app_for_evict = app.clone();
-                let max_size_mb = {
-                    let conn = state.active_db()?.get()?;
-                    db::get_setting(&conn, "page_cache_max_size_mb")
-                        .ok()
-                        .flatten()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(page_cache::DEFAULT_MAX_CACHE_SIZE_MB)
-                };
-                let on_batch = move || {
-                    if let Ok(evict_storage) = page_cache_storage(&app_for_evict) {
-                        tauri::async_runtime::spawn_blocking(move || {
-                            let _ = page_cache::run_eviction(&evict_storage, max_size_mb);
-                        });
+    // Mark a foreground render as in flight so the background prerender pass
+    // (M4) pauses and yields the source file + CPU to this page. The guard
+    // decrements on every exit, including future cancellation.
+    let _fg_guard = ForegroundRenderGuard::new(state.active_foreground_renders.clone());
+
+    // The pdfium render + JPEG encode + resize is CPU-bound and, on a
+    // network-mounted library, I/O-bound for seconds. Run it on the blocking
+    // pool so it never pins a Tauri async worker (which would stall other IPC —
+    // including the page the user is actually waiting on).
+    let (bytes, out_mime) =
+        tauri::async_runtime::spawn_blocking(move || -> FolioResult<(Vec<u8>, String)> {
+            // Cache-first path. Cached pages live at the canonical render
+            // width; resize on read clamps them to the viewport-derived
+            // target.
+            if let Ok(storage) = page_cache_storage(&app) {
+                if let Some(ref book_hash) = book_hash {
+                    if let Ok((data, mime)) =
+                        page_cache::get_cached_page(&storage, book_hash, page_index)
+                    {
+                        let (bytes, out_mime) =
+                            crate::image_util::maybe_resize_to_jpeg(data, mime, render_width)?;
+                        return Ok((bytes, out_mime));
                     }
-                };
-                let (b, m) = page_cache::get_or_render_pdf_page_with_eviction(
-                    &storage,
-                    &book_hash,
-                    &file_path,
-                    page_index,
-                    on_batch,
-                    // Private mode (B-M1, OQ-3/SB-9): skip only the on-disk
-                    // page write; the read/pre-warm path above is untouched.
-                    state.is_private(),
-                )?;
-                (b, m.to_string())
+                }
+            }
+
+            // Miss path. Use the cached-render code path (canonical 2400 px
+            // render + best-effort disk write) only when a PDF manifest is
+            // already in place — otherwise the higher render cost has no
+            // cache benefit. No manifest → render at viewport width directly,
+            // matching pre-spec behavior.
+            let (bytes, mime) = if let Some(book_hash) = book_hash.clone() {
+                if let Ok(storage) = page_cache_storage(&app) {
+                    let has_pdf_manifest = page_cache::read_manifest(&storage, &book_hash)
+                        .map(|m| m.format == BookFormat::Pdf)
+                        .unwrap_or(false);
+                    if has_pdf_manifest {
+                        let app_for_evict = app.clone();
+                        let on_batch = move || {
+                            if let Ok(evict_storage) = page_cache_storage(&app_for_evict) {
+                                tauri::async_runtime::spawn_blocking(move || {
+                                    let _ = page_cache::run_eviction(&evict_storage, max_size_mb);
+                                });
+                            }
+                        };
+                        let (b, m) = page_cache::get_or_render_pdf_page_with_eviction(
+                            &storage, &book_hash, &file_path, page_index, on_batch,
+                            // Private mode (B-M1, OQ-3/SB-9): skip only the on-disk
+                            // page write; the read/pre-warm path above is untouched.
+                            is_private,
+                        )?;
+                        (b, m.to_string())
+                    } else {
+                        // No PDF manifest — viewport render, no cache.
+                        let (b, m) =
+                            pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
+                        (b, m.to_string())
+                    }
+                } else {
+                    // Storage unavailable — viewport render, no cache.
+                    let (b, m) = pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
+                    (b, m.to_string())
+                }
             } else {
-                // No PDF manifest — viewport render, no cache.
+                // No file hash — viewport render, no cache.
                 let (b, m) = pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
                 (b, m.to_string())
-            }
-        } else {
-            // Storage unavailable — viewport render, no cache.
-            let (b, m) = pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
-            (b, m.to_string())
-        }
-    } else {
-        // No file hash — viewport render, no cache.
-        let (b, m) = pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
-        (b, m.to_string())
-    };
+            };
 
-    // Cache-miss canonical-render branch produced 2400 px JPEG bytes;
-    // the no-cache fallbacks already match `render_width`.
-    // `maybe_resize_to_jpeg` is a no-op when input == target.
-    let (bytes, out_mime) = crate::image_util::maybe_resize_to_jpeg(bytes, mime, render_width)?;
+            // Cache-miss canonical-render branch produced 2400 px JPEG bytes;
+            // the no-cache fallbacks already match `render_width`.
+            // `maybe_resize_to_jpeg` is a no-op when input == target.
+            crate::image_util::maybe_resize_to_jpeg(bytes, mime, render_width)
+        })
+        .await
+        .map_err(|e| FolioError::internal(format!("pdf page render task failed: {e}")))??;
+
     Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
         bytes, &out_mime,
     )))
@@ -9370,6 +9546,7 @@ mod tests {
                 std::collections::HashSet::from(["default".to_string()]),
             )),
             private_mode: std::sync::Arc::new(AtomicBool::new(false)),
+            active_foreground_renders: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             profile_lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             db: pool,
             profile_state: std::sync::Mutex::new(ProfileState {
