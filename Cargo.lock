@@ -1873,6 +1873,7 @@ dependencies = [
  "form_urlencoded",
  "image",
  "keyring",
+ "libc",
  "log",
  "mime_guess",
  "objc2",

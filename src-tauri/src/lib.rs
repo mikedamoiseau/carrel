@@ -8,6 +8,7 @@ pub mod page_wire;
 pub mod plugin_host;
 #[cfg(test)]
 mod release_workflow_test;
+pub mod remote_fs;
 #[cfg(test)]
 mod tauri_config_test;
 pub mod tray;
@@ -195,6 +196,7 @@ pub fn run() {
                     pools: profiles,
                 }),
                 data_dir,
+                cache_dir: app.path().app_cache_dir()?,
                 epub_cache: std::sync::Arc::new(std::sync::Mutex::new(LruCache::new(5))),
                 #[cfg(feature = "mobi")]
                 mobi_cache: std::sync::Arc::new(std::sync::Mutex::new({

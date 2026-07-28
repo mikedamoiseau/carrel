@@ -30,6 +30,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   promptly instead of stalling on pages you may never see.
 
 ### Performance
+- **Books on a network drive open to a fast local copy.** When you open a PDF or
+  comic whose file lives on a network share (e.g. an SMB/NAS library kept in
+  link mode), the app now copies it to a local cache in the background on open,
+  then renders every page from that local copy. Previously each page was read by
+  random access over the network at render time, which could take many seconds
+  per page; the one-time background copy is sequential (fast) and pays for itself
+  after the first page or two. Already-local books are untouched. The local copies
+  are kept within a disk budget (least-recently-opened evicted first) and a
+  book's copy is removed when you delete the book, so disk use stays bounded.
 - **Smoother comic/PDF page turns.** The desktop reader now warms neighboring
   pages (two on each side, next pages first) as soon as you settle on a page,
   during browser idle time and without flooding a network-mounted library, so a
