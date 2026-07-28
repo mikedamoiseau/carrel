@@ -2704,11 +2704,18 @@ impl Drop for TextIndexBuildGuard {
 #[tauri::command]
 pub async fn prepare_pdf(
     book_id: String,
+    start_page: Option<u32>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> FolioResult<page_cache::CacheManifest> {
     let _t = state.ipc_metrics.time("prepare_pdf");
-    const PDF_PREWARM_PAGES: u32 = 10;
+    // Establish the cache manifest but render NOTHING synchronously: every
+    // page is rendered by the background prerender pass below. Rendering pages
+    // here blocked the reader's `await invoke("prepare_pdf")` for the full
+    // render cost — on a large PDF over a network-mounted library that was tens
+    // of seconds (10 cold pages × several seconds each), freezing the open.
+    // Zero prewarm returns as soon as the page count is known.
+    const PDF_PREWARM_PAGES: u32 = 0;
 
     let (book, max_size_mb) = {
         let conn = state.active_db()?.get()?;
@@ -2752,6 +2759,21 @@ pub async fn prepare_pdf(
         manifest.page_count,
         prep_start.elapsed()
     );
+
+    // Reserve the first page the reader will show (the resume/initial page,
+    // else page 0): render and cache it synchronously so it is a cache hit by
+    // the time the frontend requests it. Without this, the background pass
+    // below starts at page 0 exactly as the foreground requests the visible
+    // page, and — because cold renders don't coalesce — the same page can be
+    // rendered twice concurrently, doubling expensive I/O on a network-mounted
+    // PDF and delaying the very page the user is waiting on. One reserved page
+    // costs a single render (vs. the 10 this milestone removed). Skipped in
+    // private mode, where nothing is persisted anyway (the write is suppressed,
+    // so it would neither cache nor spare the background pass).
+    if !state.is_private() && manifest.page_count > 0 {
+        let reserve = start_page.unwrap_or(0).min(manifest.page_count - 1);
+        let _ = page_cache::get_or_render_pdf_page(&storage, book_hash, &file_path, reserve);
+    }
 
     // Background (F-4-5): render the remaining pages into the disk cache so
     // later go-to-page / thumbnail scrubbing is instant, emitting progress,

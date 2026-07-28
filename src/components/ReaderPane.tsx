@@ -467,28 +467,9 @@ export default function ReaderPane({
         // Page count is only meaningful for fixed-layout (PDF) and image
         // (CBZ/CBR) formats. HTML-reflowable books (EPUB + MOBI) use scroll
         // progress instead, so skip the fetch and leave pageCount at 0.
-        if (bookInfo.format === "pdf") {
-          // First-open PDF warm pass: populates the page-cache manifest
-          // so subsequent get_pdf_page_bytes calls take the cache-first
-          // path. Reuse the returned page_count to skip a separate
-          // get_pdf_page_count round-trip; fall back to it only if
-          // prepare_pdf fails (e.g. missing file hash).
-          try {
-            const manifest = await invoke<{ page_count: number }>(
-              "prepare_pdf",
-              { bookId }
-            );
-            if (!cancelled) setPageCount(manifest.page_count);
-          } catch (e) {
-            console.warn("PDF cache preparation failed, falling back to direct read:", e);
-            try {
-              const count = await invoke<number>("get_pdf_page_count", { bookId });
-              if (!cancelled) setPageCount(count);
-            } catch {
-              // page count unavailable
-            }
-          }
-        } else if (bookInfo.format === "cbz" || bookInfo.format === "cbr") {
+        // PDF's page count comes from prepare_pdf below, which is deferred
+        // until the resume page is known (so it can reserve the right page).
+        if (bookInfo.format === "cbz" || bookInfo.format === "cbr") {
           try {
             const count = await invoke<number>("get_comic_page_count", { bookId });
             if (!cancelled) setPageCount(count);
@@ -550,12 +531,35 @@ export default function ReaderPane({
           }
         }
 
-        // Warm the comic page cache now that the resume page is known.
-        // Page 0 + `startPage` are extracted eagerly; the rest stream in the
-        // background (surfaced via the comic-extract-progress bar). Navigation
-        // to any not-yet-extracted page still works — the backend serves it
-        // on demand — so this is purely an open-latency optimization.
-        if (bookInfo.format === "cbz" || bookInfo.format === "cbr") {
+        // Warm the page cache now that the resume page is known, so the
+        // format-specific "reserve the page the reader opens on" logic targets
+        // the actual resume page rather than page 0. Navigation to any
+        // not-yet-cached page still works — the backend serves it on demand —
+        // so this is purely an open-latency optimization.
+        if (bookInfo.format === "pdf") {
+          // Establishes the page-cache manifest and renders only the resume
+          // page synchronously (the rest go to the background pass), so the
+          // first request is a cache hit and doesn't race the background pass.
+          // page_count comes back in the manifest; fall back to a direct count
+          // only if prepare_pdf fails (e.g. missing file hash).
+          try {
+            const manifest = await invoke<{ page_count: number }>("prepare_pdf", {
+              bookId,
+              startPage: resumePage,
+            });
+            if (!cancelled) setPageCount(manifest.page_count);
+          } catch (e) {
+            console.warn("PDF cache preparation failed, falling back to direct read:", e);
+            try {
+              const count = await invoke<number>("get_pdf_page_count", { bookId });
+              if (!cancelled) setPageCount(count);
+            } catch {
+              // page count unavailable
+            }
+          }
+        } else if (bookInfo.format === "cbz" || bookInfo.format === "cbr") {
+          // Page 0 + `startPage` are extracted eagerly; the rest stream in the
+          // background (surfaced via the comic-extract-progress bar).
           try {
             await invoke("prepare_comic", { bookId, startPage: resumePage });
           } catch (e) {

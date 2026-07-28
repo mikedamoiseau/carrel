@@ -5,6 +5,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Opening a large PDF no longer freezes the reader.** `prepare_pdf` used to
+  render the first 10 pages synchronously before the reader could show anything
+  — tens of seconds on a large PDF stored on a network drive. It now renders
+  only the page you're opening on, then hands the rest to the existing
+  background pass (and on-demand rendering as you navigate), so the reader opens
+  promptly instead of stalling on pages you may never see.
+
 ### Performance
 - **Smoother comic/PDF page turns.** The desktop reader now warms neighboring
   pages (two on each side, next pages first) as soon as you settle on a page,

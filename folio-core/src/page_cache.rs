@@ -1870,6 +1870,40 @@ mod tests {
     }
 
     #[test]
+    fn ensure_pdf_prewarmed_with_zero_prewarm_establishes_manifest_without_rendering() {
+        // prepare_pdf relies on this: it establishes the cache manifest (so the
+        // cache-first read path and the background prerender pass both engage)
+        // with a zero prewarm — no page-range render — then reserves only the
+        // single page the reader opens on. A non-zero prewarm here would
+        // reintroduce the multi-page synchronous open blocking this fixes.
+        let (_d, storage) = temp_storage();
+        let hash = "warm-hash";
+
+        let calls = std::cell::Cell::new(0u32);
+        let render = |idx: u32| -> FolioResult<(Vec<u8>, String)> {
+            calls.set(calls.get() + 1);
+            Ok((format!("page-{idx}").into_bytes(), "image/jpeg".into()))
+        };
+
+        let manifest = ensure_pdf_prewarmed_with_renderer(
+            &storage, "book", hash, /*page_count=*/ 25, /*prewarm=*/ 0, render,
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 0, "zero prewarm must not render any page");
+        assert_eq!(manifest.page_count, 25, "page_count is still established");
+        assert_eq!(manifest.format, BookFormat::Pdf);
+        assert!(
+            !storage.exists(&page_key(hash, "000.jpg")).unwrap(),
+            "no page is written synchronously"
+        );
+        assert!(
+            read_manifest(&storage, hash).is_some(),
+            "manifest is persisted so the cache paths engage"
+        );
+    }
+
+    #[test]
     fn ensure_pdf_prewarmed_is_idempotent() {
         let (_d, storage) = temp_storage();
         let hash = "warm-hash";
