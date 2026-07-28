@@ -95,6 +95,27 @@ pub fn staged_path(base: &Path, hash: &str, ext: &str) -> PathBuf {
         .join(staged_file_name(hash, ext))
 }
 
+/// Return the staged path if a valid staged copy already exists for
+/// `(hash, ext)`, else `None`. LOCAL-only and cheap (one `symlink_metadata`) —
+/// never touches the source, so it is safe on the render hot path where the
+/// source lives on a slow network mount.
+///
+/// Existence alone is sufficient: [`stage`] publishes atomically (copy to a
+/// temp, then rename), so a file present at the destination is always the
+/// complete copy — there is no partial-file window at this path. Rejects unsafe
+/// keys and symlinks with the same guards as [`is_staged`], so a crafted key
+/// can't escape the cache dir and a planted symlink isn't trusted.
+pub fn staged_if_present(base: &Path, hash: &str, ext: &str) -> Option<PathBuf> {
+    if !is_safe_component(hash) || !(ext.is_empty() || is_safe_component(ext)) {
+        return None;
+    }
+    let p = staged_path(base, hash, ext);
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_file() => Some(p),
+        _ => None,
+    }
+}
+
 /// True when a staged copy exists AND its byte length equals `expected_size`.
 ///
 /// The size check is the integrity guard: a content-addressed name plus an
@@ -257,6 +278,21 @@ mod tests {
         assert!(is_staged(base.path(), "h1", "pdf", data.len() as u64));
         // Wrong expected size ⇒ not a valid staged copy.
         assert!(!is_staged(base.path(), "h1", "pdf", 999));
+    }
+
+    #[test]
+    fn staged_if_present_reflects_staged_copy() {
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "b.pdf", b"payload");
+
+        // Absent before staging.
+        assert!(staged_if_present(base.path(), "hp", "pdf").is_none());
+        // Present (and equal to staged_path) after staging.
+        let dest = stage(base.path(), &src, "hp", "pdf").unwrap();
+        assert_eq!(staged_if_present(base.path(), "hp", "pdf"), Some(dest));
+        // Unsafe key never resolves.
+        assert!(staged_if_present(base.path(), "../escape", "pdf").is_none());
     }
 
     #[test]

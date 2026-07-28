@@ -55,6 +55,11 @@ pub struct AppState {
     /// Combined profile name + pool map (lock #1). See lock ordering above.
     pub profile_state: std::sync::Mutex<ProfileState>,
     pub data_dir: std::path::PathBuf,
+    /// App cache dir (`app_cache_dir()`), the base for the page cache and the
+    /// source cache (`source-cache/`). Held on `AppState` so the sync,
+    /// hot-path `resolve_book_path` can locate a staged local copy without an
+    /// `AppHandle`. Distinct from `data_dir` (app *data* dir).
+    pub cache_dir: std::path::PathBuf,
     /// EPUB archive LRU cache (lock #2). Single Mutex replaces the former
     /// dual-Mutex (epub_cache + epub_cache_order). Arc so the unified cache
     /// registry (get_unified_cache_stats / clear_all_caches) can hold the
@@ -251,6 +256,25 @@ impl AppState {
     ///   carry an absolute path. Detected via `Path::is_absolute()` and
     ///   returned as-is so the old read flow keeps working.
     pub fn resolve_book_path(&self, book: &Book) -> FolioResult<String> {
+        // Prefer a locally-staged copy of the source file when one exists. This
+        // applies BEFORE the link/import branches below, so a linked book on a
+        // network share (the case this optimizes) is served from local disk.
+        // Existence-only, LOCAL-only, and cheap — never stats the (possibly
+        // network-mounted) source, so it's safe on the per-page hot path. The
+        // staged name is content-addressed by `file_hash`, so a present copy is
+        // always this book's bytes.
+        if let Some(hash) = book.file_hash.as_deref() {
+            let ext = std::path::Path::new(&book.file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if let Some(staged) =
+                folio_core::source_cache::staged_if_present(&self.cache_dir, hash, ext)
+            {
+                return Ok(staged.to_string_lossy().into_owned());
+            }
+        }
+
         if !book.is_imported {
             return Ok(book.file_path.clone());
         }
@@ -2654,6 +2678,89 @@ async fn serve_cached_only(
     }
 }
 
+/// Hashes with a background staging task currently in flight. Dedups repeated
+/// opens of the same book: without this, every open before the first copy
+/// finishes would spawn another blocking task (each doing a network `statfs` +
+/// waiting on the per-file stage lock). A hash is claimed before spawning and
+/// released when the task ends.
+static STAGING_INFLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Claim the in-flight slot for `hash`; returns `true` if newly claimed (caller
+/// should proceed) or `false` if a stage for this hash is already running.
+fn claim_staging(hash: &str) -> bool {
+    let mut set = STAGING_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    set.insert(hash.to_string())
+}
+
+fn release_staging(hash: &str) {
+    let mut set = STAGING_INFLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+    set.remove(hash);
+}
+
+/// RAII release of an in-flight staging claim: drops the hash from
+/// `STAGING_INFLIGHT` when the staging task ends — including on an unwind, so a
+/// panic inside the copy can't leave a hash permanently claimed (which would
+/// block that book from ever re-staging this process session).
+struct StagingClaim(String);
+
+impl Drop for StagingClaim {
+    fn drop(&mut self) {
+        release_staging(&self.0);
+    }
+}
+
+/// Blocking: stage `src` to `cache_dir` under `(hash, ext)` **iff** `src` is on
+/// a network mount. Returns `true` if staging was attempted. Does the network
+/// `statfs` (`is_remote_path`) and the copy, so it MUST run in a blocking
+/// context — never on an async worker (a hung mount would stall the runtime).
+/// A failure is logged, never surfaced. Separated out so the remote-gating
+/// logic is unit-testable without an async runtime.
+fn stage_source_if_remote(cache_dir: &std::path::Path, src: &str, hash: &str, ext: &str) -> bool {
+    if !crate::remote_fs::is_remote_path(std::path::Path::new(src)) {
+        return false;
+    }
+    match folio_core::source_cache::stage(cache_dir, std::path::Path::new(src), hash, ext) {
+        Ok(p) => log::info!(
+            "staged network-mounted book to local cache: {}",
+            p.display()
+        ),
+        Err(e) => log::warn!("source-cache staging failed for {src}: {e}"),
+    }
+    true
+}
+
+/// Fire-and-forget: if `real_path` is on a network mount and the book has a
+/// content hash, stage the source file onto the local source-cache in the
+/// background, so subsequent page renders (and future opens, via
+/// `resolve_book_path`) read locally instead of by random access over SMB.
+///
+/// Never blocks the caller: the network `statfs` and the copy both run inside
+/// `spawn_blocking`. Does nothing when the source is already local (which also
+/// covers the already-staged case, since `resolve_book_path` then hands us the
+/// local staged path). Deduped per hash so repeated opens don't pile up
+/// blocking tasks; `source_cache::stage` is itself single-flight and idempotent.
+fn stage_remote_source_in_background(cache_dir: std::path::PathBuf, book: &Book, real_path: &str) {
+    let Some(hash) = book.file_hash.clone() else {
+        return;
+    };
+    if !claim_staging(&hash) {
+        return; // a background stage for this hash is already running
+    }
+    // Release the claim when the task ends, even on panic/unwind (RAII).
+    let claim = StagingClaim(hash);
+    let ext = std::path::Path::new(&book.file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let src = real_path.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        // `claim` is moved in and dropped when this closure returns or unwinds.
+        stage_source_if_remote(&cache_dir, &src, &claim.0, &ext);
+    });
+}
+
 #[tauri::command]
 pub async fn prepare_comic(
     book_id: String,
@@ -2682,6 +2789,11 @@ pub async fn prepare_comic(
             "prepare_comic only supports CBZ/CBR formats",
         ));
     }
+
+    // Stage a network-mounted source to local disk on open (background,
+    // non-blocking) so page reads stop hitting the share at render time.
+    // After the format check so a wrong-format call can't launch a large copy.
+    stage_remote_source_in_background(state.cache_dir.clone(), &book, &file_path);
 
     let book_hash = book.file_hash.as_deref().ok_or("Book has no file hash")?;
     let storage = page_cache_storage(&app)?;
@@ -2819,6 +2931,11 @@ pub async fn prepare_pdf(
     if book.format != BookFormat::Pdf {
         return Err(FolioError::invalid("prepare_pdf only supports PDF format"));
     }
+
+    // Stage a network-mounted source to local disk on open (background,
+    // non-blocking) so page reads stop hitting the share at render time.
+    // After the format check so a wrong-format call can't launch a large copy.
+    stage_remote_source_in_background(state.cache_dir.clone(), &book, &file_path);
     let book_hash = book
         .file_hash
         .as_deref()
@@ -9554,6 +9671,7 @@ mod tests {
                 pools: std::collections::HashMap::new(),
             }),
             data_dir: dir.path().to_path_buf(),
+            cache_dir: dir.path().to_path_buf(),
             epub_cache: std::sync::Arc::new(std::sync::Mutex::new(LruCache::new(5))),
             #[cfg(feature = "mobi")]
             mobi_cache: std::sync::Arc::new(std::sync::Mutex::new(LruCache::new(5))),
@@ -9588,6 +9706,101 @@ mod tests {
         assert!(state.is_unlocked("alice"));
         state.mark_locked("alice").unwrap();
         assert!(!state.is_unlocked("alice"));
+    }
+
+    /// `resolve_book_path` must return a locally-staged copy when one exists for
+    /// the book's content hash — even for a linked (non-imported) book on an
+    /// absolute (network) path — and fall back to the original path otherwise.
+    /// This is the read half of the source-cache: staging happens at open, and
+    /// every later page render resolves to the local file.
+    #[test]
+    fn resolve_book_path_prefers_staged_copy() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let mut book = Book {
+            id: "bk-staged".to_string(),
+            title: "Staged".to_string(),
+            author: String::new(),
+            file_path: "/Volumes/remote/comic.pdf".to_string(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: BookFormat::Pdf,
+            file_hash: Some("abc123hash".to_string()),
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        };
+
+        // No staged copy yet → resolves to the original (remote) path.
+        assert_eq!(
+            state.resolve_book_path(&book).unwrap(),
+            "/Volumes/remote/comic.pdf"
+        );
+
+        // Stage a local copy under the state's cache_dir (keyed by hash + ext).
+        let srcdir = tempfile::tempdir().unwrap();
+        let src = srcdir.path().join("comic.pdf");
+        std::fs::write(&src, b"staged bytes").unwrap();
+        let staged =
+            folio_core::source_cache::stage(dir.path(), &src, "abc123hash", "pdf").unwrap();
+
+        // Now resolve prefers the local staged copy.
+        assert_eq!(
+            state.resolve_book_path(&book).unwrap(),
+            staged.to_string_lossy()
+        );
+
+        // A book with no hash never resolves to a staged copy.
+        book.file_hash = None;
+        assert_eq!(
+            state.resolve_book_path(&book).unwrap(),
+            "/Volumes/remote/comic.pdf"
+        );
+    }
+
+    /// A LOCAL source must never be staged (guards against an `is_remote_path`
+    /// polarity flip that would copy every local book). A tempdir is always on
+    /// a local filesystem, so `stage_source_if_remote` returns false and writes
+    /// nothing.
+    #[test]
+    fn stage_source_if_remote_skips_local_source() {
+        let cache = tempfile::tempdir().unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let src = srcdir.path().join("local.pdf");
+        std::fs::write(&src, b"local bytes").unwrap();
+
+        let attempted =
+            stage_source_if_remote(cache.path(), &src.to_string_lossy(), "localhash", "pdf");
+
+        assert!(!attempted, "a local source must not be staged");
+        assert!(
+            folio_core::source_cache::staged_if_present(cache.path(), "localhash", "pdf").is_none(),
+            "no staged copy should exist for a local source"
+        );
+    }
+
+    /// The in-flight dedup guard: the first claim on a hash wins; a second claim
+    /// while it's held is refused; after release the hash can be claimed again.
+    #[test]
+    fn staging_inflight_guard_dedups_by_hash() {
+        let h = "inflight-guard-hash";
+        assert!(claim_staging(h), "first claim succeeds");
+        assert!(!claim_staging(h), "second concurrent claim is refused");
+        release_staging(h);
+        assert!(claim_staging(h), "claimable again after release");
+        release_staging(h);
     }
 
     #[test]
