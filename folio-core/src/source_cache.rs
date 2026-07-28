@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use crate::error::{FolioError, FolioResult};
 
@@ -116,6 +117,163 @@ pub fn staged_if_present(base: &Path, hash: &str, ext: &str) -> Option<PathBuf> 
     }
 }
 
+/// Default size budget (MB) for the whole source cache. Staged files are entire
+/// book files — a single scanned comic can be ~500 MB — so this is far larger
+/// than the page cache's rendered-JPEG budget. ~4 GB holds a working set of
+/// several large books; least-recently-opened files are evicted past it.
+pub const DEFAULT_MAX_SIZE_MB: u64 = 4096;
+
+/// Bump a staged file's modified-time to now, marking it most-recently-used for
+/// [`run_eviction`]'s LRU ordering. Called once per open (cheap, local). No-op
+/// if the book isn't staged. Best-effort — a failure just leaves the old mtime,
+/// which at worst evicts a still-wanted file slightly early.
+pub fn touch_staged(base: &Path, hash: &str, ext: &str) {
+    if let Some(p) = staged_if_present(base, hash, ext) {
+        if let Ok(f) = std::fs::File::options().write(true).open(&p) {
+            let _ = f.set_modified(SystemTime::now());
+        }
+    }
+}
+
+/// Remove the staged copy for `(hash, ext)`, if present. Best-effort — used when
+/// a book is deleted so its (large) staged file doesn't linger until size
+/// eviction reclaims it.
+///
+/// Also removes any in-progress temp for this key. It takes the same per-key
+/// stage lock `stage` holds for its whole copy→rename lifetime, so a stage that
+/// is *already running* fully publishes before we remove — removing both the
+/// final file and the temp then leaves nothing behind.
+///
+/// KNOWN LIMITATION (bounded, benign): staging is queued asynchronously, so if a
+/// book is deleted in the brief window after open but before its queued stage
+/// task calls [`stage`], this runs first (lock uncontended, nothing to remove)
+/// and the task later publishes an orphaned copy. That orphan is not a leak: the
+/// cache stays within its size budget regardless (size eviction reclaims it as a
+/// normal LRU entry), and a re-import of the same content reuses it. Fully
+/// closing this would need a delete-vs-queue tombstone; deemed not worth the
+/// machinery for a transient, self-healing orphan.
+pub fn remove_staged(base: &Path, hash: &str, ext: &str) {
+    if !is_safe_component(hash) || !(ext.is_empty() || is_safe_component(ext)) {
+        return;
+    }
+    let name = staged_file_name(hash, ext);
+    let lock = lock_for(&name);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = base.join(SOURCE_CACHE_DIR);
+    let _ = std::fs::remove_file(dir.join(&name));
+    let _ = std::fs::remove_file(dir.join(SOURCE_CACHE_TMP_DIR).join(format!("{name}.tmp")));
+}
+
+/// Evict least-recently-modified staged files until the source cache's total
+/// size is within `max_size_mb`. mtime is bumped on each open ([`touch_staged`]),
+/// so this is last-open LRU. Only regular files directly under `source-cache/`
+/// are considered — the `tmp/` subdir (in-progress copies) is skipped. Best-
+/// effort: a file that can't be stat'd or removed is skipped, never aborting.
+pub fn run_eviction(base: &Path, max_size_mb: u64) -> FolioResult<()> {
+    let dir = base.join(SOURCE_CACHE_DIR);
+
+    // First reclaim abandoned temp copies — a stage that crashed after creating
+    // its temp but before the rename leaves a (potentially ~500 MB) file in
+    // `tmp/` that the staged-file sweep below never counts or removes, so the
+    // "bounded" cache could grow without limit. Anything in `tmp/` older than
+    // the threshold is certainly not an active copy (even a 500 MB copy over a
+    // slow share finishes in minutes), so younger temps of live stages are left
+    // untouched.
+    reclaim_stale_temps(&dir.join(SOURCE_CACHE_TMP_DIR));
+
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()), // no cache dir yet — nothing to evict
+    };
+
+    // Collect regular files directly under source-cache/. `DirEntry::metadata`
+    // does not traverse symlinks, so the `tmp/` subdir (a directory) and any
+    // symlink are excluded by the `is_file` check.
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    for entry in rd.flatten() {
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        files.push((entry.path(), meta.len(), mtime));
+    }
+
+    let budget = max_size_mb.saturating_mul(1024 * 1024);
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    if total <= budget {
+        return Ok(());
+    }
+
+    // Oldest modified-time first — last-open LRU, since `touch_staged` bumps
+    // mtime on each open. Two concurrent stages can each run this from their own
+    // snapshot and over-evict a file or two (both targeting the same oldest);
+    // the result stays within budget and the extra files re-stage on demand, so
+    // no lock coordinates them.
+    files.sort_by_key(|(_, _, mtime)| *mtime);
+    for (path, size, _) in files {
+        if total <= budget {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+
+    Ok(())
+}
+
+/// Seconds after which a file in `tmp/` is considered abandoned (a crashed
+/// stage), safe to reclaim. Generously longer than any real copy: even a
+/// multi-hundred-MB copy over a slow network share completes in minutes.
+const STALE_TMP_SECS: u64 = 3600;
+
+/// Delete temp files in `tmp_dir` older than [`STALE_TMP_SECS`]. Best-effort;
+/// leaves younger temps (potentially live in-progress copies) untouched.
+///
+/// Each temp is handled under its per-key stage lock: an in-progress copy holds
+/// that lock for its whole lifetime, so once acquired here the temp is either
+/// already renamed away (stage finished) or truly abandoned (the stager is
+/// gone). The staleness re-check runs UNDER the lock, so a temp replaced by a
+/// fresh stage between enumeration and removal is re-judged (and, being live,
+/// spared) rather than deleted on stale metadata.
+fn reclaim_stale_temps(tmp_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(tmp_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in rd.flatten() {
+        // Temp files are named `{staged_file_name}.tmp`; the key without the
+        // suffix is the stage lock key.
+        let file_name = entry.file_name();
+        let Some(key) = file_name.to_str().and_then(|n| n.strip_suffix(".tmp")) else {
+            continue;
+        };
+        let lock = lock_for(key);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Re-stat UNDER the lock (state may have changed since enumeration).
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        if now
+            .duration_since(mtime)
+            .map(|age| age.as_secs() > STALE_TMP_SECS)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// True when a staged copy exists AND its byte length equals `expected_size`.
 ///
 /// The size check is the integrity guard: a content-addressed name plus an
@@ -195,6 +353,32 @@ pub fn stage(base: &Path, src: &Path, hash: &str, ext: &str) -> FolioResult<Path
     // Any failure from here on must not leave the temp behind.
     let publish = || -> FolioResult<()> {
         std::fs::copy(src, &tmp)?;
+        // `fs::copy` carries the source's permissions, so a read-only source
+        // (e.g. mode 0444 on a share) yields a read-only staged file. Ensure the
+        // owner can write it, so `touch_staged` (which needs a write handle for
+        // `set_modified`) can bump the mtime — otherwise the file's LRU position
+        // would freeze and it could be evicted while actively read. Best-effort.
+        if let Ok(meta) = std::fs::metadata(&tmp) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode();
+                if mode & 0o200 == 0 {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(mode | 0o200); // add owner-write only
+                    let _ = std::fs::set_permissions(&tmp, perms);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(&tmp, perms);
+                }
+            }
+        }
         // Guard against a short copy (e.g. the source shrank mid-copy): never
         // publish a file whose length doesn't match the source we measured.
         let copied = std::fs::metadata(&tmp)?.len();
@@ -293,6 +477,195 @@ mod tests {
         assert_eq!(staged_if_present(base.path(), "hp", "pdf"), Some(dest));
         // Unsafe key never resolves.
         assert!(staged_if_present(base.path(), "../escape", "pdf").is_none());
+    }
+
+    /// Pin a file's modified-time to `UNIX_EPOCH + secs` for deterministic LRU
+    /// ordering in eviction tests.
+    fn set_mtime(path: &Path, secs: u64) {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn one_mb() -> Vec<u8> {
+        vec![0u8; 1024 * 1024]
+    }
+
+    #[test]
+    fn run_eviction_removes_oldest_until_within_budget() {
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "s.bin", &one_mb());
+
+        let a = stage(base.path(), &src, "aaa", "bin").unwrap();
+        let b = stage(base.path(), &src, "bbb", "bin").unwrap();
+        let c = stage(base.path(), &src, "ccc", "bin").unwrap();
+        set_mtime(&a, 100); // oldest
+        set_mtime(&b, 200);
+        set_mtime(&c, 300); // newest
+
+        // 3 MB staged, 2 MB budget ⇒ evict the single oldest (a).
+        run_eviction(base.path(), 2).unwrap();
+
+        assert!(staged_if_present(base.path(), "aaa", "bin").is_none());
+        assert!(staged_if_present(base.path(), "bbb", "bin").is_some());
+        assert!(staged_if_present(base.path(), "ccc", "bin").is_some());
+    }
+
+    #[test]
+    fn run_eviction_noop_when_under_budget() {
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "s.bin", &one_mb());
+        stage(base.path(), &src, "keep1", "bin").unwrap();
+        stage(base.path(), &src, "keep2", "bin").unwrap();
+
+        run_eviction(base.path(), 100).unwrap();
+
+        assert!(staged_if_present(base.path(), "keep1", "bin").is_some());
+        assert!(staged_if_present(base.path(), "keep2", "bin").is_some());
+    }
+
+    #[test]
+    fn run_eviction_skips_tmp_subdir() {
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "s.bin", &one_mb());
+        stage(base.path(), &src, "staged", "bin").unwrap();
+
+        // Plant a large file inside the tmp/ subdir; eviction must ignore it
+        // (neither count it toward the budget nor delete it).
+        let tmp_dir = base
+            .path()
+            .join(SOURCE_CACHE_DIR)
+            .join(SOURCE_CACHE_TMP_DIR);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let tmp_file = tmp_dir.join("in-progress.tmp");
+        std::fs::write(&tmp_file, one_mb()).unwrap();
+
+        // Tiny budget: would evict everything countable, but tmp/ is off-limits.
+        run_eviction(base.path(), 0).unwrap();
+
+        assert!(tmp_file.exists(), "tmp/ contents must never be evicted");
+    }
+
+    #[test]
+    fn touch_staged_marks_recent() {
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "s.bin", b"x");
+        let dest = stage(base.path(), &src, "touchme", "bin").unwrap();
+        set_mtime(&dest, 1_000);
+
+        touch_staged(base.path(), "touchme", "bin");
+
+        let m = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        assert!(
+            m > SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+            "touch must advance the mtime"
+        );
+    }
+
+    #[test]
+    fn remove_staged_deletes_copy() {
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "s.bin", b"x");
+        stage(base.path(), &src, "goner", "bin").unwrap();
+        assert!(staged_if_present(base.path(), "goner", "bin").is_some());
+
+        remove_staged(base.path(), "goner", "bin");
+
+        assert!(staged_if_present(base.path(), "goner", "bin").is_none());
+    }
+
+    #[test]
+    fn remove_staged_also_removes_inflight_temp() {
+        let base = TempDir::new().unwrap();
+        let tmp_dir = base
+            .path()
+            .join(SOURCE_CACHE_DIR)
+            .join(SOURCE_CACHE_TMP_DIR);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        // An in-flight temp for key ("h","pdf") — as a mid-copy stage would have.
+        let temp = tmp_dir.join("h.pdf.tmp");
+        std::fs::write(&temp, b"partial").unwrap();
+
+        remove_staged(base.path(), "h", "pdf");
+
+        assert!(!temp.exists(), "the in-flight temp must be removed too");
+    }
+
+    #[test]
+    fn run_eviction_reclaims_stale_temp_but_keeps_fresh() {
+        let base = TempDir::new().unwrap();
+        let tmp_dir = base
+            .path()
+            .join(SOURCE_CACHE_DIR)
+            .join(SOURCE_CACHE_TMP_DIR);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let stale = tmp_dir.join("abandoned.tmp");
+        std::fs::write(&stale, b"crashed copy").unwrap();
+        set_mtime(&stale, 1_000); // 1970 — far older than STALE_TMP_SECS
+
+        let fresh = tmp_dir.join("in-progress.tmp");
+        std::fs::write(&fresh, b"live copy").unwrap(); // mtime ≈ now
+
+        // Runs even under budget (reclaim happens before the size check).
+        run_eviction(base.path(), 100).unwrap();
+
+        assert!(!stale.exists(), "an abandoned temp must be reclaimed");
+        assert!(fresh.exists(), "a fresh (live) temp must be left alone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_eviction_excludes_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = TempDir::new().unwrap();
+        let cache = base.path().join(SOURCE_CACHE_DIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        // A large real file OUTSIDE the cache, symlinked INTO it.
+        let target = base.path().join("big.bin");
+        std::fs::write(&target, one_mb()).unwrap();
+        let link = cache.join("linkhash.bin");
+        symlink(&target, &link).unwrap();
+
+        // Budget 0 would evict everything countable, but a symlink is neither
+        // counted nor removed (the security comment leans on this).
+        run_eviction(base.path(), 0).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "a symlink under source-cache/ must not be evicted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_makes_readonly_source_copy_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TempDir::new().unwrap();
+        let srcdir = TempDir::new().unwrap();
+        let src = write_src(srcdir.path(), "ro.bin", b"read-only source");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let dest = stage(base.path(), &src, "rohash", "bin").unwrap();
+
+        // The staged copy must be writable so LRU touch works.
+        assert!(!std::fs::metadata(&dest).unwrap().permissions().readonly());
+        set_mtime(&dest, 1_000);
+        touch_staged(base.path(), "rohash", "bin");
+        let m = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        assert!(
+            m > SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+            "touch must advance the mtime of a copy from a read-only source"
+        );
     }
 
     #[test]

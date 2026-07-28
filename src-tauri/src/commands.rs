@@ -649,12 +649,24 @@ fn evict_book_page_cache(
     storage: Option<&dyn folio_core::storage::Storage>,
     file_hash: Option<&str>,
     resolved_path: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
 ) {
     if let (Some(s), Some(h)) = (storage, file_hash) {
         let _ = page_cache::evict_book(s, h);
     }
     if let Some(p) = resolved_path {
         pdf::evict_memory_cache(p);
+    }
+    // Remove the local staged source copy (if any) so a deleted book's large
+    // staged file doesn't linger until size eviction reclaims it. The staged
+    // name is keyed by hash + the book's file extension, which `resolved_path`
+    // carries (whether it points at the original or the staged copy).
+    if let (Some(dir), Some(h), Some(p)) = (cache_dir, file_hash, resolved_path) {
+        let ext = std::path::Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        folio_core::source_cache::remove_staged(dir, h, ext);
     }
 }
 
@@ -1555,6 +1567,7 @@ pub async fn remove_book<R: tauri::Runtime>(
             .map(|s| s as &dyn folio_core::storage::Storage),
         book_hash.as_deref(),
         resolved_path.as_deref(),
+        Some(state.cache_dir.as_path()),
     );
 
     Ok(())
@@ -2721,10 +2734,18 @@ fn stage_source_if_remote(cache_dir: &std::path::Path, src: &str, hash: &str, ex
         return false;
     }
     match folio_core::source_cache::stage(cache_dir, std::path::Path::new(src), hash, ext) {
-        Ok(p) => log::info!(
-            "staged network-mounted book to local cache: {}",
-            p.display()
-        ),
+        Ok(p) => {
+            log::info!(
+                "staged network-mounted book to local cache: {}",
+                p.display()
+            );
+            // Keep the source cache within its disk budget, evicting the
+            // least-recently-opened staged files. Best-effort.
+            let _ = folio_core::source_cache::run_eviction(
+                cache_dir,
+                folio_core::source_cache::DEFAULT_MAX_SIZE_MB,
+            );
+        }
         Err(e) => log::warn!("source-cache staging failed for {src}: {e}"),
     }
     true
@@ -2761,6 +2782,18 @@ fn stage_remote_source_in_background(cache_dir: std::path::PathBuf, book: &Book,
     });
 }
 
+/// Mark a book's staged copy (if present) most-recently-used, so source-cache
+/// eviction keeps the books you actually open. Cheap, local, once per open.
+fn touch_staged_book(cache_dir: &std::path::Path, book: &Book) {
+    if let Some(hash) = book.file_hash.as_deref() {
+        let ext = std::path::Path::new(&book.file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        folio_core::source_cache::touch_staged(cache_dir, hash, ext);
+    }
+}
+
 #[tauri::command]
 pub async fn prepare_comic(
     book_id: String,
@@ -2790,9 +2823,11 @@ pub async fn prepare_comic(
         ));
     }
 
-    // Stage a network-mounted source to local disk on open (background,
-    // non-blocking) so page reads stop hitting the share at render time.
-    // After the format check so a wrong-format call can't launch a large copy.
+    // Mark the staged copy (if any) most-recently-used for eviction, then stage
+    // a network-mounted source to local disk on open (background, non-blocking)
+    // so page reads stop hitting the share at render time. After the format
+    // check so a wrong-format call can't launch a large copy.
+    touch_staged_book(&state.cache_dir, &book);
     stage_remote_source_in_background(state.cache_dir.clone(), &book, &file_path);
 
     let book_hash = book.file_hash.as_deref().ok_or("Book has no file hash")?;
@@ -2932,9 +2967,11 @@ pub async fn prepare_pdf(
         return Err(FolioError::invalid("prepare_pdf only supports PDF format"));
     }
 
-    // Stage a network-mounted source to local disk on open (background,
-    // non-blocking) so page reads stop hitting the share at render time.
-    // After the format check so a wrong-format call can't launch a large copy.
+    // Mark the staged copy (if any) most-recently-used for eviction, then stage
+    // a network-mounted source to local disk on open (background, non-blocking)
+    // so page reads stop hitting the share at render time. After the format
+    // check so a wrong-format call can't launch a large copy.
+    touch_staged_book(&state.cache_dir, &book);
     stage_remote_source_in_background(state.cache_dir.clone(), &book, &file_path);
     let book_hash = book
         .file_hash
@@ -7233,6 +7270,7 @@ pub async fn cleanup_library(
                 .map(|s| s as &dyn folio_core::storage::Storage),
             book.file_hash.as_deref(),
             Some(resolved.as_str()),
+            Some(state.cache_dir.as_path()),
         );
 
         log_event(
@@ -7701,7 +7739,12 @@ pub async fn bulk_delete_books(
         .as_ref()
         .map(|s| s as &dyn folio_core::storage::Storage);
     for (hash, path) in evict_targets {
-        evict_book_page_cache(storage_ref, hash.as_deref(), path.as_deref());
+        evict_book_page_cache(
+            storage_ref,
+            hash.as_deref(),
+            path.as_deref(),
+            Some(state.cache_dir.as_path()),
+        );
     }
 
     Ok(book_ids.len() as u32)
@@ -8177,11 +8220,39 @@ mod tests {
         page_cache::write_text_index(&storage, "hash-remove-test", &index).unwrap();
         assert!(page_cache::read_text_index(&storage, "hash-remove-test").is_some());
 
-        evict_book_page_cache(Some(&storage), Some("hash-remove-test"), None);
+        evict_book_page_cache(Some(&storage), Some("hash-remove-test"), None, None);
 
         assert!(
             page_cache::read_text_index(&storage, "hash-remove-test").is_none(),
             "eviction must remove the book's persisted page cache, including the text index"
+        );
+    }
+
+    /// Deleting a book must also remove its locally-staged source copy, so a
+    /// large staged file doesn't linger after the book is gone. `resolved_path`
+    /// carries the extension the staged file was keyed by.
+    #[test]
+    fn evict_book_page_cache_removes_staged_source_copy() {
+        let cache = tempfile::tempdir().unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let src = srcdir.path().join("book.cbz");
+        std::fs::write(&src, b"staged comic bytes").unwrap();
+        folio_core::source_cache::stage(cache.path(), &src, "del-hash", "cbz").unwrap();
+        assert!(
+            folio_core::source_cache::staged_if_present(cache.path(), "del-hash", "cbz").is_some()
+        );
+
+        // resolved_path ends in .cbz so the staged ext is derived correctly.
+        evict_book_page_cache(
+            None,
+            Some("del-hash"),
+            Some("/Volumes/remote/book.cbz"),
+            Some(cache.path()),
+        );
+
+        assert!(
+            folio_core::source_cache::staged_if_present(cache.path(), "del-hash", "cbz").is_none(),
+            "the staged source copy must be removed on book deletion"
         );
     }
 
