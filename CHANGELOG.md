@@ -23,6 +23,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   pages (two on each side, next pages first) as soon as you settle on a page,
   during browser idle time and without flooding a network-mounted library, so a
   forward turn lands on an already-rendered page instead of waiting for one.
+  Preloading only promotes pages that are already cached — it never starts a
+  cold render in the background, so it can't slow down the page you're on.
 - **Fewer redundant page re-renders after a window resize.** The desktop reader
   now quantizes the requested render width coarsely, so small window-size
   changes no longer produce a new cache key and invalidate every already-loaded

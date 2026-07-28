@@ -2512,17 +2512,40 @@ pub async fn get_comic_page_bytes(
     book_id: String,
     page_index: u32,
     target_width: Option<u32>,
+    // When true, only serve an already-cached page: a cache miss returns an
+    // empty response instead of decoding the archive. The reader's background
+    // preloader sets this so warming neighbor pages never triggers a cold
+    // decode (which, on a network-mounted library, would contend with the
+    // foreground page the user is waiting on). Foreground reads leave it unset.
+    cached_only: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> FolioResult<tauri::ipc::Response> {
     let _t = state.ipc_metrics.time("get_comic_page_bytes");
     let target_width = target_width.filter(|&w| w > 0).map(|w| w.min(9600));
+    let cached_only = cached_only.unwrap_or(false);
 
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
             .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
     };
+
+    // A cached_only probe touches ONLY the local page cache — never the source
+    // archive — so it must skip resolve_book_path / validate_file_exists, which
+    // stat the (possibly network-mounted) file and would defeat the point of a
+    // no-contention preload.
+    if cached_only {
+        return serve_cached_only(
+            app,
+            book.file_hash.clone(),
+            page_index,
+            target_width,
+            "comic",
+        )
+        .await;
+    }
+
     let file_path = state.resolve_book_path(&book)?;
     validate_file_exists(&file_path)?;
 
@@ -2580,6 +2603,44 @@ pub async fn get_comic_page_bytes(
     Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
         bytes, &mime,
     )))
+}
+
+/// Serve a page ONLY if it's already in the local page cache, without touching
+/// the source file. Used by the reader's preloader (`cached_only`): a hit is
+/// returned as normal wire bytes, a miss as an empty response the client skips.
+/// Runs the cache read + resize on the blocking pool (I/O + CPU).
+async fn serve_cached_only(
+    app: AppHandle,
+    book_hash: Option<String>,
+    page_index: u32,
+    target_width: Option<u32>,
+    label: &'static str,
+) -> FolioResult<tauri::ipc::Response> {
+    let rendered =
+        tauri::async_runtime::spawn_blocking(move || -> FolioResult<Option<(Vec<u8>, String)>> {
+            if let Ok(storage) = page_cache_storage(&app) {
+                if let Some(ref hash) = book_hash {
+                    if let Ok((data, mime)) =
+                        page_cache::get_cached_page(&storage, hash, page_index)
+                    {
+                        let (bytes, out_mime) =
+                            crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+                        return Ok(Some((bytes, out_mime)));
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| FolioError::internal(format!("{label} cache probe failed: {e}")))??;
+
+    match rendered {
+        Some((bytes, mime)) => Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
+            bytes, &mime,
+        ))),
+        // cached_only miss: empty response signals "not cached, skip".
+        None => Ok(tauri::ipc::Response::new(Vec::new())),
+    }
 }
 
 #[tauri::command]
@@ -5277,11 +5338,18 @@ pub async fn get_pdf_page_bytes(
     book_id: String,
     page_index: u32,
     width: Option<u32>,
+    // When true, only serve an already-cached page: a cache miss returns an
+    // empty response instead of rendering. The reader's background preloader
+    // sets this so warming neighbor pages never triggers a cold pdfium render
+    // (which, on a network-mounted library, would contend with the foreground
+    // page the user is waiting on). Foreground reads leave it unset.
+    cached_only: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> FolioResult<tauri::ipc::Response> {
     let _t = state.ipc_metrics.time("get_pdf_page_bytes");
     let render_width = width.filter(|&w| w > 0).map(|w| w.min(9600));
+    let cached_only = cached_only.unwrap_or(false);
 
     let book = {
         let conn = state.active_db()?.get()?;
@@ -5293,6 +5361,16 @@ pub async fn get_pdf_page_bytes(
             "get_pdf_page_bytes only supports PDF format",
         ));
     }
+
+    // A cached_only probe touches ONLY the local page cache — never the source
+    // PDF — so it must skip resolve_book_path / validate_file_exists, which stat
+    // the (possibly network-mounted) file and would defeat the point of a
+    // no-contention preload.
+    if cached_only {
+        return serve_cached_only(app, book.file_hash.clone(), page_index, render_width, "pdf")
+            .await;
+    }
+
     let file_path = state.resolve_book_path(&book)?;
     validate_file_exists(&file_path)?;
 
