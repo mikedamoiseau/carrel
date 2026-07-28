@@ -6,6 +6,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **The reader stays responsive while a page renders.** Comic and PDF page
+  renders now run on a background thread instead of the request handler, so a
+  slow page — a large PDF page fetched over a network drive can take a few
+  seconds — no longer blocks other actions (navigation, menus, the page you're
+  waiting on) until it finishes.
 - **Opening a large PDF no longer freezes the reader.** `prepare_pdf` used to
   render the first 10 pages synchronously before the reader could show anything
   — tens of seconds on a large PDF stored on a network drive. It now renders
