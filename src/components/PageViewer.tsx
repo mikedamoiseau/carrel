@@ -22,6 +22,13 @@ export interface PdfSelection {
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 4;
 const ZOOM_STEP = 0.25;
+// How long the zoom level must hold still before the backend page is
+// re-rendered at the new width. A wheel/keyboard zoom burst fires many steps in
+// quick succession; debouncing collapses them into ONE render at the settled
+// width. 200ms is below the ~250ms that reads as sluggish, yet long enough to
+// swallow a fast burst. The CSS transform (applyTransform) uses the raw zoom, so
+// visual feedback stays instant regardless of this delay.
+const ZOOM_SETTLE_MS = 200;
 // Max blob URLs kept alive at once. ~±12 pages around the current one, so
 // backtracking through a chapter stays a cache hit. Coarse render-width
 // quantization (see pageRenderWidth) keeps a window resize from churning
@@ -245,6 +252,47 @@ export default function PageViewer({
 
   // Quantize zoom to nearest 0.25 so we don't re-render on every tiny change
   const renderZoom = Math.ceil(zoom * 4) / 4;
+  // Debounce the zoom that drives the BACKEND re-fetch (via renderWidth below):
+  // a zoom burst collapses to a single render at the settled width, while
+  // applyTransform keeps using the raw `zoom` for instant visual feedback. The
+  // state seeds to the current renderZoom on the first render — whatever a
+  // restored zoom is — so the cold/initial load is never delayed.
+  //
+  // A page turn resets zoom to 1 (goTo) and must re-fetch at the new zoom
+  // IMMEDIATELY, not lag 200ms behind the pre-turn (larger) width. So when the
+  // page changes we snap to the current renderZoom synchronously — during
+  // render, not in an effect, so the load effect (which re-runs on the same
+  // page change) already sees the correct width and fetches once. Debouncing
+  // then applies only to genuine same-page zoom changes.
+  //
+  // Implemented with React's sanctioned "adjust state during render" pattern:
+  // the previous page is held in STATE (zoomPageKey), and when the page changes
+  // we call setState during render (only setState — no ref writes or other side
+  // effects, so it stays render-pure and StrictMode/concurrent-safe). React
+  // discards the in-progress render and retries with the snapped state before
+  // committing, so the load effect only ever commits at the correct width.
+  const [debouncedRenderZoom, setDebouncedRenderZoom] = useState(renderZoom);
+  const [zoomPageKey, setZoomPageKey] = useState(pageIndex);
+  const zoomPageChanged = zoomPageKey !== pageIndex;
+  if (zoomPageChanged) {
+    setZoomPageKey(pageIndex);
+    if (debouncedRenderZoom !== renderZoom) setDebouncedRenderZoom(renderZoom);
+  }
+  // Debounce genuine same-page zoom changes. The timer is local to the effect
+  // (no ref), and the cleanup cancels a superseded pending settle when
+  // renderZoom changes again or on unmount. On a page turn renderZoom drops to
+  // the reset value, so this effect re-runs and cancels any pending settle for
+  // the old zoom; the fired callback then sets debouncedRenderZoom to a value
+  // the render-phase snap already applied (an Object.is no-op).
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedRenderZoom(renderZoom), ZOOM_SETTLE_MS);
+    return () => clearTimeout(t);
+  }, [renderZoom]);
+  // On the page-change render the snapped state hasn't flushed into
+  // debouncedRenderZoom yet, so use the current renderZoom directly to keep that
+  // (discarded) render internally consistent; the committed retry reads the
+  // snapped debouncedRenderZoom, which equals renderZoom anyway.
+  const effectiveRenderZoom = zoomPageChanged ? renderZoom : debouncedRenderZoom;
 
   // Fetches a single page from the backend over the binary wire format
   // and returns a blob URL ready to assign to `<img src>`. The caller
@@ -301,7 +349,7 @@ export default function PageViewer({
   }, []);
   const renderWidth = computeRenderWidth(containerWidth, {
     dualPage,
-    zoom: renderZoom,
+    zoom: effectiveRenderZoom,
     dpr,
   });
 
@@ -481,12 +529,45 @@ export default function PageViewer({
     };
   }, [bookId]);
 
+  // Identity of the last load the effect ran, so a re-run triggered purely by
+  // a width change (zoom settle) can be told apart from a genuine page change,
+  // book switch, cold/mount load, or retry. `book` matters because the reader
+  // pane is not remounted on navigation (the id changes in place), so switching
+  // to a different book at the same page index must still show the spinner.
+  // Impossible initial values make the first run count as a real load.
+  const prevLoadKeyRef = useRef<{
+    book: string;
+    left: number;
+    right: number | null;
+    retry: number;
+  }>({
+    book: "",
+    left: -1,
+    right: -1,
+    retry: -1,
+  });
+
   // Load spread (one or two pages in parallel) with timeout
   useEffect(() => {
     let cancelled = false;
     let rafId: number | undefined;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    setLoading(true);
+    // A same-page width-only reload (zoom settle) keeps the current
+    // CSS-transformed bitmap visible instead of flashing the spinner over it;
+    // the sharper render swaps in when it resolves. Genuine page changes, the
+    // cold/mount load, and retries still flip loading true.
+    const samePageReload =
+      prevLoadKeyRef.current.book === bookId &&
+      prevLoadKeyRef.current.left === spread.left &&
+      prevLoadKeyRef.current.right === spread.right &&
+      prevLoadKeyRef.current.retry === retryCount;
+    prevLoadKeyRef.current = {
+      book: bookId,
+      left: spread.left,
+      right: spread.right,
+      retry: retryCount,
+    };
+    if (!samePageReload) setLoading(true);
     setError(null);
     // NOTE: we deliberately do NOT clear leftDisplayedId/rightDisplayedId here.
     // The `imageLayerActive` identity predicate already deactivates the text

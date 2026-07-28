@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+- **Zooming a PDF or comic in the desktop reader is now instant.** Zooming
+  scales the page you're looking at immediately (as it always did), but the
+  reader used to re-render the page through the backend on every step of a
+  wheel or held-key zoom — a burst of expensive renders that made zooming feel
+  sluggish, and flashed a loading spinner over the page each time. Now a zoom
+  burst re-renders once, after the zoom settles, and the sharper page swaps in
+  quietly without a spinner — so zooming stays smooth and the page you're
+  viewing never disappears behind a loading overlay while you adjust it.
+
 ## [2.11.0] - 2026-07-28
 
 ### Fixed
