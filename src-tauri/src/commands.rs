@@ -2761,7 +2761,11 @@ fn stage_source_if_remote(cache_dir: &std::path::Path, src: &str, hash: &str, ex
 /// covers the already-staged case, since `resolve_book_path` then hands us the
 /// local staged path). Deduped per hash so repeated opens don't pile up
 /// blocking tasks; `source_cache::stage` is itself single-flight and idempotent.
-fn stage_remote_source_in_background(cache_dir: std::path::PathBuf, book: &Book, real_path: &str) {
+pub(crate) fn stage_remote_source_in_background(
+    cache_dir: std::path::PathBuf,
+    book: &Book,
+    real_path: &str,
+) {
     let Some(hash) = book.file_hash.clone() else {
         return;
     };
@@ -2784,7 +2788,7 @@ fn stage_remote_source_in_background(cache_dir: std::path::PathBuf, book: &Book,
 
 /// Mark a book's staged copy (if present) most-recently-used, so source-cache
 /// eviction keeps the books you actually open. Cheap, local, once per open.
-fn touch_staged_book(cache_dir: &std::path::Path, book: &Book) {
+pub(crate) fn touch_staged_book(cache_dir: &std::path::Path, book: &Book) {
     if let Some(hash) = book.file_hash.as_deref() {
         let ext = std::path::Path::new(&book.file_path)
             .extension()
@@ -2792,6 +2796,43 @@ fn touch_staged_book(cache_dir: &std::path::Path, book: &Book) {
             .unwrap_or("");
         folio_core::source_cache::touch_staged(cache_dir, hash, ext);
     }
+}
+
+/// Web serving-path entry point (M2): ensure a network-mounted book has a local
+/// staged copy, without a per-page `statfs` storm. Unlike the desktop reader,
+/// the web server has no single "open" event — this runs on *every* page
+/// request, so it must be cheap on the common (already-staged) path:
+///
+/// - Staged copy present → bump its LRU recency (`touch_staged_book`) and
+///   return. A local existence check + mtime touch; no remote `statfs`, no
+///   spawn. This is what keeps a web-only read from being evicted mid-session.
+/// - No staged copy yet → kick a single background stage from the (remote)
+///   `real_path`, reusing `stage_remote_source_in_background`. That path does
+///   the remote `statfs` + copy inside `spawn_blocking` and is deduped per hash
+///   (`STAGING_INFLIGHT`), so pages 2..N requested while the copy is in flight
+///   no-op instead of piling up. Once the copy lands, `resolve_book_path` hands
+///   the caller the staged path and this function takes the cheap touch branch.
+///
+/// `real_path` is only used on the stage branch. The caller passes the resolved
+/// book path; because no staged copy was observed on this branch, it is normally
+/// the original (remote) source. If a staged copy is evicted in the narrow
+/// window between the caller's `resolve_book_path` and this check, `real_path`
+/// may instead be a now-missing staged path — harmless: `stage_source_if_remote`
+/// re-checks `is_remote_path`, which is false for a local/missing path, so
+/// nothing is staged (the next page request re-stages once the copy is gone).
+pub(crate) fn ensure_web_source_staged(cache_dir: &std::path::Path, book: &Book, real_path: &str) {
+    let Some(hash) = book.file_hash.as_deref() else {
+        return;
+    };
+    let ext = std::path::Path::new(&book.file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if folio_core::source_cache::staged_if_present(cache_dir, hash, ext).is_some() {
+        touch_staged_book(cache_dir, book);
+        return;
+    }
+    stage_remote_source_in_background(cache_dir.to_path_buf(), book, real_path);
 }
 
 #[tauri::command]
@@ -7917,6 +7958,7 @@ pub async fn web_server_set_modes(
         let web_state = crate::web_server::WebState {
             pool: state.shared_active_pool.clone(),
             data_dir: state.data_dir.clone(),
+            cache_dir: state.cache_dir.clone(),
             pin_hash: state.shared_pin_hash.clone(),
             sessions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             login_limiter: std::sync::Arc::new(crate::web_server::auth::RateLimiter::new(5, 300)),
@@ -9872,6 +9914,68 @@ mod tests {
         release_staging(h);
         assert!(claim_staging(h), "claimable again after release");
         release_staging(h);
+    }
+
+    /// M2 web trigger: when a staged copy already exists,
+    /// `ensure_web_source_staged` takes the cheap touch branch — it bumps the
+    /// copy's LRU recency (mtime) rather than re-staging. Proven by backdating
+    /// the staged file's mtime and asserting the call advances it. A bogus
+    /// `real_path` guarantees the result comes from the touch branch, not from
+    /// a stage of the source.
+    #[test]
+    fn ensure_web_source_staged_touches_existing_copy() {
+        let cache = tempfile::tempdir().unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let src = srcdir.path().join("c.pdf");
+        std::fs::write(&src, b"staged bytes").unwrap();
+        let staged =
+            folio_core::source_cache::stage(cache.path(), &src, "webm2hash", "pdf").unwrap();
+
+        // Backdate the staged copy's mtime to a fixed point well in the past.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let mut book = Book {
+            id: "web-m2".to_string(),
+            title: "M2".to_string(),
+            author: String::new(),
+            file_path: "/Volumes/remote/c.pdf".to_string(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: BookFormat::Pdf,
+            file_hash: Some("webm2hash".to_string()),
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        };
+
+        ensure_web_source_staged(cache.path(), &book, "/bogus/remote/c.pdf");
+
+        let bumped = std::fs::metadata(&staged).unwrap().modified().unwrap();
+        assert!(
+            bumped > old,
+            "an existing staged copy must have its LRU mtime bumped by the touch branch"
+        );
+
+        // A book with no hash is a no-op (guards the early return).
+        book.file_hash = None;
+        ensure_web_source_staged(cache.path(), &book, "/bogus/remote/c.pdf");
     }
 
     #[test]

@@ -39,6 +39,10 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   after the first page or two. Already-local books are untouched. The local copies
   are kept within a disk budget (least-recently-opened evicted first) and a
   book's copy is removed when you delete the book, so disk use stays bounded.
+  This now applies to the web reader too: reading a network-hosted PDF or comic
+  over the built-in web server serves pages from the same local copy (staged on
+  the first page you open), so it's fast there as well — not just in the desktop
+  app.
 - **Smoother comic/PDF page turns.** The desktop reader now warms neighboring
   pages (two on each side, next pages first) as soon as you settle on a page,
   during browser idle time and without flooding a network-mounted library, so a

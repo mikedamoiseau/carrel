@@ -253,6 +253,7 @@ async fn toggle_mode(app: &AppHandle, which: ToggleWhich) {
         let web_state = crate::web_server::WebState {
             pool: state.shared_active_pool.clone(),
             data_dir: state.data_dir.clone(),
+            cache_dir: state.cache_dir.clone(),
             pin_hash: state.shared_pin_hash.clone(),
             sessions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             login_limiter: std::sync::Arc::new(crate::web_server::auth::RateLimiter::new(5, 300)),
