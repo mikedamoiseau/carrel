@@ -34,6 +34,7 @@ pub mod plugins;
 pub mod profile_lock;
 pub mod providers;
 pub mod search;
+pub mod source_cache;
 pub mod storage;
 pub mod sync;
 pub mod vocabulary;
