@@ -6,6 +6,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **PDF pages render one at a time, preventing rare crashes.** The underlying
+  PDF library isn't safe to call from multiple threads at once; with background
+  and foreground rendering now able to overlap, PDF page rendering is serialized
+  behind a lock. This also completes the fix above — a foreground page never
+  renders at the same time as a background one, so it can't be slowed by it.
 - **Reading a large PDF no longer bogs down mid-session.** After opening a PDF,
   the app renders the remaining pages into its cache in the background. That
   pass now pauses whenever you're actively viewing or turning a page, so it
