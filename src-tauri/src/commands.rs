@@ -93,6 +93,12 @@ pub struct AppState {
     /// exists yet — B-M2); any future ambiguity in a *derived* read (not
     /// this direct atomic load) should still resolve to "suppress".
     pub private_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Count of foreground page renders (`get_pdf_page_bytes` /
+    /// `get_comic_page_bytes`) currently in flight. The background PDF
+    /// prerender pass pauses while this is non-zero so it yields the source
+    /// file and CPU to the page the user is waiting on. Leaf counter — no lock
+    /// ordering constraint.
+    pub active_foreground_renders: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Serializes the profile-lifecycle commands (`set_profile_lock`,
     /// `remove_profile_lock`, `unlock_profile`, `delete_profile`) so two
     /// concurrent IPC calls on the same profile can't interleave across the
@@ -2549,6 +2555,11 @@ pub async fn get_comic_page_bytes(
     let file_path = state.resolve_book_path(&book)?;
     validate_file_exists(&file_path)?;
 
+    // Mark a foreground render in flight so a still-running PDF prerender pass
+    // (e.g. from a book opened just before this comic) yields to this page
+    // instead of competing for the same network-mounted storage / CPU.
+    let _fg_guard = ForegroundRenderGuard::new(state.active_foreground_renders.clone());
+
     // The archive decode + optional resize is CPU-bound and, on a
     // network-mounted library, I/O-bound for seconds. Run it on the blocking
     // pool so it never pins a Tauri async worker (which would stall other IPC —
@@ -2875,10 +2886,26 @@ pub async fn prepare_pdf(
         // session" switch — matching the on-demand read path's write
         // suppression (`get_pdf_page_bytes`).
         let bg_private = state.private_mode.clone();
+        // Foreground-priority throttle: pause before each background page while
+        // the reader is rendering a page, so the pass yields the source file
+        // and CPU to the page the user is waiting on (otherwise both contend
+        // over a network-mounted library and foreground renders can exceed the
+        // reader's load timeout).
+        let bg_foreground = state.active_foreground_renders.clone();
         tauri::async_runtime::spawn_blocking(move || {
             use std::sync::atomic::Ordering;
             let emit_private = bg_private.clone();
             let abort_private = bg_private.clone();
+            let throttle_private = bg_private.clone();
+            let throttle = move || {
+                // Block while a foreground render is in flight; give up promptly
+                // if private mode aborts the pass so it can stop.
+                while bg_foreground.load(Ordering::SeqCst) > 0
+                    && !throttle_private.load(Ordering::SeqCst)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            };
             let outcome = page_cache::prerender_pdf_remaining(
                 &bg_storage,
                 &bg_hash,
@@ -2904,6 +2931,7 @@ pub async fn prepare_pdf(
                     }
                 },
                 move || abort_private.load(Ordering::SeqCst),
+                throttle,
             );
             // Guaranteed terminal event: settle the frontend bar at true
             // coverage (100% normally, or the partial value when the size
@@ -5329,6 +5357,25 @@ pub async fn get_pdf_page_text(
 /// `prepare_pdf`: a disk hit reads canonical-width bytes and resizes
 /// down to the viewport target. On miss with a PDF manifest present,
 /// renders at the canonical width and writes best-effort to disk
+/// RAII counter for in-flight foreground page renders. While any exist, the
+/// background PDF prerender pass pauses (M4) so it doesn't contend with the
+/// page the user is waiting on. Drop decrements on every exit path — normal
+/// return, `?` early return, or future cancellation.
+struct ForegroundRenderGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ForegroundRenderGuard {
+    fn new(counter: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ForegroundRenderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// (eviction is coalesced via a callback). Without a manifest (no
 /// hash, storage error, or `prepare_pdf` never ran) the function
 /// falls back to a direct render at the viewport width so uncacheable
@@ -5385,6 +5432,11 @@ pub async fn get_pdf_page_bytes(
     };
     let is_private = state.is_private();
     let book_hash = book.file_hash.clone();
+
+    // Mark a foreground render as in flight so the background prerender pass
+    // (M4) pauses and yields the source file + CPU to this page. The guard
+    // decrements on every exit, including future cancellation.
+    let _fg_guard = ForegroundRenderGuard::new(state.active_foreground_renders.clone());
 
     // The pdfium render + JPEG encode + resize is CPU-bound and, on a
     // network-mounted library, I/O-bound for seconds. Run it on the blocking
@@ -9494,6 +9546,7 @@ mod tests {
                 std::collections::HashSet::from(["default".to_string()]),
             )),
             private_mode: std::sync::Arc::new(AtomicBool::new(false)),
+            active_foreground_renders: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             profile_lifecycle: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             db: pool,
             profile_state: std::sync::Mutex::new(ProfileState {

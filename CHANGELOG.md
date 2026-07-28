@@ -6,6 +6,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Reading a large PDF no longer bogs down mid-session.** After opening a PDF,
+  the app renders the remaining pages into its cache in the background. That
+  pass now pauses whenever you're actively viewing or turning a page, so it
+  yields the disk/network and CPU to the page you're waiting on instead of
+  competing with it — previously, on a large PDF over a network drive, the two
+  fought for the file and a page could exceed the reader's load timeout.
 - **The reader stays responsive while a page renders.** Comic and PDF page
   renders now run on a background thread instead of the request handler, so a
   slow page — a large PDF page fetched over a network drive can take a few
