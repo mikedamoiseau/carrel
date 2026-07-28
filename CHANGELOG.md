@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-07-28
+
 ### Fixed
 - **PDF pages render one at a time, preventing rare crashes.** The underlying
   PDF library isn't safe to call from multiple threads at once; with background
