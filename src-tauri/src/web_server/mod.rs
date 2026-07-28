@@ -19,6 +19,11 @@ pub struct WebState {
     pub pool: Arc<Mutex<DbPool>>,
     /// App data directory (covers, EPUB images, etc.).
     pub data_dir: PathBuf,
+    /// App cache directory — root of the local source-cache
+    /// (`{cache_dir}/source-cache/…`). Mirrors `AppState::cache_dir` so the
+    /// web reader resolves network-mounted books to the same staged local
+    /// copies the desktop reader stages.
+    pub cache_dir: PathBuf,
     /// SHA-256 hash of the PIN (None if no PIN configured).
     pub pin_hash: Arc<Mutex<Option<String>>>,
     /// Active session tokens → creation time.
@@ -63,6 +68,24 @@ impl WebState {
     /// - imported rows with a storage key → resolve through the library
     ///   folder setting (falls back to the platform default)
     pub fn resolve_book_path(&self, book: &folio_core::models::Book) -> FolioResult<String> {
+        // Prefer a locally-staged copy of the source file when one exists —
+        // mirrors `AppState::resolve_book_path`, so a linked book on a network
+        // share is served from local disk. Existence-only, LOCAL-only, and
+        // cheap (never stats the possibly network-mounted source), so it's safe
+        // on the per-page hot path. Content-addressed by `file_hash`, so a
+        // present copy is always this book's bytes.
+        if let Some(hash) = book.file_hash.as_deref() {
+            let ext = std::path::Path::new(&book.file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if let Some(staged) =
+                folio_core::source_cache::staged_if_present(&self.cache_dir, hash, ext)
+            {
+                return Ok(staged.to_string_lossy().into_owned());
+            }
+        }
+
         if !book.is_imported {
             return Ok(book.file_path.clone());
         }
@@ -359,6 +382,7 @@ mod tests {
         WebState {
             pool: Arc::new(Mutex::new(pool)),
             data_dir: PathBuf::from("/tmp"),
+            cache_dir: std::env::temp_dir(),
             pin_hash: Arc::new(Mutex::new(None)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
@@ -1340,6 +1364,58 @@ mod tests {
             is_imported: false,
             want_to_read: false,
         }
+    }
+
+    /// The web reader must resolve a network-mounted book to its locally-staged
+    /// copy when one is present — the same optimization the desktop reader gets
+    /// (`AppState::resolve_book_path`). Content-addressed by `file_hash`, so a
+    /// present copy is always this book's bytes; a book with no hash, or no
+    /// staged copy, resolves to the original (remote) path unchanged.
+    #[test]
+    fn resolve_book_path_prefers_staged_copy() {
+        let cache = tempfile::tempdir().unwrap();
+        let pool = crate::db::create_pool(&PathBuf::from(":memory:")).expect("in-memory DB");
+        let state = WebState {
+            pool: Arc::new(Mutex::new(pool)),
+            data_dir: PathBuf::from("/tmp"),
+            cache_dir: cache.path().to_path_buf(),
+            pin_hash: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
+            active_profile_name: Arc::new(Mutex::new("default".to_string())),
+            unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
+            private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let mut book = cache_test_book(std::path::Path::new("/Volumes/remote/comic.pdf"));
+        book.format = crate::models::BookFormat::Pdf;
+        book.file_hash = Some("webhash1".to_string());
+
+        // No staged copy yet → resolves to the original (remote) path.
+        assert_eq!(
+            state.resolve_book_path(&book).unwrap(),
+            "/Volumes/remote/comic.pdf"
+        );
+
+        // Stage a local copy under the state's cache_dir (keyed by hash + ext).
+        let srcdir = tempfile::tempdir().unwrap();
+        let src = srcdir.path().join("comic.pdf");
+        std::fs::write(&src, b"staged bytes").unwrap();
+        let staged =
+            folio_core::source_cache::stage(cache.path(), &src, "webhash1", "pdf").unwrap();
+
+        // Now resolve prefers the local staged copy.
+        assert_eq!(
+            state.resolve_book_path(&book).unwrap(),
+            staged.to_string_lossy()
+        );
+
+        // A book with no hash never resolves to a staged copy.
+        book.file_hash = None;
+        assert_eq!(
+            state.resolve_book_path(&book).unwrap(),
+            "/Volumes/remote/comic.pdf"
+        );
     }
 
     #[tokio::test]

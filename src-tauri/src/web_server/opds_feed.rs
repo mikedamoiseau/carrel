@@ -747,6 +747,7 @@ mod tests {
         WebState {
             pool: Arc::new(Mutex::new(pool)),
             data_dir: PathBuf::from("/tmp"),
+            cache_dir: std::env::temp_dir(),
             pin_hash: Arc::new(Mutex::new(None)),
             sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),

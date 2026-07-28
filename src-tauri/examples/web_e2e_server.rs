@@ -357,6 +357,8 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     let db_path = tempdir.path().join("library.db");
     let data_dir = tempdir.path().join("appdata");
     std::fs::create_dir_all(&data_dir)?;
+    let cache_dir = tempdir.path().join("appcache");
+    std::fs::create_dir_all(&cache_dir)?;
 
     let cbz_path = tempdir.path().join("test-book.cbz");
     build_test_cbz(&cbz_path)?;
@@ -373,6 +375,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     let state = WebState {
         pool: Arc::new(Mutex::new(pool)),
         data_dir,
+        cache_dir,
         pin_hash: Arc::new(Mutex::new(None)),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
