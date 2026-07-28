@@ -529,12 +529,45 @@ export default function PageViewer({
     };
   }, [bookId]);
 
+  // Identity of the last load the effect ran, so a re-run triggered purely by
+  // a width change (zoom settle) can be told apart from a genuine page change,
+  // book switch, cold/mount load, or retry. `book` matters because the reader
+  // pane is not remounted on navigation (the id changes in place), so switching
+  // to a different book at the same page index must still show the spinner.
+  // Impossible initial values make the first run count as a real load.
+  const prevLoadKeyRef = useRef<{
+    book: string;
+    left: number;
+    right: number | null;
+    retry: number;
+  }>({
+    book: "",
+    left: -1,
+    right: -1,
+    retry: -1,
+  });
+
   // Load spread (one or two pages in parallel) with timeout
   useEffect(() => {
     let cancelled = false;
     let rafId: number | undefined;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    setLoading(true);
+    // A same-page width-only reload (zoom settle) keeps the current
+    // CSS-transformed bitmap visible instead of flashing the spinner over it;
+    // the sharper render swaps in when it resolves. Genuine page changes, the
+    // cold/mount load, and retries still flip loading true.
+    const samePageReload =
+      prevLoadKeyRef.current.book === bookId &&
+      prevLoadKeyRef.current.left === spread.left &&
+      prevLoadKeyRef.current.right === spread.right &&
+      prevLoadKeyRef.current.retry === retryCount;
+    prevLoadKeyRef.current = {
+      book: bookId,
+      left: spread.left,
+      right: spread.right,
+      retry: retryCount,
+    };
+    if (!samePageReload) setLoading(true);
     setError(null);
     // NOTE: we deliberately do NOT clear leftDisplayedId/rightDisplayedId here.
     // The `imageLayerActive` identity predicate already deactivates the text

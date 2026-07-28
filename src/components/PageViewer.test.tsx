@@ -61,7 +61,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 globalThis.URL.createObjectURL = vi.fn(() => "blob:mock");
 globalThis.URL.revokeObjectURL = vi.fn();
 
-import { render, fireEvent, cleanup, act } from "@testing-library/react";
+import { render, fireEvent, cleanup, act, screen } from "@testing-library/react";
 import PageViewer from "./PageViewer";
 
 // Foreground (non-preload) render invocations for the given command.
@@ -195,5 +195,124 @@ describe("PageViewer — zoom re-fetch debounce", () => {
     });
     expect(page1()).toHaveLength(1);
     expect(page1()[0][1]).toMatchObject({ width: 1600 });
+  });
+});
+
+describe("PageViewer — zoom-settle loading spinner suppression", () => {
+  // Deferred render harness: unlike the immediate mock above, foreground page
+  // renders stay PENDING until a resolver is fired, so the transient loading
+  // state (the full-cover spinner) is observable in the DOM. Each foreground
+  // render call pushes its resolver into `pageResolvers`; `resolvePages()`
+  // fires and clears them. Preload warms (cachedOnly) resolve immediately as a
+  // cache miss (empty payload → null) so they never hang the test.
+  let pageResolvers: Array<() => void>;
+
+  beforeEach(() => {
+    pageResolvers = [];
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "get_pdf_page_bytes" || cmd === "get_comic_page_bytes") {
+        if ((args as { cachedOnly?: boolean })?.cachedOnly) {
+          return Promise.resolve(new ArrayBuffer(0));
+        }
+        return new Promise<ArrayBuffer>((resolve) => {
+          pageResolvers.push(() => resolve(pageBytes()));
+        });
+      }
+      return Promise.resolve([]);
+    });
+  });
+
+  async function resolvePages() {
+    await act(async () => {
+      const resolvers = pageResolvers;
+      pageResolvers = [];
+      resolvers.forEach((r) => r());
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  it("shows the loading spinner during the initial cold load", async () => {
+    render(<PageViewer bookId="b1" format="pdf" totalPages={10} />);
+    await flush();
+    // Cold-load fetch is still pending → spinner overlay is on screen.
+    expect(screen.queryByText("reader.loadingPage")).not.toBeNull();
+    await resolvePages();
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+  });
+
+  it("suppresses the loading spinner during a zoom-settle re-fetch", async () => {
+    render(<PageViewer bookId="b1" format="pdf" totalPages={10} />);
+    await flush();
+    await resolvePages();
+    // Cold load done: no spinner.
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+
+    // Zoom in (Ctrl+'=') a few steps. The re-fetch is debounced (M1), so the
+    // load effect does not re-run mid-burst.
+    for (let i = 0; i < 4; i++) {
+      await act(async () => {
+        fireEvent.keyDown(window, { key: "=", ctrlKey: true });
+        await Promise.resolve();
+      });
+    }
+
+    // Let the zoom settle so the debounced re-fetch fires. In the deferred
+    // harness this sharper render is now PENDING.
+    await act(async () => {
+      vi.advanceTimersByTime(250);
+      await Promise.resolve();
+    });
+
+    // The settle re-fetch is in flight, but it is a same-page width-only
+    // reload: the current CSS-transformed bitmap must stay visible with NO
+    // spinner flashing over it. (RED against unconditional setLoading(true).)
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+
+    // The sharper bitmap swaps in when it resolves; still no spinner.
+    await resolvePages();
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+  });
+
+  it("still shows the loading spinner on a genuine page change", async () => {
+    render(<PageViewer bookId="b1" format="pdf" totalPages={10} />);
+    await flush();
+    await resolvePages();
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+
+    // Turn the page. The new page's fetch is pending → spinner MUST appear
+    // (guards against over-suppressing genuine page changes).
+    act(() => {
+      fireEvent.keyDown(window, { key: "ArrowRight" });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("reader.loadingPage")).not.toBeNull();
+
+    await resolvePages();
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+  });
+
+  it("shows the loading spinner when switching to a different book at the same page", async () => {
+    // The reader pane is not remounted on navigation (the book id changes in
+    // place), so a book switch must be told apart from a same-page width reload
+    // by the `bookId` component of the load key. RED if bookId is omitted:
+    // switching to a book at the same page index would suppress the spinner and
+    // leave the previous book's page frozen on screen until the new one loads.
+    const { rerender } = render(<PageViewer bookId="b1" format="pdf" totalPages={10} />);
+    await flush();
+    await resolvePages();
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
+
+    // Switch books; pageIndex (0) and retry are unchanged, so only bookId differs.
+    rerender(<PageViewer bookId="b2" format="pdf" totalPages={10} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("reader.loadingPage")).not.toBeNull();
+
+    await resolvePages();
+    expect(screen.queryByText("reader.loadingPage")).toBeNull();
   });
 });
