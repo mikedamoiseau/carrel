@@ -1418,6 +1418,84 @@ mod tests {
         );
     }
 
+    /// M2 acceptance (local side): a page request for a book whose source is on
+    /// a LOCAL filesystem must never create a staged copy — there's nothing to
+    /// optimize — and must not break the serving path. This also exercises the
+    /// `ensure_web_source_staged` → `spawn_blocking` trigger from the web
+    /// (tokio) request context, so a runtime mismatch would surface as a failed
+    /// render here rather than only against a real network mount.
+    #[tokio::test]
+    async fn local_book_page_request_does_not_stage() {
+        let cache = tempfile::tempdir().unwrap();
+        let pool = crate::db::create_pool(&PathBuf::from(":memory:")).expect("in-memory DB");
+        let state = WebState {
+            pool: Arc::new(Mutex::new(pool)),
+            data_dir: PathBuf::from("/tmp"),
+            cache_dir: cache.path().to_path_buf(),
+            pin_hash: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
+            active_profile_name: Arc::new(Mutex::new("default".to_string())),
+            unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
+            private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cbz_path = write_cache_test_cbz(dir.path());
+        let mut book = cache_test_book(&cbz_path);
+        book.file_hash = Some("localcbzhash".to_string());
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(&conn, &book).unwrap();
+        }
+
+        let router = build_router(
+            state,
+            ServerModes {
+                web_ui: true,
+                opds: true,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/cache-test-book/pages/0"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "a local CBZ page must still render with the staging trigger wired in"
+        );
+
+        assert!(
+            folio_core::source_cache::staged_if_present(cache.path(), "localcbzhash", "cbz")
+                .is_none(),
+            "a local book must never be staged"
+        );
+
+        let _ = tx.send(());
+    }
+
     #[tokio::test]
     async fn page_image_and_page_count_cache_control_no_pin() {
         let state = test_state();

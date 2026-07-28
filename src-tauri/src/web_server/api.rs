@@ -976,6 +976,18 @@ async fn get_page_image(
     let file_path = state.resolve_book_path(&book).map_err(folio_status)?;
     let page_cache_control = session_cache_control(&state);
 
+    // Stage the source locally when it lives on a network mount (M2). The web
+    // server has no desktop-style "open" event, so this runs per page request;
+    // it's cheap once staged (local check + LRU touch) and deduped while a copy
+    // is in flight. Only the page-image formats below reach a per-page render
+    // over the (possibly remote) file, so gate the trigger to them.
+    if matches!(
+        book.format,
+        BookFormat::Pdf | BookFormat::Cbz | BookFormat::Cbr
+    ) {
+        crate::commands::ensure_web_source_staged(&state.cache_dir, &book, &file_path);
+    }
+
     match book.format {
         BookFormat::Pdf => {
             let (bytes, mime) =
