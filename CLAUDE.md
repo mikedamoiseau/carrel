@@ -48,7 +48,7 @@ the exact string. Never run a blind `s/folio/carrel/g`.
 | `folio-*` / `folio_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
 | `mikedamoiseau/folio` | `src-tauri/src/update.rs` | break the update-check release-URL allowlist (the GitHub repo is not renamed) |
 | `FOLIO_APTABASE_KEY`, `FOLIO_LOG`, `FOLIO_DEBUG_PAGES`, `FOLIO_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
-| `folio-core`, `FolioError`, `FolioResult`, `FolioEvent` | `folio-core/` and every caller | break `folio-server`, which consumes this crate as a git dependency pinned to a release tag |
+| `folio-core`, `FolioError`, `FolioResult`, `FolioEvent` | `folio-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
 
 `CHANGELOG.md`, `docs/superpowers/`, and `src-tauri/.pr-reviews/` keep saying
 Folio too: they are historical records of releases and work that shipped under

@@ -250,7 +250,7 @@ Expand where books come from and how they persist.
 ### 19. Share Collections — **Done (scope-trimmed)**
 - ~~Export a collection as a shareable reading list (title, author, optional notes)~~
 - ~~Format: Markdown, JSON~~
-- ~~Shareable link~~ — **dropped 2026-05-14.** Needs a WAN endpoint the free app doesn't have; would depend on `folio-server` infra for a niche feature.
+- ~~Shareable link~~ — **dropped 2026-05-14.** Needs a WAN endpoint the free app doesn't have; would depend on Carrel Server infra for a niche feature.
 - ~~Import a shared list to see which books you have/are missing~~ — **dropped 2026-05-14.** No real-world supply of Carrel-format lists; users share via Goodreads / plain text / blog posts instead. Self-fulfilling problem: format would only exist if Carrel became a sharing platform, which it isn't.
 
 Manual sharing via the existing Markdown / JSON export is sufficient.
@@ -468,7 +468,7 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 - ~~Settings UI: cache size limit dropdown, current usage display, clear cache button~~
 - ~~New `prepare_comic` command for explicit extraction with loading indicator~~
 
-**Highest-ROI remaining polish on the free app (priority-ranked 2026-05-14).** Bundle as a single "perf + comics" drop after the next `folio-server` milestone; do not pull focus from #65.
+**Highest-ROI remaining polish on the free app (priority-ranked 2026-05-14).** Bundle as a single "perf + comics" drop after the next Carrel Server milestone; do not pull focus from #65.
 
 1. ~~**Image resizing/compression — P2.**~~ — **shipped 2026-05-14.** Page renderers (PDF / CBZ / CBR) now serve at viewport resolution rather than full-res, transmit raw bytes through Tauri IPC, and the frontend wraps them as blob URLs (no base64). Drops IPC payloads by ~70–90 % on typical pages and removes the base64 round-trip in the renderer. Landed across m1–m4 (`8bb53fd` viewport resize → `7999be7` binary commands → `1634f31` blob URLs → `d6314a9` retire data-URI path). ([CHANGELOG](../CHANGELOG.md#unreleased))
 2. ~~**Thumbnail strip — P2.**~~ — **shipped 2026-05-16.** Virtualized horizontal strip below the reader for CBZ / CBR / PDF, toggled by header button or `M`. Distance-from-current load ordering with directional prefetch, module-level per-book blob cache so close/reopen is instant, transparent loading tiles + retry-on-click for errors. State persists per book in `localStorage`. ([CHANGELOG](../CHANGELOG.md#unreleased))
@@ -586,7 +586,7 @@ Open-core transition: after Folio 2.0 ships (the app was renamed to Carrel in 2.
 - ~~Shipped incrementally across M1–M4 (PRs #15 → #18)~~
 - Paid server will add an S3/object-store implementation in its own crate, with a local disk cache layer in front (page turns can't be raw S3 GETs). *Out of scope for the free app.*
 
-### 65. `folio-server` — Headless Multi-User Server — **P3 / in active development**
+### 65. Carrel Server — Headless Multi-User Server — **P3 / in active development**
 
 Separate binary, **private repo at `git@bitbucket.org:mdamoiseau/folio-server.git`** (local checkout at `/Users/mike/Documents/www/folio-server`). Consumes `folio-core` as a git dependency pinned to a release tag (currently `v2.0.1`). Sold as a self-host license first; managed hosting added later only if demand is validated.
 
@@ -619,14 +619,14 @@ Separate binary, **private repo at `git@bitbucket.org:mdamoiseau/folio-server.gi
 
 ## Recommended Implementation Order
 
-The free-app roadmap is closed out. The structural refactors, the 2.0 tag, and the `folio-server` bootstrap have all shipped; the free app is now in maintenance mode and the paid server is the active line of development.
+The free-app roadmap is closed out. The structural refactors, the 2.0 tag, and the Carrel Server bootstrap have all shipped; the free app is now in maintenance mode and the paid server is the active line of development.
 
 1. ~~**#55 Structured Error Types.** `FolioError` enum + `FolioResult<T>` in `src-tauri/src/error.rs`, all commands migrated.~~ **Done.**
 2. ~~**#63 `folio-core` extraction.** Workspace crate carved out of `src-tauri/src/`; commands collapsed to thin adapters. Shipped incrementally as M1–M5.~~ **Done.**
 3. ~~**#64 Storage abstraction trait.** `Storage` trait inside `folio-core` with a local-FS implementation; DB `file_path` column now stores storage keys. Shipped incrementally as M1–M4.~~ **Done.**
 4. ~~**Phase 8 — #34 MOBI**~~ ✓ and ~~**#36 Navigation History**~~ ✓. (#40 Split View deferred to post-2.0 P2; it was not a 2.0 blocker.)
 5. ~~**Tag Folio 2.0.**~~ **Done** — `v2.0.0` shipped 2026-05-03, `v2.0.1` follow-up 2026-05-?. Free app is now in maintenance mode (see below).
-6. **#65 `folio-server`** in the private repo — **in active development**. Pulls `folio-core` as a git dependency pinned to a release tag.
+6. **#65 Carrel Server** in the private repo — **in active development**. Pulls `folio-core` as a git dependency pinned to a release tag.
 
 Post-2.0 the structural concerns play out as predicted: errors landed first, then extraction, then the storage trait, then 2.0, then the server. Remaining Phase 8 polish (#40 Split View, #62 cache improvements, #59 OPDS search nav, etc.) lives under the maintenance-mode policy below — picked up case-by-case, no longer treated as roadmap gates.
 
@@ -718,7 +718,7 @@ Lower priority features — high effort, niche audience, or dependent on other w
 
 ## Deferred: Mobile Apps
 
-Originally Phase 7. **Deprioritized — P4.** Rationale: the built-in web server (Phase 6) already lets phones and tablets access the library from a browser on the LAN, and the paid `folio-server` (Phase 10) extends that further with multi-user auth. That covers the primary mobile use case without the cross-compilation cost. A native mobile port stays technically possible but is no longer a near-term goal.
+Originally Phase 7. **Deprioritized — P4.** Rationale: the built-in web server (Phase 6) already lets phones and tablets access the library from a browser on the LAN, and the paid Carrel Server (Phase 10) extends that further with multi-user auth. That covers the primary mobile use case without the cross-compilation cost. A native mobile port stays technically possible but is no longer a near-term goal.
 
 ### 23. Android & iOS App — **P4**
 
@@ -763,6 +763,6 @@ Tauri v2 supports mobile targets. The React frontend renders in a mobile WebView
 | 6 | Remote Library Access, OPDS Server | Done | Remote access |
 | 8 | Sepia Theme, OpenDyslexic, Star Ratings, In-Book Search, Typography, Custom Fonts, Continuous Scroll, Time-to-Finish, Bookmark Naming, Series, Activity Log, MOBI, Nav History, Custom CSS, Dual-Page/Manga, Settings Reorg, i18n (EN+FR), PDF Zoom Quality, Go to Page, Animations, Comic Page Cache, Split View | 19 done | Reader & library enhancements |
 | 9 | DB Migration Versioning, Transaction Boundaries, Zip Bomb Protection, PDF Cache Memory Limits, Thread Pool, Backup Secret Atomicity, Screen Reader Live Regions, Loading Skeletons, Toast System, Search Nav, Bulk Actions, Highlight Positioning, Structured Errors | 12 done, 1 partial (#49 migration versioning: version table done; non-additive/rollback not) | Hardening & polish |
-| 10 | `folio-core` refactor, Storage trait, `folio-server` (private) | 2 done (#63, #64), `folio-server` in active development (private repo, axum + sqlx + auth scaffolding shipped, handlers WIP) | Open-core + paid server |
+| 10 | `folio-core` refactor, Storage trait, Carrel Server (private) | 2 done (#63, #64), Carrel Server in active development (private repo, axum + sqlx + auth scaffolding shipped, handlers WIP) | Open-core + paid server |
 | N/H | Dictionary, Vocabulary Builder, TTS, Library-Wide Search, Annotation Exports, Plugins/Hooks | Dictionary (#41) done (offline v1), Plugins/Hooks done, User Themes done; rest not started | Nice to have |
 | Deferred | Android & iOS App (was Phase 7) | Deferred — web server covers the primary mobile use case | Mobile |

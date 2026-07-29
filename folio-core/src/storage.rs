@@ -2,7 +2,7 @@
 //!
 //! Book files, covers, and related blobs are accessed through a `Storage`
 //! trait so the backend can be swapped (local filesystem today, S3 or other
-//! object stores in the paid `folio-server`). The desktop app uses
+//! object stores in the paid Carrel Server). The desktop app uses
 //! [`LocalStorage`] rooted at the library folder; on-disk layout stays
 //! identical to the pre-refactor code, with the one behavior *improvement*
 //! that overwriting writes are now atomic (temp-file + rename) so a failed
@@ -69,7 +69,7 @@ pub trait Storage: Send + Sync {
     ///
     /// For [`LocalStorage`] this returns the underlying path directly.
     /// Remote backends must first materialize the object to a local cache
-    /// — those implementations are introduced in the paid `folio-server`
+    /// — those implementations are introduced in the paid Carrel Server
     /// crate.
     fn local_path(&self, key: &str) -> FolioResult<PathBuf>;
 }
