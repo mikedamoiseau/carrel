@@ -140,7 +140,7 @@ jobs:
 
       # Lint the mobi feature too so clippy catches regressions in the
       # libmobi-gated code paths. --workspace --all-targets so folio-core
-      # and test/example targets are linted, not just the folio crate's lib.
+      # and test/example targets are linted, not just the carrel crate's lib.
       - name: cargo clippy (--features mobi)
         run: cargo clippy --workspace --all-targets --features mobi -- -D warnings
 

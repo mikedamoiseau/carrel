@@ -18,7 +18,7 @@ matters:
   permission model. It has no idea Tauri exists. Everything here is testable
   with a `tempfile` SQLite pool and a mock for the one trait it can't provide
   itself.
-- `src-tauri` (the `folio` crate) is the desktop shell. It supplies the OS
+- `src-tauri` (the `carrel` crate) is the desktop shell. It supplies the OS
   notification + book-import implementation, owns the manager instance, wires
   it onto the bus, and exposes the IPC commands the Settings UI calls.
 

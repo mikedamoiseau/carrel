@@ -27,7 +27,7 @@ export const config = {
   capabilities: [
     {
       "tauri:options": {
-        binary: resolve(projectRoot, "src-tauri/target/debug/folio"),
+        binary: resolve(projectRoot, "src-tauri/target/debug/carrel"),
       },
     },
   ],

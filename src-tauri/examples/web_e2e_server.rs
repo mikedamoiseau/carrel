@@ -1,14 +1,14 @@
 //! Deterministic seeded harness for the Playwright e2e suite (`e2e/`).
 //!
-//! Boots the embedded web server (`folio_lib::web_server`) against a fresh
+//! Boots the embedded web server (`carrel_lib::web_server`) against a fresh
 //! temp on-disk SQLite DB seeded with a fixed fixture set, so the specs in
 //! `e2e/` can assert exact numbers instead of resilient "at least one"
 //! checks against a live, hand-curated library.
 //!
-//! This file is an example target of the `folio` package, compiled as an
-//! external crate against the `folio_lib` library (see `[lib] name =
-//! "folio_lib"` in `src-tauri/Cargo.toml`) — everything below goes through
-//! `folio_lib`'s public API, the same surface `src-tauri/src/main.rs` uses.
+//! This file is an example target of the `carrel` package, compiled as an
+//! external crate against the `carrel_lib` library (see `[lib] name =
+//! "carrel_lib"` in `src-tauri/Cargo.toml`) — everything below goes through
+//! `carrel_lib`'s public API, the same surface `src-tauri/src/main.rs` uses.
 //!
 //! Run directly: `cargo run --example web_e2e_server` (from `src-tauri/`).
 //! `e2e/playwright.config.ts`'s `webServer` block runs this automatically
@@ -50,9 +50,9 @@
 //!   detail metadata is exercised for them (a missing cover 404s and the
 //!   client falls back to its placeholder).
 
-use folio_lib::db;
-use folio_lib::models::{Book, BookFormat, ReadingProgress};
-use folio_lib::web_server::{self, auth, ProfileHost, ServerModes, WebProfile, WebState};
+use carrel_lib::db;
+use carrel_lib::models::{Book, BookFormat, ReadingProgress};
+use carrel_lib::web_server::{self, auth, ProfileHost, ServerModes, WebProfile, WebState};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Write;
@@ -392,7 +392,7 @@ impl HarnessProfileHost {
 }
 
 impl ProfileHost for HarnessProfileHost {
-    fn list(&self) -> folio_lib::error::FolioResult<Vec<WebProfile>> {
+    fn list(&self) -> carrel_lib::error::FolioResult<Vec<WebProfile>> {
         Ok(self.profiles.lock().unwrap().clone())
     }
 
@@ -400,10 +400,10 @@ impl ProfileHost for HarnessProfileHost {
         &self,
         name: String,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = folio_lib::error::FolioResult<()>> + Send + '_>,
+        Box<dyn std::future::Future<Output = carrel_lib::error::FolioResult<()>> + Send + '_>,
     > {
         Box::pin(async move {
-            use folio_lib::error::FolioError;
+            use carrel_lib::error::FolioError;
             let mut profiles = self.profiles.lock().unwrap();
             let target = profiles
                 .iter()
@@ -436,7 +436,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     // Kept alive for the process lifetime — the harness never cleans up
     // its own temp dir (Playwright/CI kill the process instead), matching
     // how other ephemeral e2e fixtures are handled.
-    let tempdir = tempfile::Builder::new().prefix("folio-e2e-").tempdir()?;
+    let tempdir = tempfile::Builder::new().prefix("carrel-e2e-").tempdir()?;
 
     let db_path = tempdir.path().join("library.db");
     let data_dir = tempdir.path().join("appdata");
