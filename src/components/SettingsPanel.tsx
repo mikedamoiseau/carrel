@@ -2853,7 +2853,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     <span className="text-ink">libmobi</span> — LGPL-3.0-or-later,{" "}
                     {/*
                       Windows ships a statically-linked libmobi (mobi.lib baked
-                      into Carrel.exe). Linux and arm64 macOS dynamically link
+                      into carrel.exe). Linux and arm64 macOS dynamically link
                       against the system libmobi. Using `navigator.userAgent`
                       avoids pulling in `@tauri-apps/plugin-os` for this single
                       string — the user-agent inside Tauri's WebView reliably

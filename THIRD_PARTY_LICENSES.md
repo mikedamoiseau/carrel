@@ -46,7 +46,7 @@ Carrel's link mode for libmobi is platform-specific:
     pulls libmobi in automatically)
   - Fedora / RHEL: `sudo dnf install libmobi`
 
-- **Windows**: libmobi is **statically linked** into `Carrel.exe`. The
+- **Windows**: libmobi is **statically linked** into `carrel.exe`. The
   Tauri bundler does not place sibling DLLs where the OS loader expects
   them at process start, so the Windows build of libmobi is produced as
   a self-contained `mobi.lib` static archive (CMake configured with

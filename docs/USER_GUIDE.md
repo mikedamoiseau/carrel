@@ -1057,7 +1057,7 @@ MOBI support uses [libmobi](https://github.com/bfabiszewski/libmobi) (LGPL v3+).
 - **macOS (arm64 / Apple Silicon):** No installation step needed. The arm64 macOS build statically links libmobi into the app, so it is fully self-contained.
 - **Linux (Debian / Ubuntu):** `sudo apt install libmobi0` (the `.deb` declares this as a dependency, so an `apt install` of Carrel will pull it in automatically). Linux uses dynamic linking.
 - **Linux (Fedora / RHEL):** `sudo dnf install libmobi`.
-- **Windows:** No installation step needed. The Windows build statically links libmobi into `Carrel.exe`, so the installer is fully self-contained.
+- **Windows:** No installation step needed. The Windows build statically links libmobi into `carrel.exe`, so the installer is fully self-contained.
 
 If you do not need MOBI support, use the Intel (x86_64) macOS release build — it ships without the `mobi` feature and has no libmobi dependency.
 

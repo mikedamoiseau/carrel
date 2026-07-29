@@ -188,7 +188,7 @@ Importing from an SMB network share (NAS) can fail with `No such file or directo
 
 ### Windows
 
-Run the `.msi` installer and follow the prompts. MOBI support is statically linked into `Carrel.exe` — no separate libmobi install is needed.
+Run the `.msi` installer and follow the prompts. MOBI support is statically linked into `carrel.exe` — no separate libmobi install is needed.
 
 ### Linux
 

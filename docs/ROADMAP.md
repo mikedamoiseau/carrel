@@ -404,7 +404,7 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 - ~~OPDS download with AZW vs AZW3 disambiguation via URL path~~
 - ~~Conditional `.deb` / `.rpm` libmobi depends via Tauri config overlay~~
 - ~~Fixture-gated end-to-end smoke tests + CI corpus fetch (SHA-256 pinned, retry-armed, cached)~~
-- ~~**Windows MOBI support** via static libmobi linkage — libmobi built from source on the runner with CMake (`USE_ZLIB=OFF` + `USE_LIBXML2=OFF` keeps the static archive self-contained, baked into `Carrel.exe`). PR CI builds the same `mobi.lib` to catch MSVC regressions before tag-push.~~
+- ~~**Windows MOBI support** via static libmobi linkage — libmobi built from source on the runner with CMake (`USE_ZLIB=OFF` + `USE_LIBXML2=OFF` keeps the static archive self-contained, baked into `carrel.exe`). PR CI builds the same `mobi.lib` to catch MSVC regressions before tag-push.~~
 - Available on **Linux**, **arm64 macOS**, and **Windows**. The **x86_64 macOS** build is the only release that intentionally ships without MOBI support — the macos-latest runner's Homebrew libmobi is arm64-only and won't link into an x86_64 target. Re-enabling Intel Mac would need a universal libmobi (Rosetta-cross-build or manual fat-dylib).
 
 ### Power User & Reader Enhancements
