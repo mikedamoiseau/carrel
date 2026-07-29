@@ -339,14 +339,9 @@
 
   /// Re-scope to the server's active profile. Returns whether it changed.
   async function syncOfflineScopeWithServer() {
-    if (!offlineSupported()) return false;
-    try {
-      const resp = await fetch("/api/profiles", { credentials: "same-origin" });
-      if (!resp.ok) return false;
-      const active = (await resp.json()).find((p) => p.active);
-      if (!active) return false;
-      return await applyOfflineScope(active.name);
-    } catch (e) { return false; }
+    const active = (await loadProfiles()).find((p) => p.active);
+    if (!active || !offlineSupported()) return false;
+    return await applyOfflineScope(active.name);
   }
 
   // Lazy singleton connection; a failed open clears the promise so a later
@@ -1569,6 +1564,11 @@
           return;
         }
         authenticated = true;
+        // A PIN-gated boot 401s out of init() into this login, so the profile
+        // list and the offline scope are still unresolved here — resolve them
+        // before the first render, or the header would have no switcher and
+        // offline saves could land in the wrong profile's namespace.
+        if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
     }
@@ -1606,6 +1606,7 @@
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".filter-dropdown")) closeAllFilterPanels();
     if (!e.target.closest(".detail-more")) closeDetailMenu();
+    if (!e.target.closest(".profile-switcher")) closeProfilePanel();
   });
 
   function selectFilter(key, value) {
@@ -6616,6 +6617,120 @@
     return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>';
   }
 
+  // ── Profile switcher (remote profile switching) ────────────────
+  // One active profile is shared by the desktop app and every web/OPDS client,
+  // so switching here moves all of them. A locked profile is listed but not
+  // offered: its password is never accepted over the network, so it is only
+  // reachable if it was already unlocked on the desktop this session (the
+  // server reports that as `switchable`).
+  let cachedProfiles = [];
+
+  /// Fetches the profile list, caching it for the header. Also the single
+  /// source for the active profile name (offline scoping reads it too), so a
+  /// boot costs one request, not two.
+  async function loadProfiles() {
+    try {
+      const resp = await fetch("/api/profiles", { credentials: "same-origin" });
+      if (!resp.ok) return cachedProfiles;
+      const list = await resp.json();
+      if (Array.isArray(list)) cachedProfiles = list;
+    } catch (e) { /* keep whatever we had; the switcher just won't render */ }
+    return cachedProfiles;
+  }
+
+  function activeProfileName() {
+    const active = cachedProfiles.find((p) => p.active);
+    return active ? active.name : "";
+  }
+
+  const PROFILE_ICON_PATH =
+    '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>';
+
+  /// Rendered only with more than one profile: with a single profile there is
+  /// nothing to switch to, and the control would be pure decoration.
+  function profileSwitcherHtml() {
+    if (cachedProfiles.length < 2) return "";
+    const active = activeProfileName();
+    const rows = cachedProfiles
+      .map((p) => {
+        const unreachable = p.locked && !p.switchable;
+        const title = unreachable
+          ? "Unlock on the desktop to use over the network"
+          : `Switch to ${p.name}`;
+        return `<button type="button" class="profile-row" data-profile="${esc(p.name)}"
+          ${p.active ? 'aria-current="true"' : ""}${unreachable ? " disabled" : ""}
+          title="${esc(title)}">
+          <span class="profile-row-name">${esc(p.name)}</span>
+          ${p.active ? '<span class="profile-row-flag" aria-hidden="true">&#10003;</span>' : ""}
+          ${unreachable ? '<span class="profile-row-flag" aria-hidden="true">&#128274;</span>' : ""}
+        </button>`;
+      })
+      .join("");
+    return `<div class="profile-switcher">
+      <button class="nav-icon profile-switcher-btn" id="profile-switcher-btn" aria-haspopup="true"
+        aria-expanded="false" title="Profile: ${esc(active)}" aria-label="Profile: ${esc(active)}">
+        ${navIconSvg(20, PROFILE_ICON_PATH)}<span class="profile-name">${esc(active)}</span>
+      </button>
+      <div class="profile-panel" id="profile-panel" hidden>${rows}</div>
+    </div>`;
+  }
+
+  function closeProfilePanel() {
+    const panel = $("#profile-panel");
+    if (panel) panel.hidden = true;
+    const btn = $("#profile-switcher-btn");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+
+  function bindProfileSwitcher() {
+    const btn = $("#profile-switcher-btn");
+    const panel = $("#profile-panel");
+    if (!btn || !panel) return;
+    btn.onclick = () => {
+      const open = panel.hidden;
+      closeAllFilterPanels();
+      panel.hidden = !open;
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    };
+    $$("#profile-panel .profile-row").forEach((row) => {
+      row.onclick = () => {
+        closeProfilePanel();
+        if (!row.disabled) switchProfile(row.dataset.profile);
+      };
+    });
+  }
+
+  async function switchProfile(name) {
+    if (!name || name === activeProfileName()) return;
+    let resp;
+    try {
+      resp = await fetch("/api/profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ name }),
+      });
+    } catch (e) {
+      showToast("Couldn't reach Folio server");
+      return;
+    }
+    if (resp.status === 401) { authenticated = false; showLogin(); return; }
+    if (resp.status === 423) {
+      // The profile was locked (or re-locked) since the list was fetched. The
+      // password is never accepted here, so the only route in is the desktop.
+      showToast("That profile is locked — unlock it on the desktop to use it over the network");
+      await loadProfiles();
+      return;
+    }
+    if (!resp.ok) { showToast(httpErrorToastMessage(resp.status)); return; }
+    // Everything on screen belongs to the previous profile — books, ids,
+    // collections, series, progress, offline scope. Reload into the new
+    // profile's library rather than trying to invalidate each cache: the
+    // boot path already re-fetches all of it and re-scopes offline storage.
+    location.hash = "#/";
+    location.reload();
+  }
+
   function themeToggleHtml() {
     const label = themeAriaLabel();
     return `<button class="nav-icon" id="theme-toggle-btn" title="${esc(label)}" aria-label="${esc(label)}">${themeIconSvg(themeMode)}</button>`;
@@ -6648,6 +6763,7 @@
     const folderColor = activePage === "collections" ? "active" : "";
     const chartColor = activePage === "stats" ? "active" : "";
     return `<div class="nav-icons">
+      ${profileSwitcherHtml()}
       ${themeToggleHtml()}
       <button class="nav-icon ${folderColor}" title="Collections" aria-label="Collections" data-nav="collections">
         ${navIconSvg(20, NAV_ICON_PATH.collections)}
@@ -6664,6 +6780,7 @@
     });
     const themeBtn = $("#theme-toggle-btn");
     if (themeBtn) themeBtn.onclick = cycleTheme;
+    bindProfileSwitcher();
   }
 
   // Item A (app-feel Tier 1): fixed bottom tab bar for primary navigation on

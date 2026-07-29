@@ -758,6 +758,26 @@ body:not(:has(.header))::before {
 .nav-icon:hover { color: var(--ink); background: var(--warm-subtle); }
 .nav-icon.active { color: var(--accent); }
 
+/* ── Profile Switcher (remote profile switching) ── */
+/* Sits in the header cluster next to the theme toggle, and deliberately has no
+   `data-nav` attribute so it stays visible on narrow viewports where the
+   navigation icons give way to the bottom tab bar — a phone is the main place
+   someone switches profiles remotely. */
+.profile-switcher { position: relative; display: flex; }
+.profile-switcher-btn { gap: 6px; max-width: 40vw; }
+.profile-name { font-size: 0.8rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* `display: flex` below outranks the UA sheet's `[hidden] { display: none }`,
+   so the closed state needs its own rule — without it the panel stays on screen
+   after `hidden = true`. */
+.profile-panel[hidden] { display: none; }
+.profile-panel { position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; min-width: 180px; max-width: 80vw; background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius); box-shadow: 0 12px 32px var(--shadow); padding: 6px; display: flex; flex-direction: column; gap: 2px; }
+.profile-row { display: flex; width: 100%; justify-content: space-between; align-items: center; gap: 10px; padding: 8px; background: none; border: none; border-radius: 6px; color: var(--ink); font-size: 0.85rem; text-align: left; cursor: pointer; }
+.profile-row:hover:not(:disabled) { background: var(--warm-subtle); }
+.profile-row[aria-current="true"] { color: var(--accent); font-weight: 600; }
+.profile-row:disabled { color: var(--ink-muted); cursor: not-allowed; }
+.profile-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.profile-row-flag { flex-shrink: 0; font-size: 0.8rem; }
+
 /* ── Bottom Tab Bar (Item A) ────────────────────── */
 /* Fixed thumb-reach primary nav for narrow/touch viewports. Hidden by default
    so the desktop browser keeps the header icon cluster; the media query below

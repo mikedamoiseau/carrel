@@ -14,6 +14,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   so a locked profile can only be entered remotely if it was already unlocked in
   the desktop app this session, and otherwise returns `423 Locked`. See
   `docs/WEB_SERVER_API.md`.
+- **Switch profiles from the phone/web reader.** With more than one profile, the
+  web UI header gets a profile control: it shows the profile you're in and lists
+  the others, so you can move the library between profiles from a phone or tablet
+  without walking to the computer. Switching takes effect everywhere at once —
+  the desktop app and every other web/OPDS client share one active profile. A
+  locked profile is listed but greyed out ("Unlock on the desktop to use over the
+  network"), because its password is never sent over the network; unlock it once
+  in the desktop app and it becomes available remotely for that session.
 
 ### Fixed
 - **Books saved for offline reading in the web app are now kept per profile.**
