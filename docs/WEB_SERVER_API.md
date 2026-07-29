@@ -132,6 +132,13 @@ Switching changes the served library, so refetch anything cached client-side
 afterwards. Book ids are per-profile, so clients that cache book content by id
 must scope that cache by profile name.
 
+Every response carries an `x-folio-profile` header identifying the active profile
+(the profile name, hex-encoded — arbitrary names can't be sent verbatim in a
+header). It is meant for comparison, not decoding: record the value your client
+first sees, and when a later response differs, the active profile moved (another
+client switched it, or the desktop did) and anything you hold keyed by book id is
+stale. The bundled web UI reloads itself on that signal.
+
 ### System
 
 | Method | Endpoint | Description |

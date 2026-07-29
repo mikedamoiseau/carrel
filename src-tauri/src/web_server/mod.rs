@@ -255,6 +255,45 @@ pub fn get_local_ip() -> Option<String> {
 const THEME_BOOTSTRAP_SCRIPT_HASH: &str = "'sha256-FGUWTgqSoem8FWO0BBhrwgmMQsdK1kJ8wuiBBS6w55w='";
 
 /// Middleware that adds security headers to all responses (R3-3).
+/// Hex-encoded profile name, used as the `x-folio-profile` response header.
+///
+/// Clients compare it against the value they booted with to notice that the
+/// active profile moved under them (someone switched from another tab, another
+/// device, or the desktop app — there is one shared active profile). Encoded
+/// rather than sent verbatim because profile names are arbitrary text: a name
+/// containing a newline must not be able to inject a header. Callers only ever
+/// compare it, so nothing decodes it.
+pub(crate) fn profile_tag(name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(name.len() * 2);
+    for byte in name.as_bytes() {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Stamps every response with the active profile's tag (see [`profile_tag`]).
+///
+/// Read *after* the inner handler runs, so the response to `POST /api/profile`
+/// already carries the profile it switched to.
+async fn profile_tag_middleware(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let name = match state.active_profile_name.lock() {
+        Ok(guard) => guard.clone(),
+        // A poisoned lock is not worth failing an otherwise-good response over;
+        // the client simply doesn't get the hint on this one.
+        Err(_) => return response,
+    };
+    if let Ok(value) = axum::http::HeaderValue::from_str(&profile_tag(&name)) {
+        response.headers_mut().insert("x-folio-profile", value);
+    }
+    response
+}
+
 async fn security_headers_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -351,6 +390,10 @@ pub fn build_router(state: WebState, modes: ServerModes) -> Router {
             profile_lock_gate,
         ))
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            profile_tag_middleware,
+        ))
         .with_state(state)
 }
 
@@ -718,6 +761,60 @@ mod tests {
             404
         );
         let _ = tx.send(());
+    }
+
+    /// Every response carries a tag identifying the active profile so a client
+    /// left on a stale profile (another browser tab, or one open while someone
+    /// switched from the desktop) can notice on its next request and reload.
+    /// Hex-encoded rather than the raw name, because profile names are
+    /// arbitrary text and would otherwise need sanitizing to be a header value;
+    /// clients only ever compare it, never decode it.
+    #[tokio::test]
+    async fn responses_carry_the_active_profile_tag() {
+        let state = state_with_profile_host(FakeProfileHost::new());
+        let unlocked = state.unlocked_profiles.clone();
+        let active = state.active_profile_name.clone();
+        let (port, tx) = serve(state).await;
+
+        let tag = |resp: &reqwest::Response| {
+            resp.headers()
+                .get("x-folio-profile")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+
+        let first = reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+            .await
+            .unwrap();
+        let before = tag(&first).expect("header present");
+        assert_eq!(before, profile_tag("default"));
+
+        // A switch from anywhere moves the shared active-profile handle; the
+        // header must follow it.
+        unlocked.lock().unwrap().insert("magazines".to_string());
+        *active.lock().unwrap() = "magazines".to_string();
+        let second = reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+            .await
+            .unwrap();
+        let after = tag(&second).expect("header present");
+        assert_eq!(after, profile_tag("magazines"));
+        assert_ne!(before, after);
+        let _ = tx.send(());
+    }
+
+    /// Always a valid header value however the profile was named — a name with
+    /// a newline in it must not be able to inject a header — and distinct per
+    /// name so a client can tell a switch happened.
+    #[test]
+    fn profile_tag_is_hex_and_distinguishes_names() {
+        let a = profile_tag("default");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, profile_tag("default"));
+        assert_ne!(a, profile_tag("Default"));
+        assert_ne!(a, profile_tag("magazines"));
+        let weird = profile_tag("héllo\r\nX-Injected: 1");
+        assert!(weird.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(axum::http::HeaderValue::from_str(&weird).is_ok());
     }
 
     /// Harnesses (and any future headless embedding) construct `WebState`

@@ -96,6 +96,37 @@ test.describe("web UI profile switcher", () => {
     expect(await activeProfile(page)).toBe("default");
   });
 
+  test("a tab left on the old profile reloads itself on its next request", async ({
+    context,
+  }) => {
+    // Two tabs, as if one were left open on a phone while the profile moved —
+    // from another device, another tab, or the desktop app. There is one shared
+    // active profile, so the stale tab is showing another profile's library and
+    // its book ids no longer mean what it thinks.
+    const stale = await context.newPage();
+    await stale.goto("/");
+    await expect(stale.locator("#profile-switcher-btn")).toContainText("default");
+
+    const other = await context.newPage();
+    await other.goto("/");
+    await openProfileMenu(other);
+    await other.locator('.profile-row[data-profile="magazines"]').click();
+    await expect(other.locator("#profile-switcher-btn")).toContainText("magazines", {
+      timeout: 15_000,
+    });
+
+    // The stale tab makes any ordinary request (a navigation that refetches the
+    // library) and must notice from the response that it is on the wrong
+    // profile, then reload into the new one on its own.
+    await stale.locator("#search").fill("Book");
+    await expect(stale.locator("#profile-switcher-btn")).toContainText("magazines", {
+      timeout: 15_000,
+    });
+
+    await stale.close();
+    await other.close();
+  });
+
   test("the menu closes on an outside click", async ({ page }) => {
     await page.goto("/");
     await openProfileMenu(page);

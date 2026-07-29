@@ -24,6 +24,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   in the desktop app and it becomes available remotely for that session.
 
 ### Fixed
+- **A profile switch now reaches every open client.** Because one active profile
+  is shared by the desktop app and every browser/OPDS client, a switch made from
+  a phone used to leave other windows showing the previous profile's library
+  (with book ids that no longer matched it). The desktop app now follows a
+  switch made anywhere, and a stale browser tab reloads itself into the new
+  profile on its next request.
 - **Books saved for offline reading in the web app are now kept per profile.**
   Each profile has its own book ids, so a book saved offline under one profile
   could be served in place of a *different* book that happened to share that id

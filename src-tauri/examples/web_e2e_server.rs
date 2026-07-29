@@ -350,11 +350,23 @@ fn seed(
 /// way, which is all the UI specs need.
 struct HarnessProfileHost {
     profiles: Mutex<Vec<WebProfile>>,
+    /// The same handles `WebState` reads, so a harness switch moves the
+    /// server's notion of the active profile exactly like the real host does
+    /// (which goes through `commands::switch_active_profile`). Without this the
+    /// `x-folio-profile` header — and the soft-lock gate — would keep reporting
+    /// the profile the harness started on.
+    active_name: Arc<Mutex<String>>,
+    unlocked: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl HarnessProfileHost {
-    fn new() -> Self {
+    fn new(
+        active_name: Arc<Mutex<String>>,
+        unlocked: Arc<Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
         Self {
+            active_name,
+            unlocked,
             profiles: Mutex::new(vec![
                 WebProfile {
                     name: "default".to_string(),
@@ -405,6 +417,11 @@ impl ProfileHost for HarnessProfileHost {
             for p in profiles.iter_mut() {
                 p.active = p.name == name;
             }
+            // Mirror the real switch: publish the name and keep the active
+            // profile in the unlocked set, or `profile_lock_gate` would answer
+            // 503 to everything after a switch.
+            self.unlocked.lock().unwrap().insert(name.clone());
+            *self.active_name.lock().unwrap() = name;
             Ok(())
         })
     }
@@ -439,6 +456,10 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         seed(&conn, &cbz_path, &epub_path)?;
     }
 
+    let active_profile_name = Arc::new(Mutex::new("default".to_string()));
+    let unlocked_profiles = Arc::new(Mutex::new(std::collections::HashSet::from([
+        "default".to_string()
+    ])));
     let state = WebState {
         pool: Arc::new(Mutex::new(pool)),
         data_dir,
@@ -451,12 +472,13 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         // below still advertises the other profiles so the web switcher has
         // something to render; switching only moves the advertised `active`
         // flag, since there's no second seeded library to swap in.
-        active_profile_name: Arc::new(Mutex::new("default".to_string())),
-        unlocked_profiles: Arc::new(Mutex::new(std::collections::HashSet::from([
-            "default".to_string()
-        ]))),
+        active_profile_name: active_profile_name.clone(),
+        unlocked_profiles: unlocked_profiles.clone(),
         private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        profile_host: Some(Arc::new(HarnessProfileHost::new())),
+        profile_host: Some(Arc::new(HarnessProfileHost::new(
+            active_profile_name,
+            unlocked_profiles,
+        ))),
     };
 
     let router = web_server::build_router(

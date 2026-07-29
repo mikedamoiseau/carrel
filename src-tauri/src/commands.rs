@@ -4759,7 +4759,14 @@ async fn switch_active_profile_with<R: tauri::Runtime>(
     );
 
     let conn = state.active_db()?.get()?;
-    log_event(&conn, ActivityEvent::ProfileSwitched { name });
+    log_event(&conn, ActivityEvent::ProfileSwitched { name: name.clone() });
+
+    // The desktop UI can no longer assume it initiated the switch — the web
+    // layer calls this too, and there is one shared active profile. Emitting
+    // here (rather than from the command) is what makes a remote switch reach
+    // the desktop, which otherwise keeps rendering the previous profile.
+    use tauri::Emitter as _;
+    let _ = app.emit("profile-changed", name);
 
     Ok(())
 }
@@ -10041,6 +10048,44 @@ mod tests {
         let entries = db::get_activity_log(&conn, 10, 0, Some("profile_switched")).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entity_name.as_deref(), Some("alice"));
+    }
+
+    /// A switch can come from the web now, so the desktop UI can't assume it
+    /// initiated one: the core emits `profile-changed` and the frontend reloads
+    /// off that. Without it a remote switch leaves the desktop rendering the
+    /// previous profile's library.
+    #[tokio::test]
+    async fn switch_core_emits_profile_changed() {
+        use tauri::Listener;
+
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        app.handle().listen("profile-changed", move |event| {
+            sink.lock().unwrap().push(event.payload().to_string());
+        });
+
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false))
+            .await
+            .unwrap();
+
+        // Delivery is asynchronous; give the event loop a moment.
+        for _ in 0..50 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let payloads = seen.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 1, "exactly one event per switch");
+        assert!(
+            payloads[0].contains("alice"),
+            "payload names the new profile: {}",
+            payloads[0]
+        );
     }
 
     /// The core must serialize on `profile_lifecycle` — the same lock

@@ -11,6 +11,15 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 vi.mock("../lib/useFocusTrap", () => ({ useFocusTrap: () => ({ current: null }) }));
+// Captures the "profile-changed" handler so a test can fire the event the Rust
+// side emits on every switch, local or remote.
+const eventHandlers: Record<string, (e: { payload: unknown }) => void> = {};
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (name: string, handler: (e: { payload: unknown }) => void) => {
+    eventHandlers[name] = handler;
+    return Promise.resolve(() => { delete eventHandlers[name]; });
+  },
+}));
 
 import { render, screen, cleanup, fireEvent, waitFor, act } from "@testing-library/react";
 import ProfileSwitcher from "./ProfileSwitcher";
@@ -210,5 +219,33 @@ describe("ProfileSwitcher soft-lock handling", () => {
 
     await waitFor(() => expect(switchAttempts).toBe(2));
     expect(invoke).toHaveBeenCalledWith("switch_profile", { name: "work" });
+  });
+});
+
+// A profile switch can now originate anywhere — another browser tab, a phone, or
+// the desktop itself — because one active profile is shared by every client. The
+// switcher must follow the backend's `profile-changed` event, or it keeps
+// labelling the profile the app started in.
+describe("ProfileSwitcher remote switch", () => {
+  it("reloads the profile list when the active profile changes elsewhere", async () => {
+    render(<ProfileSwitcher onSwitch={() => {}} />);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("get_profiles"));
+    expect(await screen.findByText("default")).toBeInTheDocument();
+
+    // A remote switch lands: the backend now reports `work` as active.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_profiles")
+        return Promise.resolve([
+          { name: "default", is_active: false },
+          { name: "work", is_active: true },
+        ]);
+      return Promise.resolve(undefined);
+    });
+
+    await act(async () => {
+      eventHandlers["profile-changed"]?.({ payload: "work" });
+    });
+
+    await waitFor(() => expect(screen.getByText("work")).toBeInTheDocument());
   });
 });

@@ -109,6 +109,14 @@ function AppShell() {
     setProfileKey((k) => k + 1); // force Library remount
   }, [navigate]);
 
+  // The active profile is shared with the web UI, which can switch it from a
+  // phone — so the same reset has to run when the change came from elsewhere,
+  // or the desktop keeps showing the previous profile's library.
+  useEffect(() => {
+    const unlisten = listen<string>("profile-changed", () => { handleProfileSwitch(); });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [handleProfileSwitch]);
+
   // Vocabulary nav button visibility (F-1-5): shown when the setting is on
   // OR the list is non-empty — so words saved before the user disables the
   // toggle stay reachable. Re-checked on mount, whenever the Settings or

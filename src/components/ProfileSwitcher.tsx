@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { friendlyError, isLockRequired } from "../lib/errors";
 import ConfirmDialog from "./ConfirmDialog";
@@ -39,6 +40,14 @@ export default function ProfileSwitcher({ onSwitch }: ProfileSwitcherProps) {
   }, []);
 
   useEffect(() => { loadProfiles(); }, [loadProfiles]);
+
+  // A switch can originate outside this component now — the web UI can move the
+  // active profile, and there is one active profile shared by every client — so
+  // follow the backend's event instead of assuming this dropdown caused it.
+  useEffect(() => {
+    const unlisten = listen<string>("profile-changed", () => { loadProfiles(); });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [loadProfiles]);
 
   // Close dropdown on outside click
   useEffect(() => {
