@@ -1,7 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 
-// Remote profile switching from the web UI
-// (PRD docs/backlog/2026-07-26-remote-profile-switch.md).
+// Remote profile switching from the web UI (PR #119).
 //
 // The harness (src-tauri/examples/web_e2e_server.rs) advertises three profiles
 // covering every state the switcher renders: `default` (active), `magazines`
