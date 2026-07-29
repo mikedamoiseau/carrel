@@ -12,6 +12,40 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
+/// One profile as the web layer sees it (`GET /api/profiles`).
+///
+/// `switchable` is `profile_lock::access_allowed(locked, unlocked_this_session)`
+/// — the same rule the desktop command and `profile_lock_gate` apply, so the
+/// UI can grey out a locked profile instead of hiding it, and the switch
+/// endpoint's refusal is never a surprise.
+#[derive(Clone, serde::Serialize)]
+pub struct WebProfile {
+    pub name: String,
+    pub active: bool,
+    pub locked: bool,
+    pub switchable: bool,
+}
+
+/// Profile listing + switching for the web layer.
+///
+/// The pool map, the `profile_lifecycle` lock, and the plugin-host rebuild all
+/// live on `AppState`/`AppHandle`, which this module deliberately doesn't
+/// depend on — so the capability is injected instead. `lib.rs` supplies an
+/// `AppHandle`-backed implementation (the one new dependency the web layer
+/// gains for remote switching); test harnesses supply a fake, and embeddings
+/// with no Tauri app leave it `None`, which makes the endpoints 503.
+pub trait ProfileHost: Send + Sync {
+    /// All profiles with their active/locked/switchable state.
+    fn list(&self) -> FolioResult<Vec<WebProfile>>;
+
+    /// Switch the active profile. Boxed future rather than `async fn` so the
+    /// trait stays object-safe.
+    fn switch(
+        &self,
+        name: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FolioResult<()>> + Send + '_>>;
+}
+
 /// State shared with all axum handlers.
 #[derive(Clone)]
 pub struct WebState {
@@ -45,6 +79,10 @@ pub struct WebState {
     /// exactly like its desktop counterpart. The only runtime mutator is
     /// the desktop-side `set_private_mode` command.
     pub private_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Remote profile switching (`GET /api/profiles`, `POST /api/profile`).
+    /// `None` in harnesses with no Tauri app behind them — the endpoints then
+    /// report 503 instead of pretending there are no profiles.
+    pub profile_host: Option<Arc<dyn ProfileHost>>,
 }
 
 impl WebState {
@@ -217,6 +255,45 @@ pub fn get_local_ip() -> Option<String> {
 const THEME_BOOTSTRAP_SCRIPT_HASH: &str = "'sha256-FGUWTgqSoem8FWO0BBhrwgmMQsdK1kJ8wuiBBS6w55w='";
 
 /// Middleware that adds security headers to all responses (R3-3).
+/// Hex-encoded profile name, used as the `x-folio-profile` response header.
+///
+/// Clients compare it against the value they booted with to notice that the
+/// active profile moved under them (someone switched from another tab, another
+/// device, or the desktop app — there is one shared active profile). Encoded
+/// rather than sent verbatim because profile names are arbitrary text: a name
+/// containing a newline must not be able to inject a header. Callers only ever
+/// compare it, so nothing decodes it.
+pub(crate) fn profile_tag(name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(name.len() * 2);
+    for byte in name.as_bytes() {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Stamps every response with the active profile's tag (see [`profile_tag`]).
+///
+/// Read *after* the inner handler runs, so the response to `POST /api/profile`
+/// already carries the profile it switched to.
+async fn profile_tag_middleware(
+    axum::extract::State(state): axum::extract::State<WebState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let name = match state.active_profile_name.lock() {
+        Ok(guard) => guard.clone(),
+        // A poisoned lock is not worth failing an otherwise-good response over;
+        // the client simply doesn't get the hint on this one.
+        Err(_) => return response,
+    };
+    if let Ok(value) = axum::http::HeaderValue::from_str(&profile_tag(&name)) {
+        response.headers_mut().insert("x-folio-profile", value);
+    }
+    response
+}
+
 async fn security_headers_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -313,6 +390,10 @@ pub fn build_router(state: WebState, modes: ServerModes) -> Router {
             profile_lock_gate,
         ))
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            profile_tag_middleware,
+        ))
         .with_state(state)
 }
 
@@ -389,7 +470,378 @@ mod tests {
             active_profile_name: Arc::new(Mutex::new("default".to_string())),
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_host: None,
         }
+    }
+
+    // ── Profile listing / switching over HTTP ────────────────────────────
+    //
+    // The handlers are exercised against a fake `ProfileHost` that mirrors
+    // the real gate's decisions (unknown → InvalidInput, locked-and-not-
+    // unlocked → LockRequired). The gate itself is the desktop command's
+    // shared core, covered in `commands::tests`; what's under test here is
+    // the HTTP surface: JSON shape, status mapping, auth, and the
+    // CSRF-shaped request.
+
+    struct FakeProfileHost {
+        profiles: Mutex<Vec<WebProfile>>,
+    }
+
+    impl FakeProfileHost {
+        /// `default` (active, no lock), `magazines` (no lock), `vault`
+        /// (locked and not unlocked this session).
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                profiles: Mutex::new(vec![
+                    WebProfile {
+                        name: "default".into(),
+                        active: true,
+                        locked: false,
+                        switchable: true,
+                    },
+                    WebProfile {
+                        name: "magazines".into(),
+                        active: false,
+                        locked: false,
+                        switchable: true,
+                    },
+                    WebProfile {
+                        name: "vault".into(),
+                        active: false,
+                        locked: true,
+                        switchable: false,
+                    },
+                ]),
+            })
+        }
+
+        fn active(&self) -> String {
+            self.profiles
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|p| p.active)
+                .map(|p| p.name.clone())
+                .unwrap()
+        }
+    }
+
+    impl ProfileHost for FakeProfileHost {
+        fn list(&self) -> FolioResult<Vec<WebProfile>> {
+            Ok(self.profiles.lock().unwrap().clone())
+        }
+
+        fn switch(
+            &self,
+            name: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FolioResult<()>> + Send + '_>>
+        {
+            Box::pin(async move {
+                let mut profiles = self.profiles.lock().unwrap();
+                let target = profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .ok_or_else(|| FolioError::invalid(format!("Profile '{name}' not found")))?;
+                if !target.switchable {
+                    return Err(FolioError::lock_required(format!(
+                        "Profile '{name}' is locked"
+                    )));
+                }
+                for p in profiles.iter_mut() {
+                    p.active = p.name == name;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn state_with_profile_host(host: Arc<dyn ProfileHost>) -> WebState {
+        WebState {
+            profile_host: Some(host),
+            ..test_state()
+        }
+    }
+
+    /// Serves `state` on an ephemeral port; returns the port and a shutdown
+    /// sender. Mirrors `test_start_and_stop_server`'s setup.
+    async fn serve(state: WebState) -> (u16, oneshot::Sender<()>) {
+        let router = build_router(
+            state,
+            ServerModes {
+                web_ui: true,
+                opds: true,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+        });
+        (port, tx)
+    }
+
+    #[tokio::test]
+    async fn get_profiles_reports_active_locked_and_switchable() {
+        let (port, tx) = serve(state_with_profile_host(FakeProfileHost::new())).await;
+
+        let body: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!([
+                {"name": "default", "active": true, "locked": false, "switchable": true},
+                {"name": "magazines", "active": false, "locked": false, "switchable": true},
+                {"name": "vault", "active": false, "locked": true, "switchable": false},
+            ])
+        );
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn post_profile_switches_the_shared_active_profile() {
+        let host = FakeProfileHost::new();
+        let (port, tx) = serve(state_with_profile_host(host.clone())).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/profile"))
+            .json(&serde_json::json!({"name": "magazines"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"active": "magazines"})
+        );
+        assert_eq!(host.active(), "magazines");
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn post_profile_returns_404_for_an_unknown_profile() {
+        let (port, tx) = serve(state_with_profile_host(FakeProfileHost::new())).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/profile"))
+            .json(&serde_json::json!({"name": "ghost"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+        let _ = tx.send(());
+    }
+
+    /// Decision 2: the profile password never crosses the network, so a
+    /// locked profile that wasn't unlocked on the desktop this session is
+    /// refused — 423 Locked, never a password prompt.
+    #[tokio::test]
+    async fn post_profile_returns_423_for_a_locked_profile() {
+        let host = FakeProfileHost::new();
+        let (port, tx) = serve(state_with_profile_host(host.clone())).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/profile"))
+            .json(&serde_json::json!({"name": "vault"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 423);
+        assert!(resp.text().await.unwrap().contains("desktop"));
+        assert_eq!(host.active(), "default", "active profile untouched");
+        let _ = tx.send(());
+    }
+
+    /// CSRF: the session cookie is `SameSite=Strict` (asserted by
+    /// `test_login_sets_session_cookie`), so a cross-site POST carries no
+    /// session. Basic auth, however, IS accepted on every `/api` path and
+    /// browsers do replay cached Basic credentials cross-site — so the switch
+    /// additionally requires a JSON body. A form-encoded POST (the only shape
+    /// that dodges a CORS preflight, and thus the only cross-site request that
+    /// would actually reach the handler) is rejected.
+    #[tokio::test]
+    async fn post_profile_rejects_a_form_encoded_body() {
+        let host = FakeProfileHost::new();
+        let (port, tx) = serve(state_with_profile_host(host.clone())).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/profile"))
+            .form(&[("name", "magazines")])
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        assert_eq!(host.active(), "default");
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn profile_routes_require_authentication() {
+        let state = state_with_profile_host(FakeProfileHost::new());
+        *state.pin_hash.lock().unwrap() = Some(auth::hash_pin("1234"));
+        let (port, tx) = serve(state).await;
+
+        let list = reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), 401);
+
+        let switch = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/profile"))
+            .json(&serde_json::json!({"name": "magazines"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(switch.status(), 401);
+        let _ = tx.send(());
+    }
+
+    /// The OPDS surface gains no switch: `/api` is only mounted in `web_ui`
+    /// mode, so an OPDS-only server has no profile endpoints at all.
+    #[tokio::test]
+    async fn opds_only_server_exposes_no_profile_endpoints() {
+        let router = build_router(
+            state_with_profile_host(FakeProfileHost::new()),
+            ServerModes {
+                web_ui: false,
+                opds: true,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+        });
+
+        assert_eq!(
+            reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/api/profile"))
+                .json(&serde_json::json!({"name": "magazines"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        let _ = tx.send(());
+    }
+
+    /// Every response carries a tag identifying the active profile so a client
+    /// left on a stale profile (another browser tab, or one open while someone
+    /// switched from the desktop) can notice on its next request and reload.
+    /// Hex-encoded rather than the raw name, because profile names are
+    /// arbitrary text and would otherwise need sanitizing to be a header value;
+    /// clients only ever compare it, never decode it.
+    #[tokio::test]
+    async fn responses_carry_the_active_profile_tag() {
+        let state = state_with_profile_host(FakeProfileHost::new());
+        let unlocked = state.unlocked_profiles.clone();
+        let active = state.active_profile_name.clone();
+        let (port, tx) = serve(state).await;
+
+        let tag = |resp: &reqwest::Response| {
+            resp.headers()
+                .get("x-folio-profile")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+
+        let first = reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+            .await
+            .unwrap();
+        let before = tag(&first).expect("header present");
+        assert_eq!(before, profile_tag("default"));
+
+        // A switch from anywhere moves the shared active-profile handle; the
+        // header must follow it.
+        unlocked.lock().unwrap().insert("magazines".to_string());
+        *active.lock().unwrap() = "magazines".to_string();
+        let second = reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+            .await
+            .unwrap();
+        let after = tag(&second).expect("header present");
+        assert_eq!(after, profile_tag("magazines"));
+        assert_ne!(before, after);
+        let _ = tx.send(());
+    }
+
+    /// Always a valid header value however the profile was named — a name with
+    /// a newline in it must not be able to inject a header — and distinct per
+    /// name so a client can tell a switch happened.
+    #[test]
+    fn profile_tag_is_hex_and_distinguishes_names() {
+        let a = profile_tag("default");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, profile_tag("default"));
+        assert_ne!(a, profile_tag("Default"));
+        assert_ne!(a, profile_tag("magazines"));
+        let weird = profile_tag("héllo\r\nX-Injected: 1");
+        assert!(weird.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(axum::http::HeaderValue::from_str(&weird).is_ok());
+    }
+
+    /// Harnesses (and any future headless embedding) construct `WebState`
+    /// without a host; the endpoints must degrade to a clear 503 rather than
+    /// panicking or silently reporting an empty profile list.
+    #[tokio::test]
+    async fn profile_routes_report_503_without_a_profile_host() {
+        let (port, tx) = serve(test_state()).await;
+
+        assert_eq!(
+            reqwest::get(format!("http://127.0.0.1:{port}/api/profiles"))
+                .await
+                .unwrap()
+                .status(),
+            503
+        );
+        assert_eq!(
+            reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/api/profile"))
+                .json(&serde_json::json!({"name": "magazines"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            503
+        );
+        let _ = tx.send(());
     }
 
     /// Balanced-brace body of the first CSS block whose header text matches
@@ -1385,6 +1837,7 @@ mod tests {
             active_profile_name: Arc::new(Mutex::new("default".to_string())),
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_host: None,
         };
 
         let mut book = cache_test_book(std::path::Path::new("/Volumes/remote/comic.pdf"));
@@ -1438,6 +1891,7 @@ mod tests {
             active_profile_name: Arc::new(Mutex::new("default".to_string())),
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_host: None,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -3851,6 +4305,34 @@ mod tests {
     // regenerating the version fails here with the expected hash to paste
     // in, the same pattern `test_csp_allows_theme_bootstrap_script_hash`
     // (web_server::tests, this file) already uses for the CSP hash.
+    /// The offline scope marker is the SW's only channel for the active
+    /// profile's namespace on a cold start, so app.js and sw.js must agree on
+    /// where it lives — a silent drift would make the SW serve (or refuse to
+    /// serve) the wrong profile's saved books. Neither file can import the
+    /// other, so the constants are checked here.
+    #[test]
+    fn offline_scope_constants_agree_between_app_js_and_sw_js() {
+        const APP_JS: &str = include_str!("static/app.js");
+        const SW_JS: &str = include_str!("static/sw.js");
+
+        for decl in [
+            r#"const OFFLINE_SCOPE_CACHE = "folio-offline-scope";"#,
+            r#"const OFFLINE_SCOPE_URL = "/__offline_scope";"#,
+            r#"const OFFLINE_CACHE_PREFIX = "folio-offline-book-";"#,
+        ] {
+            assert!(APP_JS.contains(decl), "app.js must declare `{decl}`");
+            assert!(SW_JS.contains(decl), "sw.js must declare `{decl}`");
+        }
+
+        // The activate purge deletes every cache it doesn't recognize; the
+        // scope marker must be on its keep-list, or a SW update would silently
+        // reset every client to the default profile's namespace.
+        assert!(
+            SW_JS.contains("key !== OFFLINE_SCOPE_CACHE"),
+            "sw.js's activate purge must spare the offline scope marker cache"
+        );
+    }
+
     #[tokio::test]
     async fn cache_version_embeds_shell_asset_content_hash() {
         use sha2::{Digest, Sha256};

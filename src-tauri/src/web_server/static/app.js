@@ -247,15 +247,140 @@
   const OFFLINE_PAGE_WIDTH = 1080; // page-image download width; change here (e.g. 1600)
   const OFFLINE_CACHE_PREFIX = "folio-offline-book-"; // must mirror sw.js
   const OFFLINE_MANIFEST_VERSION = 1;
+  // Profile scoping: book ids are per-profile DB id spaces, so a cache or
+  // manifest keyed by bare book id can serve profile A's saved content for a
+  // *different* book with the same id in profile B. Everything offline is
+  // therefore namespaced by a short hash of the active profile name.
+  //
+  // The active profile's token also has to reach the service worker, which
+  // does the offline serving and has no access to the page's variables. It's
+  // published in a one-entry Cache Storage entry (readable from both contexts;
+  // localStorage is not) and pushed eagerly by postMessage on change. Both
+  // constants must mirror sw.js.
+  const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
+  const OFFLINE_SCOPE_URL = "/__offline_scope";
+  // The page's own copy of the scope. localStorage rather than the marker cache
+  // because it is synchronous, survives a cold offline launch, and isn't subject
+  // to Cache Storage quota failures — the marker is strictly the worker's copy.
+  const OFFLINE_SCOPE_STORAGE_KEY = "folio-offline-scope";
+  // The default profile keeps the unscoped names offline mode shipped with, so
+  // existing downloads survive this change; every other profile gets a
+  // 12-hex-char prefix. A bare book id can never be mistaken for a scoped one:
+  // ids are UUIDs (8 hex chars then `-`), never 12.
+  let offlineScope = "";
+  // Set when the worker's scope marker could not be published. The page and the
+  // worker would then disagree about which profile's caches are current, and the
+  // worker is the one serving — so offline is switched off for the session
+  // instead of risking one profile's content under another's book ids.
+  let offlineUnavailable = false;
 
   function offlineSupported() {
-    return "serviceWorker" in navigator &&
+    return !offlineUnavailable &&
+      "serviceWorker" in navigator &&
       !!window.indexedDB &&
       !!window.caches &&
       !!(window.crypto && window.crypto.subtle);
   }
 
-  function offlineCacheName(id) { return OFFLINE_CACHE_PREFIX + id; }
+  function offlineCacheName(id) { return OFFLINE_CACHE_PREFIX + offlineScope + id; }
+
+  /// Scope token for a profile: "" for `default` (legacy names), else the
+  /// first 12 hex chars of its SHA-256 plus a separator. Hashed rather than
+  /// used verbatim because profile names are arbitrary text (only "non-empty"
+  /// and "not default" are enforced), so a raw name could make two different
+  /// (profile, id) pairs produce one cache name.
+  async function profileScopeToken(profileName) {
+    if (!profileName || profileName === "default") return "";
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(profileName));
+    return Array.from(new Uint8Array(buf)).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("") + "-";
+  }
+
+  /// The scope published for the service worker, or "" if none is stored yet.
+  async function readPublishedScope() {
+    try {
+      const resp = await (await caches.open(OFFLINE_SCOPE_CACHE)).match(OFFLINE_SCOPE_URL);
+      return resp ? await resp.text() : "";
+    } catch (e) { return ""; }
+  }
+
+  /// Point every offline read/write at `profileName`'s namespace. Returns
+  /// whether the scope actually changed, so callers can re-derive the state
+  /// they read from the old one.
+  ///
+  /// Publishing to the marker cache (for a cold-started SW) and postMessage
+  /// (for a running one) are both needed: a SW can start after this page did,
+  /// and a running SW never re-reads the marker on its own.
+  async function applyOfflineScope(profileName) {
+    if (!offlineSupported()) return false;
+    let token;
+    try { token = await profileScopeToken(profileName); } catch (e) { return false; }
+
+    // Publish to the worker BEFORE adopting the scope here. The worker does the
+    // offline serving and reads only the marker, so a page that moved first
+    // would be reading profile B's manifests while the worker answered out of
+    // profile A's caches. Republished even when this page's token is unchanged:
+    // a worker can outlive a switch, or have been installed by another tab.
+    //
+    // Deliberately does NOT wait on `navigator.serviceWorker.ready`: that only
+    // settles once a worker is active, which on a first visit means after the
+    // whole shell + font precache, and boot must never block on it (an earlier
+    // version did, and stalled the app until the install finished).
+    try {
+      await (await caches.open(OFFLINE_SCOPE_CACHE)).put(OFFLINE_SCOPE_URL, new Response(token));
+    } catch (e) {
+      // Can't publish, so the two sides cannot be kept in agreement. Fail
+      // closed: drop the marker so the worker refuses to serve any offline
+      // content at all (it treats "no marker" as "namespace unknown"), and
+      // disable offline for this session. Better to lose the offline copies
+      // until the next load than to serve one profile's book as another's.
+      try { await caches.delete(OFFLINE_SCOPE_CACHE); } catch (err) { /* nothing left to try */ }
+      offlineUnavailable = true;
+      return false;
+    }
+
+    const changed = token !== offlineScope;
+    if (changed) {
+      offlineScope = token;
+      safeStorageSet(OFFLINE_SCOPE_STORAGE_KEY, token);
+      // Drop the connection to the previous profile's database; the next
+      // offlineDb() opens the new one.
+      if (offlineDbPromise) {
+        offlineDbPromise.then((db) => db.close()).catch(() => {});
+        offlineDbPromise = null;
+      }
+    }
+    return changed;
+  }
+
+  /// Adopt the last known scope before any offline read. Used on boot,
+  /// including an offline launch where the active profile can't be fetched.
+  ///
+  /// Read from localStorage, not the marker: this must work on a cold offline
+  /// launch and must not depend on a Cache Storage write having succeeded. The
+  /// marker is then re-published from it so a worker that has been evicted (or
+  /// was installed by another tab) agrees with this page — and if that can't be
+  /// done, offline goes off rather than out of sync.
+  async function loadPublishedOfflineScope() {
+    if (!offlineSupported()) return;
+    const stored = safeStorageGet(OFFLINE_SCOPE_STORAGE_KEY);
+    offlineScope = stored === null ? await readPublishedScope() : stored;
+    try {
+      await (await caches.open(OFFLINE_SCOPE_CACHE)).put(
+        OFFLINE_SCOPE_URL,
+        new Response(offlineScope)
+      );
+    } catch (e) {
+      try { await caches.delete(OFFLINE_SCOPE_CACHE); } catch (err) { /* nothing left to try */ }
+      offlineUnavailable = true;
+    }
+  }
+
+  /// Re-scope to the server's active profile. Returns whether it changed.
+  async function syncOfflineScopeWithServer() {
+    const active = (await loadProfiles()).find((p) => p.active);
+    if (!active || !offlineSupported()) return false;
+    return await applyOfflineScope(active.name);
+  }
 
   // Lazy singleton connection; a failed open clears the promise so a later
   // call can retry (e.g. transient quota pressure at first open). The open
@@ -274,7 +399,10 @@
       let timer = null;
       const thisPromise = new Promise((resolve, reject) => {
         const clear = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
-        const req = indexedDB.open("folio-offline", 1);
+        // Scoped per profile (see `offlineScope`): a separate database per
+        // profile keeps every store's keys — manifests, pending saves, queued
+        // progress — in their own id space without rewriting each key.
+        const req = indexedDB.open(offlineScope ? "folio-offline-" + offlineScope.slice(0, -1) : "folio-offline", 1);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains("books")) db.createObjectStore("books", { keyPath: "id" });
@@ -1074,6 +1202,29 @@
   // Response so callers that render a primary view can show the status code.
   class ApiNetworkError extends Error {}
 
+  // Stale-profile detection. One active profile is shared by the desktop app and
+  // every web/OPDS client, so it can move while this tab sits open — leaving the
+  // page showing another profile's library, with book ids that no longer mean
+  // what it thinks. Every response carries `x-folio-profile` (see
+  // `web_server::profile_tag`); the first one seen defines this page's profile,
+  // and a later mismatch means the ground moved. Comparison only — the value is
+  // never decoded, and needs no crypto (so it works on a plain-HTTP LAN too).
+  let seenProfileTag = null;
+  let profileMoveHandled = false;
+
+  function noteProfileTag(resp) {
+    let tag;
+    try { tag = resp && resp.headers ? resp.headers.get("x-folio-profile") : null; } catch (e) { return; }
+    if (!tag) return; // pre-header server, or a response the SW synthesized
+    if (seenProfileTag === null) { seenProfileTag = tag; return; }
+    if (tag === seenProfileTag || profileMoveHandled) return;
+    // Reload rather than patch: books, ids, collections, series, progress and
+    // the offline namespace all belong to the profile this page booted into.
+    // Guarded so a burst of in-flight requests can't reload repeatedly.
+    profileMoveHandled = true;
+    location.reload();
+  }
+
   async function api(path) {
     let resp;
     try {
@@ -1081,6 +1232,7 @@
     } catch (e) {
       throw new ApiNetworkError(e && e.message ? e.message : String(e));
     }
+    noteProfileTag(resp);
     if (resp.status === 401) { authenticated = false; showLogin(); return null; }
     return resp;
   }
@@ -1474,6 +1626,11 @@
           return;
         }
         authenticated = true;
+        // A PIN-gated boot 401s out of init() into this login, so the profile
+        // list and the offline scope are still unresolved here — resolve them
+        // before the first render, or the header would have no switcher and
+        // offline saves could land in the wrong profile's namespace.
+        if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
     }
@@ -1511,6 +1668,7 @@
   document.addEventListener("click", (e) => {
     if (!e.target.closest(".filter-dropdown")) closeAllFilterPanels();
     if (!e.target.closest(".detail-more")) closeDetailMenu();
+    if (!e.target.closest(".profile-switcher")) closeProfilePanel();
   });
 
   function selectFilter(key, value) {
@@ -4466,6 +4624,7 @@
         body: JSON.stringify({ chapter_index: chapterIndex, scroll_position: scrollPosition }),
         credentials: "same-origin",
       });
+      noteProfileTag(resp);
       if (resp.status === 401) { authenticated = false; showLogin(); return; }
       if (!resp.ok) return;
       const created = await resp.json();
@@ -6081,6 +6240,10 @@
         credentials: "same-origin",
         keepalive: true,
       });
+      // Checked on the reader's own write path, not just on reads: this is the
+      // request most likely to be the first thing a long-open reader tab does
+      // after the active profile moved under it.
+      noteProfileTag(resp);
       // F3: a debounced/flushed save (unlike the pagehide teardown flush)
       // can and should react to an expired session — route to the same
       // login redirect the rest of the app uses.
@@ -6521,6 +6684,121 @@
     return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>';
   }
 
+  // ── Profile switcher (remote profile switching) ────────────────
+  // One active profile is shared by the desktop app and every web/OPDS client,
+  // so switching here moves all of them. A locked profile is listed but not
+  // offered: its password is never accepted over the network, so it is only
+  // reachable if it was already unlocked on the desktop this session (the
+  // server reports that as `switchable`).
+  let cachedProfiles = [];
+
+  /// Fetches the profile list, caching it for the header. Also the single
+  /// source for the active profile name (offline scoping reads it too), so a
+  /// boot costs one request, not two.
+  async function loadProfiles() {
+    try {
+      const resp = await fetch("/api/profiles", { credentials: "same-origin" });
+      noteProfileTag(resp);
+      if (!resp.ok) return cachedProfiles;
+      const list = await resp.json();
+      if (Array.isArray(list)) cachedProfiles = list;
+    } catch (e) { /* keep whatever we had; the switcher just won't render */ }
+    return cachedProfiles;
+  }
+
+  function activeProfileName() {
+    const active = cachedProfiles.find((p) => p.active);
+    return active ? active.name : "";
+  }
+
+  const PROFILE_ICON_PATH =
+    '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>';
+
+  /// Rendered only with more than one profile: with a single profile there is
+  /// nothing to switch to, and the control would be pure decoration.
+  function profileSwitcherHtml() {
+    if (cachedProfiles.length < 2) return "";
+    const active = activeProfileName();
+    const rows = cachedProfiles
+      .map((p) => {
+        const unreachable = p.locked && !p.switchable;
+        const title = unreachable
+          ? "Unlock on the desktop to use over the network"
+          : `Switch to ${p.name}`;
+        return `<button type="button" class="profile-row" data-profile="${esc(p.name)}"
+          ${p.active ? 'aria-current="true"' : ""}${unreachable ? " disabled" : ""}
+          title="${esc(title)}">
+          <span class="profile-row-name">${esc(p.name)}</span>
+          ${p.active ? '<span class="profile-row-flag" aria-hidden="true">&#10003;</span>' : ""}
+          ${unreachable ? '<span class="profile-row-flag" aria-hidden="true">&#128274;</span>' : ""}
+        </button>`;
+      })
+      .join("");
+    return `<div class="profile-switcher">
+      <button class="nav-icon profile-switcher-btn" id="profile-switcher-btn" aria-haspopup="true"
+        aria-expanded="false" title="Profile: ${esc(active)}" aria-label="Profile: ${esc(active)}">
+        ${navIconSvg(20, PROFILE_ICON_PATH)}<span class="profile-name">${esc(active)}</span>
+      </button>
+      <div class="profile-panel" id="profile-panel" hidden>${rows}</div>
+    </div>`;
+  }
+
+  function closeProfilePanel() {
+    const panel = $("#profile-panel");
+    if (panel) panel.hidden = true;
+    const btn = $("#profile-switcher-btn");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+
+  function bindProfileSwitcher() {
+    const btn = $("#profile-switcher-btn");
+    const panel = $("#profile-panel");
+    if (!btn || !panel) return;
+    btn.onclick = () => {
+      const open = panel.hidden;
+      closeAllFilterPanels();
+      panel.hidden = !open;
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+    };
+    $$("#profile-panel .profile-row").forEach((row) => {
+      row.onclick = () => {
+        closeProfilePanel();
+        if (!row.disabled) switchProfile(row.dataset.profile);
+      };
+    });
+  }
+
+  async function switchProfile(name) {
+    if (!name || name === activeProfileName()) return;
+    let resp;
+    try {
+      resp = await fetch("/api/profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ name }),
+      });
+    } catch (e) {
+      showToast("Couldn't reach Folio server");
+      return;
+    }
+    if (resp.status === 401) { authenticated = false; showLogin(); return; }
+    if (resp.status === 423) {
+      // The profile was locked (or re-locked) since the list was fetched. The
+      // password is never accepted here, so the only route in is the desktop.
+      showToast("That profile is locked — unlock it on the desktop to use it over the network");
+      await loadProfiles();
+      return;
+    }
+    if (!resp.ok) { showToast(httpErrorToastMessage(resp.status)); return; }
+    // Everything on screen belongs to the previous profile — books, ids,
+    // collections, series, progress, offline scope. Reload into the new
+    // profile's library rather than trying to invalidate each cache: the
+    // boot path already re-fetches all of it and re-scopes offline storage.
+    location.hash = "#/";
+    location.reload();
+  }
+
   function themeToggleHtml() {
     const label = themeAriaLabel();
     return `<button class="nav-icon" id="theme-toggle-btn" title="${esc(label)}" aria-label="${esc(label)}">${themeIconSvg(themeMode)}</button>`;
@@ -6553,6 +6831,7 @@
     const folderColor = activePage === "collections" ? "active" : "";
     const chartColor = activePage === "stats" ? "active" : "";
     return `<div class="nav-icons">
+      ${profileSwitcherHtml()}
       ${themeToggleHtml()}
       <button class="nav-icon ${folderColor}" title="Collections" aria-label="Collections" data-nav="collections">
         ${navIconSvg(20, NAV_ICON_PATH.collections)}
@@ -6569,6 +6848,7 @@
     });
     const themeBtn = $("#theme-toggle-btn");
     if (themeBtn) themeBtn.onclick = cycleTheme;
+    bindProfileSwitcher();
   }
 
   // Item A (app-feel Tier 1): fixed bottom tab bar for primary navigation on
@@ -6701,6 +6981,11 @@
 
   // ── Init ──────────────────────────────────────
   async function init() {
+    // Adopt the last published profile scope before ANY offline read — every
+    // manifest/cache lookup below is namespaced by it. Read from storage, not
+    // the server, so an offline launch still uses the right profile's
+    // downloads; the online path re-syncs it against the server below.
+    await loadPublishedOfflineScope();
     // Eviction honesty first: make the manifest truthful before either boot
     // path reads it (the offline branch renders straight from it, and the
     // online grid badges read offlineBookIds). Safe on- or offline.
@@ -6739,8 +7024,18 @@
       return;
     }
     offlineMode = false;
+    // Establishes this page's profile baseline (see `noteProfileTag`) before
+    // anything else talks to the server — the boot probe is a raw fetch, so
+    // without this the first tag recorded would be a post-switch one and the
+    // page would adopt the move instead of noticing it.
+    noteProfileTag(test);
     if (test.status === 401) { showLogin(); return; }
     authenticated = true;
+    // The active profile may have moved since this browser last looked (from
+    // the desktop, or another web client — one active profile is shared by
+    // all of them). Re-scope before anything reads offline storage, and
+    // re-check integrity in the new namespace if it changed.
+    if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
     // Reconnected (or a normal online launch): flush any progress queued
     // while offline. Fire-and-forget — it serializes per book via saveChains
     // and never blocks the first render.

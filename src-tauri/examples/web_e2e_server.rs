@@ -52,7 +52,7 @@
 
 use folio_lib::db;
 use folio_lib::models::{Book, BookFormat, ReadingProgress};
-use folio_lib::web_server::{self, auth, ServerModes, WebState};
+use folio_lib::web_server::{self, auth, ProfileHost, ServerModes, WebProfile, WebState};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Write;
@@ -343,6 +343,90 @@ fn seed(
     Ok(())
 }
 
+/// Profile host for the e2e harness: three profiles covering every state the
+/// web switcher renders — the active one, a switchable one, and a locked one
+/// that must show as disabled ("unlock on the desktop"). Switching flips the
+/// advertised `active` flag; the served library is the same seeded DB either
+/// way, which is all the UI specs need.
+struct HarnessProfileHost {
+    profiles: Mutex<Vec<WebProfile>>,
+    /// The same handles `WebState` reads, so a harness switch moves the
+    /// server's notion of the active profile exactly like the real host does
+    /// (which goes through `commands::switch_active_profile`). Without this the
+    /// `x-folio-profile` header — and the soft-lock gate — would keep reporting
+    /// the profile the harness started on.
+    active_name: Arc<Mutex<String>>,
+    unlocked: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl HarnessProfileHost {
+    fn new(
+        active_name: Arc<Mutex<String>>,
+        unlocked: Arc<Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        Self {
+            active_name,
+            unlocked,
+            profiles: Mutex::new(vec![
+                WebProfile {
+                    name: "default".to_string(),
+                    active: true,
+                    locked: false,
+                    switchable: true,
+                },
+                WebProfile {
+                    name: "magazines".to_string(),
+                    active: false,
+                    locked: false,
+                    switchable: true,
+                },
+                WebProfile {
+                    name: "vault".to_string(),
+                    active: false,
+                    locked: true,
+                    switchable: false,
+                },
+            ]),
+        }
+    }
+}
+
+impl ProfileHost for HarnessProfileHost {
+    fn list(&self) -> folio_lib::error::FolioResult<Vec<WebProfile>> {
+        Ok(self.profiles.lock().unwrap().clone())
+    }
+
+    fn switch(
+        &self,
+        name: String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = folio_lib::error::FolioResult<()>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            use folio_lib::error::FolioError;
+            let mut profiles = self.profiles.lock().unwrap();
+            let target = profiles
+                .iter()
+                .find(|p| p.name == name)
+                .ok_or_else(|| FolioError::invalid(format!("Profile '{name}' not found")))?;
+            if !target.switchable {
+                return Err(FolioError::lock_required(format!(
+                    "Profile '{name}' is locked"
+                )));
+            }
+            for p in profiles.iter_mut() {
+                p.active = p.name == name;
+            }
+            // Mirror the real switch: publish the name and keep the active
+            // profile in the unlocked set, or `profile_lock_gate` would answer
+            // 503 to everything after a switch.
+            self.unlocked.lock().unwrap().insert(name.clone());
+            *self.active_name.lock().unwrap() = name;
+            Ok(())
+        })
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async_main())
@@ -372,6 +456,10 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         seed(&conn, &cbz_path, &epub_path)?;
     }
 
+    let active_profile_name = Arc::new(Mutex::new("default".to_string()));
+    let unlocked_profiles = Arc::new(Mutex::new(std::collections::HashSet::from([
+        "default".to_string()
+    ])));
     let state = WebState {
         pool: Arc::new(Mutex::new(pool)),
         data_dir,
@@ -379,14 +467,18 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         pin_hash: Arc::new(Mutex::new(None)),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
-        // This harness has no profile-switch flow of its own, so it's
-        // always the (unlocked, lock-free) "default" profile — the
-        // soft-lock gate (A-M2) must stay a no-op here.
-        active_profile_name: Arc::new(Mutex::new("default".to_string())),
-        unlocked_profiles: Arc::new(Mutex::new(std::collections::HashSet::from([
-            "default".to_string()
-        ]))),
+        // The harness serves one (unlocked, lock-free) "default" profile —
+        // the soft-lock gate (A-M2) must stay a no-op here. `profile_host`
+        // below still advertises the other profiles so the web switcher has
+        // something to render; switching only moves the advertised `active`
+        // flag, since there's no second seeded library to swap in.
+        active_profile_name: active_profile_name.clone(),
+        unlocked_profiles: unlocked_profiles.clone(),
         private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        profile_host: Some(Arc::new(HarnessProfileHost::new(
+            active_profile_name,
+            unlocked_profiles,
+        ))),
     };
 
     let router = web_server::build_router(

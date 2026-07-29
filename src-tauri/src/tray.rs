@@ -260,6 +260,7 @@ async fn toggle_mode(app: &AppHandle, which: ToggleWhich) {
             active_profile_name: state.shared_active_profile_name.clone(),
             unlocked_profiles: state.unlocked_profiles.clone(),
             private_mode: state.private_mode.clone(),
+            profile_host: Some(crate::profile_host::for_app(app)),
         };
         if let Ok(handle) = crate::web_server::start(web_state, current_port, modes).await {
             let mut h = state.web_server_handle.lock().unwrap();
