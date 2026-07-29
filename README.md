@@ -1,16 +1,16 @@
-# Folio
+# Carrel
 
 A local-first desktop app for people who want to read and organize the books they already own.
 
-![Folio library](screenshots/01-library-light.png)
+![Carrel library](screenshots/01-library-light.png)
 
-Folio is a cross-platform reader for EPUB, MOBI / AZW / AZW3, PDF, CBZ, and CBR. It keeps your library on your machine and gives you the tools to actually use it well: solid reading controls, sensible organization, metadata cleanup, highlights, profiles, backup, and OPDS catalog support.
+Carrel is a cross-platform reader for EPUB, MOBI / AZW / AZW3, PDF, CBZ, and CBR. It keeps your library on your machine and gives you the tools to actually use it well: solid reading controls, sensible organization, metadata cleanup, highlights, profiles, backup, and OPDS catalog support.
 
-## Why Folio?
+## Why Carrel?
 
 A lot of reading apps try to funnel you into a store, an account, or somebody else's ecosystem.
 
-Folio is for the opposite case: you already have the files, and you want a better home for them.
+Carrel is for the opposite case: you already have the files, and you want a better home for them.
 
 - Local-first: your books and reading data stay on your machine
 - Built for owned files: EPUBs, PDFs, and comics without vendor lock-in
@@ -160,35 +160,35 @@ Pre-built binaries are available on the [GitHub Releases page](https://github.co
 
 ### macOS
 
-Open the `.dmg`, drag **Folio.app** to **Applications**, then launch it.
+Open the `.dmg`, drag **Carrel.app** to **Applications**, then launch it.
 
 #### macOS Gatekeeper: "damaged" / "unidentified developer" warning
 
-Because Folio is not currently notarized with an Apple Developer certificate, macOS may block it on first launch.
+Because Carrel is not currently notarized with an Apple Developer certificate, macOS may block it on first launch.
 
 **Recommended — right-click to open (no Terminal):**
 
-1. In **Applications**, right-click (or Control-click) **Folio.app**.
+1. In **Applications**, right-click (or Control-click) **Carrel.app**.
 2. Choose **Open** from the menu.
 3. In the dialog, click **Open** again.
 
-This is only needed the first time. macOS remembers the choice, and afterwards you can launch Folio normally. On macOS 15 (Sequoia) and later, if there is no **Open** option in the right-click menu, double-click the app once, then go to **System Settings → Privacy & Security** and click **Open Anyway**.
+This is only needed the first time. macOS remembers the choice, and afterwards you can launch Carrel normally. On macOS 15 (Sequoia) and later, if there is no **Open** option in the right-click menu, double-click the app once, then go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
 **Alternative — clear the quarantine flag from Terminal:**
 
 ```bash
-xattr -cr /Applications/Folio.app
+xattr -cr /Applications/Carrel.app
 ```
 
 Then launch the app normally.
 
 #### macOS SMB shares: import fails for accented filenames
 
-Importing from an SMB network share (NAS) can fail with `No such file or directory (os error 2)` for files whose names contain accented characters (`é`, `à`, …). This is a macOS SMB-client bug, not a Folio one — the file is intact on the server but macOS cannot open it by name, in any application. Workarounds (rename on the server, copy via SSH, or mount over NFS) are described in the [User Guide](docs/USER_GUIDE.md#macos--import-from-a-network-share-fails-with-no-such-file-or-directory-os-error-2).
+Importing from an SMB network share (NAS) can fail with `No such file or directory (os error 2)` for files whose names contain accented characters (`é`, `à`, …). This is a macOS SMB-client bug, not a Carrel one — the file is intact on the server but macOS cannot open it by name, in any application. Workarounds (rename on the server, copy via SSH, or mount over NFS) are described in the [User Guide](docs/USER_GUIDE.md#macos--import-from-a-network-share-fails-with-no-such-file-or-directory-os-error-2).
 
 ### Windows
 
-Run the `.msi` installer and follow the prompts. MOBI support is statically linked into `folio.exe` — no separate libmobi install is needed.
+Run the `.msi` installer and follow the prompts. MOBI support is statically linked into `Carrel.exe` — no separate libmobi install is needed.
 
 ### Linux
 

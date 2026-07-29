@@ -1,6 +1,6 @@
 # Plugin system architecture
 
-How the plugin/hook system is built, for people working on Folio itself. If
+How the plugin/hook system is built, for people working on Carrel itself. If
 you just want to write a plugin, read [PLUGINS.md](./PLUGINS.md) instead — this
 document is about the machinery underneath it.
 
@@ -391,7 +391,7 @@ uses (dedup, copy-on-import, `ImportSource::Download`).
 
 The manager itself lives in a `ManagerSlot` —
 `Arc<Mutex<Option<Arc<PluginManager>>>>`. The reason it's swappable is profiles.
-Folio supports multiple library profiles, each with its own database and
+Carrel supports multiple library profiles, each with its own database and
 plugins folder. Switching profiles has to rebuild the manager against the new
 DB, and an earlier version got this wrong by pinning the manager to the default
 profile's database (caught in the M2 review).

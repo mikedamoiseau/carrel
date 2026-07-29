@@ -1,11 +1,11 @@
 name: Docs on merge
 
-# When a PR is merged into main, classify the change and keep folio's in-repo
+# When a PR is merged into main, classify the change and keep Carrel's in-repo
 # Markdown docs in sync: CHANGELOG.md, README.md, and docs/USER_GUIDE.md.
 #
 # The website + published docs on damoiseau.xyz are NOT this workflow's concern.
 # That site lives in a separate repo with its own Claude Code agent that pulls
-# folio's latest changes on a schedule and updates its documentation itself. This
+# Carrel's latest changes on a schedule and updates its documentation itself. This
 # workflow therefore touches in-repo docs ONLY and produces no website handoff.
 #
 # Auth: subscription OAuth token, NOT an API key.
@@ -54,7 +54,7 @@ jobs:
           display_report: true
           show_full_output: true
           prompt: |
-            A pull request was just merged into main of folio, a local-first
+            A pull request was just merged into main of Carrel, a local-first
             DESKTOP app (Tauri + Rust + React) for reading and organizing EPUBs,
             PDFs, CBZ, and CBR — supported platforms are macOS, Windows, and Linux.
 
@@ -91,7 +91,7 @@ jobs:
                - CHANGELOG.md — one terse line under the matching heading
                  (New / Improved / Fixed / Breaking) in the Unreleased/top section.
                  Match the file's existing Keep a Changelog style.
-               - README.md — update ONLY if the change alters folio's headline
+               - README.md — update ONLY if the change alters Carrel's headline
                  capabilities. If so, slot it into the correct "Highlights"
                  subsection (Reading / Library / Catalogs, metadata, and backup).
                  Skip README for minor fixes. Keep the feature list accurate, not noisy.
@@ -123,7 +123,7 @@ jobs:
 # WEBSITE (damoiseau.xyz) — NOT handled here, by design.
 #
 # The website lives in a separate repo with its own Claude Code agent that pulls
-# folio's latest changes on a schedule and updates the published docs itself.
+# Carrel's latest changes on a schedule and updates the published docs itself.
 # This workflow commits in-repo Markdown only (CHANGELOG / README / USER_GUIDE)
 # and never edits website files, emits a handoff brief, or opens a cross-repo PR.
 # No Bitbucket credentials or cross-platform API calls live in this repo.

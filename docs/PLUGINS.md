@@ -1,11 +1,11 @@
-# Writing Folio Plugins
+# Writing Carrel Plugins
 
-Folio plugins are small scripts that react to events in the app — tagging
+Carrel plugins are small scripts that react to events in the app — tagging
 books on import, exporting highlights, sending a notification when you finish
 a book. They run in a sandbox and can only do what you explicitly allow.
 
 > **Trust:** a plugin is local code you install yourself. Only install plugins
-> from sources you trust. Folio's permission model limits what a plugin can
+> from sources you trust. Carrel's permission model limits what a plugin can
 > reach, but it cannot make untrusted code safe.
 
 ## Installing a plugin
@@ -53,7 +53,7 @@ reason and can never be enabled.
 
 ## The script — `main.rhai`
 
-Folio calls a function named `on_event(event)` once per subscribed event.
+Carrel calls a function named `on_event(event)` once per subscribed event.
 Scripts are written in [Rhai](https://rhai.rs).
 
 ```rhai

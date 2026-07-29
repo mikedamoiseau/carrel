@@ -203,7 +203,7 @@ jobs:
           # cmake --build. libmobi's `tools/` subdirectory produces
           # CLI binaries (mobitool, mobidrm, mobimeta) that depend on
           # `getopt` (unavailable on MSVC) and on miniz symbols that
-          # don't satisfy under `USE_ZLIB=OFF`. Folio doesn't ship
+          # don't satisfy under `USE_ZLIB=OFF`. Carrel doesn't ship
           # those tools, so their link failure is expected and not
           # a release-blocker.
           #
@@ -232,7 +232,7 @@ jobs:
           # links it `PRIVATE` into the mobi target. CMake's normal
           # path expects the consumer to also be a CMake target, in
           # which case the miniz object files are added to the
-          # consumer's link line automatically. Folio's consumer is
+          # consumer's link line automatically. Carrel's consumer is
           # cargo (not CMake), so when rustc links the static
           # `mobi.lib` it sees `mobi.lib(util.obj)` referencing
           # `mz_uncompress` / `mz_crc32` with no archive providing
@@ -376,7 +376,7 @@ jobs:
           LIBMOBI_LIB_DIR: ${{ matrix.platform == 'windows-latest' && format('{0}\.libmobi-windows\lib', github.workspace) || (contains(matrix.args, 'aarch64-apple-darwin') && format('{0}/.libmobi-macos/lib', github.workspace) || '') }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Folio ${{ github.ref_name }}'
+          releaseName: 'Carrel ${{ github.ref_name }}'
           releaseBody: |
             See the assets below to download and install this version.
 

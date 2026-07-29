@@ -1,8 +1,8 @@
 # Third-Party Licenses
 
-Folio is released under the MIT License (see [`LICENSE`](./LICENSE)). It links
+Carrel is released under the MIT License (see [`LICENSE`](./LICENSE)). It links
 against or bundles the following third-party components. Each entry below
-credits the upstream project, states how Folio uses it, and points at the
+credits the upstream project, states how Carrel uses it, and points at the
 canonical license text.
 
 The full text of every license referenced here is available at
@@ -11,7 +11,7 @@ The full text of every license referenced here is available at
 Rust crate dependencies are enumerated with their licenses in
 [`Cargo.lock`](./Cargo.lock); JavaScript dependencies in
 [`package-lock.json`](./package-lock.json). The entries below call out only
-the components that affect distribution — native libraries that Folio links
+the components that affect distribution — native libraries that Carrel links
 to or ships in its release artifacts.
 
 ---
@@ -21,9 +21,9 @@ to or ships in its release artifacts.
 - **Upstream:** <https://github.com/bfabiszewski/libmobi>
 - **License:** GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later)
 - **License text:** <https://www.gnu.org/licenses/lgpl-3.0.html>
-- **How Folio uses it:** Folio links against libmobi to parse MOBI / AZW /
+- **How Carrel uses it:** Carrel links against libmobi to parse MOBI / AZW /
   AZW3 (KF8) ebook files. The link mode differs by platform — see
-  *Distribution* below. Enabled when Folio is built with the `mobi` cargo
+  *Distribution* below. Enabled when Carrel is built with the `mobi` cargo
   feature.
 - **Platform availability:** MOBI support is compiled into **Linux**,
   **arm64 (Apple Silicon) macOS**, and **Windows** release builds. The
@@ -33,7 +33,7 @@ to or ships in its release artifacts.
 
 ### Distribution
 
-Folio's link mode for libmobi is platform-specific:
+Carrel's link mode for libmobi is platform-specific:
 
 - **Linux** and **arm64 macOS**: libmobi is **dynamically linked** at
   process load time. The release binaries do **not** ship libmobi —
@@ -42,11 +42,11 @@ Folio's link mode for libmobi is platform-specific:
   package manager:
   - macOS (Apple Silicon): `brew install libmobi`
   - Debian / Ubuntu: `sudo apt install libmobi0` (the `.deb` package
-    declares this as a dependency, so a typical `apt install` of Folio
+    declares this as a dependency, so a typical `apt install` of Carrel
     pulls libmobi in automatically)
   - Fedora / RHEL: `sudo dnf install libmobi`
 
-- **Windows**: libmobi is **statically linked** into `folio.exe`. The
+- **Windows**: libmobi is **statically linked** into `Carrel.exe`. The
   Tauri bundler does not place sibling DLLs where the OS loader expects
   them at process start, so the Windows build of libmobi is produced as
   a self-contained `mobi.lib` static archive (CMake configured with
@@ -66,35 +66,35 @@ paths satisfy the *relinking* obligation differently; both are addressed.
    above and is reproduced in the upstream libmobi repository's
    `COPYING` file.
 3. **Source availability.** libmobi's source is published on GitHub at
-   the upstream URL. The exact commit Folio links against is pinned by
+   the upstream URL. The exact commit Carrel links against is pinned by
    `LIBMOBI_VERSION` in
    [`.github/workflows/release.yml`](./.github/workflows/release.yml)
    so any release can be matched to the specific upstream revision.
-   Folio does not carry a fork or apply patches.
+   Carrel does not carry a fork or apply patches.
 4. **Relinking.**
    - **Linux / arm64 macOS (dynamic):** Users may replace the shipped
      shared library with their own compatible build of libmobi without
-     modifying or rebuilding Folio. No further action is required from
+     modifying or rebuilding Carrel. No further action is required from
      the application beyond the dynamic-library layout.
    - **Windows (static):** LGPL §6 requires that recipients be able to
-     re-link Folio against a modified libmobi. The complete chain
+     re-link Carrel against a modified libmobi. The complete chain
      needed for this is published openly:
-     - Folio's source is on GitHub under MIT — see [the repository root](./).
-     - The libmobi commit Folio statically links is pinned by SHA in
+     - Carrel's source is on GitHub under MIT — see [the repository root](./).
+     - The libmobi commit Carrel statically links is pinned by SHA in
        `release.yml` (see *Source availability* above) and the exact
        CMake recipe used to produce the static archive is in the
        same workflow file (`Build libmobi (Windows)` step).
      - A user wishing to substitute a modified libmobi can rebuild
-       Folio from source against a different libmobi by changing the
+       Carrel from source against a different libmobi by changing the
        pinned SHA (or by replacing `.libmobi-windows/lib/mobi.lib`
        in the build tree before `cargo build`) and re-running the
        Tauri build. The same `LIBMOBI_INCLUDE_DIR` / `LIBMOBI_LIB_DIR`
        env vars used by CI are honoured by `folio-core/build.rs`.
 
      If you need pre-built object files (`.obj`) or the unmodified
-     `mobi.lib` Folio shipped a particular Windows release with, open
+     `mobi.lib` Carrel shipped a particular Windows release with, open
      an issue on the GitHub repository and we will provide them.
-5. **Modifications.** Folio does not modify libmobi. If that ever
+5. **Modifications.** Carrel does not modify libmobi. If that ever
    changes, the modified source will be published alongside the
    release.
 
@@ -104,10 +104,10 @@ paths satisfy the *relinking* obligation differently; both are addressed.
 
 - **Upstream:** <https://pdfium.googlesource.com/pdfium/>
 - **Binary distribution:** <https://github.com/bblanchon/pdfium-binaries>
-- **License:** BSD-3-Clause (Folio uses the Chromium-style "New BSD" license
+- **License:** BSD-3-Clause (Carrel uses the Chromium-style "New BSD" license
   text)
 - **License text:** <https://pdfium.googlesource.com/pdfium/+/refs/heads/main/LICENSE>
-- **How Folio uses it:** Dynamically linked to render PDF pages into
+- **How Carrel uses it:** Dynamically linked to render PDF pages into
   bitmaps for the Reader. Bindings are provided by the
   [`pdfium-render`](https://crates.io/crates/pdfium-render) Rust crate.
 - **Distribution:** Release builds bundle the pdfium shared library in
@@ -122,11 +122,11 @@ paths satisfy the *relinking* obligation differently; both are addressed.
   [`unrar`](https://crates.io/crates/unrar) Rust crate)
 - **License:** The UnRAR source is distributed under the **UnRAR license**,
   which permits use for decompression but explicitly forbids using the
-  source to develop RAR-compatible compression tools. Folio only reads RAR
+  source to develop RAR-compatible compression tools. Carrel only reads RAR
   / CBR archives, so this restriction is not at issue.
 - **License text:** Included in the upstream source and reproduced in the
   `unrar_sys` crate.
-- **How Folio uses it:** Statically linked for CBR (comic book RAR) archive
+- **How Carrel uses it:** Statically linked for CBR (comic book RAR) archive
   support.
 
 ---
@@ -140,7 +140,7 @@ paths satisfy the *relinking* obligation differently; both are addressed.
   <https://wordnet.princeton.edu/license-and-commercial-use>.
 - **Copyright:** WordNet 3.1 Copyright 2011 by Princeton University. All
   rights reserved.
-- **How Folio uses it:** The optional offline dictionary artifact (feature
+- **How Carrel uses it:** The optional offline dictionary artifact (feature
   F-1-1) is a prebuilt SQLite database derived from WordNet 3.1 — single-word
   lemmas, parts of speech, glosses, examples, and morphological exception
   tables. It is downloaded on demand when the reader dictionary is enabled;
@@ -151,7 +151,7 @@ paths satisfy the *relinking* obligation differently; both are addressed.
 
 ## Other notable Rust crates
 
-The following crates ship compiled code in the Folio binary. Full license
+The following crates ship compiled code in the Carrel binary. Full license
 metadata is in `Cargo.lock`; a quick summary of the major runtime
 dependencies:
 
@@ -175,5 +175,5 @@ in the app are MIT or SIL Open Font Licensed.
 ## Reporting an omission
 
 If you believe a dependency is missing from this file or that the
-attribution is incomplete, please open an issue at the Folio repository
+attribution is incomplete, please open an issue at the Carrel repository
 with the component name and a pointer to its license.

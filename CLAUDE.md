@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Development Commands
 
-Lint and formatting are checked workspace-wide from the repo root (CI-enforced). Running them scoped to `src-tauri/` only covers the `folio` crate, not `folio-core`; omitting `--all-targets` skips test/example targets:
+Lint and formatting are checked workspace-wide from the repo root (CI-enforced). Running them scoped to `src-tauri/` only covers the `carrel` crate, not `folio-core`; omitting `--all-targets` skips test/example targets:
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features mobi -- -D warnings  # libmobi-gated paths
@@ -13,7 +13,7 @@ cargo fmt --all --check
 
 The toolchain is pinned in `rust-toolchain.toml` (currently `1.96.0`); CI uses the same version via `dtolnay/rust-toolchain@1.96.0`, so local and CI rustfmt/clippy never drift. Bump both together.
 
-Running `cargo test` from `src-tauri/` only exercises the `folio` crate — `folio-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
+Running `cargo test` from `src-tauri/` only exercises the `carrel` crate — `folio-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
 ```bash
 cargo test -p folio-core --features mobi
 ```
@@ -24,7 +24,7 @@ MOBI tests require a public-domain test corpus under `src-tauri/test-fixtures/` 
 
 ## Architecture
 
-**Tauri v2 desktop app** (branded "Folio") — Rust backend + React 19 frontend communicating via IPC. All data flows through Tauri's `invoke()` IPC bridge. Commands are registered in `src-tauri/src/lib.rs` via `invoke_handler` — every new command must be added there.
+**Tauri v2 desktop app** (branded "Carrel") — Rust backend + React 19 frontend communicating via IPC. All data flows through Tauri's `invoke()` IPC bridge. Commands are registered in `src-tauri/src/lib.rs` via `invoke_handler` — every new command must be added there.
 
 The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, IPC commands, and web server — and **`folio-core`** (`folio-core/src/`) — parsing, DB, and models, with no Tauri dependency.
 
@@ -58,7 +58,7 @@ The embedded web UI (`src-tauri/src/web_server/static/`: `index.html` + `app.js`
 
 ### Book Storage
 
-Books are copied into an app-managed library folder (default `~/Documents/folio/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
+Books are copied into an app-managed library folder (default `~/Documents/Folio Library/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
 
 ## Adding Common Things
 

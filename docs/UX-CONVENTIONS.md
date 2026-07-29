@@ -1,6 +1,6 @@
 # UX Conventions
 
-Living conventions for the Folio frontend. Each section is enforced by a
+Living conventions for the Carrel frontend. Each section is enforced by a
 scanner test in `src/lib/uxConsistency.audit.test.ts` where possible, so drift
 fails CI rather than waiting on review.
 
@@ -147,7 +147,7 @@ Reach for these before hand-rolling:
 
 ## Dark mode — semantic tokens by default; risk-shade colors need `dark:`
 
-Folio's primary theming is **CSS-variable-based**. Tokens like `bg-paper`,
+Carrel's primary theming is **CSS-variable-based**. Tokens like `bg-paper`,
 `text-ink`, `text-ink-muted`, `border-warm-border`, `bg-warm-subtle`,
 `text-accent`, etc. swap automatically when the `.dark` class is set on the
 root. Reach for these first — they are the only way to stay theme-correct

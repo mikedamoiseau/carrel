@@ -1,6 +1,6 @@
-# Folio Web Server API
+# Carrel Web Server API
 
-Folio embeds an HTTP server that lets you browse and read your library from any device on the local network.
+Carrel embeds an HTTP server that lets you browse and read your library from any device on the local network.
 
 ## Getting Started
 

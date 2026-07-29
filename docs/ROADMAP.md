@@ -104,8 +104,8 @@ Expand where books come from and how they persist.
 - ~~OPDS catalog browsing (many free ebook sources use this protocol)~~
   - ~~Built-in defaults: Project Gutenberg, Standard Ebooks (New Releases), Wikisource~~
   - ~~Curated **preset picker**: 13+ vetted catalogs (multilingual: French, Hungarian, Bulgarian, English) addable in one click~~
-  - ~~Add custom OPDS catalog URLs (self-hosted Calibre servers, LAN-hosted Folio instances, etc.)~~
-  - ~~LAN/loopback host support: SSRF guard relaxed for user-added catalogs so Folio's own embedded server is reachable from another Folio instance~~
+  - ~~Add custom OPDS catalog URLs (self-hosted Calibre servers, LAN-hosted Carrel instances, etc.)~~
+  - ~~LAN/loopback host support: SSRF guard relaxed for user-added catalogs so Carrel's own embedded server is reachable from another Carrel instance~~
   - ~~Browse, search, navigate sub-catalogs, pagination~~
   - ~~One-click download & import into library~~
 - ~~Downloads into the library folder from Phase 1~~
@@ -165,7 +165,7 @@ Expand where books come from and how they persist.
 - ~~Built on OPDS — the standard protocol used by most free ebook sources~~
 - ~~Curated preset picker (13+ catalogs) with search + language + category filters~~
 - ~~Known OPDS-compatible sources: Project Gutenberg, Standard Ebooks, Wikisource, Gallica, OpenEdition, ManyBooks, arXiv, Elephant Editions, others~~
-- ~~Allow users to add custom OPDS catalog URLs (for self-hosted Calibre servers, LAN Folio instances, etc.)~~
+- ~~Allow users to add custom OPDS catalog URLs (for self-hosted Calibre servers, LAN Carrel instances, etc.)~~
 - ~~Show available formats per result, prefer EPUB when available~~
 
 ### 15. Reading Position Sync / Multi-Device Sync — **Done**
@@ -251,7 +251,7 @@ Expand where books come from and how they persist.
 - ~~Export a collection as a shareable reading list (title, author, optional notes)~~
 - ~~Format: Markdown, JSON~~
 - ~~Shareable link~~ — **dropped 2026-05-14.** Needs a WAN endpoint the free app doesn't have; would depend on `folio-server` infra for a niche feature.
-- ~~Import a shared list to see which books you have/are missing~~ — **dropped 2026-05-14.** No real-world supply of Folio-format lists; users share via Goodreads / plain text / blog posts instead. Self-fulfilling problem: format would only exist if Folio became a sharing platform, which it isn't.
+- ~~Import a shared list to see which books you have/are missing~~ — **dropped 2026-05-14.** No real-world supply of Carrel-format lists; users share via Goodreads / plain text / blog posts instead. Self-fulfilling problem: format would only exist if Carrel became a sharing platform, which it isn't.
 
 Manual sharing via the existing Markdown / JSON export is sufficient.
 
@@ -268,7 +268,7 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 ### 21. Multiple Libraries / Profiles — **Done**
 - ~~Separate libraries for different users or contexts (work vs. personal)~~
 - ~~Each profile has its own library folder, collections, settings, progress~~
-- ~~Profile switcher in the app (top nav, next to Folio wordmark)~~
+- ~~Profile switcher in the app (top nav, next to Carrel wordmark)~~
 - ~~Create, switch, and delete profiles~~
 - ~~Each profile gets its own SQLite database and library folder~~
 
@@ -305,7 +305,7 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 - ~~Per-profile: each profile's server runs independently with its own library~~
 - ~~Desktop-only feature (not applicable to mobile builds from Phase 7)~~
 - ~~Tray menu mirrors the two toggles (Web UI: ON/OFF, OPDS: ON/OFF)~~
-- ~~User-Agent `Mozilla/5.0 (compatible; Folio/1.4; OPDS reader)` so legitimate public catalogs (OpenEdition, etc.) accept us as a client~~
+- ~~User-Agent `Mozilla/5.0 (compatible; Carrel/1.4; OPDS reader)` so legitimate public catalogs (OpenEdition, etc.) accept us as a client~~
 
 **Out of scope (for now):**
 - Internet/WAN access (port forwarding, tunnels, relay servers)
@@ -404,7 +404,7 @@ Manual sharing via the existing Markdown / JSON export is sufficient.
 - ~~OPDS download with AZW vs AZW3 disambiguation via URL path~~
 - ~~Conditional `.deb` / `.rpm` libmobi depends via Tauri config overlay~~
 - ~~Fixture-gated end-to-end smoke tests + CI corpus fetch (SHA-256 pinned, retry-armed, cached)~~
-- ~~**Windows MOBI support** via static libmobi linkage — libmobi built from source on the runner with CMake (`USE_ZLIB=OFF` + `USE_LIBXML2=OFF` keeps the static archive self-contained, baked into `folio.exe`). PR CI builds the same `mobi.lib` to catch MSVC regressions before tag-push.~~
+- ~~**Windows MOBI support** via static libmobi linkage — libmobi built from source on the runner with CMake (`USE_ZLIB=OFF` + `USE_LIBXML2=OFF` keeps the static archive self-contained, baked into `Carrel.exe`). PR CI builds the same `mobi.lib` to catch MSVC regressions before tag-push.~~
 - Available on **Linux**, **arm64 macOS**, and **Windows**. The **x86_64 macOS** build is the only release that intentionally ships without MOBI support — the macos-latest runner's Homebrew libmobi is arm64-only and won't link into an x86_64 target. Re-enabling Intel Mac would need a universal libmobi (Rosetta-cross-build or manual fat-dylib).
 
 ### Power User & Reader Enhancements
@@ -568,7 +568,7 @@ Improvements identified via codebase audit (April 2026). Security and stability 
 
 ## Phase 10: folio-core Refactor & Paid Server
 
-Open-core transition: after Folio 2.0 ships, the free desktop/web app enters maintenance mode. Future development effort pivots to a commercial multi-user server product. The free app stays MIT-licensed; the paid server lives in a **private** repository and depends on `folio-core` as a git dependency pinned to a tag.
+Open-core transition: after Folio 2.0 ships (the app was renamed to Carrel in 2.11.x), the free desktop/web app enters maintenance mode. Future development effort pivots to a commercial multi-user server product. The free app stays MIT-licensed; the paid server lives in a **private** repository and depends on `folio-core` as a git dependency pinned to a tag.
 
 **Priority legend** (used throughout this roadmap for unfinished items): **P1** = do first, **P2** = do next, **P3** = planned but not urgent, **P4** = later / nice to have. Unmarked unfinished items default to P4.
 
@@ -685,7 +685,7 @@ Lower priority features — high effort, niche audience, or dependent on other w
 
 ### Shareable Highlight Quote Cards — **Done (2026-07-12)**
 - ~~Render a highlight (or an in-reader selection) as a styled PNG quote card —
-  quote, book title, author, optional cover thumbnail, optional Folio wordmark~~
+  quote, book title, author, optional cover thumbnail, optional Carrel wordmark~~
 - ~~Three style presets (Light / Sepia / Dark), defaulting to the current reader
   theme; live preview~~
 - ~~Copy the card image to the clipboard or save it as a PNG file~~
