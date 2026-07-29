@@ -31,7 +31,7 @@ const CACHE_VERSION = "folio-shell-95a6b61eae7f";
 // exactly what the server says, always.
 const OFFLINE_CACHE_PREFIX = "folio-offline-book-";
 
-// Profile scoping (PRD docs/backlog/2026-07-26-remote-profile-switch.md): book
+// Profile scoping (remote profile switching, PR #119): book
 // ids are per-profile id spaces, so offline caches are namespaced by a short
 // hash of the active profile name — "" for the default profile, which keeps the
 // names offline mode shipped with. app.js owns the token and publishes it to a

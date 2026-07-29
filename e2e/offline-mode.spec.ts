@@ -729,7 +729,7 @@ test.describe("offline mode — highlights are online-only", () => {
   });
 });
 
-// Profile-scoped offline storage (PRD docs/backlog/2026-07-26-remote-profile-switch.md).
+// Profile-scoped offline storage (remote profile switching, PR #119).
 //
 // Book ids are per-profile DB id spaces, so an offline cache keyed by bare book
 // id can serve profile A's saved content for a *different* book that happens to

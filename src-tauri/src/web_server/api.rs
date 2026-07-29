@@ -224,8 +224,8 @@ struct ProfileSwitchResponse {
     active: String,
 }
 
-/// Switch the active profile for the whole server — desktop included (PRD
-/// Decision 1: one shared active profile, not per-session).
+/// Switch the active profile for the whole server — desktop included: there is
+/// one shared active profile, not one per session.
 ///
 /// CSRF: the session cookie is `SameSite=Strict`
 /// (`mod::tests::test_login_sets_session_cookie`), so a cross-site POST
