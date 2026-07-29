@@ -4208,6 +4208,34 @@ mod tests {
     // regenerating the version fails here with the expected hash to paste
     // in, the same pattern `test_csp_allows_theme_bootstrap_script_hash`
     // (web_server::tests, this file) already uses for the CSP hash.
+    /// The offline scope marker is the SW's only channel for the active
+    /// profile's namespace on a cold start, so app.js and sw.js must agree on
+    /// where it lives — a silent drift would make the SW serve (or refuse to
+    /// serve) the wrong profile's saved books. Neither file can import the
+    /// other, so the constants are checked here.
+    #[test]
+    fn offline_scope_constants_agree_between_app_js_and_sw_js() {
+        const APP_JS: &str = include_str!("static/app.js");
+        const SW_JS: &str = include_str!("static/sw.js");
+
+        for decl in [
+            r#"const OFFLINE_SCOPE_CACHE = "folio-offline-scope";"#,
+            r#"const OFFLINE_SCOPE_URL = "/__offline_scope";"#,
+            r#"const OFFLINE_CACHE_PREFIX = "folio-offline-book-";"#,
+        ] {
+            assert!(APP_JS.contains(decl), "app.js must declare `{decl}`");
+            assert!(SW_JS.contains(decl), "sw.js must declare `{decl}`");
+        }
+
+        // The activate purge deletes every cache it doesn't recognize; the
+        // scope marker must be on its keep-list, or a SW update would silently
+        // reset every client to the default profile's namespace.
+        assert!(
+            SW_JS.contains("key !== OFFLINE_SCOPE_CACHE"),
+            "sw.js's activate purge must spare the offline scope marker cache"
+        );
+    }
+
     #[tokio::test]
     async fn cache_version_embeds_shell_asset_content_hash() {
         use sha2::{Digest, Sha256};

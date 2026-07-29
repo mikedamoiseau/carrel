@@ -914,6 +914,8 @@ You can download individual books to a device so they open and read without a co
 
 **Saving a book.** Open a book's detail page and, from the **⋯ More** menu, tap **Save offline**. Folio downloads its chapters (or comic/PDF pages, stored at a reduced width to save space) with a progress counter; you can **Cancel** mid-save. When it finishes, the same menu shows **Saved · <size>** with a **Remove offline copy** button and your total offline storage use, and the book gets a small ⤓ badge on the library grid. (This is separate from the **Download** button, which exports the original full-size book file to your device.)
 
+**Profiles.** Downloads belong to the profile they were made under. Switch profiles and you see only that profile's downloaded books — the others are kept, not deleted, and come back when you switch back.
+
 **Reading offline.** When the server can't be reached, opening the installed app takes you straight to a library of just your downloaded books, with an *"Offline — showing downloaded books"* banner and a **Retry** button. Saved books open and read normally; a saved book's own URL also opens it directly. Ordinary navigation automatically returns to the full library once the connection is back. One caveat: highlights (and the bookmarks list) live on the server and aren't stored with the offline copy, so they're not shown while offline — your text and reading position are unaffected, and highlights reappear as soon as you reconnect.
 
 **Reading progress** you make offline is remembered and synced back to your library when you reconnect. If you also read the same book on another device while you were offline, Folio keeps the more recent position rather than overwriting it.

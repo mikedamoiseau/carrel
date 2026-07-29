@@ -22,7 +22,7 @@
 // activates; app.js's registration call is feature-detected/try-catched so
 // this is silent, not an error. The manifest + icons still work for iOS
 // Safari "Add to Home Screen" over plain HTTP.
-const CACHE_VERSION = "folio-shell-f1e15fe8e27b";
+const CACHE_VERSION = "folio-shell-0cad7a55c304";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW
@@ -30,6 +30,35 @@ const CACHE_VERSION = "folio-shell-f1e15fe8e27b";
 // online behavior (auth, session expiry, profile lock, full-size pages) is
 // exactly what the server says, always.
 const OFFLINE_CACHE_PREFIX = "folio-offline-book-";
+
+// Profile scoping (PRD docs/backlog/2026-07-26-remote-profile-switch.md): book
+// ids are per-profile id spaces, so offline caches are namespaced by a short
+// hash of the active profile name — "" for the default profile, which keeps the
+// names offline mode shipped with. app.js owns the token; this worker only
+// consumes it, from a one-entry cache it can read even on a cold start (no
+// controlled page needed), refreshed by postMessage when a switch happens while
+// this worker is alive. Both constants must mirror app.js.
+const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
+const OFFLINE_SCOPE_URL = "/__offline_scope";
+
+let offlineScope = null; // null = not read yet; "" = default profile
+
+async function currentOfflineScope() {
+  if (offlineScope !== null) return offlineScope;
+  try {
+    const resp = await (await caches.open(OFFLINE_SCOPE_CACHE)).match(OFFLINE_SCOPE_URL);
+    offlineScope = resp ? await resp.text() : "";
+  } catch (e) {
+    offlineScope = "";
+  }
+  return offlineScope;
+}
+
+self.addEventListener("message", (event) => {
+  if (event.data && event.data.type === "offline-scope") {
+    offlineScope = String(event.data.scope || "");
+  }
+});
 
 const SHELL_ASSETS = [
   "/",
@@ -93,7 +122,12 @@ self.addEventListener("activate", (event) => {
           // Shell-version cleanup only — offline book caches are owned by
           // app.js (saved/deleted there) and MUST survive every SW update,
           // or each shell deploy would silently wipe the user's downloads.
-          .filter((key) => key !== CACHE_VERSION && !key.startsWith(OFFLINE_CACHE_PREFIX))
+          .filter(
+            (key) =>
+              key !== CACHE_VERSION &&
+              key !== OFFLINE_SCOPE_CACHE &&
+              !key.startsWith(OFFLINE_CACHE_PREFIX)
+          )
           .map((key) => caches.delete(key))
       )
     )
@@ -135,9 +169,14 @@ self.addEventListener("fetch", (event) => {
     // for a nonexistent cache without creating it, so unsaved books just
     // propagate the network outcome.
     const isPage = /^\/api\/books\/[^/]+\/pages\/\d+$/.test(url.pathname);
-    const matchOpts = { cacheName: OFFLINE_CACHE_PREFIX + bookMatch[1], ignoreSearch: isPage };
     event.respondWith((async () => {
-      // Is this exact request in the book's offline cache?
+      // Is this exact request in the book's offline cache, under the active
+      // profile's namespace? A book id saved under another profile lives in a
+      // differently-named cache and must never answer here.
+      const matchOpts = {
+        cacheName: OFFLINE_CACHE_PREFIX + (await currentOfflineScope()) + bookMatch[1],
+        ignoreSearch: isPage,
+      };
       const cached = await caches.match(event.request, matchOpts);
 
       // No cache to fall back to — the ONLY correct behavior is a plain

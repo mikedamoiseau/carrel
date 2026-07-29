@@ -247,6 +247,23 @@
   const OFFLINE_PAGE_WIDTH = 1080; // page-image download width; change here (e.g. 1600)
   const OFFLINE_CACHE_PREFIX = "folio-offline-book-"; // must mirror sw.js
   const OFFLINE_MANIFEST_VERSION = 1;
+  // Profile scoping: book ids are per-profile DB id spaces, so a cache or
+  // manifest keyed by bare book id can serve profile A's saved content for a
+  // *different* book with the same id in profile B. Everything offline is
+  // therefore namespaced by a short hash of the active profile name.
+  //
+  // The active profile's token also has to reach the service worker, which
+  // does the offline serving and has no access to the page's variables. It's
+  // published in a one-entry Cache Storage entry (readable from both contexts;
+  // localStorage is not) and pushed eagerly by postMessage on change. Both
+  // constants must mirror sw.js.
+  const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
+  const OFFLINE_SCOPE_URL = "/__offline_scope";
+  // The default profile keeps the unscoped names offline mode shipped with, so
+  // existing downloads survive this change; every other profile gets a
+  // 12-hex-char prefix. A bare book id can never be mistaken for a scoped one:
+  // ids are UUIDs (8 hex chars then `-`), never 12.
+  let offlineScope = "";
 
   function offlineSupported() {
     return "serviceWorker" in navigator &&
@@ -255,7 +272,83 @@
       !!(window.crypto && window.crypto.subtle);
   }
 
-  function offlineCacheName(id) { return OFFLINE_CACHE_PREFIX + id; }
+  function offlineCacheName(id) { return OFFLINE_CACHE_PREFIX + offlineScope + id; }
+
+  /// Scope token for a profile: "" for `default` (legacy names), else the
+  /// first 12 hex chars of its SHA-256 plus a separator. Hashed rather than
+  /// used verbatim because profile names are arbitrary text (only "non-empty"
+  /// and "not default" are enforced), so a raw name could make two different
+  /// (profile, id) pairs produce one cache name.
+  async function profileScopeToken(profileName) {
+    if (!profileName || profileName === "default") return "";
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(profileName));
+    return Array.from(new Uint8Array(buf)).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("") + "-";
+  }
+
+  /// The scope published for the service worker, or "" if none is stored yet.
+  async function readPublishedScope() {
+    try {
+      const resp = await (await caches.open(OFFLINE_SCOPE_CACHE)).match(OFFLINE_SCOPE_URL);
+      return resp ? await resp.text() : "";
+    } catch (e) { return ""; }
+  }
+
+  /// Point every offline read/write at `profileName`'s namespace. Returns
+  /// whether the scope actually changed, so callers can re-derive the state
+  /// they read from the old one.
+  ///
+  /// Publishing to the marker cache (for a cold-started SW) and postMessage
+  /// (for a running one) are both needed: a SW can start after this page did,
+  /// and a running SW never re-reads the marker on its own.
+  async function applyOfflineScope(profileName) {
+    if (!offlineSupported()) return false;
+    let token;
+    try { token = await profileScopeToken(profileName); } catch (e) { return false; }
+    const changed = token !== offlineScope;
+    if (changed) {
+      offlineScope = token;
+      // Drop the connection to the previous profile's database; the next
+      // offlineDb() opens the new one.
+      if (offlineDbPromise) {
+        offlineDbPromise.then((db) => db.close()).catch(() => {});
+        offlineDbPromise = null;
+      }
+    }
+    // Republished unconditionally, even when this page's scope didn't change:
+    // the service worker outlives page loads and memoizes the scope, so a
+    // worker that read a stale value (or missed an earlier message because it
+    // wasn't controlling a page yet) must be corrected on every boot. Both
+    // channels matter — the marker is what a cold-started worker reads, the
+    // message is what a running one acts on.
+    try {
+      await (await caches.open(OFFLINE_SCOPE_CACHE)).put(OFFLINE_SCOPE_URL, new Response(token));
+    } catch (e) { /* best-effort: the postMessage below still updates a live worker */ }
+    try {
+      const reg = navigator.serviceWorker && (await navigator.serviceWorker.ready);
+      const worker = (reg && reg.active) || (navigator.serviceWorker && navigator.serviceWorker.controller);
+      if (worker) worker.postMessage({ type: "offline-scope", scope: token });
+    } catch (e) { /* best-effort */ }
+    return changed;
+  }
+
+  /// Adopt the last published scope before any offline read. Used on boot,
+  /// including an offline launch where the active profile can't be fetched.
+  async function loadPublishedOfflineScope() {
+    if (!offlineSupported()) return;
+    offlineScope = await readPublishedScope();
+  }
+
+  /// Re-scope to the server's active profile. Returns whether it changed.
+  async function syncOfflineScopeWithServer() {
+    if (!offlineSupported()) return false;
+    try {
+      const resp = await fetch("/api/profiles", { credentials: "same-origin" });
+      if (!resp.ok) return false;
+      const active = (await resp.json()).find((p) => p.active);
+      if (!active) return false;
+      return await applyOfflineScope(active.name);
+    } catch (e) { return false; }
+  }
 
   // Lazy singleton connection; a failed open clears the promise so a later
   // call can retry (e.g. transient quota pressure at first open). The open
@@ -274,7 +367,10 @@
       let timer = null;
       const thisPromise = new Promise((resolve, reject) => {
         const clear = () => { if (timer !== null) { clearTimeout(timer); timer = null; } };
-        const req = indexedDB.open("folio-offline", 1);
+        // Scoped per profile (see `offlineScope`): a separate database per
+        // profile keeps every store's keys — manifests, pending saves, queued
+        // progress — in their own id space without rewriting each key.
+        const req = indexedDB.open(offlineScope ? "folio-offline-" + offlineScope.slice(0, -1) : "folio-offline", 1);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains("books")) db.createObjectStore("books", { keyPath: "id" });
@@ -6701,6 +6797,11 @@
 
   // ── Init ──────────────────────────────────────
   async function init() {
+    // Adopt the last published profile scope before ANY offline read — every
+    // manifest/cache lookup below is namespaced by it. Read from storage, not
+    // the server, so an offline launch still uses the right profile's
+    // downloads; the online path re-syncs it against the server below.
+    await loadPublishedOfflineScope();
     // Eviction honesty first: make the manifest truthful before either boot
     // path reads it (the offline branch renders straight from it, and the
     // online grid badges read offlineBookIds). Safe on- or offline.
@@ -6741,6 +6842,11 @@
     offlineMode = false;
     if (test.status === 401) { showLogin(); return; }
     authenticated = true;
+    // The active profile may have moved since this browser last looked (from
+    // the desktop, or another web client — one active profile is shared by
+    // all of them). Re-scope before anything reads offline storage, and
+    // re-check integrity in the new namespace if it changed.
+    if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
     // Reconnected (or a normal online launch): flush any progress queued
     // while offline. Fire-and-forget — it serializes per book via saveChains
     // and never blocks the first render.

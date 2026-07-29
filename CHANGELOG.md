@@ -15,6 +15,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   the desktop app this session, and otherwise returns `423 Locked`. See
   `docs/WEB_SERVER_API.md`.
 
+### Fixed
+- **Books saved for offline reading in the web app are now kept per profile.**
+  Each profile has its own book ids, so a book saved offline under one profile
+  could be served in place of a *different* book that happened to share that id
+  in another profile. Offline downloads are now namespaced per profile: switching
+  profiles shows only that profile's downloads, and downloads made under other
+  profiles are kept intact rather than discarded.
+
 ## [2.11.1] - 2026-07-28
 
 ### Performance
