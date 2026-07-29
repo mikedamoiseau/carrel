@@ -3,7 +3,7 @@ id = "opds-auto-download"
 name = "OPDS Auto-Download"
 version = "1.0.0"
 description = "Fetches a Standard Ebooks OPDS feed and imports new books. Run it from the Run-now button."
-author = "Folio"
+author = "Carrel"
 min_app_version = "2.3.0"
 
 [events]

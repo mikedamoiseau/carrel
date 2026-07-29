@@ -249,7 +249,7 @@ function escapeRe(s: string): string {
 // (red, amber, gray, …) must have a `dark:` companion in the same className,
 // otherwise the surface looks broken on the opposite theme.
 //
-// Folio's primary theming is CSS-variable-based (bg-paper, text-ink, …) and
+// Carrel's primary theming is CSS-variable-based (bg-paper, text-ink, …) and
 // auto-swaps; the only places that need explicit `dark:` prefixes are
 // non-semantic palette colors used for status (errors, warnings) or hard-
 // coded surfaces.

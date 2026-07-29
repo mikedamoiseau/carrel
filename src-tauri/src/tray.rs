@@ -13,7 +13,7 @@ pub fn build_tray_menu(
     opds_enabled: bool,
     server_running: bool,
 ) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    let show_item = MenuItemBuilder::with_id("show", "Show Folio").build(app)?;
+    let show_item = MenuItemBuilder::with_id("show", "Show Carrel").build(app)?;
     let whats_new = MenuItemBuilder::with_id("whats_new", "What's New").build(app)?;
     let check_update = MenuItemBuilder::with_id("check_update", "Check for Updates").build(app)?;
 
@@ -39,7 +39,7 @@ pub fn build_tray_menu(
 
     let sep2 = PredefinedMenuItem::separator(app)?;
 
-    let quit_item = MenuItemBuilder::with_id("quit", "Quit Folio").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit Carrel").build(app)?;
 
     MenuBuilder::new(app)
         .item(&show_item)
@@ -93,7 +93,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 } else {
                     // Window was destroyed — recreate it
                     let _ = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                        .title("Folio")
+                        .title("Carrel")
                         .inner_size(800.0, 600.0)
                         .build();
                 }
@@ -106,7 +106,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = window.emit("whats-new-open", ());
                 } else {
                     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                        .title("Folio")
+                        .title("Carrel")
                         .inner_size(800.0, 600.0)
                         .build();
                     if let Ok(w) = window {
@@ -126,7 +126,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                     let _ = window.emit("check-update-open", ());
                 } else {
                     let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
-                        .title("Folio")
+                        .title("Carrel")
                         .inner_size(800.0, 600.0)
                         .build();
                     if let Ok(w) = window {

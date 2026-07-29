@@ -341,6 +341,9 @@ pub fn merge_remote_into_local(
     result
 }
 
+/// Remote path for a book's sync state. Still `.folio-sync` after the Carrel
+/// rename — this directory already exists on users' own remotes, and renaming
+/// it orphans their sync state. See CLAUDE.md, "Legacy `folio` identifiers".
 fn sync_path(file_hash: &str) -> String {
     format!(".folio-sync/books/{file_hash}.json")
 }

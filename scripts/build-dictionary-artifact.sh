@@ -3,7 +3,7 @@
 # release asset.
 #
 # Fetches the pinned Princeton WordNet 3.1 database tarball (WNdb-3.1),
-# converts it to Folio's read-only SQLite schema via build_dictionary_db.py,
+# converts it to Carrel's read-only SQLite schema via build_dictionary_db.py,
 # gzips it deterministically, and prints the final `.gz` SHA-256 — that hash
 # is what gets baked into the Rust download consts (DICTIONARY_SHA256).
 #

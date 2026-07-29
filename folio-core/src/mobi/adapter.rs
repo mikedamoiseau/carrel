@@ -1,4 +1,4 @@
-//! High-level adapter mapping libmobi output to Folio's EPUB-style model.
+//! High-level adapter mapping libmobi output to Carrel's EPUB-style model.
 //!
 //! The wrapper in [`super`] exposes libmobi primitives (parts, resources,
 //! cover); this module composes them into the same interface the Reader

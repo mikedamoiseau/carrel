@@ -1,6 +1,6 @@
-// Auto Tagger — example Folio plugin.
+// Auto Tagger — example Carrel plugin.
 //
-// Folio calls `on_event(event)` for every event this plugin subscribes to
+// Carrel calls `on_event(event)` for every event this plugin subscribes to
 // (see plugin.toml `[events] subscribe`). Here we react to BookImported.
 //
 // The `event` map always has a `type` field plus the event's payload. For

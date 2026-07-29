@@ -333,7 +333,7 @@ function matchesExt(link: OpdsLinkLike, extNeedles: string[]): boolean {
 }
 
 /**
- * Pick the best OPDS acquisition link for import. Walks the Folio preference
+ * Pick the best OPDS acquisition link for import. Walks the Carrel preference
  * order and returns the first matching link along with a human-readable
  * label. When `allowedExtensions` is supplied (e.g. the set returned by the
  * backend's get_supported_formats command), formats not in the allowlist are
@@ -566,7 +566,7 @@ export function getHeatmapMonthLabels(weeks: HeatmapDay[][]): (number | null)[] 
   });
 }
 
-/** The valid TCP port range Folio's web server accepts (non-privileged). */
+/** The valid TCP port range Carrel's web server accepts (non-privileged). */
 export const WEB_SERVER_PORT_MIN = 1024;
 export const WEB_SERVER_PORT_MAX = 65535;
 

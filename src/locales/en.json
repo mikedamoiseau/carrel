@@ -289,7 +289,7 @@
       "dark": "Dark"
     },
     "includeCover": "Include cover",
-    "includeWordmark": "Show Folio wordmark",
+    "includeWordmark": "Show Carrel wordmark",
     "copyImage": "Copy image",
     "savePng": "Save as PNG…",
     "toasts": {
@@ -322,7 +322,7 @@
 
   "plugins": {
     "section": "Plugins",
-    "intro": "Plugins are small scripts that react to events in Folio — like tagging books on import or notifying you when you finish one. Only install plugins from sources you trust.",
+    "intro": "Plugins are small scripts that react to events in Carrel — like tagging books on import or notifying you when you finish one. Only install plugins from sources you trust.",
     "reload": "Reload plugins",
     "reloadSuccess": "Plugins reloaded",
     "installSuccess": "Plugin installed",
@@ -359,8 +359,8 @@
     "title": "Settings",
     "closeLabel": "Close settings",
     "searchPlaceholder": "Search settings…",
-    "analyticsTitle": "Help improve Folio?",
-    "analyticsMessage": "Folio can send anonymous usage statistics (app launches, your OS and version) to help us understand how many people use the app. No personal data, book titles, or library contents are ever sent. You can change this anytime in Settings.",
+    "analyticsTitle": "Help improve Carrel?",
+    "analyticsMessage": "Carrel can send anonymous usage statistics (app launches, your OS and version) to help us understand how many people use the app. No personal data, book titles, or library contents are ever sent. You can change this anytime in Settings.",
     "analyticsEnable": "Enable",
     "analyticsNotNow": "Not now",
     "analyticsToggle": "Send anonymous usage statistics",
@@ -483,7 +483,7 @@
     "rerunWizard": "Re-run setup wizard",
     "general": "General",
     "launchAtStartup": "Launch at startup",
-    "launchAtStartupHint": "Start Folio automatically when you log in",
+    "launchAtStartupHint": "Start Carrel automatically when you log in",
     "autoStartFailed": "Failed to change autostart: {{error}}",
     "showContinueReading": "Show Continue Reading section",
     "showContinueReadingHint": "Display recently opened books at the top of the library",
@@ -494,7 +494,7 @@
     "autoFocusNewBooks": "Auto-focus new books",
     "autoFocusNewBooksHint": "Enter focus mode when opening a newly imported book",
     "updateCheckOnStartup": "Check for updates on startup",
-    "updateCheckOnStartupHint": "When Folio starts, quietly check GitHub for a newer release.",
+    "updateCheckOnStartupHint": "When Carrel starts, quietly check GitHub for a newer release.",
     "remoteAccess": "Remote Access",
     "remoteAccessDescriptions": {
       "webUiCheckbox": "Web UI",
@@ -542,15 +542,15 @@
     "changeLockButton": "Change password",
     "removeLockButton": "Remove lock",
     "removeLockConfirmTitle": "Remove profile lock?",
-    "removeLockConfirmMessage": "Anyone who can open Folio will be able to switch into this profile without a password.",
+    "removeLockConfirmMessage": "Anyone who can open Carrel will be able to switch into this profile without a password.",
     "removeLockConfirm": "Remove lock",
     "lockSetSuccess": "Profile lock set.",
     "lockChangedSuccess": "Profile lock changed.",
     "lockRemovedSuccess": "Profile lock removed.",
     "remoteBackup": "Remote Backup",
     "aboutSection": "About",
-    "aboutVersion": "Folio {{version}}",
-    "aboutTagline": "Folio",
+    "aboutVersion": "Carrel {{version}}",
+    "aboutTagline": "Carrel",
     "aboutLicense": "Released under the MIT License.",
     "thirdPartyHeading": "Third-party components",
     "dynamicallyLinked": "dynamically linked",
@@ -832,7 +832,7 @@
     "unlocking": "Unlocking…",
     "cantSignIn": "Can't sign in?",
     "recoveryTitle": "Remove profile lock?",
-    "recoveryMessage": "This removes the lock without the old password. It won't touch your books or your library — anyone who can open Folio afterward will be able to switch into this profile without a password.",
+    "recoveryMessage": "This removes the lock without the old password. It won't touch your books or your library — anyone who can open Carrel afterward will be able to switch into this profile without a password.",
     "recoveryConfirm": "Remove lock",
     "resetting": "Removing…"
   },
@@ -964,7 +964,7 @@
 
   "onboarding": {
     "welcome": {
-      "title": "Welcome to Folio",
+      "title": "Welcome to Carrel",
       "subtitle": "Your personal reading companion. Let's get you set up in a few quick steps.",
       "cta": "Get Started",
       "skip": "Skip",
@@ -1015,10 +1015,10 @@
   },
 
   "whatsNew": {
-    "bannerTitle": "Folio {{version}}",
+    "bannerTitle": "Carrel {{version}}",
     "bannerSummary": "{{title}} and more",
     "bannerCta": "See what's new",
-    "modalTitle": "What's New in Folio {{version}}",
+    "modalTitle": "What's New in Carrel {{version}}",
     "modalFullChangelog": "See full changelog",
     "settingsButton": "Release Notes",
     "trayLabel": "What's New"
@@ -1028,7 +1028,7 @@
     "titleAvailable": "Update available",
     "titleUpToDate": "You're up to date",
     "titleError": "Couldn't check for updates",
-    "newVersion": "Folio {{version}} is available.",
+    "newVersion": "Carrel {{version}} is available.",
     "currentVersion": "You have {{version}}.",
     "upToDateBody": "You're on the latest version ({{version}}).",
     "errorBody": "Couldn't check for updates. Try again later.",
@@ -1095,6 +1095,6 @@
     "continueHeading": "Still saved",
     "continueHighlights": "Highlights and bookmarks — they stay in their lists",
     "continueLibrary": "The book stays in your library",
-    "restartNote": "Resets to off every time you open Folio — it never carries over between sessions."
+    "restartNote": "Resets to off every time you open Carrel — it never carries over between sessions."
   }
 }

@@ -64,7 +64,7 @@ jobs:
           # MSVC at the moment). `--features mobi` re-enables MOBI/AZW/
           # AZW3 import — libmobi is built from source as a static
           # archive (`mobi.lib`, no DLL) earlier in the job and linked
-          # directly into folio.exe. See `windows_libmobi_build_is_static`
+          # directly into carrel.exe. See `windows_libmobi_build_is_static`
           # in src-tauri/src/release_workflow_test.rs for why static.
           - platform: windows-latest
             args: '-- --no-default-features --features mobi'
@@ -188,7 +188,7 @@ jobs:
           # BUILD_SHARED_LIBS=OFF produces a static `mobi.lib` archive
           # (no DLL). With USE_ZLIB=OFF + USE_LIBXML2=OFF the archive
           # is fully self-contained, so `cargo:rustc-link-lib=static=
-          # mobi` (folio-core/build.rs) bakes libmobi into folio.exe
+          # mobi` (folio-core/build.rs) bakes libmobi into carrel.exe
           # without any runtime DLL dependency. This avoids the
           # Tauri-bundler complications of placing a DLL where the
           # OS loader will find it next to the installed binary.

@@ -263,6 +263,10 @@ const THEME_BOOTSTRAP_SCRIPT_HASH: &str = "'sha256-FGUWTgqSoem8FWO0BBhrwgmMQsdK1
 /// rather than sent verbatim because profile names are arbitrary text: a name
 /// containing a newline must not be able to inject a header. Callers only ever
 /// compare it, so nothing decodes it.
+///
+/// The header name keeps its pre-Carrel spelling: offline-cached copies of
+/// `static/app.js` and `static/sw.js` still read `x-folio-profile`. See
+/// CLAUDE.md, "Legacy `folio` identifiers".
 pub(crate) fn profile_tag(name: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(name.len() * 2);
@@ -1700,7 +1704,7 @@ mod tests {
         // Authenticate via HTTP Basic Auth (PIN as password).
         let resp = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/api/data-export"))
-            .basic_auth("folio", Some("1234"))
+            .basic_auth("carrel", Some("1234"))
             .send()
             .await
             .unwrap();
@@ -1716,7 +1720,7 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(disp.contains("folio-export-"));
+        assert!(disp.contains("carrel-export-"));
         assert!(disp.ends_with(".zip\""));
 
         let bytes = resp.bytes().await.unwrap();
@@ -1724,7 +1728,7 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).expect("valid zip");
         assert_eq!(archive.len(), 1);
         let mut entry = archive.by_index(0).unwrap();
-        assert!(entry.name().starts_with("folio-export-"));
+        assert!(entry.name().starts_with("carrel-export-"));
         assert!(entry.name().ends_with(".json"));
         let mut contents = String::new();
         std::io::Read::read_to_string(&mut entry, &mut contents).unwrap();
@@ -2074,7 +2078,7 @@ mod tests {
             .get(format!(
                 "http://127.0.0.1:{port}/api/books/cache-test-book/pages/0"
             ))
-            .basic_auth("folio", Some("1234"))
+            .basic_auth("carrel", Some("1234"))
             .send()
             .await
             .unwrap();
@@ -2093,7 +2097,7 @@ mod tests {
             .get(format!(
                 "http://127.0.0.1:{port}/api/books/cache-test-book/page-count"
             ))
-            .basic_auth("folio", Some("1234"))
+            .basic_auth("carrel", Some("1234"))
             .send()
             .await
             .unwrap();
@@ -2434,7 +2438,7 @@ mod tests {
         ] {
             let resp = client
                 .get(&url)
-                .basic_auth("folio", Some("1234"))
+                .basic_auth("carrel", Some("1234"))
                 .send()
                 .await
                 .unwrap();
@@ -4644,7 +4648,7 @@ mod tests {
         const MANIFEST_JSON: &str = include_str!("static/manifest.json");
         let value: serde_json::Value =
             serde_json::from_str(MANIFEST_JSON).expect("manifest.json must be valid JSON");
-        assert_eq!(value["name"], "Folio");
+        assert_eq!(value["name"], "Carrel");
         assert_eq!(value["display"], "standalone");
         assert!(value["theme_color"].is_string());
         assert!(value["background_color"].is_string());

@@ -275,7 +275,7 @@ const QUOTE_FONT_STACK = "'Playfair Display Variable', Georgia, serif";
 const FOOTER_FONT_STACK = "'DM Sans Variable', system-ui, -apple-system, sans-serif";
 const COVER_BOX_SIZE = 108;
 const COVER_BOX_RADIUS = 10;
-const WORDMARK_TEXT = "Folio";
+const WORDMARK_TEXT = "Carrel";
 
 function drawCoverThumb(ctx: CanvasRenderingContext2D, img: HTMLImageElement, x: number, y: number) {
   const size = COVER_BOX_SIZE;

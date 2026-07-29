@@ -245,6 +245,9 @@
   // these register/exist, every offline affordance stays hidden, and
   // behavior is exactly the pre-offline app.
   const OFFLINE_PAGE_WIDTH = 1080; // page-image download width; change here (e.g. 1600)
+  // Every `folio-`prefixed name in this file (cache names, localStorage keys)
+  // predates the Carrel rename and must keep its spelling — see sw.js and
+  // CLAUDE.md, "Legacy `folio` identifiers".
   const OFFLINE_CACHE_PREFIX = "folio-offline-book-"; // must mirror sw.js
   const OFFLINE_MANIFEST_VERSION = 1;
   // Profile scoping: book ids are per-profile DB id spaces, so a cache or
@@ -1238,13 +1241,13 @@
   }
 
   // Finding 4: short, differentiated failure text depending on *why* a fetch
-  // failed, instead of one blanket "Couldn't reach Folio server" message for
+  // failed, instead of one blanket "Couldn't reach Carrel server" message for
   // network errors, HTTP errors, and bad JSON alike.
   function apiFailureToastMessage(e) {
-    return e instanceof ApiNetworkError ? "Couldn't reach Folio server" : "Unexpected response";
+    return e instanceof ApiNetworkError ? "Couldn't reach Carrel server" : "Unexpected response";
   }
   function httpErrorToastMessage(status) {
-    return `Server error (${status}) — check the Folio app`;
+    return `Server error (${status}) — check the Carrel app`;
   }
 
   // Finding 1: shared "this whole view failed to load" fallback for views
@@ -1601,7 +1604,7 @@
     resumePromptActive = false;
     app().innerHTML = `
       <div class="login">
-        <h1>Folio</h1>
+        <h1>Carrel</h1>
         <input type="password" id="pin" placeholder="PIN" maxlength="8" autofocus>
         <button id="login-btn">Enter</button>
         <div class="error" id="login-error"></div>
@@ -1840,7 +1843,7 @@
   // just synced to a new hash while already in the library view.
   async function showLibrary(params) {
     currentView = "library";
-    document.title = "Folio";
+    document.title = "Carrel";
     flushProgressSave();
     readerState = null;
     resumePromptActive = false;
@@ -1867,7 +1870,7 @@
     if (!existing) {
       app().innerHTML = `
         <div class="header">
-          <h1>Folio</h1>
+          <h1>Carrel</h1>
           <input type="search" id="search" placeholder="Search books..." aria-label="Search books" value="${esc(activeQuery)}">
           <select id="sort-select" aria-label="Sort by">
             <option value="date_added">Recent</option>
@@ -2479,7 +2482,7 @@
   function showLibraryLoadError(message) {
     const contentEl = $("#library-content");
     if (contentEl) contentEl.innerHTML = '<div class="empty">Couldn&rsquo;t load your library.</div>';
-    showToast(message || "Couldn't reach Folio server");
+    showToast(message || "Couldn't reach Carrel server");
   }
 
   // Item 15: same `.shelf-progress`/`.shelf-progress-fill` bar the shelf
@@ -2956,7 +2959,7 @@
     if (dateStr) facts.push(`Added ${dateStr}`);
     const factsHtml = facts.length ? `<p class="detail-facts">${esc(facts.join(" · "))}</p>` : "";
 
-    document.title = `${book.title} — Folio`;
+    document.title = `${book.title} — Carrel`;
     app().innerHTML = `
       <div class="header">
         <button class="back-btn" id="back-btn" aria-label="Back">&larr;</button>
@@ -3125,7 +3128,7 @@
         } catch (e) {
           wantInFlight = false;
           if (wantBtn.isConnected) wantBtn.removeAttribute("aria-busy");
-          showToast("Couldn't reach Folio server");
+          showToast("Couldn't reach Carrel server");
           return;
         }
         if (resp.status === 401) { authenticated = false; showLogin(); return; }
@@ -3232,7 +3235,7 @@
         return;
       }
       if (!hashTargetsReader(id)) return;
-      document.title = `Reading: ${book.title} — Folio`;
+      document.title = `Reading: ${book.title} — Carrel`;
 
       // MOBI and EPUB both render through the chapter-HTML endpoint; the
       // server-side `/api/books/:id/chapters/:index` route dispatches to
@@ -6404,7 +6407,7 @@
   // ── Stats ──────────────────────────────────────
   async function showStats() {
     currentView = "stats";
-    document.title = "Folio";
+    document.title = "Carrel";
     flushProgressSave();
     readerState = null;
     resumePromptActive = false;
@@ -6493,7 +6496,7 @@
   // ── Collections ────────────────────────────────
   async function showCollections() {
     currentView = "collections";
-    document.title = "Folio";
+    document.title = "Carrel";
     flushProgressSave();
     readerState = null;
     resumePromptActive = false;
@@ -6779,7 +6782,7 @@
         body: JSON.stringify({ name }),
       });
     } catch (e) {
-      showToast("Couldn't reach Folio server");
+      showToast("Couldn't reach Carrel server");
       return;
     }
     if (resp.status === 401) { authenticated = false; showLogin(); return; }
@@ -6880,7 +6883,7 @@
   }
 
   // Item 9 (PWA): feature-detected registration — service workers only
-  // register on a secure context (https, or http://localhost). Folio's main
+  // register on a secure context (https, or http://localhost). Carrel's main
   // LAN use case (a phone hitting http://192.168.x.x:7788) is plain HTTP and
   // NOT a secure context, so `serviceWorker` won't even exist in `navigator`
   // there and this silently no-ops. The manifest + icons still work for iOS
@@ -6903,8 +6906,8 @@
     app().innerHTML = `
       <div class="resume-prompt">
         <div class="resume-prompt-panel">
-          <h2>Folio</h2>
-          <p>Couldn&rsquo;t reach the Folio server. Check your connection and try again.</p>
+          <h2>Carrel</h2>
+          <p>Couldn&rsquo;t reach the Carrel server. Check your connection and try again.</p>
           <div class="resume-actions">
             <button class="btn-primary" id="retry-init-btn">Retry</button>
           </div>
@@ -6926,7 +6929,7 @@
   function renderOfflineLibrary(rows) {
     offlineMode = true;
     currentView = "library";
-    document.title = "Folio";
+    document.title = "Carrel";
     offlineBookIds = new Set(rows.map((r) => r.id));
     const books = rows
       .slice()
@@ -6939,7 +6942,7 @@
         total_chapters: r.totalChapters,
       }));
     app().innerHTML = `
-      <div class="header"><h1>Folio</h1></div>
+      <div class="header"><h1>Carrel</h1></div>
       <div class="offline-banner" role="status">
         <span>Offline — showing downloaded books</span>
         <button class="btn-secondary" id="offline-retry-btn">Retry</button>

@@ -141,7 +141,7 @@ id = "highlight-exporter"
 name = "Highlight Exporter"
 version = "1.0.0"
 description = "Appends new highlights to a Markdown file"
-author = "Folio"
+author = "Carrel"
 min_app_version = "2.3.0"
 
 [events]

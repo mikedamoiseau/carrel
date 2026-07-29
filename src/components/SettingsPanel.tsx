@@ -1035,7 +1035,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       setExporting(true);
       setBackupMessage(null);
       const folder = typeof dest === "string" ? dest : dest[0];
-      const path = `${folder}/folio-backup-${new Date().toISOString().slice(0, 10)}.zip`;
+      const path = `${folder}/carrel-backup-${new Date().toISOString().slice(0, 10)}.zip`;
       await invoke("export_library", { destPath: path, includeFiles });
       setBackupMessage(t("settings.exportedTo", { path }));
     } catch (err) {
@@ -2853,7 +2853,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                     <span className="text-ink">libmobi</span> — LGPL-3.0-or-later,{" "}
                     {/*
                       Windows ships a statically-linked libmobi (mobi.lib baked
-                      into folio.exe). Linux and arm64 macOS dynamically link
+                      into Carrel.exe). Linux and arm64 macOS dynamically link
                       against the system libmobi. Using `navigator.userAgent`
                       avoids pulling in `@tauri-apps/plugin-os` for this single
                       string — the user-agent inside Tauri's WebView reliably

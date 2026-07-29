@@ -60,6 +60,11 @@ interface ThemeContextValue {
   loadTheme: (theme: { colors: ColorTokens; fontFamily: string; fontSize: number; typography: TypographySettings }) => void;
 }
 
+// These keys keep their `folio-` prefix after the Carrel rename — they name
+// values already in every user's localStorage, and renaming them silently
+// resets theme, typography, and reader preferences. Same for the library
+// filters in `src/screens/Library.tsx` and the web UI's keys in
+// `static/app.js`. See CLAUDE.md, "Legacy `folio` identifiers".
 const STORAGE_KEYS = {
   theme: "folio-theme",
   customColors: "folio-custom-colors",

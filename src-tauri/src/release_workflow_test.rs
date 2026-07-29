@@ -132,7 +132,7 @@ mod tests {
 
     /// We statically link libmobi on Windows (`BUILD_SHARED_LIBS=OFF`)
     /// so the Windows release ships as a single self-contained
-    /// `folio.exe` — no `mobi.dll` next to the binary, no Tauri
+    /// `carrel.exe` — no `mobi.dll` next to the binary, no Tauri
     /// bundler config to coerce the loader's DLL search path.
     /// Switching back to a shared build would require simultaneous
     /// changes to `tauri.conf.json` (resource layout), the OS
@@ -144,7 +144,7 @@ mod tests {
             RELEASE_YML.contains("-DBUILD_SHARED_LIBS=OFF"),
             "release.yml must build libmobi with `BUILD_SHARED_LIBS=OFF` \
              on Windows so the resulting `mobi.lib` static archive can \
-             be linked directly into folio.exe — flipping this to ON \
+             be linked directly into carrel.exe — flipping this to ON \
              would require shipping `mobi.dll` next to the binary, \
              which Tauri's bundler does not do out of the box."
         );

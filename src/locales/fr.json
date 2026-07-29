@@ -288,7 +288,7 @@
       "dark": "Sombre"
     },
     "includeCover": "Inclure la couverture",
-    "includeWordmark": "Afficher le filigrane Folio",
+    "includeWordmark": "Afficher le filigrane Carrel",
     "copyImage": "Copier l'image",
     "savePng": "Enregistrer en PNG…",
     "toasts": {
@@ -321,7 +321,7 @@
 
   "plugins": {
     "section": "Extensions",
-    "intro": "Les extensions sont de petits scripts qui r\u00e9agissent aux \u00e9v\u00e9nements de Folio \u2014 comme \u00e9tiqueter les livres \u00e0 l'import ou vous pr\u00e9venir quand vous en terminez un. N'installez que des extensions de sources de confiance.",
+    "intro": "Les extensions sont de petits scripts qui r\u00e9agissent aux \u00e9v\u00e9nements de Carrel \u2014 comme \u00e9tiqueter les livres \u00e0 l'import ou vous pr\u00e9venir quand vous en terminez un. N'installez que des extensions de sources de confiance.",
     "reload": "Recharger les extensions",
     "reloadSuccess": "Extensions rechargées",
     "installSuccess": "Extension installée",
@@ -358,8 +358,8 @@
     "title": "Param\u00e8tres",
     "closeLabel": "Fermer les param\u00e8tres",
     "searchPlaceholder": "Rechercher dans les param\u00e8tres\u2026",
-    "analyticsTitle": "Aider \u00e0 am\u00e9liorer Folio\u00a0?",
-    "analyticsMessage": "Folio peut envoyer des statistiques d'utilisation anonymes (lancements de l'application, votre syst\u00e8me et version) pour nous aider \u00e0 comprendre combien de personnes utilisent l'application. Aucune donn\u00e9e personnelle, titre de livre ou contenu de biblioth\u00e8que n'est jamais envoy\u00e9. Vous pouvez modifier ce choix \u00e0 tout moment dans les R\u00e9glages.",
+    "analyticsTitle": "Aider \u00e0 am\u00e9liorer Carrel\u00a0?",
+    "analyticsMessage": "Carrel peut envoyer des statistiques d'utilisation anonymes (lancements de l'application, votre syst\u00e8me et version) pour nous aider \u00e0 comprendre combien de personnes utilisent l'application. Aucune donn\u00e9e personnelle, titre de livre ou contenu de biblioth\u00e8que n'est jamais envoy\u00e9. Vous pouvez modifier ce choix \u00e0 tout moment dans les R\u00e9glages.",
     "analyticsEnable": "Activer",
     "analyticsNotNow": "Pas maintenant",
     "analyticsToggle": "Envoyer des statistiques d'utilisation anonymes",
@@ -482,7 +482,7 @@
     "rerunWizard": "Relancer l\u2019assistant de configuration",
     "general": "G\u00e9n\u00e9ral",
     "launchAtStartup": "Lancer au d\u00e9marrage",
-    "launchAtStartupHint": "D\u00e9marrer Folio automatiquement \u00e0 la connexion",
+    "launchAtStartupHint": "D\u00e9marrer Carrel automatiquement \u00e0 la connexion",
     "autoStartFailed": "\u00c9chec du changement du d\u00e9marrage automatique : {{error}}",
     "showContinueReading": "Afficher la section Continuer la lecture",
     "showContinueReadingHint": "Afficher les livres r\u00e9cemment ouverts en haut de la biblioth\u00e8que",
@@ -491,7 +491,7 @@
     "showWantToRead": "Afficher la section \u00c0 lire",
     "showWantToReadHint": "Afficher les livres marqu\u00e9s comme \u00e0 lire en haut de la biblioth\u00e8que",
     "updateCheckOnStartup": "V\u00e9rifier les mises \u00e0 jour au d\u00e9marrage",
-    "updateCheckOnStartupHint": "Au lancement de Folio, v\u00e9rifier discr\u00e8tement une nouvelle version sur GitHub.",
+    "updateCheckOnStartupHint": "Au lancement de Carrel, v\u00e9rifier discr\u00e8tement une nouvelle version sur GitHub.",
     "remoteAccess": "Acc\u00e8s \u00e0 distance",
     "remoteAccessDescriptions": {
       "webUiCheckbox": "Interface Web",
@@ -528,15 +528,15 @@
     "changeLockButton": "Changer le mot de passe",
     "removeLockButton": "Supprimer le verrou",
     "removeLockConfirmTitle": "Supprimer le verrou du profil\u00a0?",
-    "removeLockConfirmMessage": "Quiconque peut ouvrir Folio pourra basculer sur ce profil sans mot de passe.",
+    "removeLockConfirmMessage": "Quiconque peut ouvrir Carrel pourra basculer sur ce profil sans mot de passe.",
     "removeLockConfirm": "Supprimer le verrou",
     "lockSetSuccess": "Verrou du profil activ\u00e9.",
     "lockChangedSuccess": "Verrou du profil modifi\u00e9.",
     "lockRemovedSuccess": "Verrou du profil supprim\u00e9.",
     "remoteBackup": "Sauvegarde distante",
     "aboutSection": "À propos",
-    "aboutVersion": "Folio {{version}}",
-    "aboutTagline": "Folio",
+    "aboutVersion": "Carrel {{version}}",
+    "aboutTagline": "Carrel",
     "aboutLicense": "Publié sous licence MIT.",
     "thirdPartyHeading": "Composants tiers",
     "dynamicallyLinked": "lié dynamiquement",
@@ -817,7 +817,7 @@
     "unlocking": "Déverrouillage…",
     "cantSignIn": "Vous ne pouvez pas vous connecter ?",
     "recoveryTitle": "Supprimer le verrou du profil ?",
-    "recoveryMessage": "Cela supprime le verrou sans l'ancien mot de passe. Vos livres et votre bibliothèque ne sont pas touchés — quiconque peut ensuite ouvrir Folio et basculer sur ce profil sans mot de passe.",
+    "recoveryMessage": "Cela supprime le verrou sans l'ancien mot de passe. Vos livres et votre bibliothèque ne sont pas touchés — quiconque peut ensuite ouvrir Carrel et basculer sur ce profil sans mot de passe.",
     "recoveryConfirm": "Supprimer le verrou",
     "resetting": "Suppression…"
   },
@@ -949,14 +949,14 @@
 
   "onboarding": {
     "welcome": {
-      "title": "Bienvenue dans Folio",
+      "title": "Bienvenue dans Carrel",
       "subtitle": "Votre compagnon de lecture personnel. Configurons l'essentiel en quelques étapes.",
       "cta": "Commencer",
       "skip": "Passer",
       "skipHint": "vous pourrez tout configurer plus tard"
     },
     "preferences": {
-      "title": "Personnalisez Folio",
+      "title": "Personnalisez Carrel",
       "subtitle": "Réglez l'essentiel — vous pourrez modifier ces options à tout moment dans les réglages.",
       "language": "Langue",
       "theme": "Thème",
@@ -999,10 +999,10 @@
     }
   },
   "whatsNew": {
-    "bannerTitle": "Folio {{version}}",
+    "bannerTitle": "Carrel {{version}}",
     "bannerSummary": "{{title}} et plus",
     "bannerCta": "Voir les nouveaut\u00e9s",
-    "modalTitle": "Nouveaut\u00e9s de Folio {{version}}",
+    "modalTitle": "Nouveaut\u00e9s de Carrel {{version}}",
     "modalFullChangelog": "Voir le changelog complet",
     "settingsButton": "Notes de version",
     "trayLabel": "Nouveaut\u00e9s"
@@ -1012,7 +1012,7 @@
     "titleAvailable": "Mise \u00e0 jour disponible",
     "titleUpToDate": "Vous \u00eates \u00e0 jour",
     "titleError": "Impossible de v\u00e9rifier les mises \u00e0 jour",
-    "newVersion": "Folio {{version}} est disponible.",
+    "newVersion": "Carrel {{version}} est disponible.",
     "currentVersion": "Vous avez la version {{version}}.",
     "upToDateBody": "Vous utilisez la derni\u00e8re version ({{version}}).",
     "errorBody": "Impossible de v\u00e9rifier les mises \u00e0 jour. R\u00e9essayez plus tard.",
@@ -1067,6 +1067,6 @@
     "continueHeading": "Toujours enregistr\u00e9",
     "continueHighlights": "Surlignages et signets \u2014 ils restent dans leurs listes",
     "continueLibrary": "Le livre reste dans votre biblioth\u00e8que",
-    "restartNote": "Revient \u00e0 d\u00e9sactiv\u00e9 \u00e0 chaque ouverture de Folio \u2014 ne se reporte jamais d'une session \u00e0 l'autre."
+    "restartNote": "Revient \u00e0 d\u00e9sactiv\u00e9 \u00e0 chaque ouverture de Carrel \u2014 ne se reporte jamais d'une session \u00e0 l'autre."
   }
 }

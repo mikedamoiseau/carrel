@@ -207,7 +207,7 @@ describe("findMissingDarkVariants", () => {
     expect(out.map((f) => f.match)).toEqual(["text-red-700"]);
   });
 
-  it("ignores semantic Folio tokens (bg-paper, text-ink)", () => {
+  it("ignores semantic Carrel tokens (bg-paper, text-ink)", () => {
     const src = `<div className="bg-paper text-ink border-warm-border">x</div>`;
     expect(findMissingDarkVariants(src, "x.tsx")).toEqual([]);
   });

@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-// These tests require the Folio web server running on localhost:7788
+// These tests require the Carrel web server running on localhost:7788
 // with no PIN configured (open access).
 
 test.describe("Reading Stats page", () => {

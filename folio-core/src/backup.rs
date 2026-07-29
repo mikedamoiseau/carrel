@@ -19,6 +19,10 @@ pub fn secret_keys(provider_type: &ProviderType) -> Vec<&'static str> {
 
 /// Store secret values in the OS keychain. Returns the config with secrets removed.
 /// Returns an error if any keychain write fails — caller should NOT save config to DB.
+///
+/// The `folio-backup-…` service prefix used here and in [`load_secrets`] /
+/// [`remove_secrets`] survives the Carrel rename on purpose: it keys entries
+/// already in every user's keychain. See CLAUDE.md, "Legacy `folio` identifiers".
 pub fn store_secrets(config: &BackupConfig) -> FolioResult<BackupConfig> {
     let secrets = secret_keys(&config.provider_type);
     let mut clean = config.clone();
@@ -212,7 +216,7 @@ pub fn provider_schemas() -> Vec<ProviderInfo> {
                     label: "Bucket".into(),
                     field_type: "text".into(),
                     required: true,
-                    placeholder: "my-folio-backups".into(),
+                    placeholder: "my-carrel-backups".into(),
                 },
                 ConfigField {
                     key: "region".into(),
@@ -240,7 +244,7 @@ pub fn provider_schemas() -> Vec<ProviderInfo> {
                     label: "Path prefix".into(),
                     field_type: "text".into(),
                     required: false,
-                    placeholder: "/folio-backup".into(),
+                    placeholder: "/carrel-backup".into(),
                 },
             ],
         },
@@ -281,7 +285,7 @@ pub fn provider_schemas() -> Vec<ProviderInfo> {
                     label: "Remote path".into(),
                     field_type: "text".into(),
                     required: false,
-                    placeholder: "/folio-backup".into(),
+                    placeholder: "/carrel-backup".into(),
                 },
             ],
         },
@@ -315,7 +319,7 @@ pub fn provider_schemas() -> Vec<ProviderInfo> {
                     label: "Remote path".into(),
                     field_type: "text".into(),
                     required: false,
-                    placeholder: "/home/user/folio-backup".into(),
+                    placeholder: "/home/user/carrel-backup".into(),
                 },
                 ConfigField {
                     key: "known_hosts_strategy".into(),
@@ -356,7 +360,7 @@ pub fn provider_schemas() -> Vec<ProviderInfo> {
                     label: "Remote path".into(),
                     field_type: "text".into(),
                     required: false,
-                    placeholder: "/folio-backup".into(),
+                    placeholder: "/carrel-backup".into(),
                 },
             ],
         },

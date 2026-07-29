@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Folio",
+  "productName": "Carrel",
   "version": "2.11.1",
   "identifier": "com.mike.folio",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Folio",
+        "title": "Carrel",
         "width": 800,
         "height": 600
       }

@@ -316,7 +316,7 @@ fn http_get(url: &str, allow: &[String]) -> Result<String, Box<EvalAltResult>> {
     });
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("Folio-Plugin/1.0")
+        .user_agent("Carrel-Plugin/1.0")
         .redirect(policy)
         .build()
         .map_err(host_err)?;

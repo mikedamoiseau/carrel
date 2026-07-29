@@ -1,4 +1,4 @@
-//! Storage abstraction for Folio's persistent artifacts.
+//! Storage abstraction for Carrel's persistent artifacts.
 //!
 //! Book files, covers, and related blobs are accessed through a `Storage`
 //! trait so the backend can be swapped (local filesystem today, S3 or other
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{FolioError, FolioResult};
 
-/// Backend-agnostic interface for reading and writing Folio's persistent
+/// Backend-agnostic interface for reading and writing Carrel's persistent
 /// artifacts.
 ///
 /// All implementations must be thread-safe (`Send + Sync`). Keys must pass
@@ -251,7 +251,7 @@ impl Storage for LocalStorage {
 ///
 /// Public so callers outside this module with their own already-resolved
 /// absolute paths (e.g. the web server's cover-thumbnail cache in
-/// `folio::web_server::api`) can reuse the same atomicity guarantee instead
+/// `carrel::web_server::api`) can reuse the same atomicity guarantee instead
 /// of duplicating the temp-file-plus-rename dance.
 pub fn write_atomic<F>(dest: &Path, write: F) -> FolioResult<()>
 where
@@ -265,7 +265,9 @@ where
     // Unique sibling temp name so we can rename atomically onto `dest`.
     let tmp_name = format!(
         ".{}.tmp.{}",
-        dest.file_name().and_then(|n| n.to_str()).unwrap_or("folio"),
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrel"),
         uuid::Uuid::new_v4()
     );
     let tmp_path = parent.join(tmp_name);

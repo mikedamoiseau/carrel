@@ -2,7 +2,7 @@ import { expect } from "@wdio/globals";
 
 describe("App Navigation", () => {
   describe("Header Controls", () => {
-    it("should show the Folio logo as a link to home", async () => {
+    it("should show the Carrel logo as a link to home", async () => {
       const logo = await browser.$('a[href="/"]');
       await expect(logo).toBeExisting();
     });

@@ -50,11 +50,11 @@ const WINDOW_SIZE = pickWindowSize();
 
 // ─── OS / window helpers ───────────────────────────────────────────────────
 
-function resizeFolioWindow({ w, h }) {
+function resizeCarrelWindow({ w, h }) {
   const script = `
     tell application "System Events"
-      set procs to (every process whose name is "folio" or name is "Folio")
-      if (count of procs) is 0 then error "no folio process"
+      set procs to (every process whose name is "carrel" or name is "Carrel")
+      if (count of procs) is 0 then error "no carrel process"
       tell (item 1 of procs)
         set size of window 1 to {${w}, ${h}}
       end tell
@@ -63,11 +63,11 @@ function resizeFolioWindow({ w, h }) {
   execFileSync("osascript", ["-e", script]);
 }
 
-function getFolioWindowBounds() {
+function getCarrelWindowBounds() {
   const script = `
     tell application "System Events"
-      set procs to (every process whose name is "folio" or name is "Folio")
-      if (count of procs) is 0 then error "no folio process"
+      set procs to (every process whose name is "carrel" or name is "Carrel")
+      if (count of procs) is 0 then error "no carrel process"
       tell (item 1 of procs)
         set {x, y} to position of window 1
         set {w, h} to size of window 1
@@ -88,7 +88,7 @@ function getFolioWindowBounds() {
 async function capture(filename) {
   // Small settle pause so animations / hover states finish.
   await browser.pause(400);
-  const bounds = getFolioWindowBounds();
+  const bounds = getCarrelWindowBounds();
   const rect = `${bounds.x},${bounds.y},${bounds.w},${bounds.h}`;
   execFileSync("screencapture", ["-R", rect, "-x", "-o", `${OUT_DIR}/${filename}`]);
   console.log(`[screenshots] wrote ${filename}`);
@@ -244,8 +244,8 @@ async function clickFirstBookToOpenReader() {
 
 describe("README screenshots", () => {
   before(() => {
-    console.log(`[screenshots] resizing Folio window to ${WINDOW_SIZE.w}x${WINDOW_SIZE.h}`);
-    resizeFolioWindow(WINDOW_SIZE);
+    console.log(`[screenshots] resizing Carrel window to ${WINDOW_SIZE.w}x${WINDOW_SIZE.h}`);
+    resizeCarrelWindow(WINDOW_SIZE);
   });
 
   // ─── Library — theme variants ────────────────────────────────────────────
