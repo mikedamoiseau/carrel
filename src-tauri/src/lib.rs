@@ -6,6 +6,7 @@ pub mod ipc_metrics;
 pub mod observability;
 pub mod page_wire;
 pub mod plugin_host;
+pub mod profile_host;
 #[cfg(test)]
 mod release_workflow_test;
 pub mod remote_fs;
@@ -345,6 +346,7 @@ pub fn run() {
                     active_profile_name: state.shared_active_profile_name.clone(),
                     unlocked_profiles: state.unlocked_profiles.clone(),
                     private_mode: state.private_mode.clone(),
+                    profile_host: Some(crate::profile_host::for_app(&app_handle)),
                 };
                 if let Ok(handle) = web_server::start(web_state, port, modes).await {
                     {

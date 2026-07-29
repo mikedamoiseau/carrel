@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **The web API can list and switch profiles.** `GET /api/profiles` reports each
+  profile with whether it's active, has a lock, and can be switched into;
+  `POST /api/profile` switches the active profile for the whole server (desktop
+  included — there is one shared active profile). A locked profile stays
+  off-limits over the network: the profile password is never accepted over HTTP,
+  so a locked profile can only be entered remotely if it was already unlocked in
+  the desktop app this session, and otherwise returns `423 Locked`. See
+  `docs/WEB_SERVER_API.md`.
+
 ## [2.11.1] - 2026-07-28
 
 ### Performance

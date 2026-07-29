@@ -388,6 +388,7 @@ mod tests {
             active_profile_name: Arc::new(Mutex::new("default".to_string())),
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_host: None,
         }
     }
 

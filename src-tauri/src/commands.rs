@@ -4629,6 +4629,51 @@ pub async fn create_profile(
     Ok(())
 }
 
+/// All profiles with their soft-lock state, for the web layer's
+/// `GET /api/profiles`. Same set and ordering as the desktop `get_profiles`
+/// command, plus the two lock flags the remote switcher needs.
+pub(crate) fn list_profiles_with_lock_state(
+    state: &AppState,
+) -> FolioResult<Vec<crate::web_server::WebProfile>> {
+    list_profiles_with_lock_state_with(state, folio_core::profile_lock::has_lock)
+}
+
+/// [`list_profiles_with_lock_state`] with the lock-status probe injected —
+/// see [`switch_active_profile_with`] for why.
+fn list_profiles_with_lock_state_with(
+    state: &AppState,
+    has_lock: impl Fn(&str) -> FolioResult<bool>,
+) -> FolioResult<Vec<crate::web_server::WebProfile>> {
+    let (active, mut names) = {
+        let ps = state.profile_state.lock()?;
+        let mut names: Vec<String> = ps.pools.keys().cloned().collect();
+        names.push("default".to_string());
+        (ps.active.clone(), names)
+    };
+    names.sort();
+    names.dedup();
+
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            // Fail closed (A-M1 Decision 7): an unreadable keychain must not
+            // read as "no lock". Reporting the profile locked-and-unswitchable
+            // keeps the listing renderable while an attempted switch still
+            // surfaces the real keychain error.
+            let locked = has_lock(&name).unwrap_or(true);
+            crate::web_server::WebProfile {
+                active: name == active,
+                locked,
+                switchable: folio_core::profile_lock::access_allowed(
+                    locked,
+                    state.is_unlocked(&name),
+                ),
+                name,
+            }
+        })
+        .collect())
+}
+
 /// Switches the active profile. Shared core behind both the desktop
 /// `switch_profile` command and the web layer's `POST /api/profile`, so a
 /// remote switch runs the identical validated sequence — soft-lock gate,
@@ -7991,6 +8036,7 @@ pub async fn web_server_set_modes(
             active_profile_name: state.shared_active_profile_name.clone(),
             unlocked_profiles: state.unlocked_profiles.clone(),
             private_mode: state.private_mode.clone(),
+            profile_host: Some(crate::profile_host::for_app(&app)),
         };
 
         let handle = crate::web_server::start(web_state, port_used, modes).await?;
@@ -10023,6 +10069,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state.profile_state.lock().unwrap().active, "alice");
+    }
+
+    // ── Profile listing with soft-lock state (web `GET /api/profiles`) ───
+
+    #[test]
+    fn profile_list_marks_the_active_profile_and_sorts_by_name() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "magazines");
+        add_profile(&state, dir.path(), "comics");
+
+        let list = list_profiles_with_lock_state_with(&state, |_| Ok(false)).unwrap();
+
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["comics", "default", "magazines"]);
+        assert_eq!(
+            list.iter()
+                .filter(|p| p.active)
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["default"]
+        );
+    }
+
+    #[test]
+    fn profile_list_marks_a_locked_profile_unswitchable_until_unlocked() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "magazines");
+
+        let locked = list_profiles_with_lock_state_with(&state, |name| Ok(name == "magazines"))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "magazines")
+            .unwrap();
+        assert!(locked.locked);
+        assert!(
+            !locked.switchable,
+            "a locked profile not unlocked on the desktop is not reachable over HTTP"
+        );
+
+        state.mark_unlocked("magazines").unwrap();
+        let unlocked = list_profiles_with_lock_state_with(&state, |name| Ok(name == "magazines"))
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "magazines")
+            .unwrap();
+        assert!(unlocked.locked, "still has a stored lock");
+        assert!(
+            unlocked.switchable,
+            "already unlocked this session → reachable"
+        );
+    }
+
+    /// Fail-closed (A-M1 Decision 7): a keychain that can't be read must not
+    /// downgrade to "no lock". The listing still renders — a keychain outage
+    /// shouldn't blank the whole switcher — but the profile is reported locked
+    /// and unswitchable, and an attempted switch surfaces the real error.
+    #[test]
+    fn profile_list_treats_unreadable_lock_status_as_locked() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "magazines");
+
+        let list = list_profiles_with_lock_state_with(&state, |_| {
+            Err(FolioError::internal("keychain unavailable"))
+        })
+        .unwrap();
+
+        assert!(list.iter().all(|p| p.locked), "unreadable → assumed locked");
+        let magazines = list.iter().find(|p| p.name == "magazines").unwrap();
+        assert!(!magazines.switchable);
+        // `default` is in this session's unlocked set, and a session unlock
+        // outranks lock status — same as the desktop gate. So it stays
+        // switchable even while the keychain is unreadable.
+        assert!(
+            list.iter()
+                .find(|p| p.name == "default")
+                .unwrap()
+                .switchable
+        );
     }
 
     /// `resolve_book_path` must return a locally-staged copy when one exists for

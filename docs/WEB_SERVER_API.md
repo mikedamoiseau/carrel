@@ -110,6 +110,28 @@ Bodies and responses are **camelCase** (matching the `Highlight` model's seriali
 | GET | `/api/collections` | List all collections |
 | GET | `/api/collections/:id/books` | Books in a collection |
 
+### Profiles
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/profiles` | List profiles: `[{ "name": string, "active": bool, "locked": bool, "switchable": bool }]`, sorted by name. `locked` = has a stored profile lock; `switchable` = no lock, or already unlocked on the desktop this session. |
+| POST | `/api/profile` | Switch the active profile. Body: `{ "name": string }` (must be `Content-Type: application/json`). Returns `{ "active": name }`. |
+
+`POST /api/profile` status codes:
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Switched. The active profile changed for **every** client — the desktop app and all other web/OPDS sessions share one active profile. |
+| `400` | Malformed or non-JSON body. |
+| `404` | No such profile. |
+| `423 Locked` | The profile has a lock and hasn't been unlocked on the desktop this session. The profile password is never accepted over HTTP, so there is nothing to retry with — unlock it once in the desktop app. |
+| `401` | Not authenticated. |
+| `503` | This server has no profile backend (only happens in test harnesses). |
+
+Switching changes the served library, so refetch anything cached client-side
+afterwards. Book ids are per-profile, so clients that cache book content by id
+must scope that cache by profile name.
+
 ### System
 
 | Method | Endpoint | Description |
@@ -169,6 +191,16 @@ All assets are embedded in the app (no CDN dependencies). The app shell works of
 - Path traversal protection on image endpoints
 - File downloads streamed (no memory exhaustion)
 - Server binds to `0.0.0.0` (all interfaces) for LAN access
+- A locked profile can never be entered over HTTP: the profile password is not
+  accepted by any endpoint, and `POST /api/profile` refuses a locked profile
+  with `423` unless it was already unlocked in the desktop app this session
+- `POST /api/profile` requires a JSON body. Combined with the `SameSite=Strict`
+  session cookie, that closes cross-site switching: a cross-site `fetch` with
+  `Content-Type: application/json` needs a CORS preflight this server never
+  answers, and the form-encoded POST that *would* skip the preflight is
+  rejected with `400` — which matters because HTTP Basic credentials (accepted
+  on every `/api` path for OPDS clients) are replayed cross-site by browsers,
+  unlike the cookie
 
 ## Tauri Commands
 

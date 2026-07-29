@@ -186,7 +186,99 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .route("/collections/{id}/books", get(get_collection_books))
         .route("/audit/login-history", get(login_history))
         .route("/data-export", get(data_export))
+        .route("/profiles", get(list_profiles))
+        .route("/profile", axum::routing::post(switch_profile))
         .with_state(state)
+}
+
+// ── Profiles ─────────────────────────────────────────────────────────────────
+
+/// The injected profile host, or a 503 explaining that this server has none
+/// (a harness / headless embedding with no Tauri app behind it).
+fn profile_host(
+    state: &WebState,
+) -> Result<&std::sync::Arc<dyn super::ProfileHost>, (StatusCode, String)> {
+    state.profile_host.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Profile switching is unavailable on this server".to_string(),
+    ))
+}
+
+/// List profiles with their active / locked / switchable state. Locked
+/// profiles are listed (their *names* are already visible to a client holding
+/// the PIN) but marked unswitchable; their data stays dark behind
+/// `profile_lock_gate`.
+async fn list_profiles(
+    State(state): State<WebState>,
+) -> Result<Json<Vec<super::WebProfile>>, (StatusCode, String)> {
+    Ok(Json(profile_host(&state)?.list().map_err(folio_status)?))
+}
+
+#[derive(serde::Deserialize)]
+struct ProfileSwitchRequest {
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct ProfileSwitchResponse {
+    active: String,
+}
+
+/// Switch the active profile for the whole server — desktop included (PRD
+/// Decision 1: one shared active profile, not per-session).
+///
+/// CSRF: the session cookie is `SameSite=Strict`
+/// (`mod::tests::test_login_sets_session_cookie`), so a cross-site POST
+/// carries no session. Basic auth is accepted on every `/api` path though, and
+/// browsers replay cached Basic credentials cross-site — so the body is parsed
+/// strictly as JSON. A form-encoded POST, the only shape that dodges a CORS
+/// preflight and could therefore reach this handler cross-site, gets a 400; a
+/// real `application/json` POST needs a preflight this server never answers.
+async fn switch_profile(
+    State(state): State<WebState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<Json<ProfileSwitchResponse>, (StatusCode, String)> {
+    let host = profile_host(&state)?;
+
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().unwrap_or("").trim() == "application/json");
+    if !is_json {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Expected an application/json body".to_string(),
+        ));
+    }
+
+    // Parsed manually (like `put_want_to_read`) so a malformed body maps to
+    // 400 rather than axum's built-in 422.
+    let req: ProfileSwitchRequest = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid request body: {e}"),
+        )
+    })?;
+
+    host.switch(req.name.clone()).await.map_err(switch_status)?;
+
+    Ok(Json(ProfileSwitchResponse { active: req.name }))
+}
+
+/// Status mapping for a refused switch. The shared core's only `InvalidInput`
+/// is its unknown-profile check, so that's a 404; a locked profile that hasn't
+/// been unlocked on the desktop this session is `423 Locked` — the password is
+/// never accepted here, so there is nothing the client can retry with.
+fn switch_status(err: crate::error::FolioError) -> (StatusCode, String) {
+    match err {
+        crate::error::FolioError::LockRequired(msg) => (
+            StatusCode::LOCKED,
+            format!("{msg}. Unlock it on the desktop to use it over the network."),
+        ),
+        crate::error::FolioError::InvalidInput(msg) => (StatusCode::NOT_FOUND, msg),
+        other => folio_status(other),
+    }
 }
 
 // ── Health + Auth ────────────────────────────────────────────────────────────
