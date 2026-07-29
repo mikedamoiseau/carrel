@@ -378,6 +378,22 @@ test.describe("offline mode — boot & offline library (M4)", () => {
       });
     });
 
+    // An offline reload can only be served if the worker finished precaching the
+    // shell, and this spec — unlike the others, which spend seconds saving a
+    // book first — gives the install no time of its own. Wait for the cached
+    // shell explicitly instead of racing it (a lost race surfaces as
+    // `page.reload: net::ERR_INTERNET_DISCONNECTED`).
+    await page.waitForFunction(
+      async () => {
+        if (!navigator.serviceWorker.controller) return false;
+        const shell = (await caches.keys()).find((k) => k.startsWith("folio-shell-"));
+        if (!shell) return false;
+        return !!(await (await caches.open(shell)).match("/"));
+      },
+      null,
+      { timeout: 20_000 }
+    );
+
     await context.setOffline(true);
     await reloadControlled(page);
     // No manifests → the plain "couldn't reach server" card, not a library.
@@ -780,6 +796,47 @@ test.describe("offline mode — profile scoping", () => {
     await page.goto(`/#/book/${EPUB_ID}`);
     await openDetailMenu(page);
     await expect(page.locator("#offline-remove-btn")).toBeVisible();
+  });
+
+  test("a failed scope publish disables offline rather than serving the wrong profile", async ({
+    page,
+    context,
+  }) => {
+    await page.goto("/");
+    await saveBookOffline(page, EPUB_ID);
+
+    // Break Cache Storage for the scope marker only — the shape of a quota
+    // failure that hits the one write the worker's namespace depends on. Reads
+    // and every other cache keep working, so this is the fail-open window:
+    // without care the page moves to profile B's namespace while the worker is
+    // still answering out of profile A's caches.
+    await page.addInitScript(() => {
+      const open = caches.open.bind(caches);
+      caches.open = (name: string) =>
+        name === "folio-offline-scope"
+          ? Promise.reject(new DOMException("Quota exceeded", "QuotaExceededError"))
+          : open(name);
+    });
+
+    await switchProfile(page, "magazines");
+    await reloadControlled(page);
+
+    await context.setOffline(true);
+    try {
+      // Whatever the page decided about its own namespace, the worker must not
+      // answer this id from the previous profile's cache.
+      const outcome = await page.evaluate(async (id) => {
+        try {
+          const resp = await fetch(`/api/books/${id}`, { credentials: "same-origin" });
+          return { status: resp.status, body: (await resp.text()).slice(0, 120) };
+        } catch (e) {
+          return { failed: true };
+        }
+      }, EPUB_ID);
+      expect(outcome).toEqual({ failed: true });
+    } finally {
+      await context.setOffline(false);
+    }
   });
 
   test("offline in a profile with no downloads never serves another profile's saved book", async ({

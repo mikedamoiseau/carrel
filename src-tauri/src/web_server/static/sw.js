@@ -22,7 +22,7 @@
 // activates; app.js's registration call is feature-detected/try-catched so
 // this is silent, not an error. The manifest + icons still work for iOS
 // Safari "Add to Home Screen" over plain HTTP.
-const CACHE_VERSION = "folio-shell-e2dd5b53edaa";
+const CACHE_VERSION = "folio-shell-95a6b61eae7f";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW
@@ -44,12 +44,19 @@ const OFFLINE_CACHE_PREFIX = "folio-offline-book-";
 const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
 const OFFLINE_SCOPE_URL = "/__offline_scope";
 
+// Returns the active profile's namespace, or `null` when it can't be
+// established. `null` means "don't serve offline content": an absent or
+// unreadable marker is NOT the default profile — treating it as "" would answer
+// another profile's book ids out of the default profile's caches, which is the
+// exact confusion the namespace exists to prevent. app.js drops the marker when
+// it cannot publish one, so this is also how a fail-closed page switches the
+// worker off.
 async function currentOfflineScope() {
   try {
     const resp = await (await caches.open(OFFLINE_SCOPE_CACHE)).match(OFFLINE_SCOPE_URL);
-    return resp ? await resp.text() : "";
+    return resp ? await resp.text() : null;
   } catch (e) {
-    return "";
+    return null;
   }
 }
 
@@ -166,8 +173,11 @@ self.addEventListener("fetch", (event) => {
       // Is this exact request in the book's offline cache, under the active
       // profile's namespace? A book id saved under another profile lives in a
       // differently-named cache and must never answer here.
+      const scope = await currentOfflineScope();
+      // Namespace unknown → behave as if nothing were saved: plain network.
+      if (scope === null) return fetch(event.request);
       const matchOpts = {
-        cacheName: OFFLINE_CACHE_PREFIX + (await currentOfflineScope()) + bookMatch[1],
+        cacheName: OFFLINE_CACHE_PREFIX + scope + bookMatch[1],
         ignoreSearch: isPage,
       };
       const cached = await caches.match(event.request, matchOpts);

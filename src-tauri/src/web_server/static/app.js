@@ -259,14 +259,24 @@
   // constants must mirror sw.js.
   const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
   const OFFLINE_SCOPE_URL = "/__offline_scope";
+  // The page's own copy of the scope. localStorage rather than the marker cache
+  // because it is synchronous, survives a cold offline launch, and isn't subject
+  // to Cache Storage quota failures — the marker is strictly the worker's copy.
+  const OFFLINE_SCOPE_STORAGE_KEY = "folio-offline-scope";
   // The default profile keeps the unscoped names offline mode shipped with, so
   // existing downloads survive this change; every other profile gets a
   // 12-hex-char prefix. A bare book id can never be mistaken for a scoped one:
   // ids are UUIDs (8 hex chars then `-`), never 12.
   let offlineScope = "";
+  // Set when the worker's scope marker could not be published. The page and the
+  // worker would then disagree about which profile's caches are current, and the
+  // worker is the one serving — so offline is switched off for the session
+  // instead of risking one profile's content under another's book ids.
+  let offlineUnavailable = false;
 
   function offlineSupported() {
-    return "serviceWorker" in navigator &&
+    return !offlineUnavailable &&
+      "serviceWorker" in navigator &&
       !!window.indexedDB &&
       !!window.caches &&
       !!(window.crypto && window.crypto.subtle);
@@ -304,21 +314,12 @@
     if (!offlineSupported()) return false;
     let token;
     try { token = await profileScopeToken(profileName); } catch (e) { return false; }
-    const changed = token !== offlineScope;
-    if (changed) {
-      offlineScope = token;
-      // Drop the connection to the previous profile's database; the next
-      // offlineDb() opens the new one.
-      if (offlineDbPromise) {
-        offlineDbPromise.then((db) => db.close()).catch(() => {});
-        offlineDbPromise = null;
-      }
-    }
-    // Republished unconditionally, even when this page's scope didn't change:
-    // the marker is the service worker's only source for the namespace, and it
-    // re-reads it per request, so publishing on every boot is what keeps a
-    // worker that outlived a switch (or a page that never controlled one)
-    // correct. Awaited, so no request can be served before it lands.
+
+    // Publish to the worker BEFORE adopting the scope here. The worker does the
+    // offline serving and reads only the marker, so a page that moved first
+    // would be reading profile B's manifests while the worker answered out of
+    // profile A's caches. Republished even when this page's token is unchanged:
+    // a worker can outlive a switch, or have been installed by another tab.
     //
     // Deliberately does NOT wait on `navigator.serviceWorker.ready`: that only
     // settles once a worker is active, which on a first visit means after the
@@ -326,15 +327,52 @@
     // version did, and stalled the app until the install finished).
     try {
       await (await caches.open(OFFLINE_SCOPE_CACHE)).put(OFFLINE_SCOPE_URL, new Response(token));
-    } catch (e) { /* best-effort — a failed write leaves the previous scope */ }
+    } catch (e) {
+      // Can't publish, so the two sides cannot be kept in agreement. Fail
+      // closed: drop the marker so the worker refuses to serve any offline
+      // content at all (it treats "no marker" as "namespace unknown"), and
+      // disable offline for this session. Better to lose the offline copies
+      // until the next load than to serve one profile's book as another's.
+      try { await caches.delete(OFFLINE_SCOPE_CACHE); } catch (err) { /* nothing left to try */ }
+      offlineUnavailable = true;
+      return false;
+    }
+
+    const changed = token !== offlineScope;
+    if (changed) {
+      offlineScope = token;
+      safeStorageSet(OFFLINE_SCOPE_STORAGE_KEY, token);
+      // Drop the connection to the previous profile's database; the next
+      // offlineDb() opens the new one.
+      if (offlineDbPromise) {
+        offlineDbPromise.then((db) => db.close()).catch(() => {});
+        offlineDbPromise = null;
+      }
+    }
     return changed;
   }
 
-  /// Adopt the last published scope before any offline read. Used on boot,
+  /// Adopt the last known scope before any offline read. Used on boot,
   /// including an offline launch where the active profile can't be fetched.
+  ///
+  /// Read from localStorage, not the marker: this must work on a cold offline
+  /// launch and must not depend on a Cache Storage write having succeeded. The
+  /// marker is then re-published from it so a worker that has been evicted (or
+  /// was installed by another tab) agrees with this page — and if that can't be
+  /// done, offline goes off rather than out of sync.
   async function loadPublishedOfflineScope() {
     if (!offlineSupported()) return;
-    offlineScope = await readPublishedScope();
+    const stored = safeStorageGet(OFFLINE_SCOPE_STORAGE_KEY);
+    offlineScope = stored === null ? await readPublishedScope() : stored;
+    try {
+      await (await caches.open(OFFLINE_SCOPE_CACHE)).put(
+        OFFLINE_SCOPE_URL,
+        new Response(offlineScope)
+      );
+    } catch (e) {
+      try { await caches.delete(OFFLINE_SCOPE_CACHE); } catch (err) { /* nothing left to try */ }
+      offlineUnavailable = true;
+    }
   }
 
   /// Re-scope to the server's active profile. Returns whether it changed.
@@ -1164,6 +1202,29 @@
   // Response so callers that render a primary view can show the status code.
   class ApiNetworkError extends Error {}
 
+  // Stale-profile detection. One active profile is shared by the desktop app and
+  // every web/OPDS client, so it can move while this tab sits open — leaving the
+  // page showing another profile's library, with book ids that no longer mean
+  // what it thinks. Every response carries `x-folio-profile` (see
+  // `web_server::profile_tag`); the first one seen defines this page's profile,
+  // and a later mismatch means the ground moved. Comparison only — the value is
+  // never decoded, and needs no crypto (so it works on a plain-HTTP LAN too).
+  let seenProfileTag = null;
+  let profileMoveHandled = false;
+
+  function noteProfileTag(resp) {
+    let tag;
+    try { tag = resp && resp.headers ? resp.headers.get("x-folio-profile") : null; } catch (e) { return; }
+    if (!tag) return; // pre-header server, or a response the SW synthesized
+    if (seenProfileTag === null) { seenProfileTag = tag; return; }
+    if (tag === seenProfileTag || profileMoveHandled) return;
+    // Reload rather than patch: books, ids, collections, series, progress and
+    // the offline namespace all belong to the profile this page booted into.
+    // Guarded so a burst of in-flight requests can't reload repeatedly.
+    profileMoveHandled = true;
+    location.reload();
+  }
+
   async function api(path) {
     let resp;
     try {
@@ -1171,6 +1232,7 @@
     } catch (e) {
       throw new ApiNetworkError(e && e.message ? e.message : String(e));
     }
+    noteProfileTag(resp);
     if (resp.status === 401) { authenticated = false; showLogin(); return null; }
     return resp;
   }
@@ -4562,6 +4624,7 @@
         body: JSON.stringify({ chapter_index: chapterIndex, scroll_position: scrollPosition }),
         credentials: "same-origin",
       });
+      noteProfileTag(resp);
       if (resp.status === 401) { authenticated = false; showLogin(); return; }
       if (!resp.ok) return;
       const created = await resp.json();
@@ -6177,6 +6240,10 @@
         credentials: "same-origin",
         keepalive: true,
       });
+      // Checked on the reader's own write path, not just on reads: this is the
+      // request most likely to be the first thing a long-open reader tab does
+      // after the active profile moved under it.
+      noteProfileTag(resp);
       // F3: a debounced/flushed save (unlike the pagehide teardown flush)
       // can and should react to an expired session — route to the same
       // login redirect the rest of the app uses.
@@ -6631,6 +6698,7 @@
   async function loadProfiles() {
     try {
       const resp = await fetch("/api/profiles", { credentials: "same-origin" });
+      noteProfileTag(resp);
       if (!resp.ok) return cachedProfiles;
       const list = await resp.json();
       if (Array.isArray(list)) cachedProfiles = list;
@@ -6956,6 +7024,11 @@
       return;
     }
     offlineMode = false;
+    // Establishes this page's profile baseline (see `noteProfileTag`) before
+    // anything else talks to the server — the boot probe is a raw fetch, so
+    // without this the first tag recorded would be a post-switch one and the
+    // page would adopt the move instead of noticing it.
+    noteProfileTag(test);
     if (test.status === 401) { showLogin(); return; }
     authenticated = true;
     // The active profile may have moved since this browser last looked (from
