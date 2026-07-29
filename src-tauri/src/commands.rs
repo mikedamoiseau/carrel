@@ -4629,18 +4629,38 @@ pub async fn create_profile(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn switch_profile(
+/// Switches the active profile. Shared core behind both the desktop
+/// `switch_profile` command and the web layer's `POST /api/profile`, so a
+/// remote switch runs the identical validated sequence — soft-lock gate,
+/// shared pool/name swap, plugin-host rebuild, `ProfileSwitched` activity
+/// event — under the same `profile_lifecycle` lock.
+///
+/// Generic over the Tauri runtime so it can be exercised against
+/// `tauri::test::mock_app()`'s `MockRuntime` handle.
+pub(crate) async fn switch_active_profile<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
     name: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
+) -> FolioResult<()> {
+    switch_active_profile_with(app, state, name, folio_core::profile_lock::has_lock).await
+}
+
+/// [`switch_active_profile`] with the lock-status probe injected. The only
+/// production caller passes `profile_lock::has_lock`; tests pass a stub so
+/// the locked path is deterministic without a real keychain (a keychain call
+/// behaves differently per host — see the note in this module's tests).
+async fn switch_active_profile_with<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    name: String,
+    has_lock: impl Fn(&str) -> FolioResult<bool>,
 ) -> FolioResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this validate-then-mutate sequence can't interleave
-    // with `delete_profile` — otherwise `switch_profile` could validate that
-    // `name` exists, `delete_profile` could then remove its pool, and this
-    // would still set `ps.active = name`, leaving the active profile pointing
-    // at a deleted profile.
+    // with `delete_profile` — otherwise a switch could validate that `name`
+    // exists, `delete_profile` could then remove its pool, and this would
+    // still set `ps.active = name`, leaving the active profile pointing at a
+    // deleted profile.
     let _lifecycle = state.profile_lifecycle.lock().await;
     {
         let ps = state.profile_state.lock()?;
@@ -4654,10 +4674,7 @@ pub async fn switch_profile(
     // mutating `profile_state` so a rejected switch leaves the active
     // profile untouched — the frontend retries after a successful
     // `unlock_profile`.
-    if !folio_core::profile_lock::access_allowed(
-        folio_core::profile_lock::has_lock(&name)?,
-        state.is_unlocked(&name),
-    ) {
+    if !folio_core::profile_lock::access_allowed(has_lock(&name)?, state.is_unlocked(&name)) {
         return Err(FolioError::lock_required(format!(
             "Profile '{name}' is locked"
         )));
@@ -4690,7 +4707,7 @@ pub async fn switch_profile(
     // profile. Plugins are per-profile; the single bus subscriber reads the
     // swapped slot, so no listener is leaked.
     crate::plugin_host::rebuild_for_profile(
-        &app,
+        app,
         &state.data_dir,
         state.active_db()?,
         &state.plugin_manager,
@@ -4700,6 +4717,15 @@ pub async fn switch_profile(
     log_event(&conn, ActivityEvent::ProfileSwitched { name });
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn switch_profile(
+    name: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> FolioResult<()> {
+    switch_active_profile(&app, state.inner(), name).await
 }
 
 #[tauri::command]
@@ -9750,12 +9776,12 @@ mod tests {
     // exhaustively and keychain-free by
     // `folio_core::profile_lock::access_allowed`'s own unit tests.
     //
-    // `switch_profile` additionally takes a Tauri `AppHandle` (concrete,
-    // defaulting to the real `Wry` runtime — see `#[default_runtime]` on
+    // The `switch_profile` *command* takes a concrete `AppHandle` (defaulting
+    // to the real `Wry` runtime — see `#[default_runtime]` on
     // `tauri::AppHandle`), which `tauri::test::mock_app()`'s `MockRuntime`
-    // handle cannot satisfy. So `switch_profile` itself isn't exercised
-    // end-to-end here; its soft-lock gate condition is the same
-    // `access_allowed` call tested below and in folio-core.
+    // handle cannot satisfy, so the command wrapper itself isn't called here.
+    // Its whole body is `switch_active_profile`, which IS generic over the
+    // runtime and is exercised end-to-end below.
 
     /// Builds a `tauri::App<MockRuntime>` with a fresh `AppState` managed on
     /// it, backed by an in-memory DB and a tempdir data dir. `State<'_, T>`
@@ -9819,6 +9845,184 @@ mod tests {
         assert!(state.is_unlocked("alice"));
         state.mark_locked("alice").unwrap();
         assert!(!state.is_unlocked("alice"));
+    }
+
+    // ── Shared profile-switch core ───────────────────────────────────────
+    //
+    // `switch_active_profile_with` exists so these tests can drive the
+    // soft-lock decision without a real keychain (see the keychain note
+    // above): the lock-status probe is a parameter, and the only production
+    // caller passes `folio_core::profile_lock::has_lock`. The decision itself
+    // is still the shared `profile_lock::access_allowed`, so parity with the
+    // desktop command and the web gate is structural, not duplicated.
+
+    /// Adds a profile with its own on-disk DB carrying a `profile_marker`
+    /// setting that names it, so a test can prove *which* pool the shared
+    /// handle points at after a switch.
+    fn add_profile(state: &AppState, dir: &std::path::Path, name: &str) {
+        let pool = db::create_pool(&dir.join(format!("library-{name}.db"))).unwrap();
+        {
+            let conn = pool.get().unwrap();
+            db::set_setting(&conn, "profile_marker", name).unwrap();
+        }
+        state
+            .profile_state
+            .lock()
+            .unwrap()
+            .pools
+            .insert(name.to_string(), pool);
+    }
+
+    /// The `profile_marker` of whatever DB the web-server-facing shared pool
+    /// currently points at.
+    fn marker_via_shared_pool(state: &AppState) -> Option<String> {
+        let pool = state.shared_active_pool.lock().unwrap().clone();
+        let conn = pool.get().unwrap();
+        db::get_setting(&conn, "profile_marker").unwrap()
+    }
+
+    #[tokio::test]
+    async fn switch_core_swaps_shared_pool_and_active_profile_name() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+        assert_eq!(marker_via_shared_pool(&state), None, "starts on default");
+
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false))
+            .await
+            .unwrap();
+
+        assert_eq!(state.profile_state.lock().unwrap().active, "alice");
+        assert_eq!(*state.shared_active_profile_name.lock().unwrap(), "alice");
+        assert_eq!(marker_via_shared_pool(&state).as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn switch_core_rejects_unknown_profile() {
+        let (app, _dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let err =
+            switch_active_profile_with(app.handle(), &state, "ghost".to_string(), |_| Ok(false))
+                .await
+                .unwrap_err();
+
+        assert!(format!("{err}").contains("not found"), "got: {err}");
+        assert_eq!(state.profile_state.lock().unwrap().active, "default");
+        assert_eq!(*state.shared_active_profile_name.lock().unwrap(), "default");
+    }
+
+    #[tokio::test]
+    async fn switch_core_rejects_locked_profile_not_unlocked_this_session() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+
+        let err =
+            switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(true))
+                .await
+                .unwrap_err();
+
+        assert!(format!("{err}").contains("locked"), "got: {err}");
+        assert_eq!(state.profile_state.lock().unwrap().active, "default");
+        assert_eq!(*state.shared_active_profile_name.lock().unwrap(), "default");
+        assert_eq!(marker_via_shared_pool(&state), None, "pool untouched");
+    }
+
+    #[tokio::test]
+    async fn switch_core_allows_locked_profile_already_unlocked_this_session() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+        state.mark_unlocked("alice").unwrap();
+
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(true))
+            .await
+            .unwrap();
+
+        assert_eq!(state.profile_state.lock().unwrap().active, "alice");
+    }
+
+    #[tokio::test]
+    async fn switch_core_allows_profile_without_a_lock() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false))
+            .await
+            .unwrap();
+
+        assert_eq!(state.profile_state.lock().unwrap().active, "alice");
+    }
+
+    /// Fail-closed contract (A-M1 Decision 7): a keychain that can't be read
+    /// is not "unlocked" — the switch is refused, not allowed.
+    #[tokio::test]
+    async fn switch_core_refuses_when_lock_status_cannot_be_read() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+
+        let err = switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| {
+            Err(FolioError::internal("keychain unavailable"))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{err}").contains("keychain unavailable"),
+            "got: {err}"
+        );
+        assert_eq!(state.profile_state.lock().unwrap().active, "default");
+    }
+
+    /// The activity event is logged by the core, so it happens for a remote
+    /// (web) switch exactly as for the desktop command. It lands in the
+    /// *new* profile's log — that's the pool active by the time it's written.
+    #[tokio::test]
+    async fn switch_core_logs_profile_switched_in_the_new_profiles_log() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false))
+            .await
+            .unwrap();
+
+        let pool = state.shared_active_pool.lock().unwrap().clone();
+        let conn = pool.get().unwrap();
+        let entries = db::get_activity_log(&conn, 10, 0, Some("profile_switched")).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entity_name.as_deref(), Some("alice"));
+    }
+
+    /// The core must serialize on `profile_lifecycle` — the same lock
+    /// `delete_profile` holds — so a remote switch can't validate against a
+    /// profile another lifecycle command is in the middle of removing.
+    #[tokio::test]
+    async fn switch_core_waits_for_the_profile_lifecycle_lock() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+
+        let guard = state.profile_lifecycle.clone().lock_owned().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false)),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "switch must block while another profile-lifecycle command holds the lock"
+        );
+        assert_eq!(state.profile_state.lock().unwrap().active, "default");
+
+        drop(guard);
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false))
+            .await
+            .unwrap();
+        assert_eq!(state.profile_state.lock().unwrap().active, "alice");
     }
 
     /// `resolve_book_path` must return a locally-staged copy when one exists for
