@@ -315,19 +315,18 @@
       }
     }
     // Republished unconditionally, even when this page's scope didn't change:
-    // the service worker outlives page loads and memoizes the scope, so a
-    // worker that read a stale value (or missed an earlier message because it
-    // wasn't controlling a page yet) must be corrected on every boot. Both
-    // channels matter — the marker is what a cold-started worker reads, the
-    // message is what a running one acts on.
+    // the marker is the service worker's only source for the namespace, and it
+    // re-reads it per request, so publishing on every boot is what keeps a
+    // worker that outlived a switch (or a page that never controlled one)
+    // correct. Awaited, so no request can be served before it lands.
+    //
+    // Deliberately does NOT wait on `navigator.serviceWorker.ready`: that only
+    // settles once a worker is active, which on a first visit means after the
+    // whole shell + font precache, and boot must never block on it (an earlier
+    // version did, and stalled the app until the install finished).
     try {
       await (await caches.open(OFFLINE_SCOPE_CACHE)).put(OFFLINE_SCOPE_URL, new Response(token));
-    } catch (e) { /* best-effort: the postMessage below still updates a live worker */ }
-    try {
-      const reg = navigator.serviceWorker && (await navigator.serviceWorker.ready);
-      const worker = (reg && reg.active) || (navigator.serviceWorker && navigator.serviceWorker.controller);
-      if (worker) worker.postMessage({ type: "offline-scope", scope: token });
-    } catch (e) { /* best-effort */ }
+    } catch (e) { /* best-effort — a failed write leaves the previous scope */ }
     return changed;
   }
 
