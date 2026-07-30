@@ -89,7 +89,7 @@ paths satisfy the *relinking* obligation differently; both are addressed.
        pinned SHA (or by replacing `.libmobi-windows/lib/mobi.lib`
        in the build tree before `cargo build`) and re-running the
        Tauri build. The same `LIBMOBI_INCLUDE_DIR` / `LIBMOBI_LIB_DIR`
-       env vars used by CI are honoured by `folio-core/build.rs`.
+       env vars used by CI are honoured by `carrel-core/build.rs`.
 
      If you need pre-built object files (`.obj`) or the unmodified
      `mobi.lib` Carrel shipped a particular Windows release with, open

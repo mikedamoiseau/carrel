@@ -1,6 +1,6 @@
 //! Tracing subscriber initialization for the Carrel backend (F-2-3).
 //!
-//! The library crate (`folio-core`) only emits events/spans; this module —
+//! The library crate (`carrel-core`) only emits events/spans; this module —
 //! living in the binary — owns the single global subscriber. The
 //! `tracing-log` bridge (enabled via the `tracing-subscriber` feature) routes
 //! existing `log::` records into the same subscriber, so no `log::` call site
@@ -24,20 +24,20 @@ pub fn resolve_filter(env: Option<String>) -> String {
 ///
 /// - Dev (`cfg!(debug_assertions)`): human-readable `fmt` layer to stderr;
 ///   returns `None` (no flush worker needed).
-/// - Prod: non-blocking daily-rolling file at `{log_dir}/folio.log.<date>`;
+/// - Prod: non-blocking daily-rolling file at `{log_dir}/carrel.log.<date>`;
 ///   returns the `WorkerGuard`, which the caller MUST keep alive for the
 ///   lifetime of the app so buffered records flush.
 ///
 /// Uses `try_init()` so a duplicate initialization never panics — the first
 /// caller wins the global default and later calls are no-ops.
 pub fn init_tracing(log_dir: Option<PathBuf>) -> Option<WorkerGuard> {
-    let filter = EnvFilter::try_new(resolve_filter(std::env::var("FOLIO_LOG").ok()))
+    let filter = EnvFilter::try_new(resolve_filter(std::env::var("CARREL_LOG").ok()))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     match (cfg!(debug_assertions), log_dir) {
         (false, Some(dir)) => {
             let _ = std::fs::create_dir_all(&dir);
-            let appender = tracing_appender::rolling::daily(&dir, "folio.log");
+            let appender = tracing_appender::rolling::daily(&dir, "carrel.log");
             let (non_blocking, guard) = tracing_appender::non_blocking(appender);
             let _ = tracing_subscriber::registry()
                 .with(filter)
@@ -70,8 +70,8 @@ mod tests {
     fn resolve_filter_honors_env() {
         assert_eq!(resolve_filter(Some("debug".to_string())), "debug");
         assert_eq!(
-            resolve_filter(Some("folio_core=debug,info".to_string())),
-            "folio_core=debug,info"
+            resolve_filter(Some("carrel_core=debug,info".to_string())),
+            "carrel_core=debug,info"
         );
     }
 

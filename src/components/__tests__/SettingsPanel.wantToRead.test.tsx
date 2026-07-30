@@ -85,16 +85,16 @@ describe("SettingsPanel — Want to Read visibility toggle", () => {
 
     const events: Event[] = [];
     const listener = (e: Event) => events.push(e);
-    window.addEventListener("folio-show-want-to-read-changed", listener);
+    window.addEventListener("carrel-show-want-to-read-changed", listener);
 
     await act(async () => {
       fireEvent.click(toggle);
     });
 
-    expect(localStorage.getItem("folio-show-want-to-read")).toBe("true");
+    expect(localStorage.getItem("carrel-show-want-to-read")).toBe("true");
     expect(events).toHaveLength(1);
     expect(toggle).toHaveAttribute("aria-checked", "true");
 
-    window.removeEventListener("folio-show-want-to-read-changed", listener);
+    window.removeEventListener("carrel-show-want-to-read-changed", listener);
   });
 });

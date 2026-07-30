@@ -70,7 +70,7 @@ async function openReaderAtZero(page: Page, bookId: string) {
 //
 // M2 — service-worker foundations: the activate handler's shell-version
 // cleanup must never delete per-book offline content caches
-// (`folio-offline-book-*`), while still purging stale shell caches. Playwright
+// (`carrel-offline-book-*`), while still purging stale shell caches. Playwright
 // runs against localhost (a secure context), so the service worker registers
 // exactly as it does on the HTTPS deployments offline mode targets.
 
@@ -110,8 +110,8 @@ test.describe("offline mode — service worker foundations", () => {
     // cache (must die), then force a fresh SW install+activate cycle so the
     // activate purge runs with both present.
     await page.evaluate(async () => {
-      await caches.open("folio-offline-book-e2e-fake");
-      await caches.open("folio-shell-deadbeef0000");
+      await caches.open("carrel-offline-book-e2e-fake");
+      await caches.open("carrel-shell-deadbeef0000");
       const reg = await navigator.serviceWorker.getRegistration();
       await reg!.unregister();
     });
@@ -129,15 +129,15 @@ test.describe("offline mode — service worker foundations", () => {
     // stale shell cache is gone…
     await expect
       .poll(async () => page.evaluate(() => caches.keys()), { timeout: 10_000 })
-      .not.toContain("folio-shell-deadbeef0000");
+      .not.toContain("carrel-shell-deadbeef0000");
 
     // …then confirm the survivor is STILL there after the purge settles — a
     // single immediate read could race a concurrent (regressed) delete of the
     // offline cache and pass intermittently.
     await page.waitForTimeout(500);
     const keys = await page.evaluate(() => caches.keys());
-    expect(keys).toContain("folio-offline-book-e2e-fake");
-    expect(keys).not.toContain("folio-shell-deadbeef0000");
+    expect(keys).toContain("carrel-offline-book-e2e-fake");
+    expect(keys).not.toContain("carrel-shell-deadbeef0000");
   });
 });
 
@@ -151,10 +151,10 @@ test.describe("offline mode — save / unsave (M3)", () => {
     // The cache holds detail JSON, covers, TOC, both chapters, and the
     // chapter-1 inline image; the manifest row exists with a matching hash.
     const state = await page.evaluate(async (id) => {
-      const cache = await caches.open(`folio-offline-book-${id}`);
+      const cache = await caches.open(`carrel-offline-book-${id}`);
       const keys = (await cache.keys()).map((r) => new URL(r.url).pathname + new URL(r.url).search);
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -204,7 +204,7 @@ test.describe("offline mode — save / unsave (M3)", () => {
     await widthRequest;
 
     const keys = await page.evaluate(async (id) => {
-      const cache = await caches.open(`folio-offline-book-${id}`);
+      const cache = await caches.open(`carrel-offline-book-${id}`);
       return (await cache.keys()).map((r) => new URL(r.url).pathname + new URL(r.url).search);
     }, CBZ_ID);
     expect(keys).toContain(`/api/books/${CBZ_ID}/pages/0?width=1080`);
@@ -220,7 +220,7 @@ test.describe("offline mode — save / unsave (M3)", () => {
 
     // Poison the cached chapter 1 with a sentinel.
     await page.evaluate(async (id) => {
-      const cache = await caches.open(`folio-offline-book-${id}`);
+      const cache = await caches.open(`carrel-offline-book-${id}`);
       await cache.put(
         new Request(`/api/books/${id}/chapters/1`),
         new Response("<p>SENTINEL-CACHED</p>", { headers: { "Content-Type": "text/html" } }),
@@ -257,7 +257,7 @@ test.describe("offline mode — save / unsave (M3)", () => {
     // Exactly one manifest row for this book (no duplicate from the guard).
     const count = await page.evaluate(async (id) => {
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -292,9 +292,9 @@ test.describe("offline mode — save / unsave (M3)", () => {
     await expect(page.locator("#offline-save-btn")).toBeVisible();
 
     const gone = await page.evaluate(async (id) => {
-      const hasCache = await caches.has(`folio-offline-book-${id}`);
+      const hasCache = await caches.has(`carrel-offline-book-${id}`);
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -407,10 +407,10 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     await page.goto("/#/");
     await page.evaluate(async () => {
       for (const k of await caches.keys()) {
-        if (k.startsWith("folio-offline-book-")) await caches.delete(k);
+        if (k.startsWith("carrel-offline-book-")) await caches.delete(k);
       }
       await new Promise<void>((res) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => {
           const db = req.result;
           const tx = db.transaction("books", "readwrite");
@@ -430,7 +430,7 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     await page.waitForFunction(
       async () => {
         if (!navigator.serviceWorker.controller) return false;
-        const shell = (await caches.keys()).find((k) => k.startsWith("folio-shell-"));
+        const shell = (await caches.keys()).find((k) => k.startsWith("carrel-shell-"));
         if (!shell) return false;
         return !!(await (await caches.open(shell)).match("/"));
       },
@@ -471,7 +471,7 @@ test.describe("offline mode — progress replay (M5)", () => {
     // A queue row now exists for this book.
     const queued = await page.evaluate(async (id) => {
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -498,7 +498,7 @@ test.describe("offline mode — progress replay (M5)", () => {
       .poll(async () =>
         page.evaluate(async (id) => {
           const db = await new Promise<IDBDatabase>((res, rej) => {
-            const req = indexedDB.open("folio-offline");
+            const req = indexedDB.open("carrel-offline");
             req.onsuccess = () => res(req.result);
             req.onerror = () => rej(req.error);
           });
@@ -529,7 +529,7 @@ test.describe("offline mode — progress replay (M5)", () => {
     await openReaderAtZero(page, CBZ_ID);
     await page.evaluate(async (id) => {
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -565,7 +565,7 @@ test.describe("offline mode — progress replay (M5)", () => {
       .poll(async () =>
         page.evaluate(async (id) => {
           const db = await new Promise<IDBDatabase>((res, rej) => {
-            const req = indexedDB.open("folio-offline");
+            const req = indexedDB.open("carrel-offline");
             req.onsuccess = () => res(req.result);
             req.onerror = () => rej(req.error);
           });
@@ -590,7 +590,7 @@ test.describe("offline mode — eviction integrity & reconciliation (M6)", () =>
     // Simulate browser eviction: delete one cached entry so the cache's key
     // set no longer matches the manifest's inventory hash.
     await page.evaluate(async (id) => {
-      const cache = await caches.open(`folio-offline-book-${id}`);
+      const cache = await caches.open(`carrel-offline-book-${id}`);
       await cache.delete(new Request(`/api/books/${id}/chapters/1`));
     }, EPUB_ID);
 
@@ -602,9 +602,9 @@ test.describe("offline mode — eviction integrity & reconciliation (M6)", () =>
     });
 
     const state = await page.evaluate(async (id) => {
-      const hasCache = await caches.has(`folio-offline-book-${id}`);
+      const hasCache = await caches.has(`carrel-offline-book-${id}`);
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -632,12 +632,12 @@ test.describe("offline mode — eviction integrity & reconciliation (M6)", () =>
     const GHOST = "e2e-book-ghost-999";
     await page.goto("/#/");
     await page.evaluate(async (id) => {
-      const cache = await caches.open(`folio-offline-book-${id}`);
+      const cache = await caches.open(`carrel-offline-book-${id}`);
       await cache.put(new Request(`/api/books/${id}`), new Response("{}", {
         headers: { "Content-Type": "application/json" },
       }));
       const db = await new Promise<IDBDatabase>((res, rej) => {
-        const req = indexedDB.open("folio-offline");
+        const req = indexedDB.open("carrel-offline");
         req.onsuccess = () => res(req.result);
         req.onerror = () => rej(req.error);
       });
@@ -659,9 +659,9 @@ test.describe("offline mode — eviction integrity & reconciliation (M6)", () =>
     await expect
       .poll(async () =>
         page.evaluate(async (id) => {
-          const hasCache = await caches.has(`folio-offline-book-${id}`);
+          const hasCache = await caches.has(`carrel-offline-book-${id}`);
           const db = await new Promise<IDBDatabase>((res, rej) => {
-            const req = indexedDB.open("folio-offline");
+            const req = indexedDB.open("carrel-offline");
             req.onsuccess = () => res(req.result);
             req.onerror = () => rej(req.error);
           });
@@ -800,7 +800,7 @@ test.describe("offline mode — profile scoping", () => {
   }
 
   const offlineBookCacheKeys = (page: Page) =>
-    page.evaluate(() => caches.keys().then((k) => k.filter((n) => n.startsWith("folio-offline-book-"))));
+    page.evaluate(() => caches.keys().then((k) => k.filter((n) => n.startsWith("carrel-offline-book-"))));
 
   test.afterEach(async ({ page }) => {
     // The active profile is server-global state shared with every other spec.
@@ -857,7 +857,7 @@ test.describe("offline mode — profile scoping", () => {
     await page.addInitScript(() => {
       const open = caches.open.bind(caches);
       caches.open = (name: string) =>
-        name === "folio-offline-scope"
+        name === "carrel-offline-scope"
           ? Promise.reject(new DOMException("Quota exceeded", "QuotaExceededError"))
           : open(name);
     });

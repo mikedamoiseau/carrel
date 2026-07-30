@@ -16,10 +16,10 @@ pub mod tray;
 pub mod update;
 pub mod web_server;
 
-// Re-export every module that now lives in folio-core so existing `crate::…`
+// Re-export every module that now lives in carrel-core so existing `crate::…`
 // call sites in commands.rs, web_server, and tray keep compiling unchanged.
-// New code should prefer `use folio_core::…` directly.
-pub use folio_core::{
+// New code should prefer `use carrel_core::…` directly.
+pub use carrel_core::{
     backup, cbr, cbz, db, enrichment, epub, error, image_util, models, opds, openlibrary,
     page_cache, paths, pdf, providers, sync,
 };
@@ -109,7 +109,7 @@ pub fn run() {
             // enrichment call site reports without plumbing.
             {
                 let handle = app.handle().clone();
-                folio_core::http_retry::set_retry_observer(Box::new(move |ev| {
+                carrel_core::http_retry::set_retry_observer(Box::new(move |ev| {
                     let _ = handle.emit("enrichment-retry", ev);
                 }));
             }
@@ -170,7 +170,7 @@ pub fn run() {
             // `profile_lock_status` (checked against `get_profiles`'
             // active entry) and presents the unlock prompt.
             let mut unlocked_profiles = std::collections::HashSet::new();
-            if !folio_core::profile_lock::has_lock("default").unwrap_or(true) {
+            if !carrel_core::profile_lock::has_lock("default").unwrap_or(true) {
                 unlocked_profiles.insert("default".to_string());
             }
 
@@ -392,8 +392,8 @@ pub fn run() {
                 // may be populated later by `unlock_profile` once a
                 // locked-at-boot profile is unlocked.
                 let bus_slot = slot.clone();
-                folio_core::events::bus().subscribe(Box::new(
-                    move |event: &folio_core::events::FolioEvent| {
+                carrel_core::events::bus().subscribe(Box::new(
+                    move |event: &carrel_core::events::CarrelEvent| {
                         let mgr = bus_slot.lock().ok().and_then(|g| g.clone());
                         if let Some(mgr) = mgr {
                             mgr.handle_event(event);
@@ -415,7 +415,7 @@ pub fn run() {
                         *guard = manager;
                     }
                     // Plugin/hook system M1: app-lifecycle hook point.
-                    folio_core::events::bus().emit(folio_core::events::FolioEvent::AppStarted);
+                    carrel_core::events::bus().emit(carrel_core::events::CarrelEvent::AppStarted);
                 }
             }
 

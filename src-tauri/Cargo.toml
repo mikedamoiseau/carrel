@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-folio-core = { path = "../folio-core" }
+carrel-core = { path = "../carrel-core" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
@@ -73,19 +73,19 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-folio-core = { path = "../folio-core", features = ["test-utils"] }
+carrel-core = { path = "../carrel-core", features = ["test-utils"] }
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "test"] }
 tokio = { version = "1", features = ["macros"] }
 wiremock = "0.6"
 
 [features]
 default = ["sftp"]
-# Delegate to folio-core's sftp feature since `backup` now lives in the core
+# Delegate to carrel-core's sftp feature since `backup` now lives in the core
 # crate (#63 M5). Keeping the desktop flag as a convenience pass-through.
-sftp = ["folio-core/sftp"]
+sftp = ["carrel-core/sftp"]
 # MOBI/AZW/AZW3 support (#34). Opt-in because libmobi (LGPL v3+) must be
 # available at build time via pkg-config or LIBMOBI_*_DIR env vars. CI on
 # Linux installs libmobi-dev via apt (see .github/workflows/ci.yml);
 # locally, enable with `cargo … --features mobi`.
-mobi = ["folio-core/mobi"]
+mobi = ["carrel-core/mobi"]
 

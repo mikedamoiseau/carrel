@@ -64,7 +64,7 @@ describe("loadSavedThemes", () => {
 
   it("returns valid themes from localStorage", () => {
     const theme = makeTheme();
-    localStorage.setItem("folio-saved-themes", JSON.stringify([theme]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([theme]));
     const result = loadSavedThemes();
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("id-1");
@@ -72,19 +72,19 @@ describe("loadSavedThemes", () => {
   });
 
   it("returns empty array for corrupted JSON", () => {
-    localStorage.setItem("folio-saved-themes", "not-valid-json{{{");
+    localStorage.setItem("carrel-saved-themes", "not-valid-json{{{");
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("returns empty array when stored value is not an array", () => {
-    localStorage.setItem("folio-saved-themes", JSON.stringify({ id: "id-1" }));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify({ id: "id-1" }));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("migrates pre-upgrade themes without mode field as custom", () => {
     // Simulate a theme saved by the old schema (no `mode` field)
     const { mode: _mode, ...legacyTheme } = makeTheme({ id: "id-legacy", name: "Legacy" });
-    localStorage.setItem("folio-saved-themes", JSON.stringify([legacyTheme]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([legacyTheme]));
     const result = loadSavedThemes();
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe("id-legacy");
@@ -93,7 +93,7 @@ describe("loadSavedThemes", () => {
 
   it("does not overwrite an existing mode during migration", () => {
     const theme = makeTheme({ id: "id-dark", name: "Dark Theme", mode: "dark" });
-    localStorage.setItem("folio-saved-themes", JSON.stringify([theme]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([theme]));
     const result = loadSavedThemes();
     expect(result).toHaveLength(1);
     expect(result[0].mode).toBe("dark");
@@ -103,7 +103,7 @@ describe("loadSavedThemes", () => {
     const valid = makeTheme({ id: "id-valid" });
     const malformed = { id: 123, name: null }; // missing required fields
     localStorage.setItem(
-      "folio-saved-themes",
+      "carrel-saved-themes",
       JSON.stringify([malformed, valid])
     );
     const result = loadSavedThemes();
@@ -113,19 +113,19 @@ describe("loadSavedThemes", () => {
 
   it("filters out entries missing colors object", () => {
     const bad = { ...makeTheme(), colors: "not-an-object" };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("filters out entries missing typography object", () => {
     const bad = { ...makeTheme(), typography: null };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("filters out entries with empty typography object", () => {
     const bad = { ...makeTheme(), typography: {} };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
@@ -140,7 +140,7 @@ describe("loadSavedThemes", () => {
         hyphenation: true,
       },
     };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
@@ -155,7 +155,7 @@ describe("loadSavedThemes", () => {
         hyphenation: true,
       },
     };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
@@ -170,13 +170,13 @@ describe("loadSavedThemes", () => {
         hyphenation: "yes",
       },
     };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("filters out entries with NaN numeric fields", () => {
     const bad = { ...makeTheme(), fontSize: NaN };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
@@ -191,25 +191,25 @@ describe("loadSavedThemes", () => {
         hyphenation: true,
       },
     };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("filters out entries with non-positive createdAt", () => {
     const bad = { ...makeTheme(), createdAt: -1 };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("filters out entries with incomplete color tokens", () => {
     const bad = { ...makeTheme(), colors: { paper: "#ffffff" } }; // missing 8 tokens
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
   it("filters out entries with empty colors object", () => {
     const bad = { ...makeTheme(), colors: {} };
-    localStorage.setItem("folio-saved-themes", JSON.stringify([bad]));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify([bad]));
     expect(loadSavedThemes()).toEqual([]);
   });
 
@@ -218,7 +218,7 @@ describe("loadSavedThemes", () => {
       makeTheme({ id: "id-1", name: "Theme 1" }),
       makeTheme({ id: "id-2", name: "Theme 2" }),
     ];
-    localStorage.setItem("folio-saved-themes", JSON.stringify(themes));
+    localStorage.setItem("carrel-saved-themes", JSON.stringify(themes));
     expect(loadSavedThemes()).toHaveLength(2);
   });
 });
@@ -234,7 +234,7 @@ describe("saveSavedThemes", () => {
   it("persists themes to localStorage", () => {
     const themes = [makeTheme()];
     saveSavedThemes(themes);
-    expect(localStorage.getItem("folio-saved-themes")).not.toBeNull();
+    expect(localStorage.getItem("carrel-saved-themes")).not.toBeNull();
   });
 
   it("persisted themes can be reloaded", () => {

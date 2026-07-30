@@ -149,7 +149,7 @@ test.describe("web reader bookmarks — not cached offline", () => {
   test.use({ serviceWorkers: "allow" });
 
   test("bookmarks never enter a saved book's offline cache", async ({ page }) => {
-    // Save book 050 offline (populates folio-offline-book-<id>).
+    // Save book 050 offline (populates carrel-offline-book-<id>).
     await page.goto(`/#/book/${EPUB_ID}`);
     await openDetailMenu(page);
     await page.locator("#offline-save-btn").click();

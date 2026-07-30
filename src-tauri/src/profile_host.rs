@@ -12,7 +12,7 @@
 //! validated sequence and cannot drift from the desktop's rules.
 
 use crate::commands::AppState;
-use crate::error::FolioResult;
+use crate::error::CarrelResult;
 use crate::web_server::{ProfileHost, WebProfile};
 use tauri::{AppHandle, Manager};
 
@@ -22,14 +22,14 @@ struct TauriProfileHost {
 }
 
 impl ProfileHost for TauriProfileHost {
-    fn list(&self) -> FolioResult<Vec<WebProfile>> {
+    fn list(&self) -> CarrelResult<Vec<WebProfile>> {
         crate::commands::list_profiles_with_lock_state(&self.app.state::<AppState>())
     }
 
     fn switch(
         &self,
         name: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FolioResult<()>> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CarrelResult<()>> + Send + '_>> {
         Box::pin(async move {
             let state = self.app.state::<AppState>();
             crate::commands::switch_active_profile(&self.app, &state, name).await

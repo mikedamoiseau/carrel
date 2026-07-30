@@ -407,18 +407,18 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
 
   // Continue Reading section visibility (default true)
   const [showContinueReading, setShowContinueReading] = useState(() => {
-    const stored = localStorage.getItem("folio-show-continue-reading");
+    const stored = localStorage.getItem("carrel-show-continue-reading");
     return stored === null ? true : stored === "true";
   });
 
   // Discover section visibility
-  const [showDiscover, setShowDiscover] = useState(() => localStorage.getItem("folio-show-discover") === "true");
+  const [showDiscover, setShowDiscover] = useState(() => localStorage.getItem("carrel-show-discover") === "true");
 
   // Want to Read section visibility
-  const [showWantToRead, setShowWantToRead] = useState(() => localStorage.getItem("folio-show-want-to-read") === "true");
+  const [showWantToRead, setShowWantToRead] = useState(() => localStorage.getItem("carrel-show-want-to-read") === "true");
 
   // Auto-focus new imported books (default off)
-  const [autoFocusNewBooks, setAutoFocusNewBooks] = useState(() => localStorage.getItem("folio-auto-focus-new-books") === "true");
+  const [autoFocusNewBooks, setAutoFocusNewBooks] = useState(() => localStorage.getItem("carrel-auto-focus-new-books") === "true");
   const [updateCheckStartup, setUpdateCheckStartup] = useState(true);
 
   const [savedThemes, setSavedThemes] = useState<SavedTheme[]>(loadSavedThemes);
@@ -1084,7 +1084,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
       setBackupMessage(t("settings.importedBooks", { count }));
       // Tell the Library screen to re-fetch — restore writes books,
       // collections, and tags directly to the DB.
-      window.dispatchEvent(new Event("folio-library-changed"));
+      window.dispatchEvent(new Event("carrel-library-changed"));
       setRestoreConfirmPath(null);
       setRestoreModalOpen(false);
     } catch (err) {
@@ -1454,8 +1454,8 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   onClick={() => {
                     const next = !showContinueReading;
                     setShowContinueReading(next);
-                    localStorage.setItem("folio-show-continue-reading", String(next));
-                    window.dispatchEvent(new Event("folio-show-continue-reading-changed"));
+                    localStorage.setItem("carrel-show-continue-reading", String(next));
+                    window.dispatchEvent(new Event("carrel-show-continue-reading-changed"));
                   }}
                   className={`relative w-10 h-6 rounded-full transition-colors shrink-0 ${showContinueReading ? "bg-accent" : "bg-warm-border"}`}
                 >
@@ -1477,8 +1477,8 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   onClick={() => {
                     const next = !showDiscover;
                     setShowDiscover(next);
-                    localStorage.setItem("folio-show-discover", String(next));
-                    window.dispatchEvent(new Event("folio-show-discover-changed"));
+                    localStorage.setItem("carrel-show-discover", String(next));
+                    window.dispatchEvent(new Event("carrel-show-discover-changed"));
                   }}
                   className={`relative w-10 h-6 rounded-full transition-colors shrink-0 ${showDiscover ? "bg-accent" : "bg-warm-border"}`}
                 >
@@ -1500,8 +1500,8 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   onClick={() => {
                     const next = !showWantToRead;
                     setShowWantToRead(next);
-                    localStorage.setItem("folio-show-want-to-read", String(next));
-                    window.dispatchEvent(new Event("folio-show-want-to-read-changed"));
+                    localStorage.setItem("carrel-show-want-to-read", String(next));
+                    window.dispatchEvent(new Event("carrel-show-want-to-read-changed"));
                   }}
                   className={`relative w-10 h-6 rounded-full transition-colors shrink-0 ${showWantToRead ? "bg-accent" : "bg-warm-border"}`}
                 >
@@ -1523,7 +1523,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
                   onClick={() => {
                     const next = !autoFocusNewBooks;
                     setAutoFocusNewBooks(next);
-                    localStorage.setItem("folio-auto-focus-new-books", String(next));
+                    localStorage.setItem("carrel-auto-focus-new-books", String(next));
                   }}
                   className={`relative w-10 h-6 rounded-full transition-colors shrink-0 ${autoFocusNewBooks ? "bg-accent" : "bg-warm-border"}`}
                 >

@@ -40,11 +40,11 @@ const ALLOWED_WITHOUT_RUST_MATCH = new Set<string>([
 describe("MESSAGE_KEYS / Rust source sync", () => {
     it("every substring appears in the Rust backend", () => {
         // Scan both crates in the workspace: the desktop app and the shared
-        // folio-core library (extracted in #63). Error messages may live in
+        // carrel-core library (extracted in #63). Error messages may live in
         // either.
         const rustRoots = [
             resolve(__dirname, "../../src-tauri/src"),
-            resolve(__dirname, "../../folio-core/src"),
+            resolve(__dirname, "../../carrel-core/src"),
         ];
         const files = rustRoots.flatMap((root) => collectRustSources(root));
         const combined = files

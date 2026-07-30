@@ -3,7 +3,7 @@ import DOMPurify from "dompurify";
 
 // DOMPurify's default URI allowlist rejects custom schemes, which would strip
 // the reader's own `asset://localhost/...` image sources (see
-// `rewrite_img_srcs_to_asset_urls` in folio-core). This is the upstream default
+// `rewrite_img_srcs_to_asset_urls` in carrel-core). This is the upstream default
 // with `asset` added to the scheme alternation; nothing else is loosened.
 const ALLOWED_URI_REGEXP =
   /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|asset):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;

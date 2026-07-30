@@ -148,7 +148,7 @@ Click the **+ Add books** button in the top-right corner to open the import menu
 
 **Drag and drop:** You can also drag files from Finder or File Explorer directly onto the library window. A "Drop to import" overlay appears. Release to import them.
 
-When you import a book, Carrel copies the file into its own managed library folder (default `~/Documents/Folio Library/` — the folder name predates the Carrel rename and is kept so existing libraries are not orphaned). The original file is not modified or moved. Duplicate files are detected by content hash and skipped automatically.
+When you import a book, Carrel copies the file into its own managed library folder (default `~/Documents/Carrel Library/` — the folder name predates the Carrel rename and is kept so existing libraries are not orphaned). The original file is not modified or moved. Duplicate files are detected by content hash and skipped automatically.
 
 **Re-scanning a folder is fast.** If you import the same folder again — for example to resume after an interrupted batch, or to pick up newly added books — Carrel skips files it has already imported without re-reading their contents, as long as the file is unchanged (same path, size, and modification time). Only new or changed files are read in full. This makes re-importing a large folder from a network drive or external disk quick, even with thousands of books.
 
@@ -1100,11 +1100,11 @@ If you do not need MOBI support, use the Intel (x86_64) macOS release build — 
 
 | Platform | Location |
 |----------|----------|
-| macOS    | `~/Library/Application Support/com.mike.folio/` |
-| Windows  | `%APPDATA%\com.mike.folio\` |
-| Linux    | `~/.local/share/com.mike.folio/` |
+| macOS    | `~/Library/Application Support/com.mike.carrel/` |
+| Windows  | `%APPDATA%\com.mike.carrel\` |
+| Linux    | `~/.local/share/com.mike.carrel/` |
 
-**Book files:** Imported books are copied to the library folder, which defaults to `~/Documents/Folio Library/`. You can change this in Settings. Since Carrel keeps its own copy of each book, moving or deleting the original file has no effect on your library.
+**Book files:** Imported books are copied to the library folder, which defaults to `~/Documents/Carrel Library/`. You can change this in Settings. Since Carrel keeps its own copy of each book, moving or deleting the original file has no effect on your library.
 
 ### The app won't start
 

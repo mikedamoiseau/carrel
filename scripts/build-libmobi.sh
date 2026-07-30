@@ -129,4 +129,4 @@ case "$(uname -s)" in
 esac
 
 echo
-echo "Then: cargo build -p folio-core --features mobi"
+echo "Then: cargo build -p carrel-core --features mobi"

@@ -27,7 +27,7 @@ import { usePrivateMode } from "../hooks/usePrivateMode";
 import { getVolatilePosition, setVolatilePosition } from "../lib/volatileResume";
 import { sanitizeChapterHtml } from "../lib/sanitizeHtml";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { friendlyError, isBookFileMissing, toFolioError } from "../lib/errors";
+import { friendlyError, isBookFileMissing, toCarrelError } from "../lib/errors";
 import { extractLookupWord, groupSensesByPos, POS_LABEL_KEYS, type DictionaryEntry, type DictionaryStatus } from "../lib/dictionary";
 import { extractContextSentence, formatDefinitionSnapshot, primarySense } from "../lib/vocabulary";
 import { useToast } from "./Toast";
@@ -244,20 +244,20 @@ export default function ReaderPane({
   // bookId change AND write storage at toggle time (not via an effect) to
   // avoid persisting book A's state to book B's key during the swap.
   const [thumbStripOpen, setThumbStripOpen] = useState(() =>
-    bookId ? localStorage.getItem(`folio-thumbstrip-${bookId}`) === "1" : false,
+    bookId ? localStorage.getItem(`carrel-thumbstrip-${bookId}`) === "1" : false,
   );
   useEffect(() => {
     if (!bookId) {
       setThumbStripOpen(false);
       return;
     }
-    setThumbStripOpen(localStorage.getItem(`folio-thumbstrip-${bookId}`) === "1");
+    setThumbStripOpen(localStorage.getItem(`carrel-thumbstrip-${bookId}`) === "1");
   }, [bookId]);
   const toggleThumbStrip = useCallback(() => {
     if (!bookId) return;
     setThumbStripOpen((prev) => {
       const next = !prev;
-      const key = `folio-thumbstrip-${bookId}`;
+      const key = `carrel-thumbstrip-${bookId}`;
       if (next) localStorage.setItem(key, "1");
       else localStorage.removeItem(key);
       return next;
@@ -1338,7 +1338,7 @@ export default function ReaderPane({
         console.error("vocab log failed", e);
       }
     } catch (err) {
-      const { kind } = toFolioError(err);
+      const { kind } = toCarrelError(err);
       const notReady = kind === "NotFound";
       if (notReady) setDictionaryReady(false); // artifact vanished — hide Define
       setDefinitionCard((c) =>

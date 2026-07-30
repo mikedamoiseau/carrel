@@ -25,7 +25,7 @@
 //!   crucially no runtime dependency on a Homebrew `libmobi.0.dylib` at an
 //!   absolute path (which crashed the app on launch for users without
 //!   `brew install libmobi`). Linux keeps dynamic linking (apt libmobi);
-//!   the platform difference lives in `folio-core/build.rs`.
+//!   the platform difference lives in `carrel-core/build.rs`.
 
 #[cfg(test)]
 mod tests {
@@ -136,7 +136,7 @@ mod tests {
     /// bundler config to coerce the loader's DLL search path.
     /// Switching back to a shared build would require simultaneous
     /// changes to `tauri.conf.json` (resource layout), the OS
-    /// DLL-loading story, and `folio-core/build.rs` (link kind), so
+    /// DLL-loading story, and `carrel-core/build.rs` (link kind), so
     /// the test guards the static decision at the build-config level.
     #[test]
     fn windows_libmobi_build_is_static() {
@@ -151,7 +151,7 @@ mod tests {
     }
 
     /// Once `--features mobi` is on, the Tauri build step needs to
-    /// know where libmobi's headers/libs live — `folio-core/build.rs`
+    /// know where libmobi's headers/libs live — `carrel-core/build.rs`
     /// uses pkg-config first, falls back to LIBMOBI_INCLUDE_DIR /
     /// LIBMOBI_LIB_DIR. MSVC has no pkg-config in PATH on a stock
     /// runner, so the fallback is the actual exercised path. Without
@@ -162,14 +162,14 @@ mod tests {
         assert!(
             RELEASE_YML.contains("LIBMOBI_INCLUDE_DIR:"),
             "release.yml must export `LIBMOBI_INCLUDE_DIR` to the \
-             Tauri build step on Windows — folio-core/build.rs needs \
+             Tauri build step on Windows — carrel-core/build.rs needs \
              it to locate `mobi.h` for bindgen. Without this, the \
              Windows release fails at bindgen time."
         );
         assert!(
             RELEASE_YML.contains("LIBMOBI_LIB_DIR:"),
             "release.yml must export `LIBMOBI_LIB_DIR` to the Tauri \
-             build step on Windows — folio-core/build.rs needs it to \
+             build step on Windows — carrel-core/build.rs needs it to \
              tell rustc where `mobi.lib` lives. Without this, the \
              Windows release fails at link time with \"cannot find \
              -lmobi\"."
@@ -305,7 +305,7 @@ mod tests {
         );
         assert!(
             RELEASE_YML.contains("LIBMOBI_STATIC:"),
-            "release.yml must export `LIBMOBI_STATIC` so folio-core/build.rs \
+            "release.yml must export `LIBMOBI_STATIC` so carrel-core/build.rs \
              links the from-source `libmobi.a` statically on macOS instead of \
              a dylib."
         );

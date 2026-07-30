@@ -14,7 +14,7 @@ Plugins are user-supplied [Rhai](https://rhai.rs) scripts that react to
 lifecycle events. The whole thing splits across two crates, and the split
 matters:
 
-- `folio-core` owns the event bus, the manager, the Rhai runtime, and the
+- `carrel-core` owns the event bus, the manager, the Rhai runtime, and the
   permission model. It has no idea Tauri exists. Everything here is testable
   with a `tempfile` SQLite pool and a mock for the one trait it can't provide
   itself.
@@ -22,13 +22,13 @@ matters:
   notification + book-import implementation, owns the manager instance, wires
   it onto the bus, and exposes the IPC commands the Settings UI calls.
 
-The reason for that boundary: `folio-core` is UI-free and stays that way.
+The reason for that boundary: `carrel-core` is UI-free and stays that way.
 Anything that needs the OS or the running app gets injected through a single
 trait (`HostServices`). A non-desktop host — a CLI, a test — provides its own.
 
 ```mermaid
 flowchart TB
-    subgraph core["folio-core (UI-free)"]
+    subgraph core["carrel-core (UI-free)"]
         bus["EventBus<br/>bounded queue + dispatch thread"]
         mgr["PluginManager<br/>discover / enable / dispatch"]
         rt["PluginRuntime<br/>Rhai engine per plugin"]
@@ -58,11 +58,11 @@ flowchart TB
 
 ### What an event carries
 
-`FolioEvent` is a plain enum, one variant per hook point. The rule the whole
+`CarrelEvent` is a plain enum, one variant per hook point. The rule the whole
 surface follows: payloads carry IDs, never full records.
 
 ```rust
-pub enum FolioEvent {
+pub enum CarrelEvent {
     AppStarted,
     BookImported { book_id: String, format: BookFormat, source: ImportSource },
     BookOpened { book_id: String },
@@ -78,7 +78,7 @@ call a host function gated behind `read:library`. The event surface stays
 permission-neutral; the permission model does the gating in one place.
 
 Event names are a published contract — they're what manifests put in
-`[events] subscribe`. `FolioEvent::name()` and `ALL_NAMES` are the single
+`[events] subscribe`. `CarrelEvent::name()` and `ALL_NAMES` are the single
 source for them, and a test asserts every variant has a name and the two lists
 agree. Rename a variant and that test fails before a stale manifest ever loads.
 
@@ -104,7 +104,7 @@ order. Three things fall out of that design:
 sequenceDiagram
     participant Cmd as Command (import_book, ...)
     participant Bus as EventBus
-    participant Thread as folio-events thread
+    participant Thread as carrel-events thread
     participant Mgr as PluginManager
 
     Cmd->>Bus: emit(BookImported {..})
@@ -384,7 +384,7 @@ schema migration path at all.
 
 ## Desktop wiring
 
-`folio-core` can't notify or import on its own, so `DesktopHostServices`
+`carrel-core` can't notify or import on its own, so `DesktopHostServices`
 implements `HostServices`: `notify` goes through `tauri-plugin-notification`,
 `import_from_url` calls the same `import_book_from_url` path the rest of the app
 uses (dedup, copy-on-import, `ImportSource::Download`).
@@ -409,7 +409,7 @@ flowchart TD
     switch["switch_profile"] --> rebuild["rebuild_for_profile<br/>(new DB + plugins dir)"]
     rebuild --> slot
 
-    event["FolioEvent emitted"] --> sub2["forwarding closure"]
+    event["CarrelEvent emitted"] --> sub2["forwarding closure"]
     sub2 --> read["read current manager from slot"]
     read --> dispatch["manager.handle_event"]
 ```
@@ -437,12 +437,12 @@ exist yet. v1 ships `AppStarted` plus the manual **Run now** button only.
 
 | Concern | File |
 |---------|------|
-| Event enum + bus | `folio-core/src/events.rs` |
-| Manager (discover/load/dispatch) | `folio-core/src/plugins/mod.rs` |
-| Manifest parse + validate | `folio-core/src/plugins/manifest.rs` |
-| Permission taxonomy + persistence | `folio-core/src/plugins/permissions.rs` |
-| Rhai runtime + host functions | `folio-core/src/plugins/runtime.rs` |
-| SSRF-guarded download | `folio-core/src/opds.rs` |
+| Event enum + bus | `carrel-core/src/events.rs` |
+| Manager (discover/load/dispatch) | `carrel-core/src/plugins/mod.rs` |
+| Manifest parse + validate | `carrel-core/src/plugins/manifest.rs` |
+| Permission taxonomy + persistence | `carrel-core/src/plugins/permissions.rs` |
+| Rhai runtime + host functions | `carrel-core/src/plugins/runtime.rs` |
+| SSRF-guarded download | `carrel-core/src/opds.rs` |
 | Desktop host services + IPC commands | `src-tauri/src/plugin_host.rs` |
 | Bus wiring + manager init | `src-tauri/src/lib.rs` |
 | Settings UI | `src/components/PluginsPanel.tsx` |

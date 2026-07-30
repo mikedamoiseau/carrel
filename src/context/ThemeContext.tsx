@@ -60,22 +60,20 @@ interface ThemeContextValue {
   loadTheme: (theme: { colors: ColorTokens; fontFamily: string; fontSize: number; typography: TypographySettings }) => void;
 }
 
-// These keys keep their `folio-` prefix after the Carrel rename — they name
-// values already in every user's localStorage, and renaming them silently
-// resets theme, typography, and reader preferences. Same for the library
-// filters in `src/screens/Library.tsx` and the web UI's keys in
-// `static/app.js`. See CLAUDE.md, "Legacy `folio` identifiers".
+// These keys name values in the user's localStorage: renaming one silently
+// resets that preference rather than migrating it. Same for the library filters
+// in `src/screens/Library.tsx` and the web UI's keys in `static/app.js`.
 const STORAGE_KEYS = {
-  theme: "folio-theme",
-  customColors: "folio-custom-colors",
-  fontSize: "folio-font-size",
-  fontFamily: "folio-font-family",
-  scrollMode: "folio-scroll-mode",
-  typography: "folio-typography",
-  customCss: "folio-custom-css",
-  dualPage: "folio-dual-page",
-  mangaMode: "folio-manga-mode",
-  pageAnimation: "folio-page-animation",
+  theme: "carrel-theme",
+  customColors: "carrel-custom-colors",
+  fontSize: "carrel-font-size",
+  fontFamily: "carrel-font-family",
+  scrollMode: "carrel-scroll-mode",
+  typography: "carrel-typography",
+  customCss: "carrel-custom-css",
+  dualPage: "carrel-dual-page",
+  mangaMode: "carrel-manga-mode",
+  pageAnimation: "carrel-page-animation",
 } as const;
 
 export const MIN_FONT_SIZE = 14;

@@ -77,9 +77,9 @@ mod tests {
     /// Folio → Carrel rename) silently produce MSIs that install *side-by-side*
     /// with the user's existing install instead of upgrading it. `MajorUpgrade`
     /// matches on this code alone, so pinning it is what keeps in-place upgrades
-    /// working across the rename. See CLAUDE.md, "Legacy `folio` identifiers".
+    /// working across the rename. See CLAUDE.md, "Persistence-boundary identifiers".
     #[test]
-    fn wix_upgrade_code_is_pinned_to_the_folio_era_value() {
+    fn wix_upgrade_code_is_pinned_to_the_carrel_era_value() {
         const FOLIO_ERA_UPGRADE_CODE: &str = "21c2cdba-327a-5023-94aa-a2fbf307774c";
         let base = parse(BASE);
         let code = base

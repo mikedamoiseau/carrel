@@ -21,7 +21,7 @@ i18n
     interpolation: { escapeValue: false },
     detection: {
       order: ["localStorage", "navigator"],
-      lookupLocalStorage: "folio-language",
+      lookupLocalStorage: "carrel-language",
       caches: ["localStorage"],
     },
   });

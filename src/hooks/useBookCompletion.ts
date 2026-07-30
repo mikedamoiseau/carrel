@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-const DISMISSED_KEY = "folio-celebration-dismissed";
+const DISMISSED_KEY = "carrel-celebration-dismissed";
 
 interface BookInfo {
   title: string;

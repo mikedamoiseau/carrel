@@ -106,7 +106,7 @@ async function waitForLibraryWithBooks() {
 
 async function setThemeAndReload(mode) {
   await browser.execute((m) => {
-    localStorage.setItem("folio-theme", m);
+    localStorage.setItem("carrel-theme", m);
     window.location.reload();
   }, mode);
   await browser.pause(2000);

@@ -9,14 +9,14 @@ use std::net::SocketAddr;
 
 use super::WebState;
 use crate::db;
-use crate::error::{FolioError, FolioResult};
+use crate::error::{CarrelError, CarrelResult};
 
-// `folio-web-server` and the `folio_session` cookie name (see
-// `extract_cookie_token`) keep their pre-Carrel spelling: the first keys the
-// stored web PIN in the user's keychain, the second is still sent by
-// offline-cached copies of `static/app.js`. See CLAUDE.md, "Legacy `folio`
-// identifiers".
-const KEYRING_SERVICE: &str = "folio-web-server";
+// `carrel-web-server` keys the stored web PIN in the OS keychain, and the
+// `carrel_session` cookie name (see `extract_cookie_token`) is also read by
+// `static/app.js`. Changing either needs a matching change on the other side —
+// an offline-cached copy of app.js keeps sending the old cookie name until its
+// service worker updates.
+const KEYRING_SERVICE: &str = "carrel-web-server";
 const KEYRING_USER: &str = "pin";
 const SESSION_TTL_SECS: u64 = 86400; // 24 hours
 
@@ -130,12 +130,12 @@ pub fn hash_pin(pin: &str) -> String {
 }
 
 /// Store the PIN hash in the OS keychain.
-pub fn store_pin(pin: &str) -> FolioResult<()> {
+pub fn store_pin(pin: &str) -> CarrelResult<()> {
     let hash = hash_pin(pin);
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     entry
         .set_password(&hash)
-        .map_err(|e| FolioError::internal(format!("keychain: {e}")))
+        .map_err(|e| CarrelError::internal(format!("keychain: {e}")))
 }
 
 /// Load the PIN hash from the OS keychain (None if not set).
@@ -150,12 +150,12 @@ pub fn verify_pin(pin: &str, stored_hash: &str) -> bool {
 }
 
 /// Create a new session token and store it. Returns an error if the session store is unavailable.
-pub fn create_session(state: &WebState) -> FolioResult<String> {
+pub fn create_session(state: &WebState) -> CarrelResult<String> {
     let token = uuid::Uuid::new_v4().to_string();
     let mut sessions = state
         .sessions
         .lock()
-        .map_err(|_| FolioError::internal("Session store unavailable"))?;
+        .map_err(|_| CarrelError::internal("Session store unavailable"))?;
     sessions.insert(token.clone(), std::time::Instant::now());
     Ok(token)
 }
@@ -197,7 +197,7 @@ fn extract_cookie_token(req: &Request<Body>) -> Option<String> {
     let cookie_header = req.headers().get("cookie")?.to_str().ok()?;
     for part in cookie_header.split(';') {
         let trimmed = part.trim();
-        if let Some(token) = trimmed.strip_prefix("folio_session=") {
+        if let Some(token) = trimmed.strip_prefix("carrel_session=") {
             return Some(token.to_string());
         }
     }
@@ -205,10 +205,10 @@ fn extract_cookie_token(req: &Request<Body>) -> Option<String> {
 }
 
 /// Generate a QR code as an SVG string for the given URL.
-pub fn generate_qr_svg(url: &str) -> FolioResult<String> {
+pub fn generate_qr_svg(url: &str) -> CarrelResult<String> {
     use qrcode::QrCode;
-    let code =
-        QrCode::new(url.as_bytes()).map_err(|e| FolioError::internal(format!("QR encode: {e}")))?;
+    let code = QrCode::new(url.as_bytes())
+        .map_err(|e| CarrelError::internal(format!("QR encode: {e}")))?;
     let svg = code
         .render::<qrcode::render::svg::Color>()
         .min_dimensions(200, 200)

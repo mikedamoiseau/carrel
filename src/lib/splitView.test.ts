@@ -30,8 +30,8 @@ function makeStorage(): Storage {
 
 describe("split-view storage keys", () => {
   it("derives stable per-book keys", () => {
-    expect(splitModeKey("abc")).toBe("folio-split-mode-abc");
-    expect(splitCompanionKey("abc")).toBe("folio-split-companion-abc");
+    expect(splitModeKey("abc")).toBe("carrel-split-mode-abc");
+    expect(splitCompanionKey("abc")).toBe("carrel-split-companion-abc");
   });
 });
 

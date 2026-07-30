@@ -303,7 +303,7 @@ Rust-only commands from `src-tauri/`:
 cargo test
 ```
 
-Lint and formatting are checked workspace-wide from the repo root (a `src-tauri/`-scoped run misses `folio-core`, and dropping `--all-targets` skips test targets):
+Lint and formatting are checked workspace-wide from the repo root (a `src-tauri/`-scoped run misses `carrel-core`, and dropping `--all-targets` skips test targets):
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
@@ -333,7 +333,7 @@ suite stays green on fresh clones.
 - `src-tauri/src/lib.rs`, `main.rs` — app setup and command registration
 - `src-tauri/src/tray.rs` — system tray + menu
 - `src-tauri/src/web_server/` — embedded HTTP server, OPDS feed, and the embedded web UI SPA
-- `folio-core/src/` — reusable Rust crate: `db`, `models`, `error`, `paths`, parsers (`epub`, `pdf`, `cbz`, `cbr`, `mobi`), `page_cache`, `enrichment`, providers, `opds`, `openlibrary`, `backup`, `sync`, `storage`, `search`
+- `carrel-core/src/` — reusable Rust crate: `db`, `models`, `error`, `paths`, parsers (`epub`, `pdf`, `cbz`, `cbr`, `mobi`), `page_cache`, `enrichment`, providers, `opds`, `openlibrary`, `backup`, `sync`, `storage`, `search`
 - `e2e/` — Playwright web-UI end-to-end tests
 - `src-tauri/examples/web_e2e_server.rs` — seeded web-server harness the e2e suite runs against
 - `docs/` — user-facing docs

@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 
-export const STORAGE_KEY = "folio-onboarding-complete";
+export const STORAGE_KEY = "carrel-onboarding-complete";
 
 type Step = 1 | 2 | 3 | 4;
 

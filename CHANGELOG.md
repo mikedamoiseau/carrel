@@ -5,6 +5,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-07-30
+
+### Changed
+- **Internal cleanup only — nothing changes in the app.** The last places that
+  still said "Folio" behind the scenes now say Carrel: the crate names, the
+  application identifier, and the various keys used to store your settings and
+  offline data. There is no new behaviour and nothing to do.
+
 ## [3.0.0] - 2026-07-30
 
 The first release under the Carrel name. The major version reflects the one

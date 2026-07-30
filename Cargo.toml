@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "folio-core",
+    "carrel-core",
     "src-tauri",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "3.0.0"
+version = "3.0.1"
 
 [workspace.dependencies]
 # Error / serde

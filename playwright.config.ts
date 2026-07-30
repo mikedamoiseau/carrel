@@ -50,6 +50,6 @@ export default defineConfig({
     url: `http://127.0.0.1:${PORT}/api/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,
-    env: { FOLIO_E2E_PORT: String(PORT) },
+    env: { CARREL_E2E_PORT: String(PORT) },
   },
 });

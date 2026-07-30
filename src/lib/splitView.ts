@@ -3,15 +3,15 @@
  *
  * The Reader screen mounts one ReaderPane per side and tracks
  * persistence with two keys per primary book:
- *   - `folio-split-mode-<bookId>`        — "1" if split is on
- *   - `folio-split-companion-<bookId>`   — companion bookId
+ *   - `carrel-split-mode-<bookId>`        — "1" if split is on
+ *   - `carrel-split-companion-<bookId>`   — companion bookId
  *
  * Keeping this contract here (instead of inline in `Reader.tsx`) makes
  * the storage transitions easy to test without spinning up React.
  */
 
-export const SPLIT_MODE_PREFIX = "folio-split-mode-";
-export const SPLIT_COMPANION_PREFIX = "folio-split-companion-";
+export const SPLIT_MODE_PREFIX = "carrel-split-mode-";
+export const SPLIT_COMPANION_PREFIX = "carrel-split-companion-";
 
 export const splitModeKey = (bookId: string) => `${SPLIT_MODE_PREFIX}${bookId}`;
 export const splitCompanionKey = (bookId: string) =>

@@ -17,7 +17,7 @@ import { enterReaderAtStart } from "./detail-actions";
 //     (no fullscreen active) or `#back-btn` calls goBack(), which returns to
 //     the book's DETAIL page (`#/book/:id`), not straight to the library grid.
 //   - Theme: cycles light -> dark -> system -> light via `#theme-toggle-btn`;
-//     persisted as localStorage key `folio_theme`; applied as `data-theme`
+//     persisted as localStorage key `carrel_theme`; applied as `data-theme`
 //     on <html> (removed entirely for "system").
 //   - Keyboard shortcut `/` focuses `#search`, only while currentView is the
 //     library and focus isn't already inside a typing target.
@@ -81,13 +81,13 @@ test.describe("Core smoke", () => {
 
   test("theme toggle switches data-theme on <html> and persists across reload", async ({ page }) => {
     await page.goto("/");
-    await page.evaluate(() => localStorage.setItem("folio_theme", "light"));
+    await page.evaluate(() => localStorage.setItem("carrel_theme", "light"));
     await page.reload();
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
 
     await page.click("#theme-toggle-btn");
     await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-    const stored = await page.evaluate(() => localStorage.getItem("folio_theme"));
+    const stored = await page.evaluate(() => localStorage.getItem("carrel_theme"));
     expect(stored).toBe("dark");
 
     await page.reload();

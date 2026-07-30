@@ -188,7 +188,7 @@ jobs:
           # BUILD_SHARED_LIBS=OFF produces a static `mobi.lib` archive
           # (no DLL). With USE_ZLIB=OFF + USE_LIBXML2=OFF the archive
           # is fully self-contained, so `cargo:rustc-link-lib=static=
-          # mobi` (folio-core/build.rs) bakes libmobi into carrel.exe
+          # mobi` (carrel-core/build.rs) bakes libmobi into carrel.exe
           # without any runtime DLL dependency. This avoids the
           # Tauri-bundler complications of placing a DLL where the
           # OS loader will find it next to the installed binary.
@@ -360,8 +360,8 @@ jobs:
           # (not a secret), so a repo Actions *variable* is fine. When unset the
           # SDK is disabled and no analytics are ever sent — so builds without
           # this configured simply ship analytics-off.
-          FOLIO_APTABASE_KEY: ${{ vars.FOLIO_APTABASE_KEY }}
-          # folio-core/build.rs uses pkg-config first, then falls back to
+          CARREL_APTABASE_KEY: ${{ vars.CARREL_APTABASE_KEY }}
+          # carrel-core/build.rs uses pkg-config first, then falls back to
           # LIBMOBI_INCLUDE_DIR / LIBMOBI_LIB_DIR. Neither Windows (MSVC) nor
           # the macOS runner (no brew libmobi) has libmobi on the pkg-config
           # path, so the fallback is the exercised path on both. On Linux

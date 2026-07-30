@@ -5,7 +5,7 @@ import type { TFunction } from "i18next";
  * Every Tauri command now returns this shape when it fails; older/tauri-host
  * errors may arrive as plain strings or Error instances.
  */
-export type FolioErrorPayload = {
+export type CarrelErrorPayload = {
   kind:
     | "NotFound"
     | "PermissionDenied"
@@ -21,7 +21,7 @@ export type FolioErrorPayload = {
   message: string;
 };
 
-function isFolioErrorPayload(x: unknown): x is FolioErrorPayload {
+function isCarrelErrorPayload(x: unknown): x is CarrelErrorPayload {
   if (!x || typeof x !== "object" || Array.isArray(x)) return false;
   const o = x as Record<string, unknown>;
   return (
@@ -32,8 +32,8 @@ function isFolioErrorPayload(x: unknown): x is FolioErrorPayload {
 }
 
 /** Normalize anything `invoke()` (or any callback) may throw into `{kind?, message}`. */
-export function toFolioError(raw: unknown): { kind?: string; message: string } {
-  if (isFolioErrorPayload(raw)) return { kind: raw.kind, message: raw.message };
+export function toCarrelError(raw: unknown): { kind?: string; message: string } {
+  if (isCarrelErrorPayload(raw)) return { kind: raw.kind, message: raw.message };
   if (typeof raw === "string") return { message: raw };
   if (raw instanceof Error) return { message: raw.message };
   try {
@@ -117,23 +117,23 @@ export const MESSAGE_KEYS: Record<string, string> = {
  * destructive "Remove from library" recovery dialog in Reader.
  */
 export function isBookFileMissing(raw: unknown): boolean {
-  const { message } = toFolioError(raw);
+  const { message } = toCarrelError(raw);
   return message.toLowerCase().includes("book file not found");
 }
 
 /**
- * Detect the profile soft-lock gate (`FolioError::LockRequired`, backend
+ * Detect the profile soft-lock gate (`CarrelError::LockRequired`, backend
  * `kind: "LockRequired"`). `switch_profile` and the active-profile gate on
  * every data-bearing command raise this when the target profile has a
  * stored lock that hasn't been unlocked this session — the frontend shows
  * the unlock prompt instead of a generic error toast.
  */
 export function isLockRequired(raw: unknown): boolean {
-  return toFolioError(raw).kind === "LockRequired";
+  return toCarrelError(raw).kind === "LockRequired";
 }
 
 export function isBookFileError(raw: unknown): boolean {
-  const { kind, message } = toFolioError(raw);
+  const { kind, message } = toCarrelError(raw);
   if (kind === "PermissionDenied") return true;
   const lower = message.toLowerCase();
   return (
@@ -145,7 +145,7 @@ export function isBookFileError(raw: unknown): boolean {
 }
 
 export function friendlyError(raw: unknown, t: TFunction): string {
-  const { kind, message } = toFolioError(raw);
+  const { kind, message } = toCarrelError(raw);
   const lower = message.toLowerCase();
 
   for (const [key, translationKey] of Object.entries(MESSAGE_KEYS)) {

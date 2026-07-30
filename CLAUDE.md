@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Development Commands
 
-Lint and formatting are checked workspace-wide from the repo root (CI-enforced). Running them scoped to `src-tauri/` only covers the `carrel` crate, not `folio-core`; omitting `--all-targets` skips test/example targets:
+Lint and formatting are checked workspace-wide from the repo root (CI-enforced). Running them scoped to `src-tauri/` only covers the `carrel` crate, not `carrel-core`; omitting `--all-targets` skips test/example targets:
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features mobi -- -D warnings  # libmobi-gated paths
@@ -13,9 +13,9 @@ cargo fmt --all --check
 
 The toolchain is pinned in `rust-toolchain.toml` (currently `1.96.0`); CI uses the same version via `dtolnay/rust-toolchain@1.96.0`, so local and CI rustfmt/clippy never drift. Bump both together.
 
-Running `cargo test` from `src-tauri/` only exercises the `carrel` crate — `folio-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
+Running `cargo test` from `src-tauri/` only exercises the `carrel` crate — `carrel-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
 ```bash
-cargo test -p folio-core --features mobi
+cargo test -p carrel-core --features mobi
 ```
 
 `npm run test:e2e` runs against a seeded harness (`src-tauri/examples/web_e2e_server.rs`); Playwright manages the server's lifecycle (build, start, health-check, teardown), so no manual setup is needed.
@@ -26,60 +26,72 @@ MOBI tests require a public-domain test corpus under `src-tauri/test-fixtures/` 
 
 **Tauri v2 desktop app** (branded "Carrel") — Rust backend + React 19 frontend communicating via IPC. All data flows through Tauri's `invoke()` IPC bridge. Commands are registered in `src-tauri/src/lib.rs` via `invoke_handler` — every new command must be added there.
 
-The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, IPC commands, and web server — and **`folio-core`** (`folio-core/src/`) — parsing, DB, and models, with no Tauri dependency.
+The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, IPC commands, and web server — and **`carrel-core`** (`carrel-core/src/`) — parsing, DB, and models, with no Tauri dependency.
 
-### Legacy `folio` identifiers — do not rename
+### Persistence-boundary identifiers — keep stable
 
-The app was renamed Folio → Carrel on `main` after `v2.11.1` (the last release
-that shipped as Folio). Identifiers below still say
-`folio` **on purpose**, because something outside this repo already depends on
-the exact string. Never run a blind `s/folio/carrel/g`.
+The app was renamed Folio → Carrel after `v2.11.1`. `3.0.0` shipped the
+user-visible half; the rename was then completed in full, including the bundle
+identifier and every persisted key, so no `folio` identifiers remain. `CHANGELOG.md`,
+`docs/superpowers/`, and `src-tauri/.pr-reviews/` still say Folio because they
+are historical records of work that shipped under that name — leave them.
 
-| Identifier | Where | Renaming it would… |
+What follows is **not** a do-not-rename list any more. It is the list of strings
+that key data living *outside* the repo — on disk, in the OS keychain, in a
+browser, on a user's own remote. Changing one of them does not migrate the data
+it names; it orphans it. Treat each as a stable identifier and change it only
+together with a migration.
+
+| Identifier | Where | Changing it would… |
 |---|---|---|
-| `com.mike.folio` | `tauri.conf.json` `identifier` | orphan every install's app-data dir, macOS prefs domain, and keychain entries |
-| `com.mike.folio.profile-lock` | `folio-core/src/profile_lock.rs` | orphan every profile-lock password |
-| `folio-backup-{provider}-{key}` | `folio-core/src/backup.rs` | orphan every configured backup's stored SFTP/S3 credentials |
-| `folio-web-server` | `web_server/auth.rs` | orphan the stored web-UI PIN |
-| `Folio Library` | `folio-core/src/paths.rs` | silently relocate the library for every install that never set `library_folder` (it is an unwritten *fallback*, not a stored setting) |
-| `.folio-sync/…` | `folio-core/src/sync.rs` | orphan sync state already written to the user's own remote |
-| `urn:folio:*` | `web_server/opds_feed.rs` | break OPDS clients, which cache on feed/entry ids |
-| `folio_session` cookie, `x-folio-profile` header | `web_server/` + `static/` | break offline-cached `app.js`/`sw.js`, which still send and read the old names |
-| `folio-shell-*`, `folio-offline-book-*`, `folio-offline-scope` | `static/sw.js`, `static/app.js` | orphan every offline-saved book on every user's device |
-| `folio-*` / `folio_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
-| `FOLIO_APTABASE_KEY`, `FOLIO_LOG`, `FOLIO_DEBUG_PAGES`, `FOLIO_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
-| `folio-core`, `FolioError`, `FolioResult`, `FolioEvent` | `folio-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
+| `com.mike.carrel` | `tauri.conf.json` `identifier` | orphan every install's app-data dir, macOS prefs domain, and keychain entries |
+| `com.mike.carrel.profile-lock` | `carrel-core/src/profile_lock.rs` | orphan every profile-lock password |
+| `carrel-backup-{provider}-{key}` | `carrel-core/src/backup.rs` | orphan every configured backup's stored SFTP/S3 credentials |
+| `carrel-web-server` | `web_server/auth.rs` | orphan the stored web-UI PIN |
+| `Carrel Library` | `carrel-core/src/paths.rs` | silently relocate the library for every install that never set `library_folder` (it is an unwritten *fallback*, not a stored setting) |
+| `.carrel-sync/…` | `carrel-core/src/sync.rs` | orphan sync state already written to the user's own remote |
+| `urn:carrel:*` | `web_server/opds_feed.rs` | break OPDS clients, which cache on feed/entry ids |
+| `carrel_session` cookie, `x-carrel-profile` header | `web_server/` + `static/` | break offline-cached `app.js`/`sw.js`, which still send and read the old names |
+| `carrel-shell-*`, `carrel-offline-book-*`, `carrel-offline-scope` | `static/sw.js`, `static/app.js` | orphan every offline-saved book on every user's device |
+| `carrel-*` / `carrel_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
+| `CARREL_APTABASE_KEY`, `CARREL_LOG`, `CARREL_DEBUG_PAGES`, `CARREL_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
+| `carrel-core`, `CarrelError`, `CarrelResult`, `CarrelEvent` | `carrel-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
+| `carrel-offline` IndexedDB database | `static/app.js` | orphan every offline-saved book's blobs (separate from the Cache Storage entry above) |
 | `21c2cdba-327a-5023-94aa-a2fbf307774c` | `tauri.conf.json` `bundle.windows.wix.upgradeCode` | make every Windows MSI install **side-by-side** with the user's existing install instead of upgrading it in place |
 
 The WiX upgrade code deserves a note, since it is the one entry that is a bare
 UUID rather than a readable string. Tauri derives it by default from
-`uuid5(DNS, "{productName}.exe.app.x64")` — so it *changed* when `productName`
-went Folio → Carrel. `21c2cdba…` is `uuid5(DNS, "Folio.exe.app.x64")`, the value
-every shipped Folio MSI actually carries (verified by reading the `UpgradeCode`
-property out of `Folio_2.11.1_x64_en-US.msi`). Pinning it means WiX
-`MajorUpgrade` still recognizes the old install — it matches on upgrade code
-alone, so the changed `ProductName` no longer matters. Check it with
+`uuid5(DNS, "{productName}.exe.app.x64")`, so it moves whenever `productName`
+moves. It is pinned instead, to `uuid5(DNS, "Folio.exe.app.x64")` — the value
+every shipped Folio MSI carries, confirmed by reading the `UpgradeCode` property
+out of `Folio_2.11.1_x64_en-US.msi`. WiX `MajorUpgrade` matches on this code
+alone, so pinning it is what lets a new MSI upgrade an existing install in place
+regardless of what the product is called. Check it with
 `npx tauri inspect wix-upgrade-code`, which prints both the derived default and
-the override. Never change this value, including on any future rename.
+the override; `tauri_config_test.rs` asserts the pin. Never change this value.
 
-`CHANGELOG.md`, `docs/superpowers/`, and `src-tauri/.pr-reviews/` keep saying
-Folio too: they are historical records of releases and work that shipped under
-that name.
+The GitHub repo is `mikedamoiseau/carrel` (renamed from `mikedamoiseau/folio`
+2026-07-30). The slug is load-bearing in `src-tauri/src/update.rs`'s
+release-URL allowlist, `UpdateModal.tsx`'s `isTrustedReleaseUrl` /
+`isTrustedChangelogUrl`, and the dictionary-download URL in `commands.rs` —
+those three must agree or update checks start rejecting valid releases.
 
-**Update (2026-07-30):** the GitHub repo itself was renamed `mikedamoiseau/folio`
-→ `mikedamoiseau/carrel`. `mikedamoiseau/folio` was removed from the table above
-and updated to `mikedamoiseau/carrel` everywhere it was load-bearing
-(`src-tauri/src/update.rs`'s release-URL allowlist, `UpdateModal.tsx`'s
-`isTrustedReleaseUrl`/`isTrustedChangelogUrl`, the dictionary-download URL in
-`commands.rs`, and doc links). GitHub 301-redirects the old slug, but don't rely
-on that — it isn't guaranteed to last. The local `origin` remote still points at
-the old URL; update it with `git remote set-url origin git@github.com:mikedamoiseau/carrel.git`.
+Two identifiers here fail **silently** if changed carelessly, so they are worth
+singling out:
+
+- `CARREL_APTABASE_KEY` is read via `option_env!`, so a missing variable is not
+  a build error — it compiles to an empty key and the analytics SDK quietly
+  disables itself. It is a GitHub Actions repo *variable* (not a secret); renaming
+  it means creating the new variable first.
+- `Carrel Library` is an unwritten fallback rather than a stored setting, so an
+  install that never set `library_folder` re-derives it every launch. Changing
+  the string relocates that library with no error anywhere.
 
 The embedded web UI (`src-tauri/src/web_server/static/`: `index.html` + `app.js` + `app.css`, served via `include_str!`/`include_bytes!`) is a hand-written vanilla-JS SPA, independent of the React desktop frontend — it shares no code or styling with `src/`. Its service worker's `CACHE_VERSION` (`static/sw.js`) is a content hash of the shell assets, enforced by a test — bump it whenever those files change.
 
 ### Book Storage
 
-Books are copied into an app-managed library folder (default `~/Documents/Folio Library/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
+Books are copied into an app-managed library folder (default `~/Documents/Carrel Library/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
 
 ## Adding Common Things
 
@@ -115,10 +127,10 @@ This is added to Mike's `~/.zshrc`. If builds fail with `fatal error: 'new' file
 - CSP configured in `tauri.conf.json`
 - Asset protocol scoped to `$APPDATA/**`
 - File deduplication uses SHA-256 hash (`file_hash` column in `books` table)
-- Archive bounds are enforced at `folio-core`'s API boundary, not by caller diligence: every path-based EPUB entry point opens via `epub::open_validated` (entry-count + declared-size pre-scan), and entry reads are capped through `Read::take` — `MAX_TEXT_ENTRY_SIZE` (16 MB) for text entries, `MAX_ENTRY_SIZE` (100 MB) for binary ones. The pre-scan alone is not a bound: the zip crate limits a read by an entry's *compressed* size, so a size-understating entry needs the read cap. Covers EPUB and CBZ. CBR relies on unrar truncating output at the declared `unpacked_size`; MOBI has no archive layer and is bounded inside libmobi. Callers of the `*_from_archive` / `*_from_cache` variants must validate themselves
-- MOBI/AZW parsing uses libmobi (C) via `unsafe` FFI on untrusted input; the from-source builds (Windows + arm64-macOS release) pin `LIBMOBI_VERSION` (tag v0.12, drift-enforced by `release_workflow_test.rs`) while package-manager builds (Linux/macOS CI, local dev) track the distro version — see the security note atop `folio-core/src/mobi/mod.rs` for the trust boundary and bump process
+- Archive bounds are enforced at `carrel-core`'s API boundary, not by caller diligence: every path-based EPUB entry point opens via `epub::open_validated` (entry-count + declared-size pre-scan), and entry reads are capped through `Read::take` — `MAX_TEXT_ENTRY_SIZE` (16 MB) for text entries, `MAX_ENTRY_SIZE` (100 MB) for binary ones. The pre-scan alone is not a bound: the zip crate limits a read by an entry's *compressed* size, so a size-understating entry needs the read cap. Covers EPUB and CBZ. CBR relies on unrar truncating output at the declared `unpacked_size`; MOBI has no archive layer and is bounded inside libmobi. Callers of the `*_from_archive` / `*_from_cache` variants must validate themselves
+- MOBI/AZW parsing uses libmobi (C) via `unsafe` FFI on untrusted input; the from-source builds (Windows + arm64-macOS release) pin `LIBMOBI_VERSION` (tag v0.12, drift-enforced by `release_workflow_test.rs`) while package-manager builds (Linux/macOS CI, local dev) track the distro version — see the security note atop `carrel-core/src/mobi/mod.rs` for the trust boundary and bump process
 
 ## CI
 
 **Before pushing:** Always run the full CI check suite locally. A pre-push git hook enforces this:
-`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (from repo root — both cover folio-core), then `cargo test` (in `src-tauri/`), then `npm run type-check && npm run test` (in root). When touching MOBI code also run `cargo test -p folio-core --features mobi` from the workspace root — `src-tauri/`'s `cargo test` does not compile folio-core's test binary.
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (from repo root — both cover carrel-core), then `cargo test` (in `src-tauri/`), then `npm run type-check && npm run test` (in root). When touching MOBI code also run `cargo test -p carrel-core --features mobi` from the workspace root — `src-tauri/`'s `cargo test` does not compile carrel-core's test binary.

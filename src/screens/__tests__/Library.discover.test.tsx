@@ -131,7 +131,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   for (const k of Object.keys(invokeResponses)) delete invokeResponses[k];
   // Discover section is opt-in via this flag; enable it for every test.
-  localStorage.setItem("folio-show-discover", "true");
+  localStorage.setItem("carrel-show-discover", "true");
 });
 
 describe("Library — Discover section", () => {

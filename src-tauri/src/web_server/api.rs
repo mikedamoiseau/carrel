@@ -8,10 +8,10 @@ use axum::{
 };
 
 use super::auth::{log_login_attempt, LoginOutcome, WebAuthMethod};
-use super::{folio_status, WebState};
+use super::{carrel_status, WebState};
 use crate::db;
 use crate::models::BookFormat;
-use folio_core::events::{self, FolioEvent};
+use carrel_core::events::{self, CarrelEvent};
 
 /// Settings keys excluded from the GDPR export. Defense-in-depth: the web PIN
 /// and backup credentials live in the OS keyring (not in settings), but two
@@ -25,13 +25,13 @@ const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_provide
 fn build_gdpr_export(
     conn: &rusqlite::Connection,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let mut value = db::build_core_export(conn).map_err(folio_status)?;
+    let mut value = db::build_core_export(conn).map_err(carrel_status)?;
 
-    let activity = db::get_all_activity(conn).map_err(folio_status)?;
-    let activity_val = serde_json::to_value(activity).map_err(folio_status)?;
+    let activity = db::get_all_activity(conn).map_err(carrel_status)?;
+    let activity_val = serde_json::to_value(activity).map_err(carrel_status)?;
 
     let settings: serde_json::Map<String, serde_json::Value> = db::list_settings(conn)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .into_iter()
         .filter(|(k, _)| !EXPORT_SETTINGS_DENYLIST.contains(&k.as_str()))
         .map(|(k, v)| (k, serde_json::Value::String(v)))
@@ -52,7 +52,7 @@ fn export_datestamp() -> String {
 /// Best-effort: record the export in the activity log. A failure is logged and
 /// swallowed so it never fails the download (mirrors the login-audit pattern).
 fn log_export_event(conn: &rusqlite::Connection) {
-    use folio_core::activity::ActivityEvent;
+    use carrel_core::activity::ActivityEvent;
     let f = ActivityEvent::LibraryExported {
         detail: "GDPR data export (web)".to_string(),
     }
@@ -100,9 +100,9 @@ async fn data_export(State(state): State<WebState>) -> Result<Response, (StatusC
         ));
     }
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let value = build_gdpr_export(&conn)?;
-    let json = serde_json::to_string_pretty(&value).map_err(folio_status)?;
+    let json = serde_json::to_string_pretty(&value).map_err(carrel_status)?;
 
     let date = export_datestamp();
     let inner_name = format!("carrel-export-{date}.json");
@@ -112,9 +112,10 @@ async fn data_export(State(state): State<WebState>) -> Result<Response, (StatusC
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file(&inner_name, options).map_err(folio_status)?;
-        zip.write_all(json.as_bytes()).map_err(folio_status)?;
-        zip.finish().map_err(folio_status)?.into_inner()
+        zip.start_file(&inner_name, options)
+            .map_err(carrel_status)?;
+        zip.write_all(json.as_bytes()).map_err(carrel_status)?;
+        zip.finish().map_err(carrel_status)?.into_inner()
     };
 
     log_export_event(&conn);
@@ -211,7 +212,7 @@ fn profile_host(
 async fn list_profiles(
     State(state): State<WebState>,
 ) -> Result<Json<Vec<super::WebProfile>>, (StatusCode, String)> {
-    Ok(Json(profile_host(&state)?.list().map_err(folio_status)?))
+    Ok(Json(profile_host(&state)?.list().map_err(carrel_status)?))
 }
 
 #[derive(serde::Deserialize)]
@@ -270,14 +271,14 @@ async fn switch_profile(
 /// is its unknown-profile check, so that's a 404; a locked profile that hasn't
 /// been unlocked on the desktop this session is `423 Locked` — the password is
 /// never accepted here, so there is nothing the client can retry with.
-fn switch_status(err: crate::error::FolioError) -> (StatusCode, String) {
+fn switch_status(err: crate::error::CarrelError) -> (StatusCode, String) {
     match err {
-        crate::error::FolioError::LockRequired(msg) => (
+        crate::error::CarrelError::LockRequired(msg) => (
             StatusCode::LOCKED,
             format!("{msg}. Unlock it on the desktop to use it over the network."),
         ),
-        crate::error::FolioError::InvalidInput(msg) => (StatusCode::NOT_FOUND, msg),
-        other => folio_status(other),
+        crate::error::CarrelError::InvalidInput(msg) => (StatusCode::NOT_FOUND, msg),
+        other => carrel_status(other),
     }
 }
 
@@ -366,7 +367,7 @@ async fn login(
     // Successful login — clear rate limit entries for this IP
     state.login_limiter.clear(&client_ip);
 
-    let token = super::auth::create_session(&state).map_err(folio_status)?;
+    let token = super::auth::create_session(&state).map_err(carrel_status)?;
 
     // Log success only after the session token was actually created.
     if let Ok(conn) = state.conn() {
@@ -379,7 +380,8 @@ async fn login(
         );
     }
 
-    let cookie = format!("folio_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400");
+    let cookie =
+        format!("carrel_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400");
     let body = Json(LoginResponse {
         token: token.clone(),
     });
@@ -396,9 +398,9 @@ async fn login_history(
     State(state): State<WebState>,
     Query(params): Query<HistoryQuery>,
 ) -> Result<Json<Vec<crate::models::WebSessionEntry>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let rows = db::get_web_session_log(&conn, params.limit.unwrap_or(100).min(1000))
-        .map_err(folio_status)?;
+        .map_err(carrel_status)?;
     Ok(Json(rows))
 }
 
@@ -427,8 +429,8 @@ async fn list_books(
     State(state): State<WebState>,
     Query(params): Query<BookQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let books = db::list_books_grid(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let books = db::list_books_grid(&conn).map_err(carrel_status)?;
 
     let books = match params.series {
         Some(ref s) if !s.is_empty() => books
@@ -537,9 +539,9 @@ async fn continue_reading(
     State(state): State<WebState>,
     Query(params): Query<ContinueReadingQuery>,
 ) -> Result<Json<Vec<crate::models::ContinueReadingItem>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let limit = params.limit.unwrap_or(12).min(50);
-    let books = db::get_continue_reading_books(&conn, limit).map_err(folio_status)?;
+    let books = db::get_continue_reading_books(&conn, limit).map_err(carrel_status)?;
     Ok(Json(books))
 }
 
@@ -564,9 +566,9 @@ async fn get_book(
     // call meant two connections held from the pool (max 5) at once,
     // stalling concurrent detail requests under load.
     let book = {
-        let conn = state.conn().map_err(folio_status)?;
+        let conn = state.conn().map_err(carrel_status)?;
         db::get_book(&conn, &id)
-            .map_err(folio_status)?
+            .map_err(carrel_status)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?
     };
     // The filesystem stat is best-effort (`file_size` stays `None` on any
@@ -667,7 +669,7 @@ fn resolve_cover_thumb(
     let full_bytes = std::fs::read(cover_path)?;
 
     let generated =
-        folio_core::image_util::make_thumbnail(&full_bytes, crate::commands::THUMB_WIDTH)
+        carrel_core::image_util::make_thumbnail(&full_bytes, crate::commands::THUMB_WIDTH)
             .unwrap_or_else(|e| {
                 log::warn!(
                     "cover thumbnail generation failed for '{}': {e}",
@@ -696,7 +698,7 @@ fn resolve_cover_thumb(
 
         if still_current {
             if let Err(e) =
-                folio_core::storage::write_atomic(&thumb_path, |f| f.write_all(&thumb_bytes))
+                carrel_core::storage::write_atomic(&thumb_path, |f| f.write_all(&thumb_bytes))
             {
                 log::warn!(
                     "cover thumbnail persist failed for '{}': {e}",
@@ -733,10 +735,10 @@ async fn get_cover_thumb_bytes(
         .await
     {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(folio_status(e)),
+        Ok(Err(e)) => Err(carrel_status(e)),
         Err(join_err) => {
             log::warn!("cover thumbnail worker panicked for '{cover_path}': {join_err}");
-            let bytes = tokio::fs::read(&cover_path).await.map_err(folio_status)?;
+            let bytes = tokio::fs::read(&cover_path).await.map_err(carrel_status)?;
             let mime = mime_guess::from_path(&cover_path)
                 .first_or_octet_stream()
                 .to_string();
@@ -751,9 +753,9 @@ async fn get_cover(
     uri: axum::http::Uri,
 ) -> Result<Response, (StatusCode, String)> {
     let cover_path = {
-        let conn = state.conn().map_err(folio_status)?;
+        let conn = state.conn().map_err(carrel_status)?;
         let book = db::get_book(&conn, &id)
-            .map_err(folio_status)?
+            .map_err(carrel_status)?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
         book.cover_path
             .ok_or_else(|| (StatusCode::NOT_FOUND, "No cover available".to_string()))?
@@ -763,7 +765,7 @@ async fn get_cover(
     let (bytes, mime) = if size.as_deref() == Some("thumb") {
         get_cover_thumb_bytes(state.covers_root(), cover_path).await?
     } else {
-        let bytes = std::fs::read(&cover_path).map_err(folio_status)?;
+        let bytes = std::fs::read(&cover_path).map_err(carrel_status)?;
         let mime = mime_guess::from_path(&cover_path)
             .first_or_octet_stream()
             .to_string();
@@ -786,19 +788,20 @@ async fn get_chapters(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let book = db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(folio_status)?;
+    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
     let toc = match book.format {
-        BookFormat::Epub => crate::epub::get_toc(&file_path).map_err(folio_status)?,
+        BookFormat::Epub => crate::epub::get_toc(&file_path).map_err(carrel_status)?,
         #[cfg(feature = "mobi")]
         BookFormat::Mobi => {
             // MOBI has no real TOC — mirror the desktop `get_toc` behaviour by
             // synthesising a flat list from the chapter list.
-            let chapters = folio_core::mobi::get_chapter_list(&file_path).map_err(folio_status)?;
+            let chapters =
+                carrel_core::mobi::get_chapter_list(&file_path).map_err(carrel_status)?;
             chapters
                 .into_iter()
                 .map(|c| crate::models::TocEntry {
@@ -831,23 +834,23 @@ async fn get_chapter_content(
     State(state): State<WebState>,
     Path((id, index)): Path<(String, usize)>,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let book = db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(folio_status)?;
-    let images_storage = state.images_storage().map_err(folio_status)?;
+    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let images_storage = state.images_storage().map_err(carrel_status)?;
 
     let html = match book.format {
         BookFormat::Epub => {
             crate::epub::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(folio_status)?
+                .map_err(carrel_status)?
         }
         #[cfg(feature = "mobi")]
         BookFormat::Mobi => {
-            folio_core::mobi::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(folio_status)?
+            carrel_core::mobi::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
+                .map_err(carrel_status)?
         }
         #[cfg(not(feature = "mobi"))]
         BookFormat::Mobi => {
@@ -1060,12 +1063,12 @@ async fn get_page_image(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Response, (StatusCode, String)> {
     let width = parse_width(query.as_deref());
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let book = db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(folio_status)?;
+    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
     let page_cache_control = session_cache_control(&state);
 
     // Stage the source locally when it lives on a network mount (M2). The web
@@ -1082,8 +1085,8 @@ async fn get_page_image(
 
     match book.format {
         BookFormat::Pdf => {
-            let (bytes, mime) =
-                crate::pdf::get_page_image_bytes(&file_path, index, width).map_err(folio_status)?;
+            let (bytes, mime) = crate::pdf::get_page_image_bytes(&file_path, index, width)
+                .map_err(carrel_status)?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime.to_string()),
@@ -1094,8 +1097,8 @@ async fn get_page_image(
                 .into_response())
         }
         BookFormat::Cbz => {
-            let (bytes, mime) =
-                crate::cbz::get_page_image_bytes(&file_path, index, width).map_err(folio_status)?;
+            let (bytes, mime) = crate::cbz::get_page_image_bytes(&file_path, index, width)
+                .map_err(carrel_status)?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1106,8 +1109,8 @@ async fn get_page_image(
                 .into_response())
         }
         BookFormat::Cbr => {
-            let (bytes, mime) =
-                crate::cbr::get_page_image_bytes(&file_path, index, width).map_err(folio_status)?;
+            let (bytes, mime) = crate::cbr::get_page_image_bytes(&file_path, index, width)
+                .map_err(carrel_status)?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1128,17 +1131,17 @@ async fn get_page_count(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let book = db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(folio_status)?;
+    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
 
     let count = match book.format {
-        BookFormat::Pdf => crate::pdf::get_page_count(&file_path).map_err(folio_status)?,
-        BookFormat::Cbz => crate::cbz::get_page_count(&file_path).map_err(folio_status)?,
-        BookFormat::Cbr => crate::cbr::get_page_count(&file_path).map_err(folio_status)?,
+        BookFormat::Pdf => crate::pdf::get_page_count(&file_path).map_err(carrel_status)?,
+        BookFormat::Cbz => crate::cbz::get_page_count(&file_path).map_err(carrel_status)?,
+        BookFormat::Cbr => crate::cbr::get_page_count(&file_path).map_err(carrel_status)?,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1159,7 +1162,7 @@ async fn get_page_count(
 // ── Reading progress ─────────────────────────────────────────────────────────
 
 /// PUT body for saving reading progress. Field names mirror
-/// `folio_core::models::ReadingProgress` exactly (and thus the shape the
+/// `carrel_core::models::ReadingProgress` exactly (and thus the shape the
 /// desktop app already persists via `save_reading_progress`): `chapter_index`
 /// doubles as the page index for PDF/CBZ/CBR books, `scroll_position` is the
 /// 0..1 scroll fraction used by EPUB/MOBI.
@@ -1173,12 +1176,12 @@ async fn get_progress(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Json<Option<crate::models::ReadingProgress>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let progress = db::get_reading_progress(&conn, &id).map_err(folio_status)?;
+    let progress = db::get_reading_progress(&conn, &id).map_err(carrel_status)?;
     Ok(Json(progress))
 }
 
@@ -1197,9 +1200,9 @@ async fn put_progress(
         )
     })?;
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let book = db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
     // F4: intentionally NOT bounds-checked against `book.total_chapters`
@@ -1208,7 +1211,7 @@ async fn put_progress(
     // those saves made progress beyond the stale bound silently fail. The
     // client clamps the index when it reads progress back.
     let scroll_position =
-        crate::commands::validate_scroll_position(body.scroll_position).map_err(folio_status)?;
+        crate::commands::validate_scroll_position(body.scroll_position).map_err(carrel_status)?;
 
     // F1: goes through the same completion-detection path as the desktop
     // `save_reading_progress` command (`apply_reading_progress`) so a
@@ -1225,7 +1228,7 @@ async fn put_progress(
         None,
         state.is_private(),
     )
-    .map_err(folio_status)?;
+    .map_err(carrel_status)?;
 
     Ok(Json(progress))
 }
@@ -1249,11 +1252,11 @@ async fn put_want_to_read(
         )
     })?;
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
-    db::set_want_to_read(&conn, &id, body.want_to_read).map_err(folio_status)?;
+    db::set_want_to_read(&conn, &id, body.want_to_read).map_err(carrel_status)?;
     Ok(StatusCode::OK)
 }
 
@@ -1279,11 +1282,11 @@ async fn list_book_bookmarks(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<crate::models::Bookmark>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
-    let bookmarks = db::list_bookmarks(&conn, &id).map_err(folio_status)?;
+    let bookmarks = db::list_bookmarks(&conn, &id).map_err(carrel_status)?;
     Ok(Json(bookmarks))
 }
 
@@ -1300,13 +1303,13 @@ async fn create_bookmark(
         )
     })?;
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
     let scroll_position =
-        crate::commands::validate_scroll_position(body.scroll_position).map_err(folio_status)?;
+        crate::commands::validate_scroll_position(body.scroll_position).map_err(carrel_status)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1325,13 +1328,13 @@ async fn create_bookmark(
         updated_at: now,
         deleted_at: None,
     };
-    db::insert_bookmark(&conn, &bookmark).map_err(folio_status)?;
+    db::insert_bookmark(&conn, &bookmark).map_err(carrel_status)?;
 
     // Emit the same bus event as desktop `add_bookmark` so hooks/plugins fire
-    // for web-created bookmarks too. `events::bus()` is a folio-core global
+    // for web-created bookmarks too. `events::bus()` is a carrel-core global
     // singleton (not tied to a Tauri handle), already used by the web progress
     // path (`apply_reading_progress` emits `BookFinished` on it).
-    events::bus().emit(FolioEvent::BookmarkCreated {
+    events::bus().emit(CarrelEvent::BookmarkCreated {
         book_id: bookmark.book_id.clone(),
         bookmark_id: bookmark.id.clone(),
     });
@@ -1359,12 +1362,12 @@ async fn rename_bookmark(
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.chars().take(100).collect::<String>());
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     // Atomic update-and-return (RETURNING): a concurrent delete can't turn a
     // committed rename into a spurious 404, and there's no second query. None =>
     // no live bookmark with this id in this book => 404.
     let updated = db::update_bookmark_name_scoped(&conn, &id, &bookmark_id, normalized.as_deref())
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Bookmark not found".to_string()))?;
     Ok(Json(updated))
 }
@@ -1373,10 +1376,10 @@ async fn delete_bookmark(
     State(state): State<WebState>,
     Path((id, bookmark_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     // Idempotent: unknown/foreign/already-deleted ids affect 0 rows and still
     // return 204. The book_id scope prevents touching another book's row.
-    db::soft_delete_bookmark_scoped(&conn, &id, &bookmark_id).map_err(folio_status)?;
+    db::soft_delete_bookmark_scoped(&conn, &id, &bookmark_id).map_err(carrel_status)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1418,11 +1421,11 @@ async fn list_book_highlights(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<crate::models::Highlight>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
-    let highlights = db::list_highlights(&conn, &id).map_err(folio_status)?;
+    let highlights = db::list_highlights(&conn, &id).map_err(carrel_status)?;
     Ok(Json(highlights))
 }
 
@@ -1452,9 +1455,9 @@ async fn create_highlight(
     }
     validate_highlight_note(&body.note)?;
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
     let now = std::time::SystemTime::now()
@@ -1476,11 +1479,11 @@ async fn create_highlight(
         updated_at: now,
         deleted_at: None,
     };
-    db::insert_highlight(&conn, &highlight).map_err(folio_status)?;
+    db::insert_highlight(&conn, &highlight).map_err(carrel_status)?;
 
     // Same bus event as desktop `add_highlight` so hooks/plugins fire for
     // web-created highlights too (bookmark precedent).
-    events::bus().emit(FolioEvent::HighlightCreated {
+    events::bus().emit(CarrelEvent::HighlightCreated {
         book_id: highlight.book_id.clone(),
         highlight_id: highlight.id.clone(),
     });
@@ -1533,7 +1536,7 @@ async fn update_highlight(
         Some(_) => return Err((StatusCode::BAD_REQUEST, "Unknown highlight color".into())),
     };
 
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     // Atomic update-and-return (RETURNING): None => no live highlight with this
     // id in this book => 404 (bookmark `rename_bookmark` precedent).
     let updated = db::update_highlight_scoped(
@@ -1543,10 +1546,10 @@ async fn update_highlight(
         note_change.as_ref().map(|o| o.as_deref()),
         color.as_deref(),
     )
-    .map_err(folio_status)?
+    .map_err(carrel_status)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Highlight not found".to_string()))?;
 
-    events::bus().emit(FolioEvent::HighlightUpdated {
+    events::bus().emit(CarrelEvent::HighlightUpdated {
         highlight_id: updated.id.clone(),
     });
     Ok(Json(updated))
@@ -1556,12 +1559,12 @@ async fn delete_highlight_route(
     State(state): State<WebState>,
     Path((id, highlight_id)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     // Idempotent: unknown/foreign/already-deleted ids affect 0 rows and still
     // return 204. Emit the bus event only when a live row actually transitioned.
-    let n = db::soft_delete_highlight_scoped(&conn, &id, &highlight_id).map_err(folio_status)?;
+    let n = db::soft_delete_highlight_scoped(&conn, &id, &highlight_id).map_err(carrel_status)?;
     if n > 0 {
-        events::bus().emit(FolioEvent::HighlightDeleted {
+        events::bus().emit(CarrelEvent::HighlightDeleted {
             highlight_id: highlight_id.clone(),
         });
     }
@@ -1576,8 +1579,8 @@ async fn delete_highlight_route(
 async fn get_all_progress(
     State(state): State<WebState>,
 ) -> Result<Json<Vec<crate::models::ReadingProgress>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let progress = db::get_all_reading_progress(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let progress = db::get_all_reading_progress(&conn).map_err(carrel_status)?;
     Ok(Json(progress))
 }
 
@@ -1587,19 +1590,19 @@ async fn download_book(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
     let book = db::get_book(&conn, &id)
-        .map_err(folio_status)?
+        .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(folio_status)?;
+    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
 
     // R3-2: Stream the file instead of reading entirely into memory
     let file = tokio::fs::File::open(&file_path)
         .await
-        .map_err(folio_status)?;
+        .map_err(carrel_status)?;
 
-    let metadata = file.metadata().await.map_err(folio_status)?;
+    let metadata = file.metadata().await.map_err(carrel_status)?;
 
     let filename = std::path::Path::new(&file_path)
         .file_name()
@@ -1643,8 +1646,8 @@ async fn download_book_with_filename(
 async fn list_series(
     State(state): State<WebState>,
 ) -> Result<Json<Vec<crate::models::SeriesInfo>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let series = db::list_series(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let series = db::list_series(&conn).map_err(carrel_status)?;
     Ok(Json(series))
 }
 
@@ -1665,8 +1668,8 @@ struct CollectionWithCount {
 async fn list_collections(
     State(state): State<WebState>,
 ) -> Result<Json<Vec<CollectionWithCount>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let collections = db::list_collections(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let collections = db::list_collections(&conn).map_err(carrel_status)?;
 
     let result: Vec<CollectionWithCount> = collections
         .into_iter()
@@ -1695,8 +1698,8 @@ async fn get_collection_books(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<crate::models::BookGridItem>>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let books = db::get_books_in_collection_grid(&conn, &id).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let books = db::get_books_in_collection_grid(&conn, &id).map_err(carrel_status)?;
     Ok(Json(books))
 }
 
@@ -1705,8 +1708,8 @@ async fn get_collection_books(
 async fn get_stats(
     State(state): State<WebState>,
 ) -> Result<Json<db::ReadingStats>, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let stats = db::get_reading_stats(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let stats = db::get_reading_stats(&conn).map_err(carrel_status)?;
     Ok(Json(stats))
 }
 
@@ -1873,7 +1876,7 @@ mod tests {
 
     #[test]
     fn gdpr_export_redacts_backup_config() {
-        // `run_schema` is private to folio-core; build a schema-migrated
+        // `run_schema` is private to carrel-core; build a schema-migrated
         // in-memory connection through the pool helper (same as `test_state`).
         let pool = crate::db::create_pool(&std::path::PathBuf::from(":memory:")).unwrap();
         let conn = pool.get().unwrap();

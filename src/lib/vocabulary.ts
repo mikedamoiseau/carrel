@@ -1,6 +1,6 @@
 // Pure, framework-free helpers for the vocabulary builder (F-1-5).
 //
-// The backend (folio-core) owns the Leitner scheduling math and CRUD; this
+// The backend (carrel-core) owns the Leitner scheduling math and CRUD; this
 // module owns the small pieces of client-side logic that benefit from being
 // unit-tested in isolation:
 //   - `extractContextSentence` — derives the surrounding sentence from the
@@ -161,7 +161,7 @@ export function formatDefinitionSnapshot(entry: DictionaryEntry): string {
   return `${primary.gloss} (${synonyms})`;
 }
 
-/** Leitner box intervals (days), boxes 1..5 — mirrors folio-core's schedule. */
+/** Leitner box intervals (days), boxes 1..5 — mirrors carrel-core's schedule. */
 const BOX_INTERVALS_DAYS = [1, 3, 7, 14, 30];
 
 /** Review interval, in days, for a given Leitner box (clamped to 1..5). */

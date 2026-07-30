@@ -3,7 +3,7 @@
 
 Reads the `dict/` payload of `wn3.1.dict.tar.gz` and emits a self-contained,
 read-only SQLite database with the schema documented in
-`folio-core/src/dictionary.rs`. Only single-word lemmas are kept — multiword
+`carrel-core/src/dictionary.rs`. Only single-word lemmas are kept — multiword
 collocations (~40% of WordNet entries) are unreachable by the reader's
 single-word lookup, and semantic relations are dropped entirely.
 

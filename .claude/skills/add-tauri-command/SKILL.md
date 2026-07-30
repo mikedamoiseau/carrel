@@ -17,17 +17,17 @@ easy-to-forget step is registration in `lib.rs`. Three edits, in order.
 
 ```rust
 #[tauri::command]
-pub async fn my_command(arg: String, state: State<'_, AppState>) -> FolioResult<MyReturn> {
+pub async fn my_command(arg: String, state: State<'_, AppState>) -> CarrelResult<MyReturn> {
     let conn = state.pool.get().map_err(...)?;   // r2d2 pooled connection
     db::do_thing(&conn, &arg)
 }
 ```
 
-- Return `FolioResult<T>` (alias for `Result<T, FolioError>`). `FolioError`
+- Return `CarrelResult<T>` (alias for `Result<T, CarrelError>`). `CarrelError`
   serializes to the frontend automatically — do NOT hand-map to `String`.
 - Take `state: State<'_, AppState>` to reach the DB pool; never open a
   connection directly.
-- DB work belongs in `folio-core/src/db.rs`, not inline in the command.
+- DB work belongs in `carrel-core/src/db.rs`, not inline in the command.
 - Match the surrounding commands: many wrap `state.ipc_metrics.time("name")`
   and/or `#[tracing::instrument(...)]` — copy a nearby sibling.
 
@@ -69,6 +69,6 @@ npm run type-check
 | Mistake | Symptom |
 |---------|---------|
 | Forgot `generate_handler!` registration | "command not found" at runtime, compiles fine |
-| Returned `Result<T, String>` | Inconsistent error shape; use `FolioResult<T>` |
+| Returned `Result<T, String>` | Inconsistent error shape; use `CarrelResult<T>` |
 | Opened own DB connection | Bypasses the r2d2 pool; use `State<AppState>` |
-| Put CRUD logic in commands.rs | DB logic belongs in `folio-core/src/db.rs` |
+| Put CRUD logic in commands.rs | DB logic belongs in `carrel-core/src/db.rs` |

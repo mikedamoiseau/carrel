@@ -4,7 +4,7 @@ pub mod opds_feed;
 pub mod web_ui;
 
 use crate::db::DbPool;
-use crate::error::{FolioError, FolioResult};
+use crate::error::{CarrelError, CarrelResult};
 use axum::{http::StatusCode, middleware, Router};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -36,14 +36,14 @@ pub struct WebProfile {
 /// with no Tauri app leave it `None`, which makes the endpoints 503.
 pub trait ProfileHost: Send + Sync {
     /// All profiles with their active/locked/switchable state.
-    fn list(&self) -> FolioResult<Vec<WebProfile>>;
+    fn list(&self) -> CarrelResult<Vec<WebProfile>>;
 
     /// Switch the active profile. Boxed future rather than `async fn` so the
     /// trait stays object-safe.
     fn switch(
         &self,
         name: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FolioResult<()>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CarrelResult<()>> + Send + '_>>;
 }
 
 /// State shared with all axum handlers.
@@ -94,7 +94,7 @@ impl WebState {
     /// Get a database connection from the active pool.
     pub fn conn(
         &self,
-    ) -> FolioResult<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>> {
+    ) -> CarrelResult<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>> {
         let pool = self.pool.lock()?;
         Ok(pool.get()?)
     }
@@ -105,7 +105,7 @@ impl WebState {
     /// - legacy imported rows with an absolute path → return unchanged
     /// - imported rows with a storage key → resolve through the library
     ///   folder setting (falls back to the platform default)
-    pub fn resolve_book_path(&self, book: &folio_core::models::Book) -> FolioResult<String> {
+    pub fn resolve_book_path(&self, book: &carrel_core::models::Book) -> CarrelResult<String> {
         // Prefer a locally-staged copy of the source file when one exists —
         // mirrors `AppState::resolve_book_path`, so a linked book on a network
         // share is served from local disk. Existence-only, LOCAL-only, and
@@ -118,7 +118,7 @@ impl WebState {
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             if let Some(staged) =
-                folio_core::source_cache::staged_if_present(&self.cache_dir, hash, ext)
+                carrel_core::source_cache::staged_if_present(&self.cache_dir, hash, ext)
             {
                 return Ok(staged.to_string_lossy().into_owned());
             }
@@ -133,13 +133,13 @@ impl WebState {
         }
         let folder = {
             let conn = self.conn()?;
-            match folio_core::db::get_setting(&conn, "library_folder")? {
+            match carrel_core::db::get_setting(&conn, "library_folder")? {
                 Some(f) => f,
-                None => folio_core::paths::default_library_folder()?,
+                None => carrel_core::paths::default_library_folder()?,
             }
         };
-        let storage = folio_core::storage::LocalStorage::new(folder)?;
-        use folio_core::storage::Storage;
+        let storage = carrel_core::storage::LocalStorage::new(folder)?;
+        use carrel_core::storage::Storage;
         Ok(storage
             .local_path(&book.file_path)?
             .to_string_lossy()
@@ -150,9 +150,9 @@ impl WebState {
     /// `{data_dir}/images`. Mirrors `AppState::images_storage` so the Tauri
     /// and web-server flows write to the same physical layout. Introduced
     /// for #64 M6.
-    pub fn images_storage(&self) -> FolioResult<Arc<dyn folio_core::storage::Storage>> {
+    pub fn images_storage(&self) -> CarrelResult<Arc<dyn carrel_core::storage::Storage>> {
         let root = self.data_dir.join("images");
-        Ok(Arc::new(folio_core::storage::LocalStorage::new(root)?))
+        Ok(Arc::new(carrel_core::storage::LocalStorage::new(root)?))
     }
 
     /// The app-managed covers root, `{data_dir}/covers` — mirrors
@@ -177,14 +177,14 @@ impl WebState {
     }
 }
 
-/// Map any error convertible to [`FolioError`] into an HTTP `(status, message)`
+/// Map any error convertible to [`CarrelError`] into an HTTP `(status, message)`
 /// tuple for axum handlers.
 ///
 /// `NotFound` → 404, `PermissionDenied` → 403, `InvalidInput` → 400,
-/// `Network` → 502; everything else → 500. Accepts `FolioError` directly or
-/// any source error with a `From<E> for FolioError` impl (e.g. `std::io::Error`).
-pub fn folio_status<E: Into<FolioError>>(e: E) -> (StatusCode, String) {
-    let err: FolioError = e.into();
+/// `Network` → 502; everything else → 500. Accepts `CarrelError` directly or
+/// any source error with a `From<E> for CarrelError` impl (e.g. `std::io::Error`).
+pub fn carrel_status<E: Into<CarrelError>>(e: E) -> (StatusCode, String) {
+    let err: CarrelError = e.into();
     let status = match err.kind() {
         "NotFound" => StatusCode::NOT_FOUND,
         "PermissionDenied" => StatusCode::FORBIDDEN,
@@ -252,10 +252,10 @@ pub fn get_local_ip() -> Option<String> {
 /// text ever changes — a mismatch here means the browser silently blocks the
 /// script instead of erroring, so `test_csp_allows_theme_bootstrap_script_hash`
 /// exists to catch drift in CI.
-const THEME_BOOTSTRAP_SCRIPT_HASH: &str = "'sha256-FGUWTgqSoem8FWO0BBhrwgmMQsdK1kJ8wuiBBS6w55w='";
+const THEME_BOOTSTRAP_SCRIPT_HASH: &str = "'sha256-49QkYHwfN2ynPleLv4yaOqJf59H4tRu6P3+IGG901M8='";
 
 /// Middleware that adds security headers to all responses (R3-3).
-/// Hex-encoded profile name, used as the `x-folio-profile` response header.
+/// Hex-encoded profile name, used as the `x-carrel-profile` response header.
 ///
 /// Clients compare it against the value they booted with to notice that the
 /// active profile moved under them (someone switched from another tab, another
@@ -264,9 +264,8 @@ const THEME_BOOTSTRAP_SCRIPT_HASH: &str = "'sha256-FGUWTgqSoem8FWO0BBhrwgmMQsdK1
 /// containing a newline must not be able to inject a header. Callers only ever
 /// compare it, so nothing decodes it.
 ///
-/// The header name keeps its pre-Carrel spelling: offline-cached copies of
-/// `static/app.js` and `static/sw.js` still read `x-folio-profile`. See
-/// CLAUDE.md, "Legacy `folio` identifiers".
+/// `static/app.js` and `static/sw.js` also read `x-carrel-profile`, so the
+/// header name has to change on both sides at once.
 pub(crate) fn profile_tag(name: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(name.len() * 2);
@@ -293,7 +292,7 @@ async fn profile_tag_middleware(
         Err(_) => return response,
     };
     if let Ok(value) = axum::http::HeaderValue::from_str(&profile_tag(&name)) {
-        response.headers_mut().insert("x-folio-profile", value);
+        response.headers_mut().insert("x-carrel-profile", value);
     }
     response
 }
@@ -409,22 +408,22 @@ pub async fn start(
     state: WebState,
     port: u16,
     modes: ServerModes,
-) -> crate::error::FolioResult<WebServerHandle> {
-    use crate::error::FolioError;
+) -> crate::error::CarrelResult<WebServerHandle> {
+    use crate::error::CarrelError;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let router = build_router(state, modes);
 
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
-            FolioError::invalid(format!(
+            CarrelError::invalid(format!(
                 "Port {port} is already in use. Try a different port (1024\u{2013}65535)."
             ))
         } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-            FolioError::permission(format!(
+            CarrelError::permission(format!(
                 "Permission denied for port {port}. Use a port above 1024."
             ))
         } else {
-            FolioError::network(format!("Failed to start server on port {port}: {e}"))
+            CarrelError::network(format!("Failed to start server on port {port}: {e}"))
         }
     })?;
 
@@ -531,23 +530,23 @@ mod tests {
     }
 
     impl ProfileHost for FakeProfileHost {
-        fn list(&self) -> FolioResult<Vec<WebProfile>> {
+        fn list(&self) -> CarrelResult<Vec<WebProfile>> {
             Ok(self.profiles.lock().unwrap().clone())
         }
 
         fn switch(
             &self,
             name: String,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = FolioResult<()>> + Send + '_>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CarrelResult<()>> + Send + '_>>
         {
             Box::pin(async move {
                 let mut profiles = self.profiles.lock().unwrap();
                 let target = profiles
                     .iter()
                     .find(|p| p.name == name)
-                    .ok_or_else(|| FolioError::invalid(format!("Profile '{name}' not found")))?;
+                    .ok_or_else(|| CarrelError::invalid(format!("Profile '{name}' not found")))?;
                 if !target.switchable {
-                    return Err(FolioError::lock_required(format!(
+                    return Err(CarrelError::lock_required(format!(
                         "Profile '{name}' is locked"
                     )));
                 }
@@ -782,7 +781,7 @@ mod tests {
 
         let tag = |resp: &reqwest::Response| {
             resp.headers()
-                .get("x-folio-profile")
+                .get("x-carrel-profile")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
         };
@@ -1170,7 +1169,7 @@ mod tests {
             .get("set-cookie")
             .expect("login should set a cookie");
         let cookie_str = cookie.to_str().unwrap();
-        assert!(cookie_str.contains("folio_session="));
+        assert!(cookie_str.contains("carrel_session="));
         assert!(cookie_str.contains("HttpOnly"));
         assert!(cookie_str.contains("SameSite=Strict"));
 
@@ -1859,7 +1858,7 @@ mod tests {
         let src = srcdir.path().join("comic.pdf");
         std::fs::write(&src, b"staged bytes").unwrap();
         let staged =
-            folio_core::source_cache::stage(cache.path(), &src, "webhash1", "pdf").unwrap();
+            carrel_core::source_cache::stage(cache.path(), &src, "webhash1", "pdf").unwrap();
 
         // Now resolve prefers the local staged copy.
         assert_eq!(
@@ -1946,7 +1945,7 @@ mod tests {
         );
 
         assert!(
-            folio_core::source_cache::staged_if_present(cache.path(), "localcbzhash", "cbz")
+            carrel_core::source_cache::staged_if_present(cache.path(), "localcbzhash", "cbz")
                 .is_none(),
             "a local book must never be staged"
         );
@@ -4320,9 +4319,9 @@ mod tests {
         const SW_JS: &str = include_str!("static/sw.js");
 
         for decl in [
-            r#"const OFFLINE_SCOPE_CACHE = "folio-offline-scope";"#,
+            r#"const OFFLINE_SCOPE_CACHE = "carrel-offline-scope";"#,
             r#"const OFFLINE_SCOPE_URL = "/__offline_scope";"#,
-            r#"const OFFLINE_CACHE_PREFIX = "folio-offline-book-";"#,
+            r#"const OFFLINE_CACHE_PREFIX = "carrel-offline-book-";"#,
         ] {
             assert!(APP_JS.contains(decl), "app.js must declare `{decl}`");
             assert!(SW_JS.contains(decl), "sw.js must declare `{decl}`");
@@ -4369,7 +4368,7 @@ mod tests {
             cache_version_line.contains(expected_fragment),
             "sw.js's CACHE_VERSION is stale relative to the current shell asset content \
              (index.html + app.js + app.css + manifest.json). Update it to embed \
-             {expected_fragment:?}, e.g. CACHE_VERSION = \"folio-shell-{expected_fragment}\"; \
+             {expected_fragment:?}, e.g. CACHE_VERSION = \"carrel-shell-{expected_fragment}\"; \
              found: {cache_version_line}"
         );
     }
