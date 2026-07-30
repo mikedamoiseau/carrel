@@ -1,6 +1,15 @@
 # Carrel
 
-> Formerly named Folio, renamed to Carrel in 2.11.x.
+> **Carrel was previously called Folio.** Everything carries over automatically —
+> library, reading progress, highlights, bookmarks, settings, profiles, and
+> offline downloads. There is nothing to migrate and nothing to re-import.
+>
+> On **macOS and Windows** the installer adds Carrel *alongside* Folio instead of
+> replacing it, because the installers match on the application name and that
+> name changed. Once Carrel is running, delete the old app: drag `Folio.app` to
+> the Trash, or uninstall "Folio" from **Settings → Apps** on Windows. Deleting it
+> does not touch your library. On **Linux** the `.deb` / `.AppImage` replace the
+> old package normally.
 
 A local-first desktop app for people who want to read and organize the books they already own.
 

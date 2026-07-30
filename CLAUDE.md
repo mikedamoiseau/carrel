@@ -30,7 +30,8 @@ The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, 
 
 ### Legacy `folio` identifiers — do not rename
 
-The app was renamed Folio → Carrel in 2.11.x. Identifiers below still say
+The app was renamed Folio → Carrel on `main` after `v2.11.1` (the last release
+that shipped as Folio). Identifiers below still say
 `folio` **on purpose**, because something outside this repo already depends on
 the exact string. Never run a blind `s/folio/carrel/g`.
 
