@@ -152,7 +152,24 @@ Carrel is for the opposite case: you already have the files, and you want a bett
 - Privacy: [`docs/PRIVACY.md`](docs/PRIVACY.md)
 - Web server / API reference: [`docs/WEB_SERVER_API.md`](docs/WEB_SERVER_API.md)
 - Changelog: [`docs/changelog.html`](docs/changelog.html) ([raw](CHANGELOG.md))
-- Roadmap: [`docs/ROADMAP.md`](docs/ROADMAP.md)
+
+## Project status — maintenance mode
+
+Carrel has been in maintenance mode since `v2.0.0` (2026-05-03). Development
+effort has moved to Carrel Server, a separate commercial multi-user server.
+
+| | |
+|---|---|
+| Bug fixes | yes |
+| Security patches | yes |
+| Dependency updates | yes |
+| Small UX polish | case by case |
+| New file formats | no |
+| New feature requests | politely declined |
+
+The app is feature-complete for its intended scope. Issues reporting real
+breakage are welcome; feature proposals will most likely be declined, so please
+don't invest much effort in one without asking first.
 
 ## Installation
 
@@ -303,7 +320,7 @@ suite stays green on fresh clones.
 - `folio-core/src/` — reusable Rust crate: `db`, `models`, `error`, `paths`, parsers (`epub`, `pdf`, `cbz`, `cbr`, `mobi`), `page_cache`, `enrichment`, providers, `opds`, `openlibrary`, `backup`, `sync`, `storage`, `search`
 - `e2e/` — Playwright web-UI end-to-end tests
 - `src-tauri/examples/web_e2e_server.rs` — seeded web-server harness the e2e suite runs against
-- `docs/` — user-facing docs and roadmap
+- `docs/` — user-facing docs
 
 ## CI
 

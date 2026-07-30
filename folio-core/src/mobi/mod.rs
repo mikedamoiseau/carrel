@@ -7,7 +7,7 @@
 //! `LIBMOBI_INCLUDE_DIR` / `LIBMOBI_LIB_DIR` env vars.
 //!
 //! The public surface is shaped for the Carrel BookFormat adapter
-//! (see ROADMAP #34): open a file, read metadata, reconstruct the rawml, walk
+//! (see CHANGELOG 2.0.0, "MOBI / AZW / AZW3 reading"): open a file, read metadata, reconstruct the rawml, walk
 //! markup/flow/resource parts, and extract the cover.
 //!
 //! ## Security / memory-safety

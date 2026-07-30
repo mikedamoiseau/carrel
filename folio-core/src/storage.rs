@@ -20,7 +20,7 @@
 //!
 //! # Roadmap
 //!
-//! See `docs/ROADMAP.md` #64.
+//! See CHANGELOG 2.0.0, "Pluggable `Storage` trait".
 
 use std::fs;
 use std::io::Write;

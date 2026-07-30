@@ -428,9 +428,10 @@ which fires `AppStarted` at one plugin (the bundled OPDS auto-downloader works
 this way). `run_now` refuses any plugin not subscribed to `AppStarted`, so the
 button can't be used to poke arbitrary scripts.
 
-A real scheduler is recorded as a follow-up in ROADMAP #47 because it depends on
-a background job queue (F-2-2) that doesn't exist yet. It was deferred on
-purpose, not forgotten.
+**Follow-up (do not lose):** recurring/scheduled plugin triggers — e.g. periodic
+OPDS auto-download — were deferred from plugins v1 on purpose, not forgotten.
+They depend on a background job queue (research report F-2-2) that doesn't
+exist yet. v1 ships `AppStarted` plus the manual **Run now** button only.
 
 ## Where things live
 

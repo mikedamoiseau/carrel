@@ -5,7 +5,8 @@
 //! headless/server binaries. It deliberately has zero Tauri or axum
 //! dependencies so every module is reusable from any Rust context.
 //!
-//! See `docs/ROADMAP.md` #63 for the extraction plan.
+//! Extracted from `src-tauri/src/` so the server can share it; see CHANGELOG
+//! 2.0.0, "folio-core crate extraction".
 
 pub mod activity;
 pub mod backup;
