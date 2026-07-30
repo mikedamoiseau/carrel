@@ -62,11 +62,11 @@ function scheduleWhenIdle(cb: () => void): () => void {
   return () => clearTimeout(id);
 }
 
-// Enable with: localStorage.setItem("folio-debug-pages", "1")
-// Disable with: localStorage.removeItem("folio-debug-pages")
+// Enable with: localStorage.setItem("carrel-debug-pages", "1")
+// Disable with: localStorage.removeItem("carrel-debug-pages")
 // Takes effect immediately — no reload needed.
 function dbg(...args: unknown[]) {
-  if (localStorage.getItem("folio-debug-pages") === "1") {
+  if (localStorage.getItem("carrel-debug-pages") === "1") {
     console.warn("[page-load]", ...args);
   }
 }
@@ -152,7 +152,7 @@ export default function PageViewer({
   const [retryCount, setRetryCount] = useState(0);
 
   // Zoom & pan state — restore persisted zoom level per book
-  const zoomStorageKey = `folio-zoom-${bookId}`;
+  const zoomStorageKey = `carrel-zoom-${bookId}`;
   const zoomPersistTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [zoom, setZoomState] = useState(() => {
     const stored = localStorage.getItem(zoomStorageKey);

@@ -23,7 +23,7 @@ const SAMPLE = `# Changelog
 - **Web server deadlock on auto-start**. The auto-start path held the mutex.
 
 ### Changed
-- **folio-core crate extraction** (ROADMAP #63). Modules now live in a separately-tested crate.
+- **carrel-core crate extraction** (ROADMAP #63). Modules now live in a separately-tested crate.
 
 ## [1.4.1] - 2026-04-15
 

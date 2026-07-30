@@ -60,7 +60,7 @@ describe("Continue Reading Section Toggle", () => {
     expect(checked).toBe("false");
 
     const stored = await browser.execute(
-      () => localStorage.getItem("folio-show-continue-reading")
+      () => localStorage.getItem("carrel-show-continue-reading")
     );
     expect(stored).toBe("false");
 
@@ -69,7 +69,7 @@ describe("Continue Reading Section Toggle", () => {
 
     // Verify localStorage persisted the off state
     const storedVal = await browser.execute(
-      () => localStorage.getItem("folio-show-continue-reading")
+      () => localStorage.getItem("carrel-show-continue-reading")
     );
     expect(storedVal).toBe("false");
   });
@@ -86,7 +86,7 @@ describe("Continue Reading Section Toggle", () => {
     expect(checked).toBe("true");
 
     const stored = await browser.execute(
-      () => localStorage.getItem("folio-show-continue-reading")
+      () => localStorage.getItem("carrel-show-continue-reading")
     );
     expect(stored).toBe("true");
 
@@ -122,7 +122,7 @@ describe("Discover Section Toggle", () => {
     expect(checked).toBe("true");
 
     const stored = await browser.execute(
-      () => localStorage.getItem("folio-show-discover")
+      () => localStorage.getItem("carrel-show-discover")
     );
     expect(stored).toBe("true");
   });
@@ -164,7 +164,7 @@ describe("Discover Section Toggle", () => {
     await browser.pause(300);
 
     const stored = await browser.execute(
-      () => localStorage.getItem("folio-show-discover")
+      () => localStorage.getItem("carrel-show-discover")
     );
     expect(stored).toBe("true");
 
@@ -173,7 +173,7 @@ describe("Discover Section Toggle", () => {
     await browser.pause(300);
 
     const storedAfter = await browser.execute(
-      () => localStorage.getItem("folio-show-discover")
+      () => localStorage.getItem("carrel-show-discover")
     );
     expect(storedAfter).toBe("false");
 

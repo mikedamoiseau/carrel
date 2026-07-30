@@ -2,14 +2,14 @@ use secrecy::SecretString;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-use folio_core::activity::ActivityEvent;
-use folio_core::events::{self, FolioEvent, ImportSource, SyncDirection};
+use carrel_core::activity::ActivityEvent;
+use carrel_core::events::{self, CarrelEvent, ImportSource, SyncDirection};
 
 use crate::cbr;
 use crate::cbz;
 use crate::db::{self, DbPool};
 use crate::epub;
-use crate::error::{FolioError, FolioResult};
+use crate::error::{CarrelError, CarrelResult};
 use crate::ipc_metrics::IpcMetrics;
 use crate::models::{
     AutoBackup, Book, BookFormat, BookGridItem, Bookmark, ChapterMeta, CleanupEntry,
@@ -22,8 +22,8 @@ use crate::openlibrary;
 use crate::page_cache;
 use crate::pdf;
 
-pub use folio_core::cache::LruCache;
-use folio_core::cache::{
+pub use carrel_core::cache::LruCache;
+use carrel_core::cache::{
     DiskPageCacheAdapter, ManagedCache, MemoryCacheAdapter, UnifiedCacheStats,
 };
 
@@ -70,7 +70,7 @@ pub struct AppState {
     /// and search don't reopen and reparse the file via libmobi on every
     /// request. Mirrors the EPUB cache's role for the MOBI hot paths.
     #[cfg(feature = "mobi")]
-    pub mobi_cache: std::sync::Arc<std::sync::Mutex<LruCache<folio_core::mobi::CachedMobiBook>>>,
+    pub mobi_cache: std::sync::Arc<std::sync::Mutex<LruCache<carrel_core::mobi::CachedMobiBook>>>,
     /// Metadata provider registry (lock #4).
     pub enrichment_registry: std::sync::Mutex<crate::providers::ProviderRegistry>,
     /// DB pool shared with the web server, swapped on profile switch.
@@ -92,7 +92,7 @@ pub struct AppState {
     /// web callers read the same flag. `set_private_mode` is the only
     /// runtime mutator. Passive write/emit sites read this once per
     /// request via `AppState::is_private`/`WebState::is_private` and pass
-    /// an explicit `bool` into the pure folio-core functions they call —
+    /// an explicit `bool` into the pure carrel-core functions they call —
     /// never read deep inside those functions, so they stay deterministic
     /// under parallel `cargo test`. Defaults `false` (no frontend toggle
     /// exists yet — B-M2); any future ambiguity in a *derived* read (not
@@ -124,7 +124,7 @@ pub struct AppState {
     /// current manager and `switch_profile` can swap it (the manager is
     /// rebuilt against the new profile's DB on switch).
     pub plugin_manager: std::sync::Arc<
-        std::sync::Mutex<Option<std::sync::Arc<folio_core::plugins::PluginManager>>>,
+        std::sync::Mutex<Option<std::sync::Arc<carrel_core::plugins::PluginManager>>>,
     >,
     /// Keeps the non-blocking tracing file writer alive for the app's
     /// lifetime so buffered log records flush on shutdown. Held only for
@@ -161,16 +161,16 @@ impl AppState {
     /// gating here closes the desktop-IPC bypass: a locked-and-not-yet-
     /// unlocked profile (including a locked `"default"` at startup) is
     /// unreadable in-app, not merely dark on the network. Returns
-    /// `FolioError::LockRequired` in that case.
+    /// `CarrelError::LockRequired` in that case.
     ///
     /// Reads `active` and releases `profile_state` before touching
     /// `unlocked_profiles` so the two mutexes are never held together
     /// (keeps `unlocked_profiles` a leaf lock). Internal/startup callers
     /// that must reach the DB before unlock use `active_db_unchecked`.
-    pub fn active_db(&self) -> FolioResult<DbPool> {
+    pub fn active_db(&self) -> CarrelResult<DbPool> {
         let active = { self.profile_state.lock()?.active.clone() };
         if !self.is_unlocked(&active) {
-            return Err(FolioError::lock_required(format!(
+            return Err(CarrelError::lock_required(format!(
                 "Profile '{active}' is locked"
             )));
         }
@@ -183,7 +183,7 @@ impl AppState {
     /// still gate-protected — server up). Every data-bearing IPC command
     /// MUST use [`active_db`](Self::active_db) instead.
     /// Uses a single lock to read profile name and look up the pool atomically.
-    pub fn active_db_unchecked(&self) -> FolioResult<DbPool> {
+    pub fn active_db_unchecked(&self) -> CarrelResult<DbPool> {
         let ps = self.profile_state.lock()?;
         if ps.active == "default" {
             return Ok(self.db.clone());
@@ -191,12 +191,12 @@ impl AppState {
         ps.pools
             .get(&ps.active)
             .cloned()
-            .ok_or_else(|| FolioError::not_found(format!("Profile '{}' not found", ps.active)))
+            .ok_or_else(|| CarrelError::not_found(format!("Profile '{}' not found", ps.active)))
     }
 
     /// Returns the library folder path for the active profile. Reads the
     /// `library_folder` setting, falling back to the platform default.
-    pub fn active_library_folder(&self) -> FolioResult<String> {
+    pub fn active_library_folder(&self) -> CarrelResult<String> {
         let conn = self.active_db()?.get()?;
         match db::get_setting(&conn, "library_folder")? {
             Some(f) => Ok(f),
@@ -208,21 +208,25 @@ impl AppState {
     /// folder. Each call constructs a fresh `LocalStorage`; this is cheap
     /// (stores a PathBuf) and keeps the handle in sync when the user
     /// changes the library folder at runtime.
-    pub fn active_storage(&self) -> FolioResult<std::sync::Arc<dyn folio_core::storage::Storage>> {
+    pub fn active_storage(
+        &self,
+    ) -> CarrelResult<std::sync::Arc<dyn carrel_core::storage::Storage>> {
         let folder = self.active_library_folder()?;
-        Ok(std::sync::Arc::new(folio_core::storage::LocalStorage::new(
-            folder,
-        )?))
+        Ok(std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(folder)?,
+        ))
     }
 
     /// Returns a `Storage` handle for cover images, rooted at
     /// `{data_dir}/covers` — the same on-disk layout used before #64 M3.
     /// Cover keys take the form `{book_id}/cover.{ext}`.
-    pub fn covers_storage(&self) -> FolioResult<std::sync::Arc<dyn folio_core::storage::Storage>> {
+    pub fn covers_storage(
+        &self,
+    ) -> CarrelResult<std::sync::Arc<dyn carrel_core::storage::Storage>> {
         let root = self.data_dir.join("covers");
-        Ok(std::sync::Arc::new(folio_core::storage::LocalStorage::new(
-            root,
-        )?))
+        Ok(std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(root)?,
+        ))
     }
 
     /// Directory holding the offline dictionary artifact (F-1-1), at
@@ -236,11 +240,13 @@ impl AppState {
     /// Returns a `Storage` handle for EPUB inline chapter images, rooted at
     /// `{data_dir}/images` — matches the on-disk layout used before #64 M6.
     /// Image keys take the form `{book_id}/{chapter_index}/{basename}`.
-    pub fn images_storage(&self) -> FolioResult<std::sync::Arc<dyn folio_core::storage::Storage>> {
+    pub fn images_storage(
+        &self,
+    ) -> CarrelResult<std::sync::Arc<dyn carrel_core::storage::Storage>> {
         let root = self.data_dir.join("images");
-        Ok(std::sync::Arc::new(folio_core::storage::LocalStorage::new(
-            root,
-        )?))
+        Ok(std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(root)?,
+        ))
     }
 
     /// Resolve a book's stored `file_path` value to an absolute local
@@ -255,7 +261,7 @@ impl AppState {
     ///   caught by the migration (library folder changed, etc.) still
     ///   carry an absolute path. Detected via `Path::is_absolute()` and
     ///   returned as-is so the old read flow keeps working.
-    pub fn resolve_book_path(&self, book: &Book) -> FolioResult<String> {
+    pub fn resolve_book_path(&self, book: &Book) -> CarrelResult<String> {
         // Prefer a locally-staged copy of the source file when one exists. This
         // applies BEFORE the link/import branches below, so a linked book on a
         // network share (the case this optimizes) is served from local disk.
@@ -269,7 +275,7 @@ impl AppState {
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             if let Some(staged) =
-                folio_core::source_cache::staged_if_present(&self.cache_dir, hash, ext)
+                carrel_core::source_cache::staged_if_present(&self.cache_dir, hash, ext)
             {
                 return Ok(staged.to_string_lossy().into_owned());
             }
@@ -291,7 +297,7 @@ impl AppState {
 
     /// Reads the private-mode ("Don't track this session") flag (B-M1).
     /// Callers read this once per request and pass the resulting bool into
-    /// the pure folio-core functions that need it (D-1) — never re-read it
+    /// the pure carrel-core functions that need it (D-1) — never re-read it
     /// deep inside those functions.
     pub fn is_private(&self) -> bool {
         self.private_mode.load(Ordering::SeqCst)
@@ -307,7 +313,7 @@ impl AppState {
     }
 
     /// Marks `profile` as unlocked for the rest of this process session.
-    pub fn mark_unlocked(&self, profile: &str) -> FolioResult<()> {
+    pub fn mark_unlocked(&self, profile: &str) -> CarrelResult<()> {
         self.unlocked_profiles.lock()?.insert(profile.to_string());
         Ok(())
     }
@@ -315,7 +321,7 @@ impl AppState {
     /// Removes `profile` from the unlocked set. Used by `delete_profile`
     /// hygiene (A-M2, Decision 10) so a re-created same-name profile never
     /// inherits an already-unlocked session.
-    pub fn mark_locked(&self, profile: &str) -> FolioResult<()> {
+    pub fn mark_locked(&self, profile: &str) -> CarrelResult<()> {
         self.unlocked_profiles.lock()?.remove(profile);
         Ok(())
     }
@@ -326,9 +332,9 @@ impl AppState {
     /// commands can't create orphaned keychain locks for names that were
     /// mistyped or never created (A-M2) — such a lock would otherwise be
     /// silently inherited by a later same-name profile.
-    pub fn ensure_profile_exists(&self, profile: &str) -> FolioResult<()> {
+    pub fn ensure_profile_exists(&self, profile: &str) -> CarrelResult<()> {
         if profile != "default" && !self.profile_state.lock()?.pools.contains_key(profile) {
-            return Err(FolioError::invalid(format!(
+            return Err(CarrelError::invalid(format!(
                 "Profile '{profile}' not found"
             )));
         }
@@ -350,9 +356,9 @@ pub fn book_storage_key(book_id: &str, extension: &str) -> String {
 /// Returns `None` when the path is not under the library folder; linked
 /// books sit outside the library folder by design.
 ///
-/// Thin wrapper over [`folio_core::storage::key_for_local_path`].
+/// Thin wrapper over [`carrel_core::storage::key_for_local_path`].
 pub fn book_key_from_path(file_path: &str, library_folder: &str) -> Option<String> {
-    folio_core::storage::key_for_local_path(
+    carrel_core::storage::key_for_local_path(
         std::path::Path::new(library_folder),
         std::path::Path::new(file_path),
     )
@@ -381,14 +387,14 @@ fn ensure_epub_cached(cache: &mut LruCache<epub::CachedEpubArchive>, file_path: 
 /// books pin multi-GB of RAM.
 #[cfg(feature = "mobi")]
 fn ensure_mobi_cached(
-    cache: &mut LruCache<folio_core::mobi::CachedMobiBook>,
+    cache: &mut LruCache<carrel_core::mobi::CachedMobiBook>,
     file_path: &str,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     if cache.get(file_path).is_some() {
         cache.touch(file_path);
         return Ok(());
     }
-    let cached = folio_core::mobi::CachedMobiBook::open(file_path)?;
+    let cached = carrel_core::mobi::CachedMobiBook::open(file_path)?;
     let size = cached.byte_size();
     cache.insert_with_size(file_path.to_string(), cached, size);
     Ok(())
@@ -452,11 +458,11 @@ pub fn thumb_storage_key(book_id: &str) -> String {
 /// blocks app startup. All failures are non-fatal and logged.
 pub fn run_thumbnail_backfill(
     pool: db::DbPool,
-    storage: std::sync::Arc<dyn folio_core::storage::Storage>,
+    storage: std::sync::Arc<dyn carrel_core::storage::Storage>,
 ) {
     let items =
         match pool.get().map_err(Into::into).and_then(|conn| {
-            db::list_books_grid(&conn).map_err(folio_core::error::FolioError::from)
+            db::list_books_grid(&conn).map_err(carrel_core::error::CarrelError::from)
         }) {
             Ok(items) => items,
             Err(e) => {
@@ -478,7 +484,7 @@ pub fn run_thumbnail_backfill(
             Ok(b) => b,
             Err(_) => continue,
         };
-        if let Ok(Some(thumb)) = folio_core::image_util::make_thumbnail(&bytes, THUMB_WIDTH) {
+        if let Ok(Some(thumb)) = carrel_core::image_util::make_thumbnail(&bytes, THUMB_WIDTH) {
             if storage.put(&tkey, &thumb).is_ok() {
                 made += 1;
             }
@@ -493,7 +499,7 @@ pub fn run_thumbnail_backfill(
 /// on disk. Items whose cover is already small (no thumbnail was generated)
 /// keep their original `cover_path`. Best-effort: any storage error leaves
 /// the item pointing at the full cover.
-fn apply_grid_thumbnails(storage: &dyn folio_core::storage::Storage, items: &mut [BookGridItem]) {
+fn apply_grid_thumbnails(storage: &dyn carrel_core::storage::Storage, items: &mut [BookGridItem]) {
     for item in items.iter_mut() {
         if item.cover_path.is_none() {
             continue;
@@ -537,7 +543,7 @@ fn decode_cover_data_uri(data_uri: &str, book_id: &str) -> Option<(Vec<u8>, &'st
 /// `{data_dir}/covers/{book_id}/cover.{ext}` path; a future remote
 /// backend would materialize the key to a cache and return that.
 fn save_cover_via_storage(
-    storage: &dyn folio_core::storage::Storage,
+    storage: &dyn carrel_core::storage::Storage,
     book_id: &str,
     bytes: &[u8],
     ext: &str,
@@ -550,7 +556,7 @@ fn save_cover_via_storage(
     // Best-effort grid thumbnail. A failure here is non-fatal: the grid
     // falls back to serving the full cover. `Ok(None)` means the cover is
     // already small enough to use directly.
-    match folio_core::image_util::make_thumbnail(bytes, THUMB_WIDTH) {
+    match carrel_core::image_util::make_thumbnail(bytes, THUMB_WIDTH) {
         Ok(Some(thumb)) => {
             let tkey = thumb_storage_key(book_id);
             if let Err(e) = storage.put(&tkey, &thumb) {
@@ -580,7 +586,7 @@ fn save_cover_via_storage(
 
 /// Save a decoded data-URI cover via the covers storage.
 fn save_cover_from_data_uri(
-    storage: &dyn folio_core::storage::Storage,
+    storage: &dyn carrel_core::storage::Storage,
     book_id: &str,
     data_uri: &str,
 ) -> Option<String> {
@@ -591,9 +597,9 @@ fn save_cover_from_data_uri(
 /// Remove every cover artifact owned by a given book from the covers
 /// storage. Idempotent; missing entries are silently skipped.
 fn delete_book_covers(
-    storage: &dyn folio_core::storage::Storage,
+    storage: &dyn carrel_core::storage::Storage,
     book_id: &str,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let prefix = format!("{book_id}/");
     let keys = storage.list(&prefix)?;
     for key in keys {
@@ -608,9 +614,9 @@ fn delete_book_covers(
 /// images storage (all chapters). Idempotent; missing entries are silently
 /// skipped. Introduced for #64 M6.
 fn delete_book_images(
-    storage: &dyn folio_core::storage::Storage,
+    storage: &dyn carrel_core::storage::Storage,
     book_id: &str,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let prefix = format!("{book_id}/");
     let keys = storage.list(&prefix)?;
     for key in keys {
@@ -629,12 +635,12 @@ fn delete_book_images(
 /// root.
 fn page_cache_storage<R: tauri::Runtime>(
     app: &AppHandle<R>,
-) -> FolioResult<folio_core::storage::LocalStorage> {
+) -> CarrelResult<carrel_core::storage::LocalStorage> {
     let dir = app
         .path()
         .app_cache_dir()
-        .map_err(|e| FolioError::internal(format!("Failed to get cache dir: {e}")))?;
-    folio_core::storage::LocalStorage::new(dir)
+        .map_err(|e| CarrelError::internal(format!("Failed to get cache dir: {e}")))?;
+    carrel_core::storage::LocalStorage::new(dir)
 }
 
 /// Evict a permanently-removed book's page cache: the whole
@@ -646,7 +652,7 @@ fn page_cache_storage<R: tauri::Runtime>(
 /// (`remove_book`, bulk delete, missing-file cleanup) so they evict
 /// identically; unit-tested with a temp `Storage`.
 fn evict_book_page_cache(
-    storage: Option<&dyn folio_core::storage::Storage>,
+    storage: Option<&dyn carrel_core::storage::Storage>,
     file_hash: Option<&str>,
     resolved_path: Option<&str>,
     cache_dir: Option<&std::path::Path>,
@@ -666,7 +672,7 @@ fn evict_book_page_cache(
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        folio_core::source_cache::remove_staged(dir, h, ext);
+        carrel_core::source_cache::remove_staged(dir, h, ext);
     }
 }
 
@@ -691,7 +697,7 @@ pub fn supported_import_extensions() -> &'static [&'static str] {
 /// The frontend uses this to populate the file-picker and folder-scan
 /// filters so MOBI/AZW/AZW3 only appear when libmobi is compiled in.
 #[tauri::command]
-pub async fn get_supported_formats() -> FolioResult<Vec<&'static str>> {
+pub async fn get_supported_formats() -> CarrelResult<Vec<&'static str>> {
     Ok(supported_import_extensions().to_vec())
 }
 
@@ -718,7 +724,7 @@ pub(crate) fn probe_dir_writable(dir: &std::path::Path) -> bool {
 /// grant. Writability is a boolean answer, so failures (missing path, not a
 /// directory, permission denied) return `Ok(false)` rather than an error.
 #[tauri::command]
-pub async fn check_dir_writable(path: String) -> FolioResult<bool> {
+pub async fn check_dir_writable(path: String) -> CarrelResult<bool> {
     Ok(probe_dir_writable(std::path::Path::new(&path)))
 }
 
@@ -731,7 +737,7 @@ pub async fn import_book(
     file_path: String,
     state: State<'_, AppState>,
     _app: AppHandle,
-) -> FolioResult<Book> {
+) -> CarrelResult<Book> {
     let _t = state.ipc_metrics.time("import_book");
     tracing::info!("importing book");
     let db_pool = state.active_db()?;
@@ -824,12 +830,12 @@ fn with_smb_hint(base: String, path: &str, err: &std::io::Error) -> String {
 pub(crate) fn import_book_inner(
     file_path: String,
     db_pool: DbPool,
-    storage: std::sync::Arc<dyn folio_core::storage::Storage>,
-    covers_storage: std::sync::Arc<dyn folio_core::storage::Storage>,
+    storage: std::sync::Arc<dyn carrel_core::storage::Storage>,
+    covers_storage: std::sync::Arc<dyn carrel_core::storage::Storage>,
     import_mode: &str,
     force_copy: bool,
     source: ImportSource,
-) -> FolioResult<ImportOutcome> {
+) -> CarrelResult<ImportOutcome> {
     // Step 1: single stat — used for size guard, mode-dependent dedup, and to
     // avoid extra round trips on slow filesystems (network shares).
     const MAX_IMPORT_SIZE_BYTES: u64 = 500 * 1024 * 1024;
@@ -837,7 +843,7 @@ pub(crate) fn import_book_inner(
         .map_err(|e| with_smb_hint(format!("Cannot stat file: {e}"), &file_path, &e))?;
     if source_metadata.len() > MAX_IMPORT_SIZE_BYTES {
         let size_mb = source_metadata.len() / (1024 * 1024);
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "File is too large ({size_mb} MB). Maximum supported import size is 500 MB."
         )));
     }
@@ -957,13 +963,13 @@ pub(crate) fn import_book_inner(
             }
             #[cfg(not(feature = "mobi"))]
             {
-                return Err(FolioError::invalid(
+                return Err(CarrelError::invalid(
                     "MOBI/AZW/AZW3 support is not enabled in this build",
                 ));
             }
         }
         _ => {
-            return Err(FolioError::invalid(format!(
+            return Err(CarrelError::invalid(format!(
                 "unsupported file format: .{extension}"
             )))
         }
@@ -990,7 +996,7 @@ pub(crate) fn import_book_inner(
         let key = book_storage_key(&book_id, &extension);
         storage
             .put_path(&key, std::path::Path::new(&file_path))
-            .map_err(|e| FolioError::internal(format!("Failed to copy file to library: {e}")))?;
+            .map_err(|e| CarrelError::internal(format!("Failed to copy file to library: {e}")))?;
         let parser_path = storage.local_path(&key)?.to_string_lossy().to_string();
         (key, parser_path, true)
     } else {
@@ -1262,7 +1268,7 @@ pub(crate) fn import_book_inner(
         BookFormat::Mobi => {
             #[cfg(feature = "mobi")]
             {
-                use folio_core::mobi;
+                use carrel_core::mobi;
                 let meta = mobi::parse_mobi_metadata(&final_path).inspect_err(|_e| {
                     if should_copy {
                         let _ = std::fs::remove_file(&final_path);
@@ -1342,7 +1348,7 @@ pub(crate) fn import_book_inner(
                 if should_copy {
                     let _ = std::fs::remove_file(&final_path);
                 }
-                return Err(FolioError::invalid(
+                return Err(CarrelError::invalid(
                     "MOBI/AZW/AZW3 support is not enabled in this build",
                 ));
             }
@@ -1417,7 +1423,7 @@ pub(crate) fn import_book_inner(
     })?;
 
     // Emit only after the commit — the event must reflect durable state.
-    events::bus().emit(FolioEvent::BookImported {
+    events::bus().emit(CarrelEvent::BookImported {
         book_id: book.id.clone(),
         format: book.format.clone(),
         source,
@@ -1427,14 +1433,14 @@ pub(crate) fn import_book_inner(
 }
 
 #[tauri::command]
-pub async fn get_library(state: State<'_, AppState>) -> FolioResult<Vec<Book>> {
+pub async fn get_library(state: State<'_, AppState>) -> CarrelResult<Vec<Book>> {
     let _t = state.ipc_metrics.time("get_library");
     let conn = state.active_db()?.get()?;
     Ok(db::list_books(&conn)?)
 }
 
 #[tauri::command]
-pub async fn get_library_grid(state: State<'_, AppState>) -> FolioResult<Vec<BookGridItem>> {
+pub async fn get_library_grid(state: State<'_, AppState>) -> CarrelResult<Vec<BookGridItem>> {
     let _t = state.ipc_metrics.time("get_library_grid");
     let conn = state.active_db()?.get()?;
     let mut items = db::list_books_grid(&conn)?;
@@ -1449,7 +1455,7 @@ pub async fn remove_book<R: tauri::Runtime>(
     book_id: String,
     state: State<'_, AppState>,
     app: AppHandle<R>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
 
     // Fetch book before deleting so we can remove the library file and log.
@@ -1564,7 +1570,7 @@ pub async fn remove_book<R: tauri::Runtime>(
     evict_book_page_cache(
         cache_storage
             .as_ref()
-            .map(|s| s as &dyn folio_core::storage::Storage),
+            .map(|s| s as &dyn carrel_core::storage::Storage),
         book_hash.as_deref(),
         resolved_path.as_deref(),
         Some(state.cache_dir.as_path()),
@@ -1574,7 +1580,7 @@ pub async fn remove_book<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-pub async fn get_book(book_id: String, state: State<'_, AppState>) -> FolioResult<Option<Book>> {
+pub async fn get_book(book_id: String, state: State<'_, AppState>) -> CarrelResult<Option<Book>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_book(&conn, &book_id)?)
 }
@@ -1591,12 +1597,12 @@ struct FolderScanProgress {
 pub async fn scan_folder_for_books(
     folder_path: String,
     app: AppHandle,
-) -> FolioResult<Vec<String>> {
+) -> CarrelResult<Vec<String>> {
     let _state = app.state::<AppState>();
     let _t = _state.ipc_metrics.time("scan_folder_for_books");
     let dir = std::path::Path::new(&folder_path);
     if !dir.is_dir() {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "'{}' is not a directory",
             folder_path
         )));
@@ -1670,10 +1676,10 @@ pub async fn update_book_metadata(
     rating: Option<f64>,
     state: State<'_, AppState>,
     _app: AppHandle,
-) -> FolioResult<Book> {
+) -> CarrelResult<Book> {
     let conn = state.active_db()?.get()?;
     let mut book = db::get_book(&conn, &book_id)?
-        .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+        .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
 
     let has_title = title.is_some();
     let has_author = author.is_some();
@@ -1708,7 +1714,7 @@ pub async fn update_book_metadata(
     if let Some(t) = title {
         let t = normalize(t, 500);
         if t.is_empty() {
-            return Err(FolioError::invalid("Title cannot be empty."));
+            return Err(CarrelError::invalid("Title cannot be empty."));
         }
         book.title = t;
     }
@@ -1745,7 +1751,7 @@ pub async fn update_book_metadata(
         let key = cover_storage_key(&book_id, &ext);
         covers_storage
             .put_path(&key, std::path::Path::new(&image_path))
-            .map_err(|e| FolioError::internal(format!("Failed to copy cover image: {e}")))?;
+            .map_err(|e| CarrelError::internal(format!("Failed to copy cover image: {e}")))?;
         book.cover_path = Some(
             covers_storage
                 .local_path(&key)?
@@ -1806,7 +1812,7 @@ pub async fn set_want_to_read(
     book_id: String,
     want: bool,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::set_want_to_read(&conn, &book_id, want)?)
 }
@@ -1817,7 +1823,7 @@ pub async fn set_want_to_read(
 pub async fn get_recently_read(
     limit: Option<u32>,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<Book>> {
+) -> CarrelResult<Vec<Book>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_recently_read_books(&conn, limit.unwrap_or(5))?)
 }
@@ -1829,12 +1835,12 @@ pub async fn get_chapter_content(
     book_id: String,
     chapter_index: u32,
     state: State<'_, AppState>,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     let _t = state.ipc_metrics.time("get_chapter_content");
     let (file_path, format) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         (state.resolve_book_path(&book)?, book.format)
     };
 
@@ -1847,7 +1853,7 @@ pub async fn get_chapter_content(
             ensure_epub_cached(&mut cache, &file_path);
             let cached = cache
                 .get_mut(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open EPUB archive"))?;
+                .ok_or_else(|| CarrelError::internal("Failed to open EPUB archive"))?;
             Ok(epub::get_chapter_content_from_cache(
                 cached,
                 chapter_index as usize,
@@ -1861,8 +1867,8 @@ pub async fn get_chapter_content(
             ensure_mobi_cached(&mut cache, &file_path)?;
             let cached = cache
                 .get(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open MOBI book"))?;
-            Ok(folio_core::mobi::get_chapter_content_from_cache(
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
+            Ok(carrel_core::mobi::get_chapter_content_from_cache(
                 cached,
                 chapter_index as usize,
                 images_storage.as_ref(),
@@ -1870,10 +1876,10 @@ pub async fn get_chapter_content(
             )?)
         }
         #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(FolioError::invalid(
+        BookFormat::Mobi => Err(CarrelError::invalid(
             "MOBI support is not enabled in this build",
         )),
-        other => Err(FolioError::invalid(format!(
+        other => Err(CarrelError::invalid(format!(
             "get_chapter_content is not supported for format {other}"
         ))),
     }
@@ -1885,7 +1891,7 @@ pub async fn search_book_content(
     query: String,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<Vec<crate::models::SearchResult>> {
+) -> CarrelResult<Vec<crate::models::SearchResult>> {
     let _t = state.ipc_metrics.time("search_book_content");
     if query.trim().is_empty() {
         return Ok(Vec::new());
@@ -1894,7 +1900,7 @@ pub async fn search_book_content(
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
     let file_path = state.resolve_book_path(&book)?;
 
@@ -1931,7 +1937,7 @@ pub async fn search_book_content(
             ensure_epub_cached(&mut cache, &file_path);
             let cached = cache
                 .get_mut(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open EPUB archive"))?;
+                .ok_or_else(|| CarrelError::internal("Failed to open EPUB archive"))?;
             Ok(epub::search_book(cached, &query)?)
         }
         #[cfg(feature = "mobi")]
@@ -1941,11 +1947,11 @@ pub async fn search_book_content(
             ensure_mobi_cached(&mut cache, &file_path)?;
             let cached = cache
                 .get(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open MOBI book"))?;
-            let chapters = folio_core::mobi::get_chapter_list_from_cache(cached);
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
+            let chapters = carrel_core::mobi::get_chapter_list_from_cache(cached);
             let chapter_indices: Vec<u32> = chapters.iter().map(|c| c.index as u32).collect();
-            folio_core::search::search_chapters(chapter_indices, &query, &book_id, |idx| {
-                folio_core::mobi::get_chapter_content_from_cache(
+            carrel_core::search::search_chapters(chapter_indices, &query, &book_id, |idx| {
+                carrel_core::mobi::get_chapter_content_from_cache(
                     cached,
                     idx as usize,
                     images_storage.as_ref(),
@@ -1954,7 +1960,7 @@ pub async fn search_book_content(
             })
         }
         #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(FolioError::invalid(
+        BookFormat::Mobi => Err(CarrelError::invalid(
             "MOBI support is not enabled in this build",
         )),
         _ => Ok(Vec::new()), // CBZ/CBR are image-only, no text to search
@@ -1965,11 +1971,11 @@ pub async fn search_book_content(
 pub async fn get_chapter_word_counts(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<usize>> {
+) -> CarrelResult<Vec<usize>> {
     let (file_path, format) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         (state.resolve_book_path(&book)?, book.format)
     };
 
@@ -1990,16 +1996,16 @@ pub async fn get_chapter_word_counts(
             ensure_mobi_cached(&mut cache, &file_path)?;
             let cached = cache
                 .get(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open MOBI book"))?;
-            Ok(folio_core::mobi::get_chapter_word_counts_from_cache(
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
+            Ok(carrel_core::mobi::get_chapter_word_counts_from_cache(
                 cached,
             )?)
         }
         #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(FolioError::invalid(
+        BookFormat::Mobi => Err(CarrelError::invalid(
             "MOBI support is not enabled in this build",
         )),
-        other => Err(FolioError::invalid(format!(
+        other => Err(CarrelError::invalid(format!(
             "get_chapter_word_counts is not supported for format {other}"
         ))),
     }
@@ -2009,11 +2015,11 @@ pub async fn get_chapter_word_counts(
 pub async fn get_chapter_metadata_batch(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<ChapterMeta>> {
+) -> CarrelResult<Vec<ChapterMeta>> {
     let (file_path, format) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         (state.resolve_book_path(&book)?, book.format)
     };
 
@@ -2034,16 +2040,16 @@ pub async fn get_chapter_metadata_batch(
             ensure_mobi_cached(&mut cache, &file_path)?;
             let cached = cache
                 .get(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open MOBI book"))?;
-            Ok(folio_core::mobi::get_chapter_metadata_batch_from_cache(
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
+            Ok(carrel_core::mobi::get_chapter_metadata_batch_from_cache(
                 cached,
             )?)
         }
         #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(FolioError::invalid(
+        BookFormat::Mobi => Err(CarrelError::invalid(
             "MOBI support is not enabled in this build",
         )),
-        other => Err(FolioError::invalid(format!(
+        other => Err(CarrelError::invalid(format!(
             "get_chapter_metadata_batch is not supported for format {other}"
         ))),
     }
@@ -2082,12 +2088,12 @@ pub async fn get_all_chapters(
     book_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<String>> {
+) -> CarrelResult<Vec<String>> {
     let _t = state.ipc_metrics.time("get_all_chapters");
     let (file_path, total_chapters, format) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         let total = book.total_chapters;
         (state.resolve_book_path(&book)?, total, book.format)
     };
@@ -2132,10 +2138,10 @@ pub async fn get_all_chapters(
             ensure_mobi_cached(&mut cache, &file_path)?;
             let cached = cache
                 .get(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open MOBI book"))?;
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
             let mut chapters = Vec::with_capacity(total_chapters as usize);
             for i in 0..total_chapters as usize {
-                let html = folio_core::mobi::get_chapter_content_from_cache(
+                let html = carrel_core::mobi::get_chapter_content_from_cache(
                     cached,
                     i,
                     images_storage.as_ref(),
@@ -2157,10 +2163,10 @@ pub async fn get_all_chapters(
             Ok(chapters)
         }
         #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(FolioError::invalid(
+        BookFormat::Mobi => Err(CarrelError::invalid(
             "MOBI support is not enabled in this build",
         )),
-        other => Err(FolioError::invalid(format!(
+        other => Err(CarrelError::invalid(format!(
             "get_all_chapters is not supported for format {other}"
         ))),
     }
@@ -2170,12 +2176,12 @@ pub async fn get_all_chapters(
 pub async fn get_toc(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<crate::models::TocEntry>> {
+) -> CarrelResult<Vec<crate::models::TocEntry>> {
     let _t = state.ipc_metrics.time("get_toc");
     let (file_path, format) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         (state.resolve_book_path(&book)?, book.format)
     };
 
@@ -2199,8 +2205,8 @@ pub async fn get_toc(
             ensure_mobi_cached(&mut cache, &file_path)?;
             let cached = cache
                 .get(&file_path)
-                .ok_or_else(|| FolioError::internal("Failed to open MOBI book"))?;
-            let chapters = folio_core::mobi::get_chapter_list_from_cache(cached);
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
+            let chapters = carrel_core::mobi::get_chapter_list_from_cache(cached);
             Ok(chapters
                 .into_iter()
                 .map(|c| crate::models::TocEntry {
@@ -2212,10 +2218,10 @@ pub async fn get_toc(
                 .collect())
         }
         #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(FolioError::invalid(
+        BookFormat::Mobi => Err(CarrelError::invalid(
             "MOBI support is not enabled in this build",
         )),
-        other => Err(FolioError::invalid(format!(
+        other => Err(CarrelError::invalid(format!(
             "get_toc is not supported for format {other}"
         ))),
     }
@@ -2227,7 +2233,7 @@ pub async fn get_toc(
 pub async fn get_reading_progress(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Option<ReadingProgress>> {
+) -> CarrelResult<Option<ReadingProgress>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_reading_progress(&conn, &book_id)?)
 }
@@ -2235,12 +2241,12 @@ pub async fn get_reading_progress(
 #[tauri::command]
 pub async fn get_all_reading_progress(
     state: State<'_, AppState>,
-) -> FolioResult<Vec<ReadingProgress>> {
+) -> CarrelResult<Vec<ReadingProgress>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_all_reading_progress(&conn)?)
 }
 
-fn validate_file_exists(file_path: &str) -> FolioResult<()> {
+fn validate_file_exists(file_path: &str) -> CarrelResult<()> {
     let path = std::path::Path::new(file_path);
     if !path.exists() {
         let base = format!(
@@ -2248,7 +2254,7 @@ fn validate_file_exists(file_path: &str) -> FolioResult<()> {
             file_path
         );
         let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
-        return Err(FolioError::not_found(with_smb_hint(
+        return Err(CarrelError::not_found(with_smb_hint(
             base, file_path, &not_found,
         )));
     }
@@ -2258,7 +2264,7 @@ fn validate_file_exists(file_path: &str) -> FolioResult<()> {
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
     {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "Symbolic links are not supported for book files.",
         ));
     }
@@ -2268,13 +2274,13 @@ fn validate_file_exists(file_path: &str) -> FolioResult<()> {
 /// Validate that a path, once canonicalized, lies within an expected parent directory.
 /// Returns the canonical path on success.
 #[allow(dead_code)]
-fn validate_path_within(path: &str, parent: &str) -> FolioResult<std::path::PathBuf> {
+fn validate_path_within(path: &str, parent: &str) -> CarrelResult<std::path::PathBuf> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("Cannot resolve path '{}': {}", path, e))?;
     let canonical_parent = std::fs::canonicalize(parent)
         .map_err(|e| format!("Cannot resolve library folder '{}': {}", parent, e))?;
     if !canonical.starts_with(&canonical_parent) {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "Path '{}' is outside the library folder.",
             path
         )));
@@ -2282,9 +2288,9 @@ fn validate_path_within(path: &str, parent: &str) -> FolioResult<std::path::Path
     Ok(canonical)
 }
 
-pub(crate) fn validate_scroll_position(pos: f64) -> FolioResult<f64> {
+pub(crate) fn validate_scroll_position(pos: f64) -> CarrelResult<f64> {
     if pos.is_nan() || pos.is_infinite() {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "scroll_position must be a finite number",
         ));
     }
@@ -2297,7 +2303,7 @@ pub(crate) fn validate_scroll_position(pos: f64) -> FolioResult<f64> {
 /// (crossing onto the last chapter for the first time — by comparing the
 /// *prior* stored progress against the new one) and performs the same side
 /// effects regardless of caller: an activity-log entry and a
-/// `FolioEvent::BookFinished` bus emission (consumed by hooks/plugins,
+/// `CarrelEvent::BookFinished` bus emission (consumed by hooks/plugins,
 /// independent of any `AppHandle`). The desktop-only `book-completed` window
 /// event is additionally emitted when an `AppHandle` is supplied — the web
 /// path passes `None` since there's no window to notify. This is the fix for
@@ -2327,7 +2333,7 @@ pub(crate) fn apply_reading_progress(
     scroll_position: f64,
     app: Option<&AppHandle>,
     suppress_passive: bool,
-) -> FolioResult<ReadingProgress> {
+) -> CarrelResult<ReadingProgress> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2360,7 +2366,7 @@ pub(crate) fn apply_reading_progress(
     db::upsert_reading_progress(conn, &progress)?;
 
     if is_on_last_chapter && !was_completed_before {
-        events::bus().emit(FolioEvent::BookFinished {
+        events::bus().emit(CarrelEvent::BookFinished {
             book_id: book_id.to_string(),
         });
         log_event(
@@ -2394,17 +2400,17 @@ pub async fn save_reading_progress(
     scroll_position: f64,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let scroll_position = validate_scroll_position(scroll_position)?;
 
     let conn = state.active_db()?.get()?;
 
     // Validate chapter_index against the book's total chapters
     let book = db::get_book(&conn, &book_id)?
-        .ok_or_else(|| FolioError::not_found(format!("Book not found: {}", book_id)))?;
+        .ok_or_else(|| CarrelError::not_found(format!("Book not found: {}", book_id)))?;
 
     if book.total_chapters > 0 && chapter_index >= book.total_chapters {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "chapter_index {} is out of range (book has {} chapters)",
             chapter_index, book.total_chapters
         )));
@@ -2439,7 +2445,7 @@ pub async fn set_private_mode<R: tauri::Runtime>(
     enabled: bool,
     app: AppHandle<R>,
     state: State<'_, AppState>,
-) -> FolioResult<bool> {
+) -> CarrelResult<bool> {
     state.private_mode.store(enabled, Ordering::SeqCst);
     let _ = app.emit("private-mode-changed", enabled);
     Ok(enabled)
@@ -2448,7 +2454,7 @@ pub async fn set_private_mode<R: tauri::Runtime>(
 /// Reads the current private-mode flag. Status-only — the flag can only be
 /// changed via `set_private_mode`.
 #[tauri::command]
-pub async fn get_private_mode(state: State<'_, AppState>) -> FolioResult<bool> {
+pub async fn get_private_mode(state: State<'_, AppState>) -> CarrelResult<bool> {
     Ok(state.is_private())
 }
 
@@ -2458,7 +2464,7 @@ pub async fn get_private_mode(state: State<'_, AppState>) -> FolioResult<bool> {
 pub async fn get_bookmarks(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<Bookmark>> {
+) -> CarrelResult<Vec<Bookmark>> {
     let conn = state.active_db()?.get()?;
     Ok(db::list_bookmarks(&conn, &book_id)?)
 }
@@ -2470,7 +2476,7 @@ pub async fn add_bookmark(
     scroll_position: f64,
     note: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<Bookmark> {
+) -> CarrelResult<Bookmark> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2490,7 +2496,7 @@ pub async fn add_bookmark(
     let conn = state.active_db()?.get()?;
     db::insert_bookmark(&conn, &bookmark)?;
 
-    events::bus().emit(FolioEvent::BookmarkCreated {
+    events::bus().emit(CarrelEvent::BookmarkCreated {
         book_id: bookmark.book_id.clone(),
         bookmark_id: bookmark.id.clone(),
     });
@@ -2499,7 +2505,7 @@ pub async fn add_bookmark(
 }
 
 #[tauri::command]
-pub async fn remove_bookmark(bookmark_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn remove_bookmark(bookmark_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::soft_delete_bookmark(&conn, &bookmark_id)?)
 }
@@ -2509,7 +2515,7 @@ pub async fn update_bookmark(
     bookmark_id: String,
     name: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let truncated_name: Option<String> = name
         .as_deref()
         .filter(|s| !s.trim().is_empty())
@@ -2522,11 +2528,14 @@ pub async fn update_bookmark(
 // --- Comic (CBZ / CBR) ---
 
 #[tauri::command]
-pub async fn get_comic_page_count(book_id: String, state: State<'_, AppState>) -> FolioResult<u32> {
+pub async fn get_comic_page_count(
+    book_id: String,
+    state: State<'_, AppState>,
+) -> CarrelResult<u32> {
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
     let file_path = state.resolve_book_path(&book)?;
 
@@ -2534,7 +2543,7 @@ pub async fn get_comic_page_count(book_id: String, state: State<'_, AppState>) -
     match book.format {
         BookFormat::Cbz => cbz::get_page_count(&file_path),
         BookFormat::Cbr => cbr::get_page_count(&file_path),
-        _ => Err(FolioError::invalid(format!(
+        _ => Err(CarrelError::invalid(format!(
             "get_comic_page_count is not supported for {:?}",
             book.format
         ))),
@@ -2563,7 +2572,7 @@ pub async fn get_comic_page_bytes(
     cached_only: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<tauri::ipc::Response> {
+) -> CarrelResult<tauri::ipc::Response> {
     let _t = state.ipc_metrics.time("get_comic_page_bytes");
     let target_width = target_width.filter(|&w| w > 0).map(|w| w.min(9600));
     let cached_only = cached_only.unwrap_or(false);
@@ -2571,7 +2580,7 @@ pub async fn get_comic_page_bytes(
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
 
     // A cached_only probe touches ONLY the local page cache — never the source
@@ -2604,7 +2613,7 @@ pub async fn get_comic_page_bytes(
     let book_hash = book.file_hash.clone();
     let format = book.format;
     let (bytes, mime) =
-        tauri::async_runtime::spawn_blocking(move || -> FolioResult<(Vec<u8>, String)> {
+        tauri::async_runtime::spawn_blocking(move || -> CarrelResult<(Vec<u8>, String)> {
             let start = std::time::Instant::now();
 
             // Cache-first path. Cached pages are full-resolution archive bytes;
@@ -2632,7 +2641,7 @@ pub async fn get_comic_page_bytes(
                 BookFormat::Cbz => cbz::get_page_image_bytes(&file_path, page_index, target_width)?,
                 BookFormat::Cbr => cbr::get_page_image_bytes(&file_path, page_index, target_width)?,
                 _ => {
-                    return Err(FolioError::invalid(format!(
+                    return Err(CarrelError::invalid(format!(
                         "get_comic_page_bytes is not supported for {format:?}"
                     )));
                 }
@@ -2646,7 +2655,7 @@ pub async fn get_comic_page_bytes(
             Ok((bytes, mime.to_string()))
         })
         .await
-        .map_err(|e| FolioError::internal(format!("comic page render task failed: {e}")))??;
+        .map_err(|e| CarrelError::internal(format!("comic page render task failed: {e}")))??;
 
     Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
         bytes, &mime,
@@ -2663,9 +2672,9 @@ async fn serve_cached_only(
     page_index: u32,
     target_width: Option<u32>,
     label: &'static str,
-) -> FolioResult<tauri::ipc::Response> {
+) -> CarrelResult<tauri::ipc::Response> {
     let rendered =
-        tauri::async_runtime::spawn_blocking(move || -> FolioResult<Option<(Vec<u8>, String)>> {
+        tauri::async_runtime::spawn_blocking(move || -> CarrelResult<Option<(Vec<u8>, String)>> {
             if let Ok(storage) = page_cache_storage(&app) {
                 if let Some(ref hash) = book_hash {
                     if let Ok((data, mime)) =
@@ -2680,7 +2689,7 @@ async fn serve_cached_only(
             Ok(None)
         })
         .await
-        .map_err(|e| FolioError::internal(format!("{label} cache probe failed: {e}")))??;
+        .map_err(|e| CarrelError::internal(format!("{label} cache probe failed: {e}")))??;
 
     match rendered {
         Some((bytes, mime)) => Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
@@ -2733,7 +2742,7 @@ fn stage_source_if_remote(cache_dir: &std::path::Path, src: &str, hash: &str, ex
     if !crate::remote_fs::is_remote_path(std::path::Path::new(src)) {
         return false;
     }
-    match folio_core::source_cache::stage(cache_dir, std::path::Path::new(src), hash, ext) {
+    match carrel_core::source_cache::stage(cache_dir, std::path::Path::new(src), hash, ext) {
         Ok(p) => {
             log::info!(
                 "staged network-mounted book to local cache: {}",
@@ -2741,9 +2750,9 @@ fn stage_source_if_remote(cache_dir: &std::path::Path, src: &str, hash: &str, ex
             );
             // Keep the source cache within its disk budget, evicting the
             // least-recently-opened staged files. Best-effort.
-            let _ = folio_core::source_cache::run_eviction(
+            let _ = carrel_core::source_cache::run_eviction(
                 cache_dir,
-                folio_core::source_cache::DEFAULT_MAX_SIZE_MB,
+                carrel_core::source_cache::DEFAULT_MAX_SIZE_MB,
             );
         }
         Err(e) => log::warn!("source-cache staging failed for {src}: {e}"),
@@ -2794,7 +2803,7 @@ pub(crate) fn touch_staged_book(cache_dir: &std::path::Path, book: &Book) {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        folio_core::source_cache::touch_staged(cache_dir, hash, ext);
+        carrel_core::source_cache::touch_staged(cache_dir, hash, ext);
     }
 }
 
@@ -2828,7 +2837,7 @@ pub(crate) fn ensure_web_source_staged(cache_dir: &std::path::Path, book: &Book,
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    if folio_core::source_cache::staged_if_present(cache_dir, hash, ext).is_some() {
+    if carrel_core::source_cache::staged_if_present(cache_dir, hash, ext).is_some() {
         touch_staged_book(cache_dir, book);
         return;
     }
@@ -2841,12 +2850,12 @@ pub async fn prepare_comic(
     start_page: Option<u32>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<page_cache::CacheManifest> {
+) -> CarrelResult<page_cache::CacheManifest> {
     let _t = state.ipc_metrics.time("prepare_comic");
     let (book, max_size_mb) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         let max_size_mb = db::get_setting(&conn, "page_cache_max_size_mb")
             .ok()
             .flatten()
@@ -2859,7 +2868,7 @@ pub async fn prepare_comic(
     validate_file_exists(&file_path)?;
 
     if book.format != BookFormat::Cbz && book.format != BookFormat::Cbr {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "prepare_comic only supports CBZ/CBR formats",
         ));
     }
@@ -2980,7 +2989,7 @@ pub async fn prepare_pdf(
     start_page: Option<u32>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<page_cache::CacheManifest> {
+) -> CarrelResult<page_cache::CacheManifest> {
     let _t = state.ipc_metrics.time("prepare_pdf");
     // Establish the cache manifest but render NOTHING synchronously: every
     // page is rendered by the background prerender pass below. Rendering pages
@@ -2993,7 +3002,7 @@ pub async fn prepare_pdf(
     let (book, max_size_mb) = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         let max_size_mb = db::get_setting(&conn, "page_cache_max_size_mb")
             .ok()
             .flatten()
@@ -3005,7 +3014,7 @@ pub async fn prepare_pdf(
     validate_file_exists(&file_path)?;
 
     if book.format != BookFormat::Pdf {
-        return Err(FolioError::invalid("prepare_pdf only supports PDF format"));
+        return Err(CarrelError::invalid("prepare_pdf only supports PDF format"));
     }
 
     // Mark the staged copy (if any) most-recently-used for eviction, then stage
@@ -3017,7 +3026,7 @@ pub async fn prepare_pdf(
     let book_hash = book
         .file_hash
         .as_deref()
-        .ok_or_else(|| FolioError::invalid("Book has no file hash; cannot populate PDF cache"))?;
+        .ok_or_else(|| CarrelError::invalid("Book has no file hash; cannot populate PDF cache"))?;
 
     let storage = page_cache_storage(&app)?;
     let prep_start = std::time::Instant::now();
@@ -3246,7 +3255,7 @@ pub async fn prepare_pdf(
 /// `page_cache_storage` exactly like the existing page-cache commands.
 fn cache_registry(
     state: &AppState,
-    storage: std::sync::Arc<dyn folio_core::storage::Storage>,
+    storage: std::sync::Arc<dyn carrel_core::storage::Storage>,
 ) -> Vec<Box<dyn ManagedCache>> {
     let mut registry: Vec<Box<dyn ManagedCache>> = vec![Box::new(MemoryCacheAdapter::new(
         "epub",
@@ -3267,23 +3276,23 @@ fn cache_registry(
 pub async fn get_unified_cache_stats(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<UnifiedCacheStats> {
-    let storage: std::sync::Arc<dyn folio_core::storage::Storage> =
+) -> CarrelResult<UnifiedCacheStats> {
+    let storage: std::sync::Arc<dyn carrel_core::storage::Storage> =
         std::sync::Arc::new(page_cache_storage(&app)?);
-    Ok(folio_core::cache::unified_stats(&cache_registry(
+    Ok(carrel_core::cache::unified_stats(&cache_registry(
         &state, storage,
     )))
 }
 
 #[tauri::command]
-pub async fn clear_all_caches(app: AppHandle, state: State<'_, AppState>) -> FolioResult<()> {
-    let storage: std::sync::Arc<dyn folio_core::storage::Storage> =
+pub async fn clear_all_caches(app: AppHandle, state: State<'_, AppState>) -> CarrelResult<()> {
+    let storage: std::sync::Arc<dyn carrel_core::storage::Storage> =
         std::sync::Arc::new(page_cache_storage(&app)?);
-    folio_core::cache::clear_all(&cache_registry(&state, storage))
+    carrel_core::cache::clear_all(&cache_registry(&state, storage))
 }
 
 #[tauri::command]
-pub async fn clear_page_cache(app: AppHandle) -> FolioResult<()> {
+pub async fn clear_page_cache(app: AppHandle) -> CarrelResult<()> {
     let storage = page_cache_storage(&app)?;
     page_cache::clear_cache(&storage)
 }
@@ -3297,7 +3306,7 @@ pub async fn record_reading_session(
     duration_secs: i64,
     pages_read: i32,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     if duration_secs < 10 {
         return Ok(());
     } // Skip very short sessions
@@ -3319,7 +3328,7 @@ pub async fn record_reading_session(
 }
 
 #[tauri::command]
-pub async fn get_reading_stats(state: State<'_, AppState>) -> FolioResult<db::ReadingStats> {
+pub async fn get_reading_stats(state: State<'_, AppState>) -> CarrelResult<db::ReadingStats> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_reading_stats(&conn)?)
 }
@@ -3328,7 +3337,7 @@ pub async fn get_reading_stats(state: State<'_, AppState>) -> FolioResult<db::Re
 pub async fn get_book_reading_time(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<i64> {
+) -> CarrelResult<i64> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_book_reading_time(&conn, &book_id)?)
 }
@@ -3337,7 +3346,7 @@ pub async fn get_book_reading_time(
 pub async fn get_book_reading_stats(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Option<db::BookReadingStats>> {
+) -> CarrelResult<Option<db::BookReadingStats>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_book_reading_stats(&conn, &book_id)?)
 }
@@ -3355,7 +3364,7 @@ pub async fn add_highlight(
     end_offset: u32,
     note: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<Highlight> {
+) -> CarrelResult<Highlight> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3376,7 +3385,7 @@ pub async fn add_highlight(
     let conn = state.active_db()?.get()?;
     db::insert_highlight(&conn, &highlight)?;
 
-    events::bus().emit(FolioEvent::HighlightCreated {
+    events::bus().emit(CarrelEvent::HighlightCreated {
         book_id: highlight.book_id.clone(),
         highlight_id: highlight.id.clone(),
     });
@@ -3388,7 +3397,7 @@ pub async fn add_highlight(
 pub async fn get_highlights(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<Highlight>> {
+) -> CarrelResult<Vec<Highlight>> {
     let conn = state.active_db()?.get()?;
     Ok(db::list_highlights(&conn, &book_id)?)
 }
@@ -3398,7 +3407,7 @@ pub async fn get_chapter_highlights(
     book_id: String,
     chapter_index: u32,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<Highlight>> {
+) -> CarrelResult<Vec<Highlight>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_chapter_highlights(&conn, &book_id, chapter_index)?)
 }
@@ -3408,18 +3417,21 @@ pub async fn update_highlight_note(
     highlight_id: String,
     note: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     db::update_highlight_note(&conn, &highlight_id, note.as_deref())?;
-    events::bus().emit(FolioEvent::HighlightUpdated { highlight_id });
+    events::bus().emit(CarrelEvent::HighlightUpdated { highlight_id });
     Ok(())
 }
 
 #[tauri::command]
-pub async fn remove_highlight(highlight_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn remove_highlight(
+    highlight_id: String,
+    state: State<'_, AppState>,
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     db::soft_delete_highlight(&conn, &highlight_id)?;
-    events::bus().emit(FolioEvent::HighlightDeleted { highlight_id });
+    events::bus().emit(CarrelEvent::HighlightDeleted { highlight_id });
     Ok(())
 }
 
@@ -3427,10 +3439,10 @@ pub async fn remove_highlight(highlight_id: String, state: State<'_, AppState>) 
 pub async fn export_highlights_markdown(
     book_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     let conn = state.active_db()?.get()?;
     let book = db::get_book(&conn, &book_id)?
-        .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+        .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
     let highlights = db::list_highlights(&conn, &book_id)?;
 
     let mut md = format!("# Highlights: {}\n\n", book.title);
@@ -3457,7 +3469,7 @@ pub async fn search_highlights(
     query: String,
     limit: Option<u32>,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<HighlightSearchResult>> {
+) -> CarrelResult<Vec<HighlightSearchResult>> {
     let conn = state.active_db()?.get()?;
     Ok(db::search_highlights(&conn, &query, limit.unwrap_or(200))?)
 }
@@ -3471,7 +3483,7 @@ pub struct Tag {
 }
 
 #[tauri::command]
-pub async fn get_all_tags(state: State<'_, AppState>) -> FolioResult<Vec<Tag>> {
+pub async fn get_all_tags(state: State<'_, AppState>) -> CarrelResult<Vec<Tag>> {
     let conn = state.active_db()?.get()?;
     let tags = db::list_tags(&conn)?;
     Ok(tags
@@ -3481,7 +3493,7 @@ pub async fn get_all_tags(state: State<'_, AppState>) -> FolioResult<Vec<Tag>> {
 }
 
 #[tauri::command]
-pub async fn get_book_tags(book_id: String, state: State<'_, AppState>) -> FolioResult<Vec<Tag>> {
+pub async fn get_book_tags(book_id: String, state: State<'_, AppState>) -> CarrelResult<Vec<Tag>> {
     let conn = state.active_db()?.get()?;
     let tags = db::get_book_tags(&conn, &book_id)?;
     Ok(tags
@@ -3495,7 +3507,7 @@ pub async fn add_tag_to_book(
     book_id: String,
     tag_name: String,
     state: State<'_, AppState>,
-) -> FolioResult<Tag> {
+) -> CarrelResult<Tag> {
     let conn = state.active_db()?.get()?;
     // Find or create tag
     let tag_id = if let Some(id) = db::get_tag_by_name(&conn, &tag_name)? {
@@ -3517,7 +3529,7 @@ pub async fn remove_tag_from_book(
     book_id: String,
     tag_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::remove_tag_from_book(&conn, &book_id, &tag_id)?)
 }
@@ -3529,7 +3541,7 @@ pub struct BookTagAssoc {
 }
 
 #[tauri::command]
-pub async fn get_all_book_tags(state: State<'_, AppState>) -> FolioResult<Vec<BookTagAssoc>> {
+pub async fn get_all_book_tags(state: State<'_, AppState>) -> CarrelResult<Vec<BookTagAssoc>> {
     let conn = state.active_db()?.get()?;
     let assocs = db::list_all_book_tags(&conn)?;
     Ok(assocs
@@ -3558,13 +3570,13 @@ const VALID_RULE_PAIRS: &[(&str, &str)] = &[
     ("reading_progress", "equals"),
 ];
 
-fn validate_collection_rules(rules: &[NewRuleInput]) -> FolioResult<()> {
+fn validate_collection_rules(rules: &[NewRuleInput]) -> CarrelResult<()> {
     for rule in rules {
         if !VALID_RULE_PAIRS
             .iter()
             .any(|(f, o)| *f == rule.field && *o == rule.operator)
         {
-            return Err(FolioError::invalid(format!(
+            return Err(CarrelError::invalid(format!(
                 "Invalid collection rule: field '{}' with operator '{}'",
                 rule.field, rule.operator
             )));
@@ -3581,7 +3593,7 @@ pub async fn create_collection(
     color: Option<String>,
     rules: Vec<NewRuleInput>,
     state: State<'_, AppState>,
-) -> FolioResult<Collection> {
+) -> CarrelResult<Collection> {
     validate_collection_rules(&rules)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3640,7 +3652,7 @@ pub async fn update_collection(
     color: Option<String>,
     rules: Vec<NewRuleInput>,
     state: State<'_, AppState>,
-) -> FolioResult<Collection> {
+) -> CarrelResult<Collection> {
     validate_collection_rules(&rules)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3696,13 +3708,13 @@ pub async fn update_collection(
 }
 
 #[tauri::command]
-pub async fn get_collections(state: State<'_, AppState>) -> FolioResult<Vec<Collection>> {
+pub async fn get_collections(state: State<'_, AppState>) -> CarrelResult<Vec<Collection>> {
     let conn = state.active_db()?.get()?;
     Ok(db::list_collections(&conn)?)
 }
 
 #[tauri::command]
-pub async fn delete_collection(id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn delete_collection(id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     log_event(&conn, ActivityEvent::CollectionDeleted { id: id.clone() });
     Ok(db::delete_collection(&conn, &id)?)
@@ -3713,7 +3725,7 @@ pub async fn add_book_to_collection(
     book_id: String,
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     let coll_type: String = conn.query_row(
         "SELECT type FROM collections WHERE id = ?1",
@@ -3721,7 +3733,7 @@ pub async fn add_book_to_collection(
         |row| row.get(0),
     )?;
     if coll_type == "automated" {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "Cannot manually add books to an automated collection",
         ));
     }
@@ -3741,7 +3753,7 @@ pub async fn remove_book_from_collection(
     book_id: String,
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     db::remove_book_from_collection(&conn, &book_id, &collection_id)?;
     log_event(
@@ -3758,7 +3770,7 @@ pub async fn remove_book_from_collection(
 pub async fn get_books_in_collection(
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<Book>> {
+) -> CarrelResult<Vec<Book>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_books_in_collection(&conn, &collection_id)?)
 }
@@ -3767,7 +3779,7 @@ pub async fn get_books_in_collection(
 pub async fn get_books_in_collection_grid(
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<BookGridItem>> {
+) -> CarrelResult<Vec<BookGridItem>> {
     let conn = state.active_db()?.get()?;
     let mut items = db::get_books_in_collection_grid(&conn, &collection_id)?;
     if let Ok(storage) = state.covers_storage() {
@@ -3782,7 +3794,7 @@ pub async fn get_books_in_collection_grid(
 pub async fn export_collection_markdown(
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     let conn = state.active_db()?.get()?;
 
     // Get collection name
@@ -3810,7 +3822,7 @@ pub async fn export_collection_markdown(
 pub async fn export_collection_json(
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     let conn = state.active_db()?.get()?;
     let name: String = conn.query_row(
         "SELECT name FROM collections WHERE id = ?1",
@@ -3845,7 +3857,7 @@ pub async fn export_collection_json(
 pub async fn search_openlibrary(
     title: String,
     author: Option<String>,
-) -> FolioResult<Vec<openlibrary::OpenLibraryResult>> {
+) -> CarrelResult<Vec<openlibrary::OpenLibraryResult>> {
     let (tx, rx) = std::sync::mpsc::channel();
     tauri::async_runtime::spawn_blocking(move || {
         let _ = tx.send(openlibrary::search(&title, author.as_deref()));
@@ -3859,7 +3871,7 @@ pub async fn enrich_book_from_openlibrary(
     book_id: String,
     openlibrary_key: String,
     state: State<'_, AppState>,
-) -> FolioResult<Book> {
+) -> CarrelResult<Book> {
     let _t = state.ipc_metrics.time("enrich_book_from_openlibrary");
     tracing::info!("enriching book from openlibrary");
     // Fetch detailed metadata from OpenLibrary (on a separate thread)
@@ -3873,7 +3885,7 @@ pub async fn enrich_book_from_openlibrary(
     // Also get search result for rating/isbn (work endpoint doesn't have them)
     let conn = state.active_db()?.get()?;
     let mut book = db::get_book(&conn, &book_id)?
-        .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+        .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
 
     // Do a quick search to get rating and ISBN
     let search_title = book.title.clone();
@@ -3918,7 +3930,7 @@ pub async fn enrich_book_from_openlibrary(
     book.isbn = isbn;
     book.openlibrary_key = Some(openlibrary_key);
 
-    events::bus().emit(FolioEvent::MetadataEnriched {
+    events::bus().emit(CarrelEvent::MetadataEnriched {
         book_id: book_id.clone(),
         provider: "OpenLibrary".to_string(),
     });
@@ -3998,7 +4010,7 @@ fn trusted_hosts_from_db(conn: &rusqlite::Connection) -> Vec<String> {
 }
 
 #[tauri::command]
-pub async fn get_opds_catalogs(state: State<'_, AppState>) -> FolioResult<Vec<OpdsCatalogSource>> {
+pub async fn get_opds_catalogs(state: State<'_, AppState>) -> CarrelResult<Vec<OpdsCatalogSource>> {
     let conn = state.active_db()?.get()?;
     let custom_json =
         db::get_setting(&conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
@@ -4025,7 +4037,7 @@ fn add_opds_catalog_inner(
     name: String,
     url: String,
     preset_id: Option<String>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let custom_json =
         db::get_setting(conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
     let mut custom: Vec<OpdsCatalogSource> = serde_json::from_str(&custom_json).unwrap_or_default();
@@ -4044,9 +4056,9 @@ pub async fn add_opds_catalog(
     url: String,
     preset_id: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     if !opds::is_user_addable_url(&url) {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "Invalid catalog URL — only http:// or https:// URLs are accepted.",
         ));
     }
@@ -4055,7 +4067,7 @@ pub async fn add_opds_catalog(
 }
 
 #[tauri::command]
-pub async fn remove_opds_catalog(url: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn remove_opds_catalog(url: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     let custom_json =
         db::get_setting(&conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
@@ -4085,7 +4097,7 @@ pub async fn search_all_catalogs(
     query: String,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<opds::OpdsEntry>> {
+) -> CarrelResult<Vec<opds::OpdsEntry>> {
     // Collect all catalog URLs
     let catalogs = get_opds_catalogs(state).await?;
     let trusted = trusted_hosts_from_catalogs(&catalogs);
@@ -4217,7 +4229,7 @@ fn dedup_discover_entries(
 /// Returns a cached list of popular/new books from all configured catalogs.
 /// Results are cached for 24 hours in the settings DB to avoid slowing down startup.
 #[tauri::command]
-pub async fn get_discover_books(state: State<'_, AppState>) -> FolioResult<Vec<opds::OpdsEntry>> {
+pub async fn get_discover_books(state: State<'_, AppState>) -> CarrelResult<Vec<opds::OpdsEntry>> {
     let conn = state.active_db()?.get()?;
 
     // Library title/author pairs, used to drop books the user already owns.
@@ -4342,10 +4354,10 @@ fn opds_extension_from_url(url: &str) -> Option<&'static str> {
 /// (new or existing duplicate). Backs the plugin `import:books` host function
 /// (`plugin_host::DesktopHostServices::import_from_url`); runs on the caller's
 /// thread, so it uses blocking download + import directly.
-pub(crate) fn import_book_from_url(state: &AppState, url: &str) -> FolioResult<String> {
+pub(crate) fn import_book_from_url(state: &AppState, url: &str) -> CarrelResult<String> {
     let ext = opds_extension_from_url(url).unwrap_or("epub");
     if !supported_import_extensions().contains(&ext) {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "Format '.{ext}' is not supported in this build."
         )));
     }
@@ -4410,7 +4422,7 @@ fn opds_extension_from_mime(mime: &str) -> Option<&'static str> {
 }
 
 #[tauri::command]
-pub async fn browse_opds(url: String, state: State<'_, AppState>) -> FolioResult<opds::OpdsFeed> {
+pub async fn browse_opds(url: String, state: State<'_, AppState>) -> CarrelResult<opds::OpdsFeed> {
     let trusted = {
         let conn = state.active_db()?.get()?;
         trusted_hosts_from_db(&conn)
@@ -4428,7 +4440,7 @@ pub async fn download_opds_book(
     mime_type: Option<String>,
     state: State<'_, AppState>,
     _app: AppHandle,
-) -> FolioResult<OpdsImportResult> {
+) -> CarrelResult<OpdsImportResult> {
     // Determine the file extension for the temp import path. Precedence:
     //   1. URL suffix — Carrel's own feed and many well-behaved feeds put the
     //      extension in the path; this is the only signal that disambiguates
@@ -4462,7 +4474,7 @@ pub async fn download_opds_book(
     // get_supported_formats, but feature flags could diverge (e.g. direct
     // IPC calls from tests), and the import error is clearer here.
     if !supported_import_extensions().contains(&ext) {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "Format '.{ext}' is not supported in this build."
         )));
     }
@@ -4532,7 +4544,7 @@ pub struct Profile {
 }
 
 #[tauri::command]
-pub async fn get_profiles(state: State<'_, AppState>) -> FolioResult<Vec<Profile>> {
+pub async fn get_profiles(state: State<'_, AppState>) -> CarrelResult<Vec<Profile>> {
     let ps = state.profile_state.lock()?;
     let mut result = vec![Profile {
         name: "default".to_string(),
@@ -4553,7 +4565,7 @@ pub async fn get_profiles(state: State<'_, AppState>) -> FolioResult<Vec<Profile
 /// `password` is treated as "no lock" when `None` or blank/whitespace-only
 /// (matching the frontend's checkbox-off case) — in which case behavior is
 /// unchanged from before this option existed. A non-empty password is
-/// hashed and stored via [`folio_core::profile_lock::set_lock`], then the
+/// hashed and stored via [`carrel_core::profile_lock::set_lock`], then the
 /// profile is marked unlocked for this session: the caller just typed the
 /// password to create it, so re-prompting immediately would be pointless
 /// (a future app restart still prompts normally, since the session set
@@ -4563,10 +4575,10 @@ pub async fn create_profile(
     name: String,
     password: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let name = name.trim().to_string();
     if name.is_empty() || name == "default" {
-        return Err(FolioError::invalid("Invalid profile name"));
+        return Err(CarrelError::invalid("Invalid profile name"));
     }
 
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
@@ -4580,7 +4592,7 @@ pub async fn create_profile(
 
     let db_path = state.data_dir.join(format!("library-{name}.db"));
     if db_path.exists() {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "Profile '{name}' already exists"
         )));
     }
@@ -4605,14 +4617,14 @@ pub async fn create_profile(
         let password = password.expect("lock_requested implies Some");
         let set = async {
             let phc = hash_password_blocking(SecretString::from(password)).await?;
-            folio_core::profile_lock::set_lock(&name, &phc)
+            carrel_core::profile_lock::set_lock(&name, &phc)
         }
         .await;
         if let Err(e) = set {
             drop(pool);
             let _ = std::fs::remove_file(&db_path);
             let _ = std::fs::remove_dir_all(&profile_folder);
-            return Err(FolioError::internal(format!(
+            return Err(CarrelError::internal(format!(
                 "Failed to create locked profile '{name}': {e}"
             )));
         }
@@ -4634,16 +4646,16 @@ pub async fn create_profile(
 /// command, plus the two lock flags the remote switcher needs.
 pub(crate) fn list_profiles_with_lock_state(
     state: &AppState,
-) -> FolioResult<Vec<crate::web_server::WebProfile>> {
-    list_profiles_with_lock_state_with(state, folio_core::profile_lock::has_lock)
+) -> CarrelResult<Vec<crate::web_server::WebProfile>> {
+    list_profiles_with_lock_state_with(state, carrel_core::profile_lock::has_lock)
 }
 
 /// [`list_profiles_with_lock_state`] with the lock-status probe injected —
 /// see [`switch_active_profile_with`] for why.
 fn list_profiles_with_lock_state_with(
     state: &AppState,
-    has_lock: impl Fn(&str) -> FolioResult<bool>,
-) -> FolioResult<Vec<crate::web_server::WebProfile>> {
+    has_lock: impl Fn(&str) -> CarrelResult<bool>,
+) -> CarrelResult<Vec<crate::web_server::WebProfile>> {
     let (active, mut names) = {
         let ps = state.profile_state.lock()?;
         let mut names: Vec<String> = ps.pools.keys().cloned().collect();
@@ -4664,7 +4676,7 @@ fn list_profiles_with_lock_state_with(
             crate::web_server::WebProfile {
                 active: name == active,
                 locked,
-                switchable: folio_core::profile_lock::access_allowed(
+                switchable: carrel_core::profile_lock::access_allowed(
                     locked,
                     state.is_unlocked(&name),
                 ),
@@ -4686,8 +4698,8 @@ pub(crate) async fn switch_active_profile<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
     name: String,
-) -> FolioResult<()> {
-    switch_active_profile_with(app, state, name, folio_core::profile_lock::has_lock).await
+) -> CarrelResult<()> {
+    switch_active_profile_with(app, state, name, carrel_core::profile_lock::has_lock).await
 }
 
 /// [`switch_active_profile`] with the lock-status probe injected. The only
@@ -4698,8 +4710,8 @@ async fn switch_active_profile_with<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
     name: String,
-    has_lock: impl Fn(&str) -> FolioResult<bool>,
-) -> FolioResult<()> {
+    has_lock: impl Fn(&str) -> CarrelResult<bool>,
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this validate-then-mutate sequence can't interleave
     // with `delete_profile` — otherwise a switch could validate that `name`
@@ -4710,7 +4722,7 @@ async fn switch_active_profile_with<R: tauri::Runtime>(
     {
         let ps = state.profile_state.lock()?;
         if name != "default" && !ps.pools.contains_key(&name) {
-            return Err(FolioError::invalid(format!("Profile '{name}' not found")));
+            return Err(CarrelError::invalid(format!("Profile '{name}' not found")));
         }
     }
 
@@ -4719,8 +4731,8 @@ async fn switch_active_profile_with<R: tauri::Runtime>(
     // mutating `profile_state` so a rejected switch leaves the active
     // profile untouched — the frontend retries after a successful
     // `unlock_profile`.
-    if !folio_core::profile_lock::access_allowed(has_lock(&name)?, state.is_unlocked(&name)) {
-        return Err(FolioError::lock_required(format!(
+    if !carrel_core::profile_lock::access_allowed(has_lock(&name)?, state.is_unlocked(&name)) {
+        return Err(CarrelError::lock_required(format!(
             "Profile '{name}' is locked"
         )));
     }
@@ -4776,23 +4788,23 @@ pub async fn switch_profile(
     name: String,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     switch_active_profile(&app, state.inner(), name).await
 }
 
 #[tauri::command]
-pub async fn delete_profile(name: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
     let _lifecycle = state.profile_lifecycle.lock().await;
     if name == "default" {
-        return Err(FolioError::invalid("Cannot delete the default profile"));
+        return Err(CarrelError::invalid("Cannot delete the default profile"));
     }
     {
         let mut ps = state.profile_state.lock()?;
         if ps.active == name {
-            return Err(FolioError::invalid(
+            return Err(CarrelError::invalid(
                 "Cannot delete the active profile. Switch to another profile first.",
             ));
         }
@@ -4806,7 +4818,7 @@ pub async fn delete_profile(name: String, state: State<'_, AppState>) -> FolioRe
     // drop the profile from the unlocked set, best-effort, so a re-created
     // same-name profile never inherits the old lock or an already-unlocked
     // session.
-    let _ = folio_core::profile_lock::clear_lock(&name);
+    let _ = carrel_core::profile_lock::clear_lock(&name);
     state.mark_locked(&name)?;
 
     Ok(())
@@ -4815,27 +4827,27 @@ pub async fn delete_profile(name: String, state: State<'_, AppState>) -> FolioRe
 // --- Profile soft-lock (A-M2) ---
 //
 // See `docs/superpowers/specs/2026-07-07-profile-soft-lock-design.md`.
-// `folio_core::profile_lock` (A-M1) owns the Argon2id KDF and keychain
+// `carrel_core::profile_lock` (A-M1) owns the Argon2id KDF and keychain
 // storage; these commands are the IPC-facing wiring plus the session
 // unlock state on `AppState`. The profile password never crosses the web
 // layer (Decision 5) — these commands are desktop-only.
 
-/// Run [`folio_core::profile_lock::hash_password`] off the async runtime.
+/// Run [`carrel_core::profile_lock::hash_password`] off the async runtime.
 /// Argon2id is CPU/memory-heavy (~19 MiB, 2 iterations); never call it
 /// directly from a `#[tauri::command]` body.
-async fn hash_password_blocking(password: SecretString) -> FolioResult<String> {
+async fn hash_password_blocking(password: SecretString) -> CarrelResult<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = tx.send(folio_core::profile_lock::hash_password(&password));
+        let _ = tx.send(carrel_core::profile_lock::hash_password(&password));
     });
     rx.recv()?
 }
 
-/// Run [`folio_core::profile_lock::verify_password`] off the async runtime.
-async fn verify_password_blocking(password: SecretString, phc: String) -> FolioResult<bool> {
+/// Run [`carrel_core::profile_lock::verify_password`] off the async runtime.
+async fn verify_password_blocking(password: SecretString, phc: String) -> CarrelResult<bool> {
     let (tx, rx) = std::sync::mpsc::channel();
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = tx.send(folio_core::profile_lock::verify_password(&password, &phc));
+        let _ = tx.send(carrel_core::profile_lock::verify_password(&password, &phc));
     });
     rx.recv()?
 }
@@ -4850,23 +4862,23 @@ pub async fn set_profile_lock(
     password: String,
     current_password: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
     let _lifecycle = state.profile_lifecycle.lock().await;
     state.ensure_profile_exists(&profile)?;
-    if let Some(existing_phc) = folio_core::profile_lock::load_lock(&profile)? {
+    if let Some(existing_phc) = carrel_core::profile_lock::load_lock(&profile)? {
         let current = current_password.ok_or_else(|| {
-            FolioError::invalid("Current password is required to change the profile lock")
+            CarrelError::invalid("Current password is required to change the profile lock")
         })?;
         if !verify_password_blocking(SecretString::from(current), existing_phc).await? {
-            return Err(FolioError::invalid("Incorrect current password"));
+            return Err(CarrelError::invalid("Incorrect current password"));
         }
     }
 
     let phc = hash_password_blocking(SecretString::from(password)).await?;
-    folio_core::profile_lock::set_lock(&profile, &phc)?;
+    carrel_core::profile_lock::set_lock(&profile, &phc)?;
     state.mark_unlocked(&profile)?;
     Ok(())
 }
@@ -4878,18 +4890,18 @@ pub async fn remove_profile_lock(
     profile: String,
     current_password: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
     let _lifecycle = state.profile_lifecycle.lock().await;
     state.ensure_profile_exists(&profile)?;
-    let phc = folio_core::profile_lock::load_lock(&profile)?
-        .ok_or_else(|| FolioError::invalid("Profile has no lock to remove"))?;
+    let phc = carrel_core::profile_lock::load_lock(&profile)?
+        .ok_or_else(|| CarrelError::invalid("Profile has no lock to remove"))?;
     if !verify_password_blocking(SecretString::from(current_password), phc).await? {
-        return Err(FolioError::invalid("Incorrect password"));
+        return Err(CarrelError::invalid("Incorrect password"));
     }
-    folio_core::profile_lock::clear_lock(&profile)?;
+    carrel_core::profile_lock::clear_lock(&profile)?;
     // A profile with no lock is never gated (see `access_allowed`) — keep
     // the invariant that `unlocked_profiles` reflects that, in case this
     // profile is currently active and being watched by the web gate.
@@ -4909,7 +4921,7 @@ pub async fn unlock_profile(
     profile: String,
     password: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
@@ -4917,9 +4929,9 @@ pub async fn unlock_profile(
     state.ensure_profile_exists(&profile)?;
     // A profile with no lock configured has nothing to verify — falls
     // through to `mark_unlocked` and the plugin-start tail below.
-    if let Some(phc) = folio_core::profile_lock::load_lock(&profile)? {
+    if let Some(phc) = carrel_core::profile_lock::load_lock(&profile)? {
         if !verify_password_blocking(SecretString::from(password), phc).await? {
-            return Err(FolioError::invalid("Incorrect password"));
+            return Err(CarrelError::invalid("Incorrect password"));
         }
     }
     state.mark_unlocked(&profile)?;
@@ -4942,7 +4954,7 @@ fn run_deferred_plugin_start<R: tauri::Runtime>(
     app: &AppHandle<R>,
     profile: &str,
     state: &AppState,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let active = { state.profile_state.lock()?.active.clone() };
     if profile == active && state.plugin_manager.lock()?.is_none() {
         crate::plugin_host::rebuild_for_profile(
@@ -4951,7 +4963,7 @@ fn run_deferred_plugin_start<R: tauri::Runtime>(
             state.active_db()?,
             &state.plugin_manager,
         );
-        folio_core::events::bus().emit(folio_core::events::FolioEvent::AppStarted);
+        carrel_core::events::bus().emit(carrel_core::events::CarrelEvent::AppStarted);
     }
     Ok(())
 }
@@ -4968,13 +4980,13 @@ pub async fn reset_profile_lock<R: tauri::Runtime>(
     app: AppHandle<R>,
     profile: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
     let _lifecycle = state.profile_lifecycle.lock().await;
     state.ensure_profile_exists(&profile)?;
-    folio_core::profile_lock::clear_lock(&profile)?;
+    carrel_core::profile_lock::clear_lock(&profile)?;
     state.mark_unlocked(&profile)?;
     // Recovery is an alternate unlock path: if the active profile was locked
     // at boot, run the same deferred plugin startup `unlock_profile` does.
@@ -4994,10 +5006,10 @@ pub struct ProfileLockStatus {
 pub async fn profile_lock_status(
     profile: String,
     state: State<'_, AppState>,
-) -> FolioResult<ProfileLockStatus> {
+) -> CarrelResult<ProfileLockStatus> {
     state.ensure_profile_exists(&profile)?;
     Ok(ProfileLockStatus {
-        locked: folio_core::profile_lock::has_lock(&profile)?,
+        locked: carrel_core::profile_lock::has_lock(&profile)?,
         unlocked_this_session: state.is_unlocked(&profile),
     })
 }
@@ -5013,14 +5025,14 @@ pub struct LibraryFolderInfo {
 }
 
 /// Thin wrapper kept for backwards compatibility with the existing in-crate
-/// call sites; the implementation lives in [`folio_core::paths`] so both the
+/// call sites; the implementation lives in [`carrel_core::paths`] so both the
 /// desktop app and future headless binaries share a single definition.
-pub fn default_library_folder() -> FolioResult<String> {
-    folio_core::paths::default_library_folder()
+pub fn default_library_folder() -> CarrelResult<String> {
+    carrel_core::paths::default_library_folder()
 }
 
 #[tauri::command]
-pub async fn get_library_folder(state: State<'_, AppState>) -> FolioResult<String> {
+pub async fn get_library_folder(state: State<'_, AppState>) -> CarrelResult<String> {
     let conn = state.active_db()?.get()?;
     if let Some(folder) = db::get_setting(&conn, "library_folder")? {
         Ok(folder)
@@ -5030,7 +5042,9 @@ pub async fn get_library_folder(state: State<'_, AppState>) -> FolioResult<Strin
 }
 
 #[tauri::command]
-pub async fn get_library_folder_info(state: State<'_, AppState>) -> FolioResult<LibraryFolderInfo> {
+pub async fn get_library_folder_info(
+    state: State<'_, AppState>,
+) -> CarrelResult<LibraryFolderInfo> {
     let conn = state.active_db()?.get()?;
     let path = if let Some(f) = db::get_setting(&conn, "library_folder")? {
         f
@@ -5083,11 +5097,11 @@ pub async fn set_library_folder(
     new_folder: String,
     move_files: bool,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     // Validate the folder path: reject obviously dangerous values.
     let folder_path = std::path::Path::new(&new_folder);
     if new_folder.is_empty() || new_folder == "/" || new_folder == "\\" {
-        return Err(FolioError::invalid("Invalid library folder path."));
+        return Err(CarrelError::invalid("Invalid library folder path."));
     }
     // Ensure the folder exists (or can be created) then canonicalize.
     std::fs::create_dir_all(&new_folder)?;
@@ -5167,7 +5181,7 @@ pub async fn set_library_folder(
                     rollback_errors.join("; ")
                 );
             }
-            return Err(FolioError::io(msg));
+            return Err(CarrelError::io(msg));
         }
         completed.push((src.clone(), dest.clone()));
     }
@@ -5186,19 +5200,19 @@ pub async fn set_library_folder(
 }
 
 #[tauri::command]
-pub async fn copy_to_library(book_id: String, state: State<'_, AppState>) -> FolioResult<Book> {
+pub async fn copy_to_library(book_id: String, state: State<'_, AppState>) -> CarrelResult<Book> {
     let conn = state.active_db()?.get()?;
     let book =
-        db::get_book(&conn, &book_id)?.ok_or_else(|| FolioError::not_found("Book not found"))?;
+        db::get_book(&conn, &book_id)?.ok_or_else(|| CarrelError::not_found("Book not found"))?;
 
     if book.is_imported {
-        return Err(FolioError::invalid("Book is already in the library"));
+        return Err(CarrelError::invalid("Book is already in the library"));
     }
 
     // Linked book: `file_path` is an external absolute path. Verify it still exists,
     // then import it through the library storage (#64 M2/M4).
     if !std::path::Path::new(&book.file_path).exists() {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "Source file not available. Reconnect the drive and try again.",
         ));
     }
@@ -5212,7 +5226,7 @@ pub async fn copy_to_library(book_id: String, state: State<'_, AppState>) -> Fol
     let key = book_storage_key(&book.id, &ext);
     storage
         .put_path(&key, std::path::Path::new(&book.file_path))
-        .map_err(|e| FolioError::internal(format!("Failed to copy file to library: {e}")))?;
+        .map_err(|e| CarrelError::internal(format!("Failed to copy file to library: {e}")))?;
 
     db::update_book_path(&conn, &book.id, &key, true)?;
 
@@ -5226,7 +5240,7 @@ pub async fn copy_to_library(book_id: String, state: State<'_, AppState>) -> Fol
     );
 
     db::get_book(&conn, &book_id)?
-        .ok_or_else(|| FolioError::not_found("Book not found after update"))
+        .ok_or_else(|| CarrelError::not_found("Book not found after update"))
 }
 
 // --- Library Export/Import ---
@@ -5237,7 +5251,7 @@ pub async fn export_library(
     include_files: bool,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -5348,13 +5362,13 @@ struct LibraryExport {
     #[serde(default)]
     books: Vec<Book>,
     #[serde(default)]
-    reading_progress: Vec<folio_core::models::ReadingProgress>,
+    reading_progress: Vec<carrel_core::models::ReadingProgress>,
     #[serde(default)]
-    bookmarks: Vec<folio_core::models::Bookmark>,
+    bookmarks: Vec<carrel_core::models::Bookmark>,
     #[serde(default)]
-    highlights: Vec<folio_core::models::Highlight>,
+    highlights: Vec<carrel_core::models::Highlight>,
     #[serde(default)]
-    collections: Vec<folio_core::models::Collection>,
+    collections: Vec<carrel_core::models::Collection>,
     #[serde(default)]
     tags: Vec<(String, String)>,
     #[serde(default)]
@@ -5366,7 +5380,7 @@ pub async fn import_library_backup(
     archive_path: String,
     state: State<'_, AppState>,
     _app: AppHandle,
-) -> FolioResult<u32> {
+) -> CarrelResult<u32> {
     use std::io::Read;
 
     let file = std::fs::File::open(&archive_path)?;
@@ -5388,7 +5402,7 @@ pub async fn import_library_backup(
             },
             serde_json::Value::Object(_) => serde_json::from_value(value)?,
             _ => {
-                return Err(FolioError::invalid(
+                return Err(CarrelError::invalid(
                     "library.json is neither an object nor an array",
                 ))
             }
@@ -5535,11 +5549,11 @@ pub async fn check_pdf_support() -> bool {
 }
 
 #[tauri::command]
-pub async fn get_pdf_page_count(book_id: String, state: State<'_, AppState>) -> FolioResult<u32> {
+pub async fn get_pdf_page_count(book_id: String, state: State<'_, AppState>) -> CarrelResult<u32> {
     let file_path = {
         let conn = state.active_db()?.get()?;
         let book = db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?;
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?;
         state.resolve_book_path(&book)?
     };
     validate_file_exists(&file_path)?;
@@ -5554,14 +5568,14 @@ pub async fn get_pdf_page_glyphs(
     book_id: String,
     page_index: u32,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<pdf::Glyph>> {
+) -> CarrelResult<Vec<pdf::Glyph>> {
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
     if book.format != BookFormat::Pdf {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "get_pdf_page_glyphs only supports PDF format",
         ));
     }
@@ -5584,14 +5598,14 @@ pub async fn get_pdf_page_text(
     page_index: u32,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
     if book.format != BookFormat::Pdf {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "get_pdf_page_text only supports PDF format",
         ));
     }
@@ -5615,7 +5629,7 @@ pub async fn get_pdf_page_text(
     pages
         .get(page_index as usize)
         .cloned()
-        .ok_or_else(|| FolioError::not_found(format!("page {page_index} not found")))
+        .ok_or_else(|| CarrelError::not_found(format!("page {page_index} not found")))
 }
 
 /// PDF page reader for the desktop frontend. Returns raw JPEG bytes
@@ -5623,7 +5637,7 @@ pub async fn get_pdf_page_text(
 /// `Blob` + `URL.createObjectURL` for `<img src>`.
 ///
 /// `width` controls the viewport-target width (clamped to 9600). When
-/// omitted, `folio_core::pdf::get_page_image_bytes` falls back to
+/// omitted, `carrel_core::pdf::get_page_image_bytes` falls back to
 /// `DEFAULT_RENDER_WIDTH` (1200 px).
 ///
 /// Cache-first against the `page-cache/` namespace populated by
@@ -5666,7 +5680,7 @@ pub async fn get_pdf_page_bytes(
     cached_only: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<tauri::ipc::Response> {
+) -> CarrelResult<tauri::ipc::Response> {
     let _t = state.ipc_metrics.time("get_pdf_page_bytes");
     let render_width = width.filter(|&w| w > 0).map(|w| w.min(9600));
     let cached_only = cached_only.unwrap_or(false);
@@ -5674,10 +5688,10 @@ pub async fn get_pdf_page_bytes(
     let book = {
         let conn = state.active_db()?.get()?;
         db::get_book(&conn, &book_id)?
-            .ok_or_else(|| FolioError::not_found(format!("Book '{book_id}' not found")))?
+            .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
     if book.format != BookFormat::Pdf {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "get_pdf_page_bytes only supports PDF format",
         ));
     }
@@ -5716,7 +5730,7 @@ pub async fn get_pdf_page_bytes(
     // pool so it never pins a Tauri async worker (which would stall other IPC —
     // including the page the user is actually waiting on).
     let (bytes, out_mime) =
-        tauri::async_runtime::spawn_blocking(move || -> FolioResult<(Vec<u8>, String)> {
+        tauri::async_runtime::spawn_blocking(move || -> CarrelResult<(Vec<u8>, String)> {
             // Cache-first path. Cached pages live at the canonical render
             // width; resize on read clamps them to the viewport-derived
             // target.
@@ -5781,7 +5795,7 @@ pub async fn get_pdf_page_bytes(
             crate::image_util::maybe_resize_to_jpeg(bytes, mime, render_width)
         })
         .await
-        .map_err(|e| FolioError::internal(format!("pdf page render task failed: {e}")))??;
+        .map_err(|e| CarrelError::internal(format!("pdf page render task failed: {e}")))??;
 
     Ok(tauri::ipc::Response::new(crate::page_wire::append_tag(
         bytes, &out_mime,
@@ -5791,7 +5805,7 @@ pub async fn get_pdf_page_bytes(
 // ---- Remote Backup Commands ----
 
 #[tauri::command]
-pub async fn get_backup_providers() -> FolioResult<Vec<crate::backup::ProviderInfo>> {
+pub async fn get_backup_providers() -> CarrelResult<Vec<crate::backup::ProviderInfo>> {
     Ok(crate::backup::provider_schemas())
 }
 
@@ -5890,7 +5904,7 @@ pub async fn test_backup_connection(
 #[tauri::command]
 pub async fn get_backup_config(
     state: State<'_, AppState>,
-) -> FolioResult<Option<crate::backup::BackupConfig>> {
+) -> CarrelResult<Option<crate::backup::BackupConfig>> {
     let conn = state.active_db()?.get()?;
     match db::get_setting(&conn, "backup_config")? {
         Some(j) => {
@@ -5917,10 +5931,10 @@ struct BackupLockGuard {
 }
 
 impl BackupLockGuard {
-    fn acquire(profile_name: String) -> FolioResult<Self> {
+    fn acquire(profile_name: String) -> CarrelResult<Self> {
         let mut running = BACKUP_RUNNING.lock()?;
         if !running.insert(profile_name.clone()) {
-            return Err(FolioError::invalid(
+            return Err(CarrelError::invalid(
                 "A backup is already in progress for this profile",
             ));
         }
@@ -5948,7 +5962,7 @@ impl Drop for BackupLockGuard {
 pub async fn run_backup(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<crate::backup::SyncResult> {
+) -> CarrelResult<crate::backup::SyncResult> {
     let _t = state.ipc_metrics.time("run_backup");
     let profile_name = {
         let ps = state.profile_state.lock()?;
@@ -5957,7 +5971,7 @@ pub async fn run_backup(
     let _guard = BackupLockGuard::acquire(profile_name.clone())?;
     let conn = state.active_db()?.get()?;
     let json = db::get_setting(&conn, "backup_config")?
-        .ok_or_else(|| FolioError::not_found("No backup provider configured"))?;
+        .ok_or_else(|| CarrelError::not_found("No backup provider configured"))?;
     let mut config: crate::backup::BackupConfig = serde_json::from_str(&json)?;
     crate::backup::load_secrets(&mut config)?;
     let provider_name = config.provider_type.clone();
@@ -5987,7 +6001,7 @@ pub async fn run_backup(
     });
     let result = rx.recv()?;
     let log_conn = state.active_db()?.get()?;
-    events::bus().emit(FolioEvent::BackupCompleted {
+    events::bus().emit(CarrelEvent::BackupCompleted {
         provider: format!("{provider_name:?}"),
         success: result.is_ok(),
     });
@@ -6023,7 +6037,7 @@ pub async fn run_backup(
 #[tauri::command]
 pub async fn get_backup_status(
     state: State<'_, AppState>,
-) -> FolioResult<Option<crate::backup::SyncManifest>> {
+) -> CarrelResult<Option<crate::backup::SyncManifest>> {
     let conn = state.active_db()?.get()?;
     let json = match db::get_setting(&conn, "backup_config")? {
         Some(j) => j,
@@ -6058,7 +6072,7 @@ pub async fn start_scan(
     include_skipped: Option<bool>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     SCAN_CANCEL.store(false, Ordering::SeqCst);
     let conn = state.active_db()?.get()?;
     if include_skipped.unwrap_or(false) {
@@ -6202,7 +6216,7 @@ pub async fn start_scan(
 }
 
 #[tauri::command]
-pub async fn cancel_scan() -> FolioResult<()> {
+pub async fn cancel_scan() -> CarrelResult<()> {
     SCAN_CANCEL.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -6240,7 +6254,7 @@ pub async fn is_import_running() -> bool {
 }
 
 #[tauri::command]
-pub async fn cancel_import() -> FolioResult<()> {
+pub async fn cancel_import() -> CarrelResult<()> {
     IMPORT_CANCEL.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -6250,7 +6264,7 @@ pub async fn start_files_import(
     paths: Vec<String>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let resources = acquire_import_slot(&state)?;
     let app_clone = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -6264,7 +6278,7 @@ pub async fn start_folder_import(
     folder_path: String,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let _t = state.ipc_metrics.time("start_folder_import");
     // Validate the root folder up front so the IPC call surfaces obvious
     // mistakes (typo, deleted folder, file picked instead of directory,
@@ -6274,18 +6288,18 @@ pub async fn start_folder_import(
     // is that the folder cannot be traversed at all.
     let root = std::path::Path::new(&folder_path);
     let root_meta = std::fs::metadata(root)
-        .map_err(|e| FolioError::invalid(format!("Cannot read folder: {e}")))?;
+        .map_err(|e| CarrelError::invalid(format!("Cannot read folder: {e}")))?;
     if !root_meta.is_dir() {
-        return Err(FolioError::invalid("Selected path is not a folder"));
+        return Err(CarrelError::invalid("Selected path is not a folder"));
     }
     std::fs::canonicalize(root)
-        .map_err(|e| FolioError::invalid(format!("Cannot resolve folder: {e}")))?;
+        .map_err(|e| CarrelError::invalid(format!("Cannot resolve folder: {e}")))?;
     // Drop the iterator immediately — we only care that opening the
     // directory succeeds. The walker will re-open it inside the spawned
     // task and silently skip nested dirs that fail to read, which is the
     // intended behavior for partial-permission trees.
     let _ = std::fs::read_dir(root)
-        .map_err(|e| FolioError::invalid(format!("Cannot read folder: {e}")))?;
+        .map_err(|e| CarrelError::invalid(format!("Cannot read folder: {e}")))?;
 
     let resources = acquire_import_slot(&state)?;
     let app_clone = app.clone();
@@ -6368,18 +6382,18 @@ pub async fn start_folder_import(
 
 struct ImportResources {
     db_pool: DbPool,
-    storage: std::sync::Arc<dyn folio_core::storage::Storage>,
-    covers_storage: std::sync::Arc<dyn folio_core::storage::Storage>,
+    storage: std::sync::Arc<dyn carrel_core::storage::Storage>,
+    covers_storage: std::sync::Arc<dyn carrel_core::storage::Storage>,
     import_mode: String,
 }
 
-fn acquire_import_slot(state: &State<'_, AppState>) -> FolioResult<ImportResources> {
+fn acquire_import_slot(state: &State<'_, AppState>) -> CarrelResult<ImportResources> {
     if IMPORT_RUNNING.swap(true, Ordering::SeqCst) {
-        return Err(FolioError::invalid("Import already running"));
+        return Err(CarrelError::invalid("Import already running"));
     }
     IMPORT_CANCEL.store(false, Ordering::SeqCst);
     // From here on, every error path must release the slot.
-    let result = (|| -> FolioResult<ImportResources> {
+    let result = (|| -> CarrelResult<ImportResources> {
         let db_pool = state.active_db()?;
         let storage = state.active_storage()?;
         let covers_storage = state.covers_storage()?;
@@ -6581,10 +6595,10 @@ fn run_import_task(app: AppHandle, paths: Vec<String>, resources: ImportResource
 }
 
 #[tauri::command]
-pub async fn scan_single_book(book_id: String, state: State<'_, AppState>) -> FolioResult<Book> {
+pub async fn scan_single_book(book_id: String, state: State<'_, AppState>) -> CarrelResult<Book> {
     let conn = state.active_db()?.get()?;
     let book = db::get_book(&conn, &book_id)?
-        .ok_or_else(|| FolioError::not_found(format!("Book '{}' not found", book_id)))?;
+        .ok_or_else(|| CarrelError::not_found(format!("Book '{}' not found", book_id)))?;
     let parsed = crate::enrichment::parse_filename(
         std::path::Path::new(&book.file_path)
             .file_stem()
@@ -6650,7 +6664,7 @@ pub async fn scan_single_book(book_id: String, state: State<'_, AppState>) -> Fo
             )?;
             // Apply new metadata fields if the book doesn't already have them
             let mut book = db::get_book(&conn, &book_id)?
-                .ok_or_else(|| FolioError::not_found("Book not found"))?;
+                .ok_or_else(|| CarrelError::not_found("Book not found"))?;
             let mut changed = false;
             if book.language.is_none() {
                 if let Some(ref v) = result.data.language {
@@ -6675,9 +6689,9 @@ pub async fn scan_single_book(book_id: String, state: State<'_, AppState>) -> Fo
             }
             db::set_enrichment_status(&conn, &book_id, "enriched")?;
             let updated_book = db::get_book(&conn, &book_id)?
-                .ok_or_else(|| FolioError::not_found("Book not found"))?;
+                .ok_or_else(|| CarrelError::not_found("Book not found"))?;
             let tried = result.providers_tried.join(", ");
-            events::bus().emit(FolioEvent::MetadataEnriched {
+            events::bus().emit(CarrelEvent::MetadataEnriched {
                 book_id: book_id.clone(),
                 provider: result.data.source.clone(),
             });
@@ -6702,13 +6716,13 @@ pub async fn scan_single_book(book_id: String, state: State<'_, AppState>) -> Fo
                     detail: format!("No match found (searched: {})", tried),
                 },
             );
-            Err(FolioError::not_found("No match found"))
+            Err(CarrelError::not_found("No match found"))
         }
     }
 }
 
 #[tauri::command]
-pub async fn queue_book_for_scan(book_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn queue_book_for_scan(book_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::set_enrichment_status(&conn, &book_id, "queued")?)
 }
@@ -6717,7 +6731,7 @@ pub async fn queue_book_for_scan(book_id: String, state: State<'_, AppState>) ->
 pub async fn get_setting_value(
     key: String,
     state: State<'_, AppState>,
-) -> FolioResult<Option<String>> {
+) -> CarrelResult<Option<String>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_setting(&conn, &key)?)
 }
@@ -6727,7 +6741,7 @@ pub async fn set_setting_value(
     key: String,
     value: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::set_setting(&conn, &key, &value)?)
 }
@@ -6775,8 +6789,8 @@ fn should_emit_download_progress(loaded: u64, total: u64, last: &mut u64) -> boo
 #[tauri::command]
 pub async fn get_dictionary_status(
     state: State<'_, AppState>,
-) -> FolioResult<folio_core::dictionary::DictionaryStatus> {
-    Ok(folio_core::dictionary::inspect(&state.dictionary_dir()))
+) -> CarrelResult<carrel_core::dictionary::DictionaryStatus> {
+    Ok(carrel_core::dictionary::inspect(&state.dictionary_dir()))
 }
 
 /// Download and install the dictionary artifact, emitting
@@ -6788,14 +6802,14 @@ pub async fn get_dictionary_status(
 pub async fn download_dictionary<R: tauri::Runtime>(
     state: State<'_, AppState>,
     app: AppHandle<R>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     use std::sync::atomic::Ordering;
     if state
         .dictionary_downloading
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err(FolioError::invalid(
+        return Err(CarrelError::invalid(
             "A dictionary download is already in progress.",
         ));
     }
@@ -6803,7 +6817,7 @@ pub async fn download_dictionary<R: tauri::Runtime>(
     let emitter = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut last: u64 = 0;
-        folio_core::dictionary::download_and_install(
+        carrel_core::dictionary::download_and_install(
             DICTIONARY_URL,
             DICTIONARY_SHA256,
             &dir,
@@ -6818,7 +6832,7 @@ pub async fn download_dictionary<R: tauri::Runtime>(
         )
     })
     .await
-    .map_err(|e| FolioError::internal(format!("download task failed: {e}")));
+    .map_err(|e| CarrelError::internal(format!("download task failed: {e}")));
     // Clear the guard regardless of outcome (join error or install result).
     state.dictionary_downloading.store(false, Ordering::SeqCst);
     let install = result?;
@@ -6836,12 +6850,12 @@ pub async fn download_dictionary<R: tauri::Runtime>(
 /// Delete the installed artifact, first dropping the cached pool so the file
 /// handle is released before removal.
 #[tauri::command]
-pub async fn delete_dictionary(state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn delete_dictionary(state: State<'_, AppState>) -> CarrelResult<()> {
     {
         let mut pool = state.dictionary_pool.lock()?;
         *pool = None;
     }
-    folio_core::dictionary::delete(&state.dictionary_dir())
+    carrel_core::dictionary::delete(&state.dictionary_dir())
 }
 
 /// Look up a word against the installed artifact. A missing artifact surfaces
@@ -6851,18 +6865,18 @@ pub async fn delete_dictionary(state: State<'_, AppState>) -> FolioResult<()> {
 pub async fn lookup_word(
     word: String,
     state: State<'_, AppState>,
-) -> FolioResult<Option<folio_core::dictionary::DictionaryEntry>> {
+) -> CarrelResult<Option<carrel_core::dictionary::DictionaryEntry>> {
     let pool = {
         let mut guard = state.dictionary_pool.lock()?;
         if guard.is_none() {
-            *guard = Some(folio_core::dictionary::open_readonly_pool(
+            *guard = Some(carrel_core::dictionary::open_readonly_pool(
                 &state.dictionary_dir(),
             )?);
         }
         guard.as_ref().expect("pool populated above").clone()
     };
     let conn = pool.get()?;
-    folio_core::dictionary::lookup(&conn, &word)
+    carrel_core::dictionary::lookup(&conn, &word)
 }
 
 // ---- Vocabulary builder (F-1-5) ----
@@ -6885,7 +6899,7 @@ fn log_vocabulary_word_entry(
     context_sentence: Option<String>,
     start_offset: Option<i64>,
     end_offset: Option<i64>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     if db::get_setting(conn, "vocabulary_enabled")?.as_deref() != Some("true") {
         return Ok(());
     }
@@ -6930,7 +6944,7 @@ pub async fn log_vocabulary_word(
     start_offset: Option<i64>,
     end_offset: Option<i64>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     log_vocabulary_word_entry(
         &conn,
@@ -6948,19 +6962,19 @@ pub async fn log_vocabulary_word(
 }
 
 #[tauri::command]
-pub async fn list_vocabulary(state: State<'_, AppState>) -> FolioResult<Vec<VocabularyWord>> {
+pub async fn list_vocabulary(state: State<'_, AppState>) -> CarrelResult<Vec<VocabularyWord>> {
     let conn = state.active_db()?.get()?;
     db::list_vocabulary(&conn)
 }
 
 #[tauri::command]
-pub async fn delete_vocabulary_word(id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn delete_vocabulary_word(id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     db::delete_vocabulary_word(&conn, &id)
 }
 
 #[tauri::command]
-pub async fn clear_vocabulary(state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn clear_vocabulary(state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     db::clear_vocabulary(&conn)
 }
@@ -6969,7 +6983,7 @@ pub async fn clear_vocabulary(state: State<'_, AppState>) -> FolioResult<()> {
 pub async fn get_due_vocabulary(
     limit: i64,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<VocabularyWord>> {
+) -> CarrelResult<Vec<VocabularyWord>> {
     let conn = state.active_db()?.get()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6985,7 +6999,7 @@ fn record_vocabulary_review_now(
     conn: &rusqlite::Connection,
     id: &str,
     correct: bool,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -6998,13 +7012,13 @@ pub async fn record_vocabulary_review(
     id: String,
     correct: bool,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     record_vocabulary_review_now(&conn, &id, correct)
 }
 
 #[tauri::command]
-pub async fn get_feature_flags(state: State<'_, AppState>) -> FolioResult<Vec<FeatureFlag>> {
+pub async fn get_feature_flags(state: State<'_, AppState>) -> CarrelResult<Vec<FeatureFlag>> {
     let conn = state.active_db()?.get()?;
     Ok(db::list_feature_flags(&conn)?)
 }
@@ -7015,7 +7029,7 @@ pub async fn set_feature_flag(
     enabled: bool,
     description: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::set_feature_flag(
         &conn,
@@ -7026,13 +7040,13 @@ pub async fn set_feature_flag(
 }
 
 #[tauri::command]
-pub async fn get_feature_flag_value(key: String, state: State<'_, AppState>) -> FolioResult<bool> {
+pub async fn get_feature_flag_value(key: String, state: State<'_, AppState>) -> CarrelResult<bool> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_feature_flag(&conn, &key)?)
 }
 
 #[tauri::command]
-pub async fn delete_feature_flag(key: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn delete_feature_flag(key: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     Ok(db::delete_feature_flag(&conn, &key)?)
 }
@@ -7040,7 +7054,7 @@ pub async fn delete_feature_flag(key: String, state: State<'_, AppState>) -> Fol
 #[tauri::command]
 pub async fn get_enrichment_providers(
     state: State<'_, AppState>,
-) -> FolioResult<Vec<crate::providers::ProviderInfo>> {
+) -> CarrelResult<Vec<crate::providers::ProviderInfo>> {
     let reg = state.enrichment_registry.lock()?;
     Ok(reg.list_providers())
 }
@@ -7051,7 +7065,7 @@ pub async fn set_enrichment_provider_config(
     enabled: bool,
     api_key: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let config = crate::providers::ProviderConfig {
         enabled,
         api_key: api_key.filter(|k| !k.is_empty()),
@@ -7074,7 +7088,7 @@ pub async fn set_enrichment_provider_config(
 pub async fn set_enrichment_provider_order(
     order: Vec<String>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let mut reg = state.enrichment_registry.lock()?;
     reg.reorder(&order);
     // Persist the order
@@ -7092,7 +7106,7 @@ pub async fn get_activity_log(
     offset: Option<u32>,
     action_filter: Option<String>,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<crate::models::ActivityEntry>> {
+) -> CarrelResult<Vec<crate::models::ActivityEntry>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_activity_log(
         &conn,
@@ -7106,7 +7120,7 @@ pub async fn get_activity_log(
 pub async fn get_login_history(
     limit: Option<u32>,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<crate::models::WebSessionEntry>> {
+) -> CarrelResult<Vec<crate::models::WebSessionEntry>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_web_session_log(
         &conn,
@@ -7118,7 +7132,7 @@ pub async fn get_login_history(
 pub async fn export_activity_log(
     dest_path: String,
     state: State<'_, AppState>,
-) -> FolioResult<String> {
+) -> CarrelResult<String> {
     let conn = state.active_db()?.get()?;
     let rows = db::get_all_activity(&conn)?;
     let json = serde_json::to_string_pretty(&rows)?;
@@ -7131,7 +7145,7 @@ pub async fn prune_activity_log(
     keep: Option<u32>,
     max_age_days: Option<u32>,
     state: State<'_, AppState>,
-) -> FolioResult<usize> {
+) -> CarrelResult<usize> {
     let conn = state.active_db()?.get()?;
     let deleted = db::prune_activity_log(&conn, keep.unwrap_or(1000), max_age_days.unwrap_or(90))?;
     Ok(deleted)
@@ -7141,7 +7155,7 @@ pub async fn prune_activity_log(
 pub async fn preview_collection_rules(
     rules: Vec<crate::models::NewRuleInput>,
     state: State<'_, AppState>,
-) -> FolioResult<usize> {
+) -> CarrelResult<usize> {
     let conn = state.active_db()?.get()?;
     Ok(db::preview_collection_rules(&conn, &rules)?)
 }
@@ -7149,7 +7163,7 @@ pub async fn preview_collection_rules(
 #[tauri::command]
 pub async fn get_collection_suggestions(
     state: State<'_, AppState>,
-) -> FolioResult<Vec<CollectionSuggestion>> {
+) -> CarrelResult<Vec<CollectionSuggestion>> {
     let conn = state.active_db()?.get()?;
     let collections = db::list_collections(&conn)?;
     Ok(db::get_collection_suggestions(&conn, &collections)?)
@@ -7188,10 +7202,10 @@ pub async fn import_custom_font(
     file_path: String,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<CustomFont> {
+) -> CarrelResult<CustomFont> {
     let source = std::path::Path::new(&file_path);
     if !source.exists() {
-        return Err(FolioError::invalid(format!("File not found: {file_path}")));
+        return Err(CarrelError::invalid(format!("File not found: {file_path}")));
     }
 
     let extension = source
@@ -7201,7 +7215,7 @@ pub async fn import_custom_font(
         .to_lowercase();
 
     if !["ttf", "otf", "woff2"].contains(&extension.as_str()) {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "Unsupported font format: .{extension}"
         )));
     }
@@ -7216,7 +7230,7 @@ pub async fn import_custom_font(
     let fonts_dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| FolioError::internal(format!("tauri: {e}")))?
+        .map_err(|e| CarrelError::internal(format!("tauri: {e}")))?
         .join("fonts");
     std::fs::create_dir_all(&fonts_dir)?;
 
@@ -7241,13 +7255,13 @@ pub async fn import_custom_font(
 }
 
 #[tauri::command]
-pub async fn get_custom_fonts(state: State<'_, AppState>) -> FolioResult<Vec<CustomFont>> {
+pub async fn get_custom_fonts(state: State<'_, AppState>) -> CarrelResult<Vec<CustomFont>> {
     let conn = state.active_db()?.get()?;
     Ok(db::list_custom_fonts(&conn)?)
 }
 
 #[tauri::command]
-pub async fn remove_custom_font(font_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn remove_custom_font(font_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
 
     if let Some(font) = db::get_custom_font(&conn, &font_id)? {
@@ -7258,11 +7272,11 @@ pub async fn remove_custom_font(font_id: String, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
-pub async fn check_file_exists(file_path: String) -> FolioResult<bool> {
+pub async fn check_file_exists(file_path: String) -> CarrelResult<bool> {
     if std::path::Path::new(&file_path).exists() {
         Ok(true)
     } else {
-        Err(FolioError::not_found(format!(
+        Err(CarrelError::not_found(format!(
             "Book file not found at '{}'. It may have been moved or deleted.",
             file_path
         )))
@@ -7273,7 +7287,7 @@ pub async fn check_file_exists(file_path: String) -> FolioResult<bool> {
 pub async fn cleanup_library(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<CleanupResult> {
+) -> CarrelResult<CleanupResult> {
     use std::io::Write as _;
     use zip::write::SimpleFileOptions;
 
@@ -7386,7 +7400,7 @@ pub async fn cleanup_library(
         evict_book_page_cache(
             cache_storage
                 .as_ref()
-                .map(|s| s as &dyn folio_core::storage::Storage),
+                .map(|s| s as &dyn carrel_core::storage::Storage),
             book.file_hash.as_deref(),
             Some(resolved.as_str()),
             Some(state.cache_dir.as_path()),
@@ -7415,7 +7429,7 @@ pub async fn cleanup_library(
 }
 
 #[tauri::command]
-pub async fn list_auto_backups(state: State<'_, AppState>) -> FolioResult<Vec<AutoBackup>> {
+pub async fn list_auto_backups(state: State<'_, AppState>) -> CarrelResult<Vec<AutoBackup>> {
     let backups_dir = state.data_dir.join("backups");
     if !backups_dir.exists() {
         return Ok(Vec::new());
@@ -7462,7 +7476,7 @@ pub async fn list_auto_backups(state: State<'_, AppState>) -> FolioResult<Vec<Au
 }
 
 #[tauri::command]
-pub async fn get_series(state: State<'_, AppState>) -> FolioResult<Vec<SeriesInfo>> {
+pub async fn get_series(state: State<'_, AppState>) -> CarrelResult<Vec<SeriesInfo>> {
     let conn = state.active_db()?.get()?;
     Ok(db::list_series(&conn)?)
 }
@@ -7529,7 +7543,7 @@ pub async fn sync_pull_book(
     book_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     // Private mode (B-M1): read once at the top of this request and reuse
     // for every passive write/emit below (the plugin-bus open signal, and
     // the inbound sync merge's progress arm).
@@ -7540,13 +7554,13 @@ pub async fn sync_pull_book(
     // guards, but never while private (a tracker plugin with `network`
     // could exfiltrate a "private" read otherwise — SB-4).
     if !suppress_passive {
-        events::bus().emit(FolioEvent::BookOpened {
+        events::bus().emit(CarrelEvent::BookOpened {
             book_id: book_id.clone(),
         });
     }
 
     // Private mode (B-M1): the automatic open-sync itself is passive egress.
-    // A GET on `.folio-sync/books/{file_hash}.json` reveals *which* book was
+    // A GET on `.carrel-sync/books/{file_hash}.json` reveals *which* book was
     // opened (object path) and *when* (timing) to the configured remote, even
     // with zero annotation changes. Gating the progress/activity/event side
     // effects is not enough — the network round-trip must not happen at all.
@@ -7573,7 +7587,7 @@ pub async fn sync_pull_book(
 
     let book = match db::get_book(&conn, &book_id)? {
         Some(b) => b,
-        None => return Err(FolioError::not_found(format!("Book not found: {book_id}"))),
+        None => return Err(CarrelError::not_found(format!("Book not found: {book_id}"))),
     };
     let file_hash = match &book.file_hash {
         Some(h) => h.clone(),
@@ -7592,7 +7606,7 @@ pub async fn sync_pull_book(
     let timeout = std::time::Duration::from_secs(5);
     match rx.recv_timeout(timeout) {
         Ok(Ok(Some(remote))) => {
-            events::bus().emit(FolioEvent::SyncCompleted {
+            events::bus().emit(CarrelEvent::SyncCompleted {
                 direction: SyncDirection::Pull,
                 success: true,
             });
@@ -7637,14 +7651,14 @@ pub async fn sync_pull_book(
         }
         Ok(Ok(None)) => {
             // No remote file — success (nothing to merge)
-            events::bus().emit(FolioEvent::SyncCompleted {
+            events::bus().emit(CarrelEvent::SyncCompleted {
                 direction: SyncDirection::Pull,
                 success: true,
             });
             let _ = db::set_setting(&conn, "last_sync_success_at", &now_unix_secs().to_string());
         }
         Ok(Err(e)) => {
-            events::bus().emit(FolioEvent::SyncCompleted {
+            events::bus().emit(CarrelEvent::SyncCompleted {
                 direction: SyncDirection::Pull,
                 success: false,
             });
@@ -7669,7 +7683,7 @@ pub async fn sync_pull_book(
         }
         Err(_) => {
             // Timeout
-            events::bus().emit(FolioEvent::SyncCompleted {
+            events::bus().emit(CarrelEvent::SyncCompleted {
                 direction: SyncDirection::Pull,
                 success: false,
             });
@@ -7694,7 +7708,7 @@ pub async fn sync_pull_book(
 }
 
 #[tauri::command]
-pub async fn sync_push_book(book_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn sync_push_book(book_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     // Private mode (B-M1): read once here and carry into the spawned
     // background thread below (State can't be moved across the
     // spawn_blocking boundary, so capture the bool now).
@@ -7704,13 +7718,13 @@ pub async fn sync_push_book(book_id: String, state: State<'_, AppState>) -> Foli
     // which makes it the backend's close signal — emit before the sync
     // guards, but never while private (SB-4).
     if !suppress_passive {
-        events::bus().emit(FolioEvent::BookClosed {
+        events::bus().emit(CarrelEvent::BookClosed {
             book_id: book_id.clone(),
         });
     }
 
     // Private mode (B-M1): symmetric with `sync_pull_book`. The automatic
-    // close-sync fetches then pushes `.folio-sync/books/{file_hash}.json`,
+    // close-sync fetches then pushes `.carrel-sync/books/{file_hash}.json`,
     // exposing the book-hash + timing to the remote as passive egress. Return
     // before touching the backup operator; deliberate annotation saves
     // reconcile on the next non-private close.
@@ -7735,7 +7749,7 @@ pub async fn sync_push_book(book_id: String, state: State<'_, AppState>) -> Foli
 
     let book = match db::get_book(&conn, &book_id)? {
         Some(b) => b,
-        None => return Err(FolioError::not_found(format!("Book not found: {book_id}"))),
+        None => return Err(CarrelError::not_found(format!("Book not found: {book_id}"))),
     };
     let file_hash = match &book.file_hash {
         Some(h) => h.clone(),
@@ -7764,7 +7778,7 @@ pub async fn sync_push_book(book_id: String, state: State<'_, AppState>) -> Foli
             suppress_passive,
         ) {
             Ok(()) => {
-                events::bus().emit(FolioEvent::SyncCompleted {
+                events::bus().emit(CarrelEvent::SyncCompleted {
                     direction: SyncDirection::Push,
                     success: true,
                 });
@@ -7785,7 +7799,7 @@ pub async fn sync_push_book(book_id: String, state: State<'_, AppState>) -> Foli
                 }
             }
             Err(e) => {
-                events::bus().emit(FolioEvent::SyncCompleted {
+                events::bus().emit(CarrelEvent::SyncCompleted {
                     direction: SyncDirection::Push,
                     success: false,
                 });
@@ -7818,7 +7832,7 @@ pub async fn bulk_delete_books(
     book_ids: Vec<String>,
     state: State<'_, AppState>,
     app: AppHandle,
-) -> FolioResult<u32> {
+) -> CarrelResult<u32> {
     let conn = state.active_db()?.get()?;
 
     // Capture each book's file_hash + resolved path before the DB delete so
@@ -7838,7 +7852,7 @@ pub async fn bulk_delete_books(
             Ok(None) => None,
             Err(e) => Some(Err(e.into())),
         })
-        .collect::<FolioResult<Vec<_>>>()?;
+        .collect::<CarrelResult<Vec<_>>>()?;
 
     let ids_ref: Vec<&str> = book_ids.iter().map(|s| s.as_str()).collect();
     db::bulk_delete_books(&conn, &ids_ref)?;
@@ -7856,7 +7870,7 @@ pub async fn bulk_delete_books(
     let storage = page_cache_storage(&app).ok();
     let storage_ref = storage
         .as_ref()
-        .map(|s| s as &dyn folio_core::storage::Storage);
+        .map(|s| s as &dyn carrel_core::storage::Storage);
     for (hash, path) in evict_targets {
         evict_book_page_cache(
             storage_ref,
@@ -7874,7 +7888,7 @@ pub async fn bulk_add_to_collection(
     book_ids: Vec<String>,
     collection_id: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     let ids_ref: Vec<&str> = book_ids.iter().map(|s| s.as_str()).collect();
     db::bulk_add_to_collection(&conn, &ids_ref, &collection_id)?;
@@ -7886,7 +7900,7 @@ pub async fn bulk_add_tag(
     book_ids: Vec<String>,
     tag: String,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     let conn = state.active_db()?.get()?;
     let ids_ref: Vec<&str> = book_ids.iter().map(|s| s.as_str()).collect();
     db::bulk_add_tag(&conn, &ids_ref, &tag)?;
@@ -7908,7 +7922,7 @@ pub async fn bulk_update_metadata(
     book_ids: Vec<String>,
     fields: BulkEditFields,
     state: State<'_, AppState>,
-) -> FolioResult<u32> {
+) -> CarrelResult<u32> {
     let conn = state.active_db()?.get()?;
     let ids_ref: Vec<&str> = book_ids.iter().map(|s| s.as_str()).collect();
 
@@ -7932,7 +7946,7 @@ pub async fn bulk_update_metadata(
     let author = if let Some(s) = fields.author {
         let t = normalize_str(s, 500);
         if t.is_empty() {
-            return Err(FolioError::invalid("Author cannot be empty."));
+            return Err(CarrelError::invalid("Author cannot be empty."));
         }
         Some(t)
     } else {
@@ -7971,7 +7985,7 @@ pub async fn bulk_update_metadata(
 /// New settings are only written when they are absent, so a user who
 /// adjusted the new settings between two migration runs keeps their
 /// changes.
-pub fn migrate_web_server_setting(conn: &rusqlite::Connection) -> FolioResult<()> {
+pub fn migrate_web_server_setting(conn: &rusqlite::Connection) -> CarrelResult<()> {
     let Some(old) = db::get_setting(conn, "web_server_enabled")? else {
         return Ok(());
     };
@@ -7993,7 +8007,7 @@ pub async fn web_server_set_modes(
     port: Option<u16>,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<crate::web_server::WebServerStatus> {
+) -> CarrelResult<crate::web_server::WebServerStatus> {
     // 1. Persist intent first. Settings reflect what the user wants;
     //    runtime state is derived.
     {
@@ -8100,7 +8114,7 @@ pub async fn web_server_set_modes(
 #[tauri::command]
 pub async fn web_server_status(
     state: State<'_, AppState>,
-) -> FolioResult<crate::web_server::WebServerStatus> {
+) -> CarrelResult<crate::web_server::WebServerStatus> {
     let has_pin = crate::web_server::auth::load_pin_hash().is_some();
 
     // Read user intent (these settings drive the running state).
@@ -8136,12 +8150,12 @@ pub async fn web_server_status(
 }
 
 #[tauri::command]
-pub async fn web_server_set_pin(pin: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn web_server_set_pin(pin: String, state: State<'_, AppState>) -> CarrelResult<()> {
     if pin.is_empty() {
-        return Err(FolioError::invalid("PIN cannot be empty"));
+        return Err(CarrelError::invalid("PIN cannot be empty"));
     }
 
-    crate::web_server::auth::validate_pin(&pin).map_err(FolioError::invalid)?;
+    crate::web_server::auth::validate_pin(&pin).map_err(CarrelError::invalid)?;
 
     crate::web_server::auth::store_pin(&pin)?;
 
@@ -8169,12 +8183,12 @@ pub async fn web_server_set_pin(pin: String, state: State<'_, AppState>) -> Foli
 }
 
 #[tauri::command]
-pub async fn web_server_get_qr(state: State<'_, AppState>) -> FolioResult<String> {
+pub async fn web_server_get_qr(state: State<'_, AppState>) -> CarrelResult<String> {
     let handle = state.web_server_handle.lock()?;
     let url = handle
         .as_ref()
         .map(|h| h.url.clone())
-        .ok_or_else(|| FolioError::not_found("Web server is not running"))?;
+        .ok_or_else(|| CarrelError::not_found("Web server is not running"))?;
     crate::web_server::auth::generate_qr_svg(&url)
 }
 
@@ -8329,12 +8343,12 @@ mod tests {
     #[test]
     fn evict_book_page_cache_removes_persisted_text_index() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = folio_core::storage::LocalStorage::new(dir.path()).unwrap();
+        let storage = carrel_core::storage::LocalStorage::new(dir.path()).unwrap();
 
         // Seed a page-cache text index for a book's hash, as prepare_pdf's
         // background pass (or a search miss) would have written.
-        let index = folio_core::pdf::PdfTextIndex {
-            version: folio_core::pdf::TEXT_INDEX_VERSION,
+        let index = carrel_core::pdf::PdfTextIndex {
+            version: carrel_core::pdf::TEXT_INDEX_VERSION,
             page_count: 1,
             pages: vec!["needle".to_string()],
         };
@@ -8358,9 +8372,9 @@ mod tests {
         let srcdir = tempfile::tempdir().unwrap();
         let src = srcdir.path().join("book.cbz");
         std::fs::write(&src, b"staged comic bytes").unwrap();
-        folio_core::source_cache::stage(cache.path(), &src, "del-hash", "cbz").unwrap();
+        carrel_core::source_cache::stage(cache.path(), &src, "del-hash", "cbz").unwrap();
         assert!(
-            folio_core::source_cache::staged_if_present(cache.path(), "del-hash", "cbz").is_some()
+            carrel_core::source_cache::staged_if_present(cache.path(), "del-hash", "cbz").is_some()
         );
 
         // resolved_path ends in .cbz so the staged ext is derived correctly.
@@ -8372,7 +8386,7 @@ mod tests {
         );
 
         assert!(
-            folio_core::source_cache::staged_if_present(cache.path(), "del-hash", "cbz").is_none(),
+            carrel_core::source_cache::staged_if_present(cache.path(), "del-hash", "cbz").is_none(),
             "the staged source copy must be removed on book deletion"
         );
     }
@@ -8527,7 +8541,7 @@ mod tests {
     #[tokio::test]
     async fn sync_push_book_skips_network_sync_when_private() {
         // B-M1 regression (Codex + Codex-2): automatic close-sync is passive
-        // egress (GET+PUT on `.folio-sync/books/{file_hash}.json` reveals the
+        // egress (GET+PUT on `.carrel-sync/books/{file_hash}.json` reveals the
         // book-hash + timing) and must not run while private. The private
         // early return fires before the backup config is even parsed, so with
         // a *malformed* config + sync enabled a non-private close surfaces the
@@ -8621,12 +8635,12 @@ mod tests {
 
     #[test]
     fn get_login_history_reads_web_session_rows() {
-        use folio_core::db;
+        use carrel_core::db;
         let dir = tempfile::tempdir().unwrap();
         let conn = db::init_db(&dir.path().join("t.db")).unwrap();
         db::insert_web_session_log(
             &conn,
-            &folio_core::models::WebSessionEntry {
+            &carrel_core::models::WebSessionEntry {
                 id: "x1".into(),
                 timestamp: 1000,
                 ip: "203.0.113.9".into(),
@@ -8645,13 +8659,13 @@ mod tests {
 
     #[test]
     fn export_activity_log_writes_parseable_json() {
-        use folio_core::db;
+        use carrel_core::db;
         let dir = tempfile::tempdir().unwrap();
         let conn = db::init_db(&dir.path().join("t.db")).unwrap();
 
         log_event(
             &conn,
-            folio_core::activity::ActivityEvent::BookImported {
+            carrel_core::activity::ActivityEvent::BookImported {
                 id: "b1".into(),
                 title: "Title".into(),
                 format: "EPUB".into(),
@@ -8663,16 +8677,16 @@ mod tests {
         let dest = dir.path().join("activity.json");
         std::fs::write(&dest, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
 
-        let parsed: Vec<folio_core::models::ActivityEntry> =
+        let parsed: Vec<carrel_core::models::ActivityEntry> =
             serde_json::from_str(&std::fs::read_to_string(&dest).unwrap()).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].action, "book_imported");
         assert_eq!(parsed[0].detail.as_deref(), Some("EPUB by Auth"));
     }
 
-    fn temp_covers_storage() -> (tempfile::TempDir, folio_core::storage::LocalStorage) {
+    fn temp_covers_storage() -> (tempfile::TempDir, carrel_core::storage::LocalStorage) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = folio_core::storage::LocalStorage::new(dir.path()).unwrap();
+        let storage = carrel_core::storage::LocalStorage::new(dir.path()).unwrap();
         (dir, storage)
     }
 
@@ -8748,7 +8762,7 @@ mod tests {
 
         delete_book_covers(&storage, "target").unwrap();
 
-        use folio_core::storage::Storage;
+        use carrel_core::storage::Storage;
         assert!(storage.list("target/").unwrap().is_empty());
         assert_eq!(storage.list("other/").unwrap().len(), 1);
     }
@@ -9158,9 +9172,9 @@ mod tests {
     fn backup_lock_guard_releases_when_caller_returns_err_early() {
         // Simulates the real regression: a fallible `?` after `acquire` must
         // NOT leak the profile into BACKUP_RUNNING.
-        fn fallible(name: String) -> FolioResult<()> {
+        fn fallible(name: String) -> CarrelResult<()> {
             let _guard = BackupLockGuard::acquire(name)?;
-            Err(FolioError::internal("simulated setup failure"))
+            Err(CarrelError::internal("simulated setup failure"))
         }
         let name = "test-raii-early-err".to_string();
         let result = fallible(name.clone());
@@ -9487,11 +9501,11 @@ mod tests {
         // tests need no serialization.
         let work = tempfile::tempdir().unwrap();
         let db_pool = db::create_pool(&work.path().join("library.db")).unwrap();
-        let storage: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
+        let storage: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
         );
-        let covers: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
+        let covers: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
         );
 
         let src = write_minimal_epub(work.path(), "book");
@@ -9546,11 +9560,11 @@ mod tests {
     fn reimport_with_changed_mtime_falls_through_to_hash() {
         let work = tempfile::tempdir().unwrap();
         let db_pool = db::create_pool(&work.path().join("library.db")).unwrap();
-        let storage: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
+        let storage: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
         );
-        let covers: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
+        let covers: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
         );
 
         let src = write_minimal_epub(work.path(), "book");
@@ -9604,11 +9618,11 @@ mod tests {
     fn reimport_fast_path_skips_when_hash_would_miss() {
         let work = tempfile::tempdir().unwrap();
         let db_pool = db::create_pool(&work.path().join("library.db")).unwrap();
-        let storage: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
+        let storage: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
         );
-        let covers: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
+        let covers: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
         );
 
         let src = write_minimal_epub(work.path(), "book");
@@ -9673,11 +9687,11 @@ mod tests {
         // forever. Without the refresh the fast-path never warms back up.
         let work = tempfile::tempdir().unwrap();
         let db_pool = db::create_pool(&work.path().join("library.db")).unwrap();
-        let storage: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
+        let storage: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("library")).unwrap(),
         );
-        let covers: std::sync::Arc<dyn folio_core::storage::Storage> = std::sync::Arc::new(
-            folio_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
+        let covers: std::sync::Arc<dyn carrel_core::storage::Storage> = std::sync::Arc::new(
+            carrel_core::storage::LocalStorage::new(work.path().join("covers")).unwrap(),
         );
 
         let src = write_minimal_epub(work.path(), "book");
@@ -9814,7 +9828,7 @@ mod tests {
 
     // ---- Profile soft-lock (A-M2) ----
     //
-    // `folio_core::profile_lock`'s keychain-backed functions
+    // `carrel_core::profile_lock`'s keychain-backed functions
     // (`has_lock`/`load_lock`/`set_lock`) are deliberately never called in a
     // way whose *result* this test suite depends on — mirrors A-M1's own
     // tests and `backup.rs`'s untested `store_secrets`/`load_secrets`. A
@@ -9827,7 +9841,7 @@ mod tests {
     // on `AppState` bookkeeping that doesn't depend on it. The soft-lock
     // *decision* itself (locked && not-unlocked => denied) is covered
     // exhaustively and keychain-free by
-    // `folio_core::profile_lock::access_allowed`'s own unit tests.
+    // `carrel_core::profile_lock::access_allowed`'s own unit tests.
     //
     // The `switch_profile` *command* takes a concrete `AppHandle` (defaulting
     // to the real `Wry` runtime — see `#[default_runtime]` on
@@ -9905,7 +9919,7 @@ mod tests {
     // `switch_active_profile_with` exists so these tests can drive the
     // soft-lock decision without a real keychain (see the keychain note
     // above): the lock-status probe is a parameter, and the only production
-    // caller passes `folio_core::profile_lock::has_lock`. The decision itself
+    // caller passes `carrel_core::profile_lock::has_lock`. The decision itself
     // is still the shared `profile_lock::access_allowed`, so parity with the
     // desktop command and the web gate is structural, not duplicated.
 
@@ -10018,7 +10032,7 @@ mod tests {
         add_profile(&state, dir.path(), "alice");
 
         let err = switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| {
-            Err(FolioError::internal("keychain unavailable"))
+            Err(CarrelError::internal("keychain unavailable"))
         })
         .await
         .unwrap_err();
@@ -10179,7 +10193,7 @@ mod tests {
         add_profile(&state, dir.path(), "magazines");
 
         let list = list_profiles_with_lock_state_with(&state, |_| {
-            Err(FolioError::internal("keychain unavailable"))
+            Err(CarrelError::internal("keychain unavailable"))
         })
         .unwrap();
 
@@ -10243,7 +10257,7 @@ mod tests {
         let src = srcdir.path().join("comic.pdf");
         std::fs::write(&src, b"staged bytes").unwrap();
         let staged =
-            folio_core::source_cache::stage(dir.path(), &src, "abc123hash", "pdf").unwrap();
+            carrel_core::source_cache::stage(dir.path(), &src, "abc123hash", "pdf").unwrap();
 
         // Now resolve prefers the local staged copy.
         assert_eq!(
@@ -10275,7 +10289,8 @@ mod tests {
 
         assert!(!attempted, "a local source must not be staged");
         assert!(
-            folio_core::source_cache::staged_if_present(cache.path(), "localhash", "pdf").is_none(),
+            carrel_core::source_cache::staged_if_present(cache.path(), "localhash", "pdf")
+                .is_none(),
             "no staged copy should exist for a local source"
         );
     }
@@ -10305,7 +10320,7 @@ mod tests {
         let src = srcdir.path().join("c.pdf");
         std::fs::write(&src, b"staged bytes").unwrap();
         let staged =
-            folio_core::source_cache::stage(cache.path(), &src, "webm2hash", "pdf").unwrap();
+            carrel_core::source_cache::stage(cache.path(), &src, "webm2hash", "pdf").unwrap();
 
         // Backdate the staged copy's mtime to a fixed point well in the past.
         let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
@@ -10379,10 +10394,10 @@ mod tests {
 
     /// Mirrors the exact condition `switch_profile` gates on: a locked,
     /// not-yet-unlocked profile must be denied (surfaced as
-    /// `FolioError::LockRequired`).
+    /// `CarrelError::LockRequired`).
     #[test]
     fn switch_profile_gate_denies_locked_and_not_unlocked() {
-        assert!(!folio_core::profile_lock::access_allowed(true, false));
+        assert!(!carrel_core::profile_lock::access_allowed(true, false));
     }
 
     #[test]
@@ -10393,12 +10408,12 @@ mod tests {
         // switch through.
         let (app, _dir) = mock_app_with_state();
         let state = app.handle().state::<AppState>();
-        assert!(!folio_core::profile_lock::access_allowed(
+        assert!(!carrel_core::profile_lock::access_allowed(
             true,
             state.is_unlocked("bob")
         ));
         state.mark_unlocked("bob").unwrap();
-        assert!(folio_core::profile_lock::access_allowed(
+        assert!(carrel_core::profile_lock::access_allowed(
             true,
             state.is_unlocked("bob")
         ));
@@ -10541,15 +10556,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             status.state,
-            folio_core::dictionary::DictionaryState::Missing
+            carrel_core::dictionary::DictionaryState::Missing
         );
 
-        folio_core::dictionary::write_test_artifact(&handle.state::<AppState>().dictionary_dir())
+        carrel_core::dictionary::write_test_artifact(&handle.state::<AppState>().dictionary_dir())
             .unwrap();
         let status = get_dictionary_status(handle.state::<AppState>())
             .await
             .unwrap();
-        assert_eq!(status.state, folio_core::dictionary::DictionaryState::Ready);
+        assert_eq!(
+            status.state,
+            carrel_core::dictionary::DictionaryState::Ready
+        );
     }
 
     #[tokio::test]
@@ -10564,7 +10582,7 @@ mod tests {
         assert_eq!(err.kind(), "NotFound");
 
         // Install a synthetic artifact; lookup resolves and caches the pool.
-        folio_core::dictionary::write_test_artifact(&handle.state::<AppState>().dictionary_dir())
+        carrel_core::dictionary::write_test_artifact(&handle.state::<AppState>().dictionary_dir())
             .unwrap();
         let entry = lookup_word("cat".to_string(), handle.state::<AppState>())
             .await
@@ -10578,7 +10596,7 @@ mod tests {
                 .await
                 .unwrap()
                 .state,
-            folio_core::dictionary::DictionaryState::Missing
+            carrel_core::dictionary::DictionaryState::Missing
         );
         // With the pool cleared and the file gone, lookup is NotFound again.
         let err = lookup_word("cat".to_string(), handle.state::<AppState>())
@@ -10939,15 +10957,15 @@ pub fn take_startup_update_check(state: State<'_, AppState>) -> bool {
 // ── Autostart ──────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_autostart_enabled(app: AppHandle) -> FolioResult<bool> {
+pub async fn get_autostart_enabled(app: AppHandle) -> CarrelResult<bool> {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch()
         .is_enabled()
-        .map_err(|e| FolioError::internal(format!("Failed to check autostart: {}", e)))
+        .map_err(|e| CarrelError::internal(format!("Failed to check autostart: {}", e)))
 }
 
 #[tauri::command]
-pub async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> FolioResult<()> {
+pub async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> CarrelResult<()> {
     use tauri_plugin_autostart::ManagerExt;
 
     let autostart = app.autolaunch();
@@ -10970,7 +10988,7 @@ pub async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> FolioResult
 /// Writes an already-encoded PNG (from the frontend canvas's `toBlob`) to a
 /// user-chosen path. No image decoding/encoding happens on the Rust side.
 #[tauri::command]
-pub async fn save_quote_card_png(path: String, bytes: Vec<u8>) -> FolioResult<()> {
+pub async fn save_quote_card_png(path: String, bytes: Vec<u8>) -> CarrelResult<()> {
     std::fs::write(&path, &bytes)?;
     Ok(())
 }

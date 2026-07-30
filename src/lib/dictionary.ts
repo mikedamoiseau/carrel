@@ -9,7 +9,7 @@
 //   - `groupSensesByPos` — orders senses into the fixed n/v/a/r part-of-speech
 //     grouping the definition card renders.
 //
-// These mirror the shapes the backend returns (`folio-core::dictionary`), which
+// These mirror the shapes the backend returns (`carrel-core::dictionary`), which
 // serialize as camelCase.
 
 /** On-disk state of the artifact, from `get_dictionary_status`. */

@@ -6,7 +6,7 @@ use axum::{
     Router,
 };
 
-use super::{folio_status, WebState};
+use super::{carrel_status, WebState};
 use crate::db;
 use crate::models::Book;
 use sha2::{Digest, Sha256};
@@ -156,13 +156,13 @@ fn book_to_entry(book: &Book) -> String {
         r#"<link rel="http://opds-spec.org/acquisition" href="/api/books/{id}/download/{id}.{ext}" type="{mime}" title="{title}.{ext}"/>"#
     );
 
-    // `urn:folio:*` ids throughout this module keep their pre-Carrel spelling:
-    // OPDS clients cache and dedupe on feed and entry ids. See CLAUDE.md,
-    // "Legacy `folio` identifiers".
+    // OPDS clients cache and dedupe on feed and entry ids, so changing the
+    // `urn:carrel:*` scheme used throughout this module makes every entry look
+    // new to an already-subscribed client.
     format!(
         r#"<entry>
   <title>{title}</title>
-  <id>urn:folio:{id}</id>
+  <id>urn:carrel:{id}</id>
   <updated>{updated}</updated>
   <author><name>{author}</name></author>
   {description}
@@ -212,14 +212,14 @@ async fn root_catalog() -> Response {
     let entries = format!(
         r#"<entry>
   <title>All Books</title>
-  <id>urn:folio:all</id>
+  <id>urn:carrel:all</id>
   <updated>{now}</updated>
   <content type="text">Browse the entire library</content>
   <link rel="subsection" href="/opds/all" type="{ATOM_ACQ_TYPE}"/>
 </entry>
 <entry>
   <title>Recently Added</title>
-  <id>urn:folio:new</id>
+  <id>urn:carrel:new</id>
   <updated>{now}</updated>
   <content type="text">Books added recently</content>
   <link rel="subsection" href="/opds/new" type="{ATOM_ACQ_TYPE}"/>
@@ -229,7 +229,7 @@ async fn root_catalog() -> Response {
 
     let xml = wrap_feed(
         "Carrel Library",
-        "urn:folio:root",
+        "urn:carrel:root",
         &entries,
         "/opds",
         ATOM_CONTENT_TYPE,
@@ -250,15 +250,15 @@ async fn all_books(
     Query(params): Query<PaginationQuery>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let books = db::list_books(&conn).map_err(folio_status)?;
-    let pairs = db::book_etag_pairs(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let books = db::list_books(&conn).map_err(carrel_status)?;
+    let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
     // Whole-set tag shared by every page: clients cache per-URL, so a
     // shared tag across page URLs is correct and any library change
     // invalidates all pages at once.
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:folio:all", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:all", &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
@@ -287,7 +287,7 @@ async fn all_books(
 
     let xml = wrap_feed(
         "All Books",
-        "urn:folio:all",
+        "urn:carrel:all",
         &entries,
         &self_href,
         ATOM_ACQ_TYPE,
@@ -309,16 +309,16 @@ async fn new_books(
     State(state): State<WebState>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let mut books = db::list_books(&conn).map_err(folio_status)?;
-    let pairs = db::book_etag_pairs(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let mut books = db::list_books(&conn).map_err(carrel_status)?;
+    let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
     // Sort by added_at descending, take 25 most recent
     books.sort_by_key(|b| std::cmp::Reverse(b.added_at));
     books.truncate(25);
 
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:folio:new", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:new", &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
@@ -331,7 +331,7 @@ async fn new_books(
 
     let xml = wrap_feed(
         "Recently Added",
-        "urn:folio:new",
+        "urn:carrel:new",
         &entries,
         "/opds/new",
         ATOM_ACQ_TYPE,
@@ -354,13 +354,13 @@ async fn collection_feed(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let books = db::get_books_in_collection(&conn, &id).map_err(folio_status)?;
-    let pairs = db::book_etag_pairs(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let books = db::get_books_in_collection(&conn, &id).map_err(carrel_status)?;
+    let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
     // Hash the RESOLVED membership — works for manual and rule-based collections alike.
-    let feed_id = format!("urn:folio:collection:{id}");
+    let feed_id = format!("urn:carrel:collection:{id}");
     let etag = feed_etag(&feed_id, &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
@@ -401,8 +401,8 @@ async fn search_books(
     State(state): State<WebState>,
     Query(params): Query<SearchQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(folio_status)?;
-    let books = db::list_books(&conn).map_err(folio_status)?;
+    let conn = state.conn().map_err(carrel_status)?;
+    let books = db::list_books(&conn).map_err(carrel_status)?;
 
     let filtered: Vec<Book> = match params.q {
         Some(ref q) if !q.is_empty() => {
@@ -427,7 +427,7 @@ async fn search_books(
     let search_term = params.q.as_deref().unwrap_or("");
     let xml = wrap_feed(
         &format!("Search: {}", xml_escape(search_term)),
-        "urn:folio:search",
+        "urn:carrel:search",
         &entries,
         &format!("/opds/search?q={}", urlencoding::encode(search_term)),
         ATOM_ACQ_TYPE,
@@ -479,7 +479,7 @@ mod tests {
         let entry = book_to_entry(&book);
         assert!(entry.contains("<title>Test &amp; Book</title>"));
         assert!(entry.contains("Author &lt;Name&gt;"));
-        assert!(entry.contains("urn:folio:test-1"));
+        assert!(entry.contains("urn:carrel:test-1"));
         assert!(entry.contains("application/epub+zip"));
         assert!(entry.contains("/api/books/test-1/download"));
         assert!(entry.contains("A &lt;great&gt; book"));
@@ -631,8 +631,8 @@ mod tests {
     #[test]
     fn feed_etag_is_order_independent_and_weak() {
         let p = pairs(&[("a", 1), ("b", 2)]);
-        let t1 = feed_etag("urn:folio:all", &["a", "b"], &p);
-        let t2 = feed_etag("urn:folio:all", &["b", "a"], &p);
+        let t1 = feed_etag("urn:carrel:all", &["a", "b"], &p);
+        let t2 = feed_etag("urn:carrel:all", &["b", "a"], &p);
         assert_eq!(t1, t2);
         assert!(t1.starts_with("W/\""), "weak ETag required, got {t1}");
         assert!(t1.ends_with('"'));
@@ -641,26 +641,26 @@ mod tests {
     #[test]
     fn feed_etag_changes_on_updated_at_bump_and_set_change() {
         let p1 = pairs(&[("a", 1), ("b", 2)]);
-        let base = feed_etag("urn:folio:all", &["a", "b"], &p1);
+        let base = feed_etag("urn:carrel:all", &["a", "b"], &p1);
 
         // updated_at bump
         let p2 = pairs(&[("a", 1), ("b", 3)]);
-        assert_ne!(base, feed_etag("urn:folio:all", &["a", "b"], &p2));
+        assert_ne!(base, feed_etag("urn:carrel:all", &["a", "b"], &p2));
 
         // id removed from rendered set
-        assert_ne!(base, feed_etag("urn:folio:all", &["a"], &p1));
+        assert_ne!(base, feed_etag("urn:carrel:all", &["a"], &p1));
 
         // id added to rendered set
         let p3 = pairs(&[("a", 1), ("b", 2), ("c", 9)]);
-        assert_ne!(base, feed_etag("urn:folio:all", &["a", "b", "c"], &p3));
+        assert_ne!(base, feed_etag("urn:carrel:all", &["a", "b", "c"], &p3));
     }
 
     #[test]
     fn feed_etag_differs_across_feed_ids() {
         let p = pairs(&[("a", 1)]);
         assert_ne!(
-            feed_etag("urn:folio:all", &["a"], &p),
-            feed_etag("urn:folio:new", &["a"], &p)
+            feed_etag("urn:carrel:all", &["a"], &p),
+            feed_etag("urn:carrel:new", &["a"], &p)
         );
     }
 

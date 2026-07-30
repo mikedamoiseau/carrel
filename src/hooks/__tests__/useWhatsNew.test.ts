@@ -33,14 +33,14 @@ describe("useWhatsNew", () => {
   });
 
   it("shows banner when flag enabled, not dismissed, and onboarding complete", async () => {
-    localStorage.setItem("folio-onboarding-complete", "true");
+    localStorage.setItem("carrel-onboarding-complete", "true");
     const { result } = renderHook(() => useWhatsNew());
     await vi.waitFor(() => expect(result.current.showBanner).toBe(true));
   });
 
   it("hides banner when already dismissed for current version", async () => {
-    localStorage.setItem("folio-onboarding-complete", "true");
-    localStorage.setItem("folio-whats-new-dismissed", "2.0.3");
+    localStorage.setItem("carrel-onboarding-complete", "true");
+    localStorage.setItem("carrel-whats-new-dismissed", "2.0.3");
     const { result } = renderHook(() => useWhatsNew());
     await vi.waitFor(() => expect(result.current.flagLoaded).toBe(true));
     expect(result.current.showBanner).toBe(false);
@@ -53,7 +53,7 @@ describe("useWhatsNew", () => {
   });
 
   it("hides banner when feature flag disabled", async () => {
-    localStorage.setItem("folio-onboarding-complete", "true");
+    localStorage.setItem("carrel-onboarding-complete", "true");
     vi.mocked(invoke).mockResolvedValue(false);
     const { result } = renderHook(() => useWhatsNew());
     await vi.waitFor(() => expect(result.current.flagLoaded).toBe(true));
@@ -61,16 +61,16 @@ describe("useWhatsNew", () => {
   });
 
   it("dismissBanner sets localStorage and hides banner", async () => {
-    localStorage.setItem("folio-onboarding-complete", "true");
+    localStorage.setItem("carrel-onboarding-complete", "true");
     const { result } = renderHook(() => useWhatsNew());
     await vi.waitFor(() => expect(result.current.showBanner).toBe(true));
     act(() => result.current.dismissBanner());
     expect(result.current.showBanner).toBe(false);
-    expect(localStorage.getItem("folio-whats-new-dismissed")).toBe("2.0.3");
+    expect(localStorage.getItem("carrel-whats-new-dismissed")).toBe("2.0.3");
   });
 
   it("openModal and closeModal toggle showModal", async () => {
-    localStorage.setItem("folio-onboarding-complete", "true");
+    localStorage.setItem("carrel-onboarding-complete", "true");
     const { result } = renderHook(() => useWhatsNew());
     await vi.waitFor(() => expect(result.current.flagLoaded).toBe(true));
     expect(result.current.showModal).toBe(false);
@@ -81,7 +81,7 @@ describe("useWhatsNew", () => {
   });
 
   it("currentRelease matches appVersion", async () => {
-    localStorage.setItem("folio-onboarding-complete", "true");
+    localStorage.setItem("carrel-onboarding-complete", "true");
     const { result } = renderHook(() => useWhatsNew());
     await vi.waitFor(() => expect(result.current.currentRelease).not.toBeNull());
     expect(result.current.currentRelease!.version).toBe("2.0.3");

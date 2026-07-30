@@ -19,7 +19,7 @@ The web UI is a hand-written mini-SPA, completely independent from the React des
 | `src-tauri/src/web_server/static/app.css` | ~122 lines | Plain CSS. Custom properties in `:root`: `--bg:#111; --fg:#eee; --accent:#6c9; --card-bg:#1a1a2e; --border:#333`. Single `@media (max-width: 600px)` block. Dark-only, no theme toggle. |
 | `src-tauri/src/web_server/web_ui.rs` | 63 lines | Serves the static files via `include_str!`/`include_bytes!` (assets are **embedded in the Rust binary**). Routes: `GET /`, `/app.js`, `/app.css`, `/favicon.png`, `/favicon.ico`. |
 | `src-tauri/src/web_server/api.rs` | ~997 lines | JSON API consumed by app.js (see endpoint list below). |
-| `src-tauri/src/web_server/auth.rs` | ~589 lines | Optional PIN auth. Session cookie `folio_session` (24h TTL, in-memory) or Basic Auth. Public (unauthenticated) route carve-out: `/api/auth`, `/api/health`, `/`, `/app.js`, `/app.css`, `/favicon.ico`, `/favicon.png`. Per-IP rate limiting. |
+| `src-tauri/src/web_server/auth.rs` | ~589 lines | Optional PIN auth. Session cookie `carrel_session` (24h TTL, in-memory) or Basic Auth. Public (unauthenticated) route carve-out: `/api/auth`, `/api/health`, `/`, `/app.js`, `/app.css`, `/favicon.ico`, `/favicon.png`. Per-IP rate limiting. |
 | `src-tauri/src/web_server/mod.rs` | ~1010 lines | `WebState`, `build_router`, security-headers middleware, `DEFAULT_PORT = 7788`. ~300 lines of `#[cfg(test)]` integration tests. |
 | `src-tauri/src/web_server/opds_feed.rs` | ~945 lines | OPDS 1.2 catalog (separate surface, mostly out of scope here). |
 
@@ -52,7 +52,7 @@ Fonts: `--font-sans: "DM Sans Variable"`, `--font-serif: "Playfair Display Varia
 1. **Static assets are compiled into the binary.** Any change to `static/*` requires a Rust rebuild to show up in the served UI (`cargo build` / restart of `npm run tauri dev`). There is no frontend build step, no bundler, no npm deps for the web UI — keep it that way (vanilla JS/CSS only, no framework).
 2. **New static files (e.g. `manifest.json`, `sw.js`, font files) need three registrations:** an `include_str!`/`include_bytes!` route in `web_ui.rs`, **and** an entry in the auth middleware's public-route carve-out in `auth.rs` (otherwise PIN-protected setups will 401 them), and correct `Content-Type`.
 3. **Security invariants — do not weaken:** chapter HTML is sanitized server-side (`sanitize_chapter_html` in api.rs) before serving; keep using `esc()` for any user/book data interpolated into template literals in app.js; filename params go through `is_safe_filename` (api.rs); security headers come from `security_headers_middleware` (mod.rs) — check CSP there before adding inline scripts/styles (external files preferred).
-4. **New API endpoints** go in `api.rs::routes()`. DB access goes through functions in `folio-core/src/db.rs` (receive `&Connection`, never manage pool lifecycle). New tables/columns: additive migration in `folio-core/src/db.rs::run_schema()`.
+4. **New API endpoints** go in `api.rs::routes()`. DB access goes through functions in `carrel-core/src/db.rs` (receive `&Connection`, never manage pool lifecycle). New tables/columns: additive migration in `carrel-core/src/db.rs::run_schema()`.
 5. **Testing/verification:** web server has integration tests in `mod.rs` `#[cfg(test)]` — add coverage there for new endpoints. Before pushing: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` (repo root), `cargo test` (in `src-tauri/`), `npm run type-check && npm run test` (root). Visual verification: Playwright is available in the repo's `node_modules` — run scripts with `NODE_PATH=<repo>/node_modules node script.js` against `http://localhost:7788`.
 6. **Surgical changes.** Match existing app.js/app.css style (vanilla, small, no abstractions). Don't refactor unrelated code.
 
@@ -168,14 +168,14 @@ Coordinates with Item 2 (shares reader navigation handlers — build handlers on
 Progress flows one way: desktop app writes to SQLite; web stats page reads it. The web reader always opens at page/chapter 0 and records nothing. Stats page explicitly says "Start reading on the desktop app to see your progress here."
 
 ### Scope
-1. **API — read:** `GET /api/books/{id}/progress` → current position (existing `ReadingProgress` model in `folio-core/src/models.rs`; check for an existing read function in `folio-core/src/db.rs` — the desktop app already loads progress, reuse that function).
-2. **API — write:** `PUT /api/books/{id}/progress` with JSON body (position: chapter index + scroll offset for EPUB/MOBI, page index for PDF/CBZ/CBR — mirror whatever shape the desktop app persists; **grep every consumer of the progress table before changing any field semantics**). Auth-protected (default middleware). Reuse the desktop's upsert function in `folio-core/src/db.rs` if one exists; add one there if not.
+1. **API — read:** `GET /api/books/{id}/progress` → current position (existing `ReadingProgress` model in `carrel-core/src/models.rs`; check for an existing read function in `carrel-core/src/db.rs` — the desktop app already loads progress, reuse that function).
+2. **API — write:** `PUT /api/books/{id}/progress` with JSON body (position: chapter index + scroll offset for EPUB/MOBI, page index for PDF/CBZ/CBR — mirror whatever shape the desktop app persists; **grep every consumer of the progress table before changing any field semantics**). Auth-protected (default middleware). Reuse the desktop's upsert function in `carrel-core/src/db.rs` if one exists; add one there if not.
 3. **Frontend:** on reader open, fetch progress and jump to the saved position (offer "Resume at page 23 / Start over" if saved position > 0). While reading, debounce-save position (e.g. 2s after last page turn, plus `visibilitychange`/`pagehide` flush).
 4. **Reading sessions (optional, only if cheap):** if the stats tables track sessions/time, consider a lightweight session record for web reads so the stats page reflects web activity. If the schema makes this non-trivial, skip — position sync is the core deliverable; note the decision in the PR.
 5. **Conflict policy:** last-write-wins on `updated_at`. No merge logic.
 
 ### Files
-`api.rs` (2 routes + handlers), `folio-core/src/db.rs` (reuse/add progress read+upsert), `app.js` (`showReader` + detail page "Continue" button), `mod.rs` (integration tests for both endpoints, including 401-when-PIN-set and write-then-read roundtrip).
+`api.rs` (2 routes + handlers), `carrel-core/src/db.rs` (reuse/add progress read+upsert), `app.js` (`showReader` + detail page "Continue" button), `mod.rs` (integration tests for both endpoints, including 401-when-PIN-set and write-then-read roundtrip).
 
 ### Acceptance criteria
 - Integration tests in `mod.rs` pass: PUT then GET returns the written position; unauthenticated PUT is rejected when a PIN is configured.
@@ -196,7 +196,7 @@ Item 8's "Continue" button and Item 5's "Continue Reading" shelf both consume `G
 Home = flat wall of every cover, sorted by "Recent" dropdown. No resume affordance; finding the book you're mid-way through means remembering its title.
 
 ### Scope
-1. **API:** either extend `GET /api/books` with `?filter=reading` / `?filter=recent` params, or add `GET /api/books/continue-reading` (books with progress > 0 and < 100%, ordered by `last_read_at` desc, limit ~12). Check what the desktop Library screen uses in `folio-core/src/db.rs` — a query probably already exists; expose it, don't duplicate it.
+1. **API:** either extend `GET /api/books` with `?filter=reading` / `?filter=recent` params, or add `GET /api/books/continue-reading` (books with progress > 0 and < 100%, ordered by `last_read_at` desc, limit ~12). Check what the desktop Library screen uses in `carrel-core/src/db.rs` — a query probably already exists; expose it, don't duplicate it.
 2. **Frontend:** `showLibrary` renders (when unfiltered/unsearched):
    - **Continue Reading** — horizontal shelf, cards show a progress bar (percent from progress data) and open the reader directly at the saved position (not the detail page).
    - **Recently Added** — horizontal shelf, last ~12 imports.
@@ -205,7 +205,7 @@ Home = flat wall of every cover, sorted by "Recent" dropdown. No resume affordan
 3. Progress bar on shelf cards: thin accent-colored bar at the card bottom (matches desktop `BookCard` which shows reading progress).
 
 ### Files
-`app.js` (`showLibrary`), `app.css` (shelf layout: horizontal scroll with snap points, `scroll-snap-type: x mandatory`), `api.rs` (+ `folio-core/src/db.rs` if a new query is needed), `mod.rs` tests for any new endpoint.
+`app.js` (`showLibrary`), `app.css` (shelf layout: horizontal scroll with snap points, `scroll-snap-type: x mandatory`), `api.rs` (+ `carrel-core/src/db.rs` if a new query is needed), `mod.rs` tests for any new endpoint.
 
 ### Acceptance criteria
 - With ≥1 in-progress book: home shows shelves + grid; clicking a Continue card lands in the reader at the saved position.
@@ -220,7 +220,7 @@ Home = flat wall of every cover, sorted by "Recent" dropdown. No resume affordan
 **Priority: medium. Small. Hard dependency on Item 1 (needs both palettes defined).**
 
 ### Scope
-1. Header button cycling light → dark → system (system = follow `prefers-color-scheme` via `matchMedia`, react to changes live). Persist choice in `localStorage` (`folio_theme`).
+1. Header button cycling light → dark → system (system = follow `prefers-color-scheme` via `matchMedia`, react to changes live). Persist choice in `localStorage` (`carrel_theme`).
 2. Apply by setting `data-theme="light|dark"` on `<html>` before first paint — inline the tiny bootstrap script in `index.html` `<head>` (check the CSP in `security_headers_middleware` in mod.rs allows it; if `script-src` lacks `'unsafe-inline'`, either add a hash for this one script or accept a first-paint flash and set it at the top of app.js — prefer the hash approach, do not broadly enable `unsafe-inline`).
 3. Optional: sepia as a third palette (desktop has it; tokens in `src/lib/themes` — port values if trivial, otherwise skip and note it).
 4. Icon reflects current mode (sun/moon/auto glyph — inline SVG, no icon library).
@@ -266,7 +266,7 @@ One horizontal `overflow-x: auto` strip of pill buttons: "All Books", then colle
 **Priority: medium. Depends on Item 4 for the progress/Continue elements; everything else is independent.**
 
 ### Current behavior
-Cover, title, "Format: PDF", Read + Download buttons, in an otherwise empty screen. `GET /api/books/{id}` likely already returns more fields than the page renders (author, series, description, rating, page count, file size, added date — check the `Book` model in `folio-core/src/models.rs` and the api.rs handler; extend the API response only if fields are missing and the data is in the DB).
+Cover, title, "Format: PDF", Read + Download buttons, in an otherwise empty screen. `GET /api/books/{id}` likely already returns more fields than the page renders (author, series, description, rating, page count, file size, added date — check the `Book` model in `carrel-core/src/models.rs` and the api.rs handler; extend the API response only if fields are missing and the data is in the DB).
 
 ### Scope
 1. **Metadata block:** author, series name + volume, description (render as text — it may contain publisher HTML; keep escaping with `esc()`, or sanitize server-side if HTML rendering is wanted), format badge, page/chapter count, file size, date added, rating (read-only stars).
@@ -353,7 +353,7 @@ Install prompts and service workers require a secure context: `localhost` works 
 `GET /api/books/{id}/cover` (api.rs `get_cover`, ~line 420) reads `book.cover_path` — the **full-size** `cover.jpg` — and the web UI uses that one endpoint everywhere: library grid, shelf cards, and detail page. With a ~2000-book library the grid downloads thousands of full-resolution covers to render ~160-200px cards.
 
 The infrastructure for the fix already exists and is unused by the web server:
-- `folio-core/src/image_util.rs::make_thumbnail(bytes, target_width)` — produces a q80 JPEG clamped to a target width; returns `Ok(None)` when the source is already at/below the target ("use the original").
+- `carrel-core/src/image_util.rs::make_thumbnail(bytes, target_width)` — produces a q80 JPEG clamped to a target width; returns `Ok(None)` when the source is already at/below the target ("use the original").
 - The desktop app already persists `thumb.jpg` next to `cover.jpg` in `{app_data}/covers/{book_id}/` — verified ~2347 `thumb.jpg` files on disk on this machine. Find the desktop write path (grep `make_thumbnail` / `thumb.jpg` consumers in commands.rs / import pipeline) and mirror its exact naming + target width.
 
 ### Scope
@@ -428,7 +428,7 @@ Each batch: feature branch, run full CI suite locally before push (see Shared Co
 
 # Implementation Decision Log
 
-All 11 items were implemented 2026-07-04/05 on the epic branch `feature/web-ui-revamp` (sub-branches `web-ui/01-design-system`, `web-ui/02-reader-ux`, `web-ui/04-progress-sync`, `web-ui/05-shelves-detail`, `web-ui/06-theme-navigation`, `web-ui/09-pwa-polish`, `web-ui/11-cover-thumbnails`, each merged after a two-reviewer loop: workflow-based `/code-review` at high effort + Codex review, with all confirmed findings fixed before merge). Final merged state passes the full CI suite: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, 236 src-tauri tests, 503 folio-core tests, `npm run type-check`, 580 frontend tests. **The branch has not been pushed** — pushing/PR was not part of the brief.
+All 11 items were implemented 2026-07-04/05 on the epic branch `feature/web-ui-revamp` (sub-branches `web-ui/01-design-system`, `web-ui/02-reader-ux`, `web-ui/04-progress-sync`, `web-ui/05-shelves-detail`, `web-ui/06-theme-navigation`, `web-ui/09-pwa-polish`, `web-ui/11-cover-thumbnails`, each merged after a two-reviewer loop: workflow-based `/code-review` at high effort + Codex review, with all confirmed findings fixed before merge). Final merged state passes the full CI suite: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, 236 src-tauri tests, 503 carrel-core tests, `npm run type-check`, 580 frontend tests. **The branch has not been pushed** — pushing/PR was not part of the brief.
 
 Decisions taken autonomously, for later review:
 
@@ -483,7 +483,7 @@ Decisions taken autonomously, for later review:
 36. **Generation-scoped in-flight guard.** `libraryLoadingPage` is only cleared in `loadNextPage`'s `finally` when the captured `gen` is still current, so an abandoned old-generation fetch can't clear the live generation's guard and let a duplicate page append (review fix — Codex).
 
 ## Item 15 (added 2026-07-05)
-37. **Bulk progress endpoint, not a model change.** `GET /api/reading-progress` is a thin wrapper over the pre-existing `db::get_all_reading_progress` (already used by the `last_read` sort — returns full `ReadingProgress` rows, so no new query was needed). `BookGridItem` was deliberately NOT widened (shared `folio-core` model; would ripple to the desktop `get_library` path). Correctly PIN-gated (not in the public carve-out). Frontend fetches once, merges client-side.
+37. **Bulk progress endpoint, not a model change.** `GET /api/reading-progress` is a thin wrapper over the pre-existing `db::get_all_reading_progress` (already used by the `last_read` sort — returns full `ReadingProgress` rows, so no new query was needed). `BookGridItem` was deliberately NOT widened (shared `carrel-core` model; would ripple to the desktop `get_library` path). Correctly PIN-gated (not in the public carve-out). Frontend fetches once, merges client-side.
 38. **One canonical progress resolver for grid + shelf.** `effectiveProgress()` mirrors `mergeProgress`'s rule — the F8 local (this-tab) value wins only when its `.ts` is newer than the server row's `last_read_at` — and treats `chapter_index <= 0` as "no progress" (matches `showDetail`'s `hasProgress` and `get_continue_reading_books`'s `chapter_index > 0` filter). Both the grid card and the Continue Reading shelf card render from this one source, so the same book can never show two different percentages on one screen. A "Start Over"-reset book (local chapter 0) resolves to **no bar** rather than a misleading `1/total` bar (review fixes).
 39. **Badge reuses the shelf bar; guarded for `total_chapters=0`.** Extracted `progressBarHtml(chapterIndex, totalChapters)` — single source for the `.shelf-progress` markup, returns `""` when `total_chapters <= 0` (matches the continue-reading exclusion; no more empty 0%-width track). No new CSS.
 40. **Best-effort, resilient, fetched once per entry.** `refreshProgressByBook` never rejects (guards that the body is an array, wraps the merge) so a garbage/`null` progress response can never leave the grid stuck on skeletons; a failed fetch retains the last-known map instead of wiping all badges; and progress is fetched once per fresh library entry (coming from another view) and reused across in-library sort/search/filter re-renders rather than re-fetching the whole table on every keystroke (review fixes).
@@ -555,7 +555,7 @@ The two genuinely-missing items follow.
 
 ### Decisions (locked)
 
-- **Bulk progress endpoint, not a model change.** Add `GET /api/reading-progress` returning all progress rows the web session can see (`Vec<ReadingProgress>` — `book_id`, `chapter_index`, `scroll_position`, `last_read_at`). Do **not** add a progress field to `BookGridItem`: it is a shared `folio-core` model consumed by the desktop `get_library` path, and widening it ripples outside the web surface (per the "grep consumers before schema changes" rule). The web frontend fetches progress once and merges it onto cards client-side. `db::get_all_reading_progress` already exists for the `last_read` sort but returns only `book_id → last_read_at`; either add a `db::list_all_reading_progress() -> Vec<ReadingProgress>` or reuse an existing full-row query — grep `db.rs` first.
+- **Bulk progress endpoint, not a model change.** Add `GET /api/reading-progress` returning all progress rows the web session can see (`Vec<ReadingProgress>` — `book_id`, `chapter_index`, `scroll_position`, `last_read_at`). Do **not** add a progress field to `BookGridItem`: it is a shared `carrel-core` model consumed by the desktop `get_library` path, and widening it ripples outside the web surface (per the "grep consumers before schema changes" rule). The web frontend fetches progress once and merges it onto cards client-side. `db::get_all_reading_progress` already exists for the `last_read` sort but returns only `book_id → last_read_at`; either add a `db::list_all_reading_progress() -> Vec<ReadingProgress>` or reuse an existing full-row query — grep `db.rs` first.
 - **Reuse the shelf visual + helper verbatim.** Grid badge = the same thin `--accent` fill bar (`shelf-progress`/`shelf-progress-fill` style) and the same `progressPercent(chapter_index, total_chapters)` helper. Consistency with shelves, zero new visual language.
 - **Percent semantics mirror the shelf/desktop convention.** `progressPercent` already clamps; `chapter_index` doubles as page index for page-based formats (see Decision-log 8). No new math.
 - **No badge when there's no progress.** Books with no progress row render exactly as today (no bar). A "finished" book (100%) shows a full bar — no separate checkmark/state in v1 (log it as a deliberate omission).

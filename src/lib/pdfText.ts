@@ -1,7 +1,7 @@
 // Pure mapping helpers for the PDF text-selection layer (F-1-4, M3).
 // No Tauri/DOM dependencies — see pdfText.test.ts for the Vitest coverage.
-// `Glyph` mirrors folio-core's `Glyph` struct byte-for-byte (see
-// `folio-core/src/pdf.rs`): `off` is the char ordinal into the page's
+// `Glyph` mirrors carrel-core's `Glyph` struct byte-for-byte (see
+// `carrel-core/src/pdf.rs`): `off` is the char ordinal into the page's
 // `chars()`-built text; `x/y/w/h` are normalized (0..1) fractions of the
 // page's rendered box, `y` already converted to top-down orientation.
 

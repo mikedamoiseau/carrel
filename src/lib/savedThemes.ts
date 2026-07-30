@@ -12,7 +12,7 @@ export interface SavedTheme {
   createdAt: number;
 }
 
-const STORAGE_KEY = "folio-saved-themes";
+const STORAGE_KEY = "carrel-saved-themes";
 
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const VALID_FONT_FAMILIES = new Set(["serif", "literata", "sans-serif", "dyslexic"]);

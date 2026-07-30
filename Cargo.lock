@@ -851,9 +851,9 @@ dependencies = [
  "ammonia",
  "axum",
  "base64 0.22.1",
+ "carrel-core",
  "chrono",
  "dirs 5.0.1",
- "folio-core",
  "form_urlencoded",
  "image",
  "keyring",
@@ -898,6 +898,47 @@ dependencies = [
  "urlencoding",
  "uuid",
  "wiremock",
+ "zip",
+]
+
+[[package]]
+name = "carrel-core"
+version = "3.0.0"
+dependencies = [
+ "ammonia",
+ "argon2",
+ "base64 0.22.1",
+ "bindgen",
+ "chrono",
+ "chrono-tz",
+ "dirs 5.0.1",
+ "flate2",
+ "image",
+ "keyring",
+ "log",
+ "opendal",
+ "pdfium-render",
+ "pkg-config",
+ "quick-xml 0.36.2",
+ "r2d2",
+ "r2d2_sqlite",
+ "rand_core 0.6.4",
+ "regex",
+ "reqwest 0.12.28",
+ "rhai",
+ "rusqlite",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "unrar",
+ "url",
+ "urlencoding",
+ "uuid",
  "zip",
 ]
 
@@ -1916,47 +1957,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "folio-core"
-version = "3.0.0"
-dependencies = [
- "ammonia",
- "argon2",
- "base64 0.22.1",
- "bindgen",
- "chrono",
- "chrono-tz",
- "dirs 5.0.1",
- "flate2",
- "image",
- "keyring",
- "log",
- "opendal",
- "pdfium-render",
- "pkg-config",
- "quick-xml 0.36.2",
- "r2d2",
- "r2d2_sqlite",
- "rand_core 0.6.4",
- "regex",
- "reqwest 0.12.28",
- "rhai",
- "rusqlite",
- "secrecy",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml 0.8.2",
- "tracing",
- "unrar",
- "url",
- "urlencoding",
- "uuid",
- "zip",
-]
 
 [[package]]
 name = "foreign-types"

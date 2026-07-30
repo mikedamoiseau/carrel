@@ -51,11 +51,11 @@ describe("useBookCompletion", () => {
     await vi.waitFor(() => expect(result.current.showCelebration).toBe(true));
     act(() => result.current.dismiss());
     expect(result.current.showCelebration).toBe(false);
-    expect(JSON.parse(localStorage.getItem("folio-celebration-dismissed") || "[]")).toContain("book-1");
+    expect(JSON.parse(localStorage.getItem("carrel-celebration-dismissed") || "[]")).toContain("book-1");
   });
 
   it("does not show if already dismissed in localStorage", async () => {
-    localStorage.setItem("folio-celebration-dismissed", JSON.stringify(["book-1"]));
+    localStorage.setItem("carrel-celebration-dismissed", JSON.stringify(["book-1"]));
     const { result, rerender } = renderHook(
       ({ ch }) => useBookCompletion("book-1", ch, 10),
       { initialProps: { ch: 8 } },

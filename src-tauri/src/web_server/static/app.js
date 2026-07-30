@@ -26,7 +26,7 @@
   // palette and updates live on its own when the OS preference changes, no
   // JS re-render needed. The index.html bootstrap script applies the same
   // stored value before first paint to avoid a flash of the wrong theme.
-  const THEME_STORAGE_KEY = "folio_theme";
+  const THEME_STORAGE_KEY = "carrel_theme";
 
   // Finding 1: a bare localStorage.getItem/setItem call can throw
   // (SecurityError) under some browser configurations (e.g. Chrome "block
@@ -47,7 +47,7 @@
   // an in-memory object so a change still applies for the session even when
   // the persist is denied (private mode / quota). Values are validated on the
   // way in — clamp to range THEN snap to the control's step grid.
-  const TYPO_KEY = "folio-web-typography";
+  const TYPO_KEY = "carrel-web-typography";
   const TYPO_DEFAULTS = { fontSize: 18, lineHeight: 1.8, fontFamily: "lora", columnWidth: 700 };
   const FONT_STACKS = {
     lora: '"Lora Variable", Georgia, serif',
@@ -224,8 +224,8 @@
   // byte-identically to production and the e2e harness, so this is gated on a
   // flag the specs set via addInitScript before load — it never ships to the
   // production reader (whose M3 controls call changeTypography directly).
-  if (window.__folioExposeTypoHook) {
-    window.__folioTypo = { validate: validateTypography, get: getTypography, set: setTypography, change: changeTypography };
+  if (window.__carrelExposeTypoHook) {
+    window.__carrelTypo = { validate: validateTypography, get: getTypography, set: setTypography, change: changeTypography };
   }
 
   // Item 10: same guarded pattern as safeStorageGet/Set, but backed by
@@ -245,10 +245,7 @@
   // these register/exist, every offline affordance stays hidden, and
   // behavior is exactly the pre-offline app.
   const OFFLINE_PAGE_WIDTH = 1080; // page-image download width; change here (e.g. 1600)
-  // Every `folio-`prefixed name in this file (cache names, localStorage keys)
-  // predates the Carrel rename and must keep its spelling — see sw.js and
-  // CLAUDE.md, "Legacy `folio` identifiers".
-  const OFFLINE_CACHE_PREFIX = "folio-offline-book-"; // must mirror sw.js
+  const OFFLINE_CACHE_PREFIX = "carrel-offline-book-"; // must mirror sw.js
   const OFFLINE_MANIFEST_VERSION = 1;
   // Profile scoping: book ids are per-profile DB id spaces, so a cache or
   // manifest keyed by bare book id can serve profile A's saved content for a
@@ -260,12 +257,12 @@
   // published in a one-entry Cache Storage entry (readable from both contexts;
   // localStorage is not) and pushed eagerly by postMessage on change. Both
   // constants must mirror sw.js.
-  const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
+  const OFFLINE_SCOPE_CACHE = "carrel-offline-scope";
   const OFFLINE_SCOPE_URL = "/__offline_scope";
   // The page's own copy of the scope. localStorage rather than the marker cache
   // because it is synchronous, survives a cold offline launch, and isn't subject
   // to Cache Storage quota failures — the marker is strictly the worker's copy.
-  const OFFLINE_SCOPE_STORAGE_KEY = "folio-offline-scope";
+  const OFFLINE_SCOPE_STORAGE_KEY = "carrel-offline-scope";
   // The default profile keeps the unscoped names offline mode shipped with, so
   // existing downloads survive this change; every other profile gets a
   // 12-hex-char prefix. A bare book id can never be mistaken for a scoped one:
@@ -405,7 +402,7 @@
         // Scoped per profile (see `offlineScope`): a separate database per
         // profile keeps every store's keys — manifests, pending saves, queued
         // progress — in their own id space without rewriting each key.
-        const req = indexedDB.open(offlineScope ? "folio-offline-" + offlineScope.slice(0, -1) : "folio-offline", 1);
+        const req = indexedDB.open(offlineScope ? "carrel-offline-" + offlineScope.slice(0, -1) : "carrel-offline", 1);
         req.onupgradeneeded = () => {
           const db = req.result;
           if (!db.objectStoreNames.contains("books")) db.createObjectStore("books", { keyPath: "id" });
@@ -1208,7 +1205,7 @@
   // Stale-profile detection. One active profile is shared by the desktop app and
   // every web/OPDS client, so it can move while this tab sits open — leaving the
   // page showing another profile's library, with book ids that no longer mean
-  // what it thinks. Every response carries `x-folio-profile` (see
+  // what it thinks. Every response carries `x-carrel-profile` (see
   // `web_server::profile_tag`); the first one seen defines this page's profile,
   // and a later mismatch means the ground moved. Comparison only — the value is
   // never decoded, and needs no crypto (so it works on a plain-HTTP LAN too).
@@ -1217,7 +1214,7 @@
 
   function noteProfileTag(resp) {
     let tag;
-    try { tag = resp && resp.headers ? resp.headers.get("x-folio-profile") : null; } catch (e) { return; }
+    try { tag = resp && resp.headers ? resp.headers.get("x-carrel-profile") : null; } catch (e) { return; }
     if (!tag) return; // pre-header server, or a response the SW synthesized
     if (seenProfileTag === null) { seenProfileTag = tag; return; }
     if (tag === seenProfileTag || profileMoveHandled) return;
@@ -1929,7 +1926,7 @@
   // round trip. Saved keyed by the exact hash being left (so a different
   // filter/search/sort state never restores the wrong scroll offset).
   function libraryScrollKey(hash) {
-    return "folio_scroll_" + hash;
+    return "carrel_scroll_" + hash;
   }
   // Item 14: persists the page count alongside the scroll offset — with
   // infinite scroll, a deep `scrollY` is only meaningful once the pages that
@@ -3353,7 +3350,7 @@
       index,
       count,
       chromeHidden: false,
-      fitMode: safeStorageGet("folio_reader_fit_mode") || "fit-height",
+      fitMode: safeStorageGet("carrel_reader_fit_mode") || "fit-height",
       handlers: null,
       renderGen: 0,
       scrollPosition: mode === "chapter" ? (scrollPosition || 0) : 0,
@@ -4875,7 +4872,7 @@
       $("#fit-toggle-btn").addEventListener("click", () => {
         resetZoom();
         readerState.fitMode = readerState.fitMode === "fit-height" ? "fit-width" : "fit-height";
-        safeStorageSet("folio_reader_fit_mode", readerState.fitMode);
+        safeStorageSet("carrel_reader_fit_mode", readerState.fitMode);
         applyFitMode();
       });
     } else {

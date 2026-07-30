@@ -22,7 +22,7 @@ export async function loadFont(key: string): Promise<void> {
 }
 
 export function preloadStoredFont(): void {
-  const key = localStorage.getItem("folio-font-family") ?? "serif";
+  const key = localStorage.getItem("carrel-font-family") ?? "serif";
   if (FONT_MODULES[key]) {
     loadFont(key);
   }

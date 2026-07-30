@@ -73,19 +73,19 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, 150);
   const [sortBy, setSortBy] = useState<"date_added" | "last_read" | "title" | "author" | "progress" | "rating" | "series">(() => {
-    const stored = localStorage.getItem("folio-library-sort-by");
+    const stored = localStorage.getItem("carrel-library-sort-by");
     if (stored === "date_added" || stored === "last_read" || stored === "title" || stored === "author" || stored === "progress" || stored === "rating" || stored === "series") return stored;
     return "date_added";
   });
-  const [sortAsc, setSortAsc] = useState(() => localStorage.getItem("folio-library-sort-asc") === "true");
-  const [filterFormat, setFilterFormat] = useState<string>(() => localStorage.getItem("folio-library-filter-format") ?? "all");
-  const [filterStatus, setFilterStatus] = useState<string>(() => localStorage.getItem("folio-library-filter-status") ?? "all");
-  const [filterRating, setFilterRating] = useState<string>(() => localStorage.getItem("folio-library-filter-rating") ?? "all");
-  const [filterSource, setFilterSource] = useState<string>(() => localStorage.getItem("folio-library-filter-source") ?? "all");
-  const [filterWantToRead, setFilterWantToRead] = useState(() => localStorage.getItem("folio-library-filter-want-to-read") === "true");
+  const [sortAsc, setSortAsc] = useState(() => localStorage.getItem("carrel-library-sort-asc") === "true");
+  const [filterFormat, setFilterFormat] = useState<string>(() => localStorage.getItem("carrel-library-filter-format") ?? "all");
+  const [filterStatus, setFilterStatus] = useState<string>(() => localStorage.getItem("carrel-library-filter-status") ?? "all");
+  const [filterRating, setFilterRating] = useState<string>(() => localStorage.getItem("carrel-library-filter-rating") ?? "all");
+  const [filterSource, setFilterSource] = useState<string>(() => localStorage.getItem("carrel-library-filter-source") ?? "all");
+  const [filterWantToRead, setFilterWantToRead] = useState(() => localStorage.getItem("carrel-library-filter-want-to-read") === "true");
   const [filterTagIds, setFilterTagIds] = useState<string[]>(() => {
     try {
-      const stored = localStorage.getItem("folio-library-filter-tags");
+      const stored = localStorage.getItem("carrel-library-filter-tags");
       if (!stored) return [];
       const parsed: unknown = JSON.parse(stored);
       if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) return parsed;
@@ -95,14 +95,14 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   const [allTags, setAllTags] = useState<Tag[]>([]);
   const [bookTagMap, setBookTagMap] = useState<Map<string, Set<string>>>(new Map());
   // Persist filter/sort state to localStorage
-  useEffect(() => { localStorage.setItem("folio-library-sort-by", sortBy); }, [sortBy]);
-  useEffect(() => { localStorage.setItem("folio-library-sort-asc", String(sortAsc)); }, [sortAsc]);
-  useEffect(() => { localStorage.setItem("folio-library-filter-format", filterFormat); }, [filterFormat]);
-  useEffect(() => { localStorage.setItem("folio-library-filter-status", filterStatus); }, [filterStatus]);
-  useEffect(() => { localStorage.setItem("folio-library-filter-rating", filterRating); }, [filterRating]);
-  useEffect(() => { localStorage.setItem("folio-library-filter-source", filterSource); }, [filterSource]);
-  useEffect(() => { localStorage.setItem("folio-library-filter-want-to-read", String(filterWantToRead)); }, [filterWantToRead]);
-  useEffect(() => { localStorage.setItem("folio-library-filter-tags", JSON.stringify(filterTagIds)); }, [filterTagIds]);
+  useEffect(() => { localStorage.setItem("carrel-library-sort-by", sortBy); }, [sortBy]);
+  useEffect(() => { localStorage.setItem("carrel-library-sort-asc", String(sortAsc)); }, [sortAsc]);
+  useEffect(() => { localStorage.setItem("carrel-library-filter-format", filterFormat); }, [filterFormat]);
+  useEffect(() => { localStorage.setItem("carrel-library-filter-status", filterStatus); }, [filterStatus]);
+  useEffect(() => { localStorage.setItem("carrel-library-filter-rating", filterRating); }, [filterRating]);
+  useEffect(() => { localStorage.setItem("carrel-library-filter-source", filterSource); }, [filterSource]);
+  useEffect(() => { localStorage.setItem("carrel-library-filter-want-to-read", String(filterWantToRead)); }, [filterWantToRead]);
+  useEffect(() => { localStorage.setItem("carrel-library-filter-tags", JSON.stringify(filterTagIds)); }, [filterTagIds]);
 
   const [fileNotAvailableBookId, setFileNotAvailableBookId] = useState<string | null>(null);
 
@@ -133,7 +133,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   // Collapsed series groups (series view)
   const [collapsedSeries, setCollapsedSeries] = useState<Set<string>>(new Set());
   const [seriesViewMode, setSeriesViewMode] = useState<"stacked" | "expanded">(() => {
-    const stored = localStorage.getItem("folio-series-view-mode");
+    const stored = localStorage.getItem("carrel-series-view-mode");
     return stored === "stacked" ? "stacked" : "expanded";
   });
   const contentRef = useRef<HTMLDivElement>(null);
@@ -148,7 +148,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
     setScrollEl(node);
   }, []);
   const scrollBeforeDrillRef = useRef<{ collectionId: string | null; scrollTop: number } | null>(null);
-  useEffect(() => { localStorage.setItem("folio-series-view-mode", seriesViewMode); }, [seriesViewMode]);
+  useEffect(() => { localStorage.setItem("carrel-series-view-mode", seriesViewMode); }, [seriesViewMode]);
 
   // scanToast state kept for LiveRegion — visual toasts now use useToast()
   const [scanToastMessage, setScanToastMessage] = useState("");
@@ -159,15 +159,15 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
 
   // Recently read
   const [showContinueReading, setShowContinueReading] = useState(() => {
-    const stored = localStorage.getItem("folio-show-continue-reading");
+    const stored = localStorage.getItem("carrel-show-continue-reading");
     return stored === null ? true : stored === "true";
   });
   const [recentlyRead, setRecentlyRead] = useState<Book[]>([]);
 
   // Discover — popular/new books from catalogs (loaded lazily, cached 24h)
   interface DiscoverEntry { id: string; title: string; author: string; summary: string; coverUrl: string | null; links: { href: string; mimeType: string; rel: string }[]; navUrl: string | null }
-  const [showDiscover, setShowDiscover] = useState(() => localStorage.getItem("folio-show-discover") === "true");
-  const [showWantToRead, setShowWantToRead] = useState(() => localStorage.getItem("folio-show-want-to-read") === "true");
+  const [showDiscover, setShowDiscover] = useState(() => localStorage.getItem("carrel-show-discover") === "true");
+  const [showWantToRead, setShowWantToRead] = useState(() => localStorage.getItem("carrel-show-want-to-read") === "true");
   const [discoverBooks, setDiscoverBooks] = useState<DiscoverEntry[]>([]);
   const [discoverInfo, setDiscoverInfo] = useState<{ id: string; rect: DOMRect } | null>(null);
   const [discoverLoading, setDiscoverLoading] = useState(true);
@@ -177,25 +177,25 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   // Sync showContinueReading when changed from SettingsPanel
   useEffect(() => {
     const handler = () => {
-      const stored = localStorage.getItem("folio-show-continue-reading");
+      const stored = localStorage.getItem("carrel-show-continue-reading");
       setShowContinueReading(stored === null ? true : stored === "true");
     };
-    window.addEventListener("folio-show-continue-reading-changed", handler);
-    return () => window.removeEventListener("folio-show-continue-reading-changed", handler);
+    window.addEventListener("carrel-show-continue-reading-changed", handler);
+    return () => window.removeEventListener("carrel-show-continue-reading-changed", handler);
   }, []);
 
   // Sync showDiscover when changed from SettingsPanel
   useEffect(() => {
-    const handler = () => setShowDiscover(localStorage.getItem("folio-show-discover") === "true");
-    window.addEventListener("folio-show-discover-changed", handler);
-    return () => window.removeEventListener("folio-show-discover-changed", handler);
+    const handler = () => setShowDiscover(localStorage.getItem("carrel-show-discover") === "true");
+    window.addEventListener("carrel-show-discover-changed", handler);
+    return () => window.removeEventListener("carrel-show-discover-changed", handler);
   }, []);
 
   // Sync showWantToRead when changed from SettingsPanel
   useEffect(() => {
-    const handler = () => setShowWantToRead(localStorage.getItem("folio-show-want-to-read") === "true");
-    window.addEventListener("folio-show-want-to-read-changed", handler);
-    return () => window.removeEventListener("folio-show-want-to-read-changed", handler);
+    const handler = () => setShowWantToRead(localStorage.getItem("carrel-show-want-to-read") === "true");
+    window.addEventListener("carrel-show-want-to-read-changed", handler);
+    return () => window.removeEventListener("carrel-show-want-to-read-changed", handler);
   }, []);
 
   // Collections state
@@ -340,8 +340,8 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
       loadRecentlyRead();
       loadSeries();
     };
-    window.addEventListener("folio-library-changed", handler);
-    return () => window.removeEventListener("folio-library-changed", handler);
+    window.addEventListener("carrel-library-changed", handler);
+    return () => window.removeEventListener("carrel-library-changed", handler);
   }, [loadCollections, loadBooks, loadRecentlyRead, loadSeries]);
 
   // Re-fetch recently read when toggled on
@@ -435,7 +435,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
         }
       }
       const autoFocus =
-        localStorage.getItem("folio-auto-focus-new-books") === "true" &&
+        localStorage.getItem("carrel-auto-focus-new-books") === "true" &&
         recentlyImportedRef.current.has(bookId);
       navigate(`/reader/${bookId}`, autoFocus ? { state: { autoFocus: true } } : undefined);
     },

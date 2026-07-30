@@ -71,10 +71,10 @@ pub struct WebState {
 
 ### Authentication
 
-- PIN stored via `keyring` crate (pattern from `backup.rs`): service=`folio-web-server`, user=`pin`, value=SHA-256 hash
+- PIN stored via `keyring` crate (pattern from `backup.rs`): service=`carrel-web-server`, user=`pin`, value=SHA-256 hash
 - `POST /api/auth` with `{ "pin": "1234" }` returns `{ "token": "uuid-v4" }`
 - Token stored in `sessions` map (24h TTL)
-- Middleware checks `Authorization: Bearer <token>` header or `folio_session` cookie
+- Middleware checks `Authorization: Bearer <token>` header or `carrel_session` cookie
 - OPDS routes also accept HTTP Basic Auth (`Authorization: Basic base64(any:pin)`) for reader app compatibility
 - Routes exempt from auth: `POST /api/auth`, `GET /` (login page only when unauthenticated)
 

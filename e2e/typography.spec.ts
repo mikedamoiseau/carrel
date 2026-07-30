@@ -7,7 +7,7 @@ import { enterReaderAtStart } from "./detail-actions";
 // 2 chapters, ch1 lengthened to ~60 paragraphs so `#reader-stage` scrolls.
 const EPUB_ID = "e2e-book-050";
 
-// app.js is an IIFE; the typography surface is exposed on `window.__folioTypo`
+// app.js is an IIFE; the typography surface is exposed on `window.__carrelTypo`
 // for these tests: { validate, get, set, change }.
 type TypoHook = {
   validate: (raw: unknown) => Record<string, unknown>;
@@ -49,12 +49,12 @@ async function readerContentStyle(page: Page) {
   });
 }
 
-// The typography test hook (window.__folioTypo) is gated in app.js behind this
+// The typography test hook (window.__carrelTypo) is gated in app.js behind this
 // flag, set before load, so the internal API never ships to the production
 // reader. Registered before every test's navigation.
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
-    (window as unknown as { __folioExposeTypoHook: boolean }).__folioExposeTypoHook = true;
+    (window as unknown as { __carrelExposeTypoHook: boolean }).__carrelExposeTypoHook = true;
   });
 });
 
@@ -62,7 +62,7 @@ test.describe("Web reader typography — settings model", () => {
   test("validateTypography clamps then snaps", async ({ page }) => {
     await gotoLibrary(page);
     const out = await page.evaluate(() =>
-      (window as unknown as { __folioTypo: TypoHook }).__folioTypo.validate({
+      (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo.validate({
         fontSize: "x",
         lineHeight: 2.5,
         fontFamily: "bad",
@@ -77,7 +77,7 @@ test.describe("Web reader typography — settings model", () => {
     });
   });
 
-  test("the __folioTypo hook is NOT exposed without the opt-in flag (production)", async ({
+  test("the __carrelTypo hook is NOT exposed without the opt-in flag (production)", async ({
     browser,
   }) => {
     // Fresh context that never ran the beforeEach opt-in (it applied to the
@@ -87,7 +87,7 @@ test.describe("Web reader typography — settings model", () => {
     const p = await ctx.newPage();
     await p.goto("/");
     await p.locator(".grid .card").first().waitFor({ timeout: 15_000 });
-    const hook = await p.evaluate(() => (window as unknown as { __folioTypo?: unknown }).__folioTypo);
+    const hook = await p.evaluate(() => (window as unknown as { __carrelTypo?: unknown }).__carrelTypo);
     expect(hook).toBeUndefined();
     await ctx.close();
   });
@@ -102,7 +102,7 @@ test.describe("Web reader typography — settings model", () => {
   });
 
   test("malformed stored typography falls back to defaults", async ({ page }) => {
-    await page.addInitScript(() => localStorage.setItem("folio-web-typography", "{not json"));
+    await page.addInitScript(() => localStorage.setItem("carrel-web-typography", "{not json"));
     await openEpubChapter(page);
     const cs = await readerContentStyle(page);
     expect(cs.fontSize).toBe("18px");
@@ -112,16 +112,16 @@ test.describe("Web reader typography — settings model", () => {
     await page.addInitScript(() => {
       const orig = Storage.prototype.setItem;
       Storage.prototype.setItem = function (k: string, v: string) {
-        if (k === "folio-web-typography") throw new Error("quota");
+        if (k === "carrel-web-typography") throw new Error("quota");
         return orig.call(this, k, v);
       };
     });
     await openEpubChapter(page);
     await page.evaluate(() =>
-      (window as unknown as { __folioTypo: TypoHook }).__folioTypo.set({ fontSize: 22 })
+      (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo.set({ fontSize: 22 })
     );
     const fs = await page.evaluate(
-      () => (window as unknown as { __folioTypo: TypoHook }).__folioTypo.get().fontSize
+      () => (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo.get().fontSize
     );
     expect(fs).toBe(22); // in-memory survived the denied persist
   });
@@ -171,7 +171,7 @@ test.describe("Web reader typography — reflow preservation", () => {
     expect(before).not.toBeNull();
 
     await page.evaluate(() =>
-      (window as unknown as { __folioTypo: TypoHook }).__folioTypo.change({ fontSize: 24 })
+      (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo.change({ fontSize: 24 })
     );
     await page.waitForTimeout(100);
 
@@ -186,7 +186,7 @@ test.describe("Web reader typography — reflow preservation", () => {
     expect(before).not.toBeNull();
 
     await page.evaluate(() => {
-      const t = (window as unknown as { __folioTypo: TypoHook }).__folioTypo;
+      const t = (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo;
       t.change({ fontSize: 20 });
       t.change({ fontSize: 22 });
       t.change({ fontSize: 24 });
@@ -207,7 +207,7 @@ test.describe("Web reader typography — reflow preservation", () => {
       });
     const before = await stageRatio();
     await page.evaluate(() =>
-      (window as unknown as { __folioTypo: TypoHook }).__folioTypo.change({ fontSize: 22 })
+      (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo.change({ fontSize: 22 })
     );
     await page.waitForTimeout(100);
     const after = await stageRatio();
@@ -282,7 +282,7 @@ test.describe("Web reader typography — Aa control", () => {
   test("steppers disable at the maximum", async ({ page }) => {
     await page.addInitScript(() =>
       localStorage.setItem(
-        "folio-web-typography",
+        "carrel-web-typography",
         JSON.stringify({ fontSize: 24, lineHeight: 2.4, fontFamily: "lora", columnWidth: 700 })
       )
     );
@@ -297,7 +297,7 @@ test.describe("Web reader typography — Aa control", () => {
   test("steppers disable at the minimum", async ({ page }) => {
     await page.addInitScript(() =>
       localStorage.setItem(
-        "folio-web-typography",
+        "carrel-web-typography",
         JSON.stringify({ fontSize: 14, lineHeight: 1.2, fontFamily: "lora", columnWidth: 700 })
       )
     );
@@ -372,7 +372,7 @@ test.describe("Web reader typography — Aa control", () => {
   test("keyboard focus stays in the panel when a stepper disables at its bound", async ({ page }) => {
     await page.addInitScript(() =>
       localStorage.setItem(
-        "folio-web-typography",
+        "carrel-web-typography",
         JSON.stringify({ fontSize: 22, lineHeight: 1.8, fontFamily: "lora", columnWidth: 700 })
       )
     );
@@ -428,7 +428,7 @@ test.describe("Web reader typography — font-load race & layout", () => {
     // whose captured anchor is the first paragraph), then — while the font is
     // still loading — the user scrolls down to a mid paragraph.
     await page.evaluate(() =>
-      (window as unknown as { __folioTypo: TypoHook }).__folioTypo.change({ fontSize: 22 })
+      (window as unknown as { __carrelTypo: TypoHook }).__carrelTypo.change({ fontSize: 22 })
     );
     await page.locator("#reader-stage").evaluate((s) => {
       s.scrollTop = Math.round((s.scrollHeight - s.clientHeight) / 2);

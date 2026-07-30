@@ -118,7 +118,7 @@ beforeEach(() => {
 describe("Library — want-to-read filter", () => {
   // Series sort renders cards in a plain CSS grid (not the Virtuoso window),
   // so the cards are reliably in the DOM under jsdom.
-  beforeEach(() => localStorage.setItem("folio-library-sort-by", "series"));
+  beforeEach(() => localStorage.setItem("carrel-library-sort-by", "series"));
 
   it("hides unflagged books when the filter is active", async () => {
     invokeResponses["get_library_grid"] = [
@@ -153,9 +153,9 @@ describe("Library — want-to-read filter", () => {
 
 describe("Library — want-to-read home shelf", () => {
   beforeEach(() => {
-    localStorage.setItem("folio-show-want-to-read", "true");
+    localStorage.setItem("carrel-show-want-to-read", "true");
     // Series sort renders cards in a plain grid, a reliable "loaded" signal.
-    localStorage.setItem("folio-library-sort-by", "series");
+    localStorage.setItem("carrel-library-sort-by", "series");
   });
 
   it("renders flagged books in the shelf when enabled and unfiltered", async () => {
@@ -178,7 +178,7 @@ describe("Library — want-to-read home shelf", () => {
   });
 
   it("hides the shelf when the visibility flag is off", async () => {
-    localStorage.setItem("folio-show-want-to-read", "false");
+    localStorage.setItem("carrel-show-want-to-read", "false");
     invokeResponses["get_library_grid"] = [gridBook("flagged", "Flagged Book", true)];
     render(<Library />);
     await screen.findByText("Flagged Book");

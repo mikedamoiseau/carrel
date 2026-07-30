@@ -18,7 +18,7 @@
 //!
 //! - 130 books, ids `e2e-book-001`..`e2e-book-130`, titles `Book 001`..
 //!   `Book 130`. `added_at` increases with the numeric suffix, so the
-//!   default `ORDER BY added_at DESC, id` (see `folio-core/src/db.rs`'s
+//!   default `ORDER BY added_at DESC, id` (see `carrel-core/src/db.rs`'s
 //!   `list_books_grid`) puts `Book 130` first and `Book 001` last:
 //!     - page 1 (offset 0,   limit 60) = Book 130 .. Book 071
 //!     - page 2 (offset 60,  limit 60) = Book 070 .. Book 011
@@ -128,7 +128,7 @@ fn build_test_cbz(path: &Path) -> Result<(), Box<dyn Error>> {
 
 /// Writes a tiny, valid 2-chapter EPUB to `path`. Chapter index 1 embeds one
 /// inline `<img>` so the F-4-4 prefetch e2e can assert both HTML prefetch and
-/// inline-image warming. Structure mirrors what `folio_core::epub` parses:
+/// inline-image warming. Structure mirrors what `carrel_core::epub` parses:
 /// `META-INF/container.xml` -> `OEBPS/content.opf` (spine of 2 xhtml items).
 /// Two chapters (not three) is deliberate: the deepest a reader can navigate
 /// is the last chapter, which fails `get_continue_reading_books`' guard
@@ -353,7 +353,7 @@ struct HarnessProfileHost {
     /// The same handles `WebState` reads, so a harness switch moves the
     /// server's notion of the active profile exactly like the real host does
     /// (which goes through `commands::switch_active_profile`). Without this the
-    /// `x-folio-profile` header — and the soft-lock gate — would keep reporting
+    /// `x-carrel-profile` header — and the soft-lock gate — would keep reporting
     /// the profile the harness started on.
     active_name: Arc<Mutex<String>>,
     unlocked: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -392,7 +392,7 @@ impl HarnessProfileHost {
 }
 
 impl ProfileHost for HarnessProfileHost {
-    fn list(&self) -> carrel_lib::error::FolioResult<Vec<WebProfile>> {
+    fn list(&self) -> carrel_lib::error::CarrelResult<Vec<WebProfile>> {
         Ok(self.profiles.lock().unwrap().clone())
     }
 
@@ -400,17 +400,17 @@ impl ProfileHost for HarnessProfileHost {
         &self,
         name: String,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = carrel_lib::error::FolioResult<()>> + Send + '_>,
+        Box<dyn std::future::Future<Output = carrel_lib::error::CarrelResult<()>> + Send + '_>,
     > {
         Box::pin(async move {
-            use carrel_lib::error::FolioError;
+            use carrel_lib::error::CarrelError;
             let mut profiles = self.profiles.lock().unwrap();
             let target = profiles
                 .iter()
                 .find(|p| p.name == name)
-                .ok_or_else(|| FolioError::invalid(format!("Profile '{name}' not found")))?;
+                .ok_or_else(|| CarrelError::invalid(format!("Profile '{name}' not found")))?;
             if !target.switchable {
-                return Err(FolioError::lock_required(format!(
+                return Err(CarrelError::lock_required(format!(
                     "Profile '{name}' is locked"
                 )));
             }
@@ -489,7 +489,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         },
     );
 
-    let port: u16 = std::env::var("FOLIO_E2E_PORT")
+    let port: u16 = std::env::var("CARREL_E2E_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7810);

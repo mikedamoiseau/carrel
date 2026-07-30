@@ -23,18 +23,17 @@
 // this is silent, not an error. The manifest + icons still work for iOS
 // Safari "Add to Home Screen" over plain HTTP.
 //
-// The `folio-` prefix on this and the two cache names below outlived the Carrel
-// rename on purpose: these name caches already sitting in every user's browser,
-// and renaming them orphans every offline-saved book. Only the trailing content
-// hash is meant to change. See CLAUDE.md, "Legacy `folio` identifiers".
-const CACHE_VERSION = "folio-shell-bafd953daae5";
+// The `carrel-` prefix on this and the two cache names below names caches held
+// in the user's browser: renaming it orphans every offline-saved book rather
+// than migrating it. Only the trailing content hash is meant to change.
+const CACHE_VERSION = "carrel-shell-3e68df99537a";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW
 // reads them as a fallback when the network is unreachable. Network-first, so
 // online behavior (auth, session expiry, profile lock, full-size pages) is
 // exactly what the server says, always.
-const OFFLINE_CACHE_PREFIX = "folio-offline-book-";
+const OFFLINE_CACHE_PREFIX = "carrel-offline-book-";
 
 // Profile scoping (remote profile switching, PR #119): book
 // ids are per-profile id spaces, so offline caches are namespaced by a short
@@ -46,7 +45,7 @@ const OFFLINE_CACHE_PREFIX = "folio-offline-book-";
 // profile switches, so a cached value could serve one profile's saved book
 // under another. The read is a local Cache Storage lookup on a one-entry cache,
 // and only on book routes — cheap next to the cache match it precedes.
-const OFFLINE_SCOPE_CACHE = "folio-offline-scope";
+const OFFLINE_SCOPE_CACHE = "carrel-offline-scope";
 const OFFLINE_SCOPE_URL = "/__offline_scope";
 
 // Returns the active profile's namespace, or `null` when it can't be

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { TFunction } from "i18next";
-import { friendlyError, toFolioError, isBookFileError, isBookFileMissing, isLockRequired } from "./errors";
+import { friendlyError, toCarrelError, isBookFileError, isBookFileMissing, isLockRequired } from "./errors";
 
 const mockT = ((key: string) => key) as TFunction;
 
@@ -53,7 +53,7 @@ describe("friendlyError", () => {
         expect(friendlyError("Response too large (limit: 5 MB).", mockT)).toBe("errors.tooLarge");
     });
 
-    describe("structured FolioError payloads", () => {
+    describe("structured CarrelError payloads", () => {
         it("unwraps {kind, message} before matching", () => {
             const err = { kind: "NotFound", message: "Book file not found at '/x.epub'" };
             expect(friendlyError(err, mockT)).toBe("errors.fileNotFound");
@@ -121,20 +121,20 @@ describe("friendlyError", () => {
             expect(friendlyError(new Error("HTTP error: connection reset"), mockT)).toBe("errors.networkError");
         });
 
-        it("toFolioError extracts kind+message from payload", () => {
-            expect(toFolioError({ kind: "Internal", message: "oops" })).toEqual({
+        it("toCarrelError extracts kind+message from payload", () => {
+            expect(toCarrelError({ kind: "Internal", message: "oops" })).toEqual({
                 kind: "Internal",
                 message: "oops",
             });
         });
 
-        it("toFolioError wraps bare strings", () => {
-            expect(toFolioError("hello")).toEqual({ message: "hello" });
+        it("toCarrelError wraps bare strings", () => {
+            expect(toCarrelError("hello")).toEqual({ message: "hello" });
         });
 
-        it("toFolioError handles null and undefined gracefully", () => {
-            expect(toFolioError(null).message).toBeTruthy();
-            expect(toFolioError(undefined).message).toBeTruthy();
+        it("toCarrelError handles null and undefined gracefully", () => {
+            expect(toCarrelError(null).message).toBeTruthy();
+            expect(toCarrelError(undefined).message).toBeTruthy();
         });
     });
 });

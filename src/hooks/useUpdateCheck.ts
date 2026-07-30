@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { toFolioError } from "../lib/errors";
+import { toCarrelError } from "../lib/errors";
 import type { UpdateCheck, UpdateModalState } from "../components/UpdateModal";
 
 const TOGGLE_KEY = "update_check_on_startup";
@@ -78,7 +78,7 @@ export function useUpdateCheck(onboardingActive: boolean) {
         }
       } catch (err) {
         if (mode.current === "manual" && gen.current === myGen) {
-          present({ status: "error", rateLimited: toFolioError(err).message === "rate_limited" });
+          present({ status: "error", rateLimited: toCarrelError(err).message === "rate_limited" });
         }
         // auto: swallow
       } finally {

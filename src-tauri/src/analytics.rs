@@ -10,14 +10,14 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::commands::AppState;
-use crate::error::{FolioError, FolioResult};
+use crate::error::{CarrelError, CarrelResult};
 
 /// Aptabase cloud app key. Client-side by design (not a secret). Read from the
 /// build-time env var so dev builds stay silent unless a key is provided; an
-/// empty key disables the SDK safely. Set `FOLIO_APTABASE_KEY` in the release
+/// empty key disables the SDK safely. Set `CARREL_APTABASE_KEY` in the release
 /// build environment (e.g. CI) to the app key from the Aptabase dashboard
 /// (format `A-EU-XXXXXXXXXX`).
-pub const APTABASE_APP_KEY: &str = match option_env!("FOLIO_APTABASE_KEY") {
+pub const APTABASE_APP_KEY: &str = match option_env!("CARREL_APTABASE_KEY") {
     Some(k) => k,
     None => "",
 };
@@ -72,14 +72,14 @@ pub fn read_consent(data_dir: &Path) -> Consent {
     }
 }
 
-pub fn write_consent(data_dir: &Path, c: Consent) -> FolioResult<()> {
+pub fn write_consent(data_dir: &Path, c: Consent) -> CarrelResult<()> {
     let file = ConsentFile {
         consent: c.as_str().to_string(),
     };
     let json = serde_json::to_string_pretty(&file)
-        .map_err(|e| crate::error::FolioError::internal(e.to_string()))?;
+        .map_err(|e| crate::error::CarrelError::internal(e.to_string()))?;
     std::fs::write(consent_path(data_dir), json)
-        .map_err(|e| crate::error::FolioError::internal(e.to_string()))?;
+        .map_err(|e| crate::error::CarrelError::internal(e.to_string()))?;
     Ok(())
 }
 
@@ -97,15 +97,18 @@ pub fn maybe_track_app_started(app: &tauri::App, data_dir: &Path) {
 
 /// Return the app-global analytics consent as `"unset"|"enabled"|"disabled"`.
 #[tauri::command]
-pub async fn get_analytics_consent(state: State<'_, AppState>) -> FolioResult<String> {
+pub async fn get_analytics_consent(state: State<'_, AppState>) -> CarrelResult<String> {
     Ok(read_consent(&state.data_dir).as_str().to_string())
 }
 
 /// Persist the app-global analytics consent. Rejects values outside the enum.
 #[tauri::command]
-pub async fn set_analytics_consent(consent: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn set_analytics_consent(
+    consent: String,
+    state: State<'_, AppState>,
+) -> CarrelResult<()> {
     let parsed = Consent::parse(&consent)
-        .ok_or_else(|| FolioError::invalid(format!("invalid consent value: {consent}")))?;
+        .ok_or_else(|| CarrelError::invalid(format!("invalid consent value: {consent}")))?;
     write_consent(&state.data_dir, parsed)
 }
 

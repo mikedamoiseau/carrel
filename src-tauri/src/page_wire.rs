@@ -14,13 +14,13 @@
 //! ```
 //!
 //! Appending (vs prefixing) lets us reuse the page bytes returned by
-//! `folio_core` parsers in place — one `Vec::push` — instead of
+//! `carrel_core` parsers in place — one `Vec::push` — instead of
 //! allocating a new buffer and copying the payload. The frontend
 //! mirror lives at `src/lib/pageWire.ts` and must stay in sync with
 //! the constants below.
 //!
 //! Unknown mimes degrade to JPEG, matching the resize fallback in
-//! `folio_core::image_util` and the PDF render path.
+//! `carrel_core::image_util` and the PDF render path.
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub const MIME_TAG_JPEG: u8 = 0;

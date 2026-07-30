@@ -7,14 +7,14 @@ description: Use when changing Carrel's SQLite schema — adding a table or colu
 
 ## Overview
 
-The schema lives in `folio-core/src/db.rs::run_schema`, which runs on every app
+The schema lives in `carrel-core/src/db.rs::run_schema`, which runs on every app
 startup. It must be **idempotent and additive**: existing installs auto-migrate
 in place, and `library.db` is never dropped to apply a change. The DB only
 auto-recreates when the file is deleted (a manual reset), not on schema change.
 
 ## Steps
 
-### 1. Add additive SQL — `folio-core/src/db.rs::run_schema`
+### 1. Add additive SQL — `carrel-core/src/db.rs::run_schema`
 
 `run_schema` is a single `conn.execute_batch(...)` of `CREATE TABLE IF NOT
 EXISTS` statements. To add:
@@ -35,14 +35,14 @@ If you remove a column, make one nullable, or change its meaning, find and
 update every reader/writer first:
 
 ```bash
-grep -rn "column_name" folio-core/src src-tauri/src src
+grep -rn "column_name" carrel-core/src src-tauri/src src
 ```
 
 Verify each hit handles the new shape (Rust `models.rs` structs, `db.rs` row
 mapping, frontend types). A loosened contract with an unupdated consumer is a
 silent runtime break, not a compile error.
 
-### 3. Update the model struct — `folio-core/src/models.rs`
+### 3. Update the model struct — `carrel-core/src/models.rs`
 
 Add/adjust the field on `Book` / `Bookmark` / `Collection` / etc. and the
 `rusqlite` row-mapping in `db.rs` (column index or name must match the new
@@ -51,7 +51,7 @@ schema).
 ## Verify
 
 ```bash
-cargo test -p folio-core                                # db.rs has fixture tests (tempfile)
+cargo test -p carrel-core                                # db.rs has fixture tests (tempfile)
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

@@ -1,6 +1,6 @@
 //! Desktop-side glue for the plugin/hook system (spec 2026-06-12).
 //!
-//! `folio-core` owns the runtime and manager but stays UI-free; this module
+//! `carrel-core` owns the runtime and manager but stays UI-free; this module
 //! provides the `HostServices` implementation (OS notifications) and the
 //! Tauri command surface for the Plugins settings panel.
 
@@ -12,15 +12,15 @@ use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_notification::NotificationExt;
 
-use folio_core::activity::ActivityEvent;
-use folio_core::plugins::manifest::is_valid_plugin_id;
-use folio_core::plugins::permissions::{self, Permission};
-use folio_core::plugins::runtime::{HostServices, RuntimeDeps};
-use folio_core::plugins::{PluginInfo, PluginManager, PluginStatus};
+use carrel_core::activity::ActivityEvent;
+use carrel_core::plugins::manifest::is_valid_plugin_id;
+use carrel_core::plugins::permissions::{self, Permission};
+use carrel_core::plugins::runtime::{HostServices, RuntimeDeps};
+use carrel_core::plugins::{PluginInfo, PluginManager, PluginStatus};
 
 use crate::commands::{log_event, AppState};
 use crate::db::DbPool;
-use crate::error::{FolioError, FolioResult};
+use crate::error::{CarrelError, CarrelResult};
 
 /// `HostServices` backed by the Tauri notification plugin.
 pub struct DesktopHostServices<R: tauri::Runtime> {
@@ -179,16 +179,16 @@ fn to_view(info: PluginInfo) -> PluginView {
     }
 }
 
-fn manager(state: &AppState) -> FolioResult<Arc<PluginManager>> {
+fn manager(state: &AppState) -> CarrelResult<Arc<PluginManager>> {
     state
         .plugin_manager
         .lock()?
         .clone()
-        .ok_or_else(|| FolioError::internal("plugin system not initialized"))
+        .ok_or_else(|| CarrelError::internal("plugin system not initialized"))
 }
 
 #[tauri::command]
-pub async fn plugin_list(state: State<'_, AppState>) -> FolioResult<Vec<PluginView>> {
+pub async fn plugin_list(state: State<'_, AppState>) -> CarrelResult<Vec<PluginView>> {
     let mgr = manager(&state)?;
     Ok(mgr.list()?.into_iter().map(to_view).collect())
 }
@@ -207,19 +207,19 @@ pub struct GrantInput {
 /// an actually-writable directory; otherwise the grant set is rejected so an
 /// unwritable export folder is never persisted. Grants without a path and all
 /// other permissions are unaffected.
-fn validate_write_grants(grants: &[(Permission, Option<String>)]) -> FolioResult<()> {
+fn validate_write_grants(grants: &[(Permission, Option<String>)]) -> CarrelResult<()> {
     for (perm, params) in grants {
         if *perm != Permission::WriteFiles {
             continue;
         }
         let path = params.as_deref().map(str::trim).unwrap_or("");
         if path.is_empty() {
-            return Err(FolioError::invalid(
+            return Err(CarrelError::invalid(
                 "the 'write files' permission requires choosing an export folder",
             ));
         }
         if !crate::commands::probe_dir_writable(std::path::Path::new(path)) {
-            return Err(FolioError::permission(format!(
+            return Err(CarrelError::permission(format!(
                 "the chosen export folder is not writable: {path}"
             )));
         }
@@ -235,9 +235,9 @@ pub async fn plugin_enable(
     plugin_id: String,
     grants: Vec<GrantInput>,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     if !is_valid_plugin_id(&plugin_id) {
-        return Err(FolioError::invalid("invalid plugin id"));
+        return Err(CarrelError::invalid("invalid plugin id"));
     }
     let mgr = manager(&state)?;
 
@@ -257,10 +257,10 @@ pub async fn plugin_enable(
                 Permission::parse(&g.permission)
                     .map(|p| (p, g.params.clone()))
                     .ok_or_else(|| {
-                        FolioError::invalid(format!("unknown permission: {}", g.permission))
+                        CarrelError::invalid(format!("unknown permission: {}", g.permission))
                     })
             })
-            .collect::<FolioResult<_>>()?
+            .collect::<CarrelResult<_>>()?
     };
 
     // The grant set must match the manifest exactly: every required
@@ -270,11 +270,11 @@ pub async fn plugin_enable(
         .list()?
         .into_iter()
         .find(|p| p.id == plugin_id)
-        .ok_or_else(|| FolioError::not_found(format!("plugin not found: {plugin_id}")))?;
+        .ok_or_else(|| CarrelError::not_found(format!("plugin not found: {plugin_id}")))?;
     let required: Vec<Permission> = info.permissions.clone();
     for req in &required {
         if !approved.iter().any(|(p, _)| p == req) {
-            return Err(FolioError::invalid(format!(
+            return Err(CarrelError::invalid(format!(
                 "consent missing for required permission: {}",
                 req.as_str()
             )));
@@ -282,7 +282,7 @@ pub async fn plugin_enable(
     }
     for (got, _) in &approved {
         if !required.contains(got) {
-            return Err(FolioError::invalid(format!(
+            return Err(CarrelError::invalid(format!(
                 "permission '{}' is not declared in the plugin manifest",
                 got.as_str()
             )));
@@ -320,9 +320,9 @@ pub async fn plugin_enable(
 }
 
 #[tauri::command]
-pub async fn plugin_disable(plugin_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn plugin_disable(plugin_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     if !is_valid_plugin_id(&plugin_id) {
-        return Err(FolioError::invalid("invalid plugin id"));
+        return Err(CarrelError::invalid("invalid plugin id"));
     }
     let mgr = manager(&state)?;
     let name = mgr
@@ -344,24 +344,24 @@ pub async fn plugin_disable(plugin_id: String, state: State<'_, AppState>) -> Fo
 }
 
 #[tauri::command]
-pub async fn plugin_reload(state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn plugin_reload(state: State<'_, AppState>) -> CarrelResult<()> {
     manager(&state)?.reload()
 }
 
 /// Manually trigger an `AppStarted`-driven plugin (the "Run now" button).
 #[tauri::command]
-pub async fn plugin_run_now(plugin_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn plugin_run_now(plugin_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     if !is_valid_plugin_id(&plugin_id) {
-        return Err(FolioError::invalid("invalid plugin id"));
+        return Err(CarrelError::invalid("invalid plugin id"));
     }
     manager(&state)?.run_now(&plugin_id)
 }
 
 /// Wipe all grants and runtime state for a plugin ("Remove plugin data").
 #[tauri::command]
-pub async fn plugin_remove_data(plugin_id: String, state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn plugin_remove_data(plugin_id: String, state: State<'_, AppState>) -> CarrelResult<()> {
     if !is_valid_plugin_id(&plugin_id) {
-        return Err(FolioError::invalid("invalid plugin id"));
+        return Err(CarrelError::invalid("invalid plugin id"));
     }
     let mgr = manager(&state)?;
     mgr.disable(&plugin_id)?;
@@ -385,11 +385,11 @@ pub struct ExamplePlugin {
 pub async fn plugin_list_examples(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<Vec<ExamplePlugin>> {
+) -> CarrelResult<Vec<ExamplePlugin>> {
     let examples_dir = app
         .path()
         .resolve("resources/example-plugins", BaseDirectory::Resource)
-        .map_err(|e| FolioError::internal(format!("cannot resolve example plugins: {e}")))?;
+        .map_err(|e| CarrelError::internal(format!("cannot resolve example plugins: {e}")))?;
     let user_dir = plugins_dir(&state.data_dir);
 
     let mut out = Vec::new();
@@ -405,7 +405,7 @@ pub async fn plugin_list_examples(
             Ok(r) => r,
             Err(_) => continue,
         };
-        let Ok(manifest) = folio_core::plugins::manifest::parse_manifest(&raw) else {
+        let Ok(manifest) = carrel_core::plugins::manifest::parse_manifest(&raw) else {
             continue;
         };
         let installed = user_dir.join(&manifest.id).join("plugin.toml").is_file();
@@ -428,9 +428,9 @@ pub async fn plugin_install_example(
     example_id: String,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> FolioResult<()> {
+) -> CarrelResult<()> {
     if !is_valid_plugin_id(&example_id) {
-        return Err(FolioError::invalid("invalid plugin id"));
+        return Err(CarrelError::invalid("invalid plugin id"));
     }
     let src = app
         .path()
@@ -438,15 +438,15 @@ pub async fn plugin_install_example(
             format!("resources/example-plugins/{example_id}"),
             BaseDirectory::Resource,
         )
-        .map_err(|e| FolioError::internal(format!("cannot resolve example: {e}")))?;
+        .map_err(|e| CarrelError::internal(format!("cannot resolve example: {e}")))?;
     if !src.join("plugin.toml").is_file() {
-        return Err(FolioError::not_found(format!(
+        return Err(CarrelError::not_found(format!(
             "example plugin not found: {example_id}"
         )));
     }
     let dest = plugins_dir(&state.data_dir).join(&example_id);
     if dest.exists() {
-        return Err(FolioError::invalid(format!(
+        return Err(CarrelError::invalid(format!(
             "a plugin named '{example_id}' is already installed"
         )));
     }
@@ -463,10 +463,10 @@ pub async fn plugin_install_example(
 
 /// Open the plugins directory in the OS file manager.
 #[tauri::command]
-pub async fn plugin_open_dir(state: State<'_, AppState>) -> FolioResult<()> {
+pub async fn plugin_open_dir(state: State<'_, AppState>) -> CarrelResult<()> {
     let dir = plugins_dir(&state.data_dir);
     std::fs::create_dir_all(&dir)?;
-    open::that(&dir).map_err(|e| FolioError::internal(format!("cannot open plugins dir: {e}")))?;
+    open::that(&dir).map_err(|e| CarrelError::internal(format!("cannot open plugins dir: {e}")))?;
     Ok(())
 }
 
@@ -480,8 +480,8 @@ fn now_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use folio_core::plugins::manifest::parse_manifest;
-    use folio_core::plugins::runtime::PluginRuntime;
+    use carrel_core::plugins::manifest::parse_manifest;
+    use carrel_core::plugins::runtime::PluginRuntime;
 
     struct NoopServices;
     impl HostServices for NoopServices {
@@ -495,7 +495,7 @@ mod tests {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/example-plugins");
         let tmp = tempfile::tempdir().unwrap();
-        let pool = folio_core::db::create_pool(&tmp.path().join("t.db")).unwrap();
+        let pool = carrel_core::db::create_pool(&tmp.path().join("t.db")).unwrap();
 
         let mut checked = 0;
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {

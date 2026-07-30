@@ -18,15 +18,15 @@ The parsing layer is in better shape than the average media-parsing codebase. Pa
 
 > **Update 2026-07-23:** #1–#3 addressed on `main` via PR #107 (merge commit `eef85f6`).
 > - #1 — real DOMPurify layer added (`src/lib/sanitizeHtml.ts`), both `ReaderPane` sinks sanitized; the CLAUDE.md claim is now accurate.
-> - #2 — code guards + `LIBMOBI_VERSION` pin already existed; added a trust-boundary / CVE-bump doc atop `folio-core/src/mobi/mod.rs`. Not code-hardened further (system-linked lib; no fuzz harness — pinned stable toolchain).
+> - #2 — code guards + `LIBMOBI_VERSION` pin already existed; added a trust-boundary / CVE-bump doc atop `carrel-core/src/mobi/mod.rs`. Not code-hardened further (system-linked lib; no fuzz harness — pinned stable toolchain).
 > - #3 — probing found a *real reachable* bug (ammonia leaves `>` literal in attr values → tag truncated → `src` unrewritten). Fixed with a quote-aware `find_tag_end`.
 > #4 and #5 (both Low) were deliberately left out of scope.
 
 ## Positives (verified, worth keeping)
 
-- **Path traversal / zip-slip is defended twice.** `sanitize_cover_href` (`folio-core/src/epub.rs:524`) rejects null bytes, absolute paths, Windows drive prefixes, and `..` escapes; `storage::validate_key` (`folio-core/src/storage.rs:88`) independently rejects `\`, absolute/drive keys, empty and `.`/`..` segments. Cover/image bytes are read into memory and re-stored under derived keys (`{book_id}/{index}/{hash}-{basename}`), never written to an attacker-named path.
-- **Decompression-bomb caps.** `MAX_ARCHIVE_ENTRIES = 10_000` and `MAX_ENTRY_SIZE = 100 MB` are enforced with an O(n) pre-scan over the central directory (`validate_archive`, `folio-core/src/epub.rs`), and entry reads are additionally bounded by `Read::take` (`MAX_TEXT_ENTRY_SIZE = 16 MB` for text entries, `MAX_ENTRY_SIZE` for binary ones) so an entry that lies about its decompressed size cannot expand past the cap.
-  - **Correction (2026-07-27):** until this date the pre-scan was *not* reached by `folio-core`'s own path-based entry points — only `CachedEpubArchive::open`, `cbz::open_archive`, and the desktop import (which calls `validate_archive` itself) enforced it. `parse_epub_metadata`, `get_chapter_content`, `get_chapter_list`, `extract_cover`, and `get_toc` opened the zip with a bare `ZipArchive::new`, so the LAN web server's chapter route (`api.rs:752`) parsed unvalidated archives. Fixed by routing every path-based wrapper through one `open_validated` helper, plus the bounded reads described above. Reads in `cbz.rs` (`:84` ComicInfo XML, `:156`/`:205` page bytes) are still unbounded — the archive pre-scan applies there, but a size-understating entry is not capped on read.
+- **Path traversal / zip-slip is defended twice.** `sanitize_cover_href` (`carrel-core/src/epub.rs:524`) rejects null bytes, absolute paths, Windows drive prefixes, and `..` escapes; `storage::validate_key` (`carrel-core/src/storage.rs:88`) independently rejects `\`, absolute/drive keys, empty and `.`/`..` segments. Cover/image bytes are read into memory and re-stored under derived keys (`{book_id}/{index}/{hash}-{basename}`), never written to an attacker-named path.
+- **Decompression-bomb caps.** `MAX_ARCHIVE_ENTRIES = 10_000` and `MAX_ENTRY_SIZE = 100 MB` are enforced with an O(n) pre-scan over the central directory (`validate_archive`, `carrel-core/src/epub.rs`), and entry reads are additionally bounded by `Read::take` (`MAX_TEXT_ENTRY_SIZE = 16 MB` for text entries, `MAX_ENTRY_SIZE` for binary ones) so an entry that lies about its decompressed size cannot expand past the cap.
+  - **Correction (2026-07-27):** until this date the pre-scan was *not* reached by `carrel-core`'s own path-based entry points — only `CachedEpubArchive::open`, `cbz::open_archive`, and the desktop import (which calls `validate_archive` itself) enforced it. `parse_epub_metadata`, `get_chapter_content`, `get_chapter_list`, `extract_cover`, and `get_toc` opened the zip with a bare `ZipArchive::new`, so the LAN web server's chapter route (`api.rs:752`) parsed unvalidated archives. Fixed by routing every path-based wrapper through one `open_validated` helper, plus the bounded reads described above. Reads in `cbz.rs` (`:84` ComicInfo XML, `:156`/`:205` page bytes) are still unbounded — the archive pre-scan applies there, but a size-understating entry is not capped on read.
 - **XXE effectively mitigated.** OPF/ComicInfo metadata is pulled with hand-rolled string extraction (`extract_tag_text`, `find_cover_href`), and `quick-xml` (used elsewhere) does not resolve external entities/DTDs by default. No entity-expansion (billion-laughs) surface.
 - **Comic archives read into memory** (`cbz.rs`, `cbr.rs` via `entry.read()`), not extracted to disk — so zip-slip does not apply to comics either.
 - **All EPUB chapter HTML passes through `ammonia::clean()`** before it reaches the UI (`epub.rs:699/745/852/921/946`).
@@ -58,12 +58,12 @@ So the documented two-layer defense-in-depth is actually **single-layer**: serve
 
 ### 2. MOBI parsed via `unsafe` C FFI (libmobi) on fully untrusted input — A06 — Medium
 
-`folio-core/src/mobi/` wraps libmobi through `unsafe extern "C"` (`ffi.rs`, `mod.rs`). Parsing is applied to attacker-controlled `.mobi` files, including raw pointer/length trust at **two** sites:
+`carrel-core/src/mobi/` wraps libmobi through `unsafe extern "C"` (`ffi.rs`, `mod.rs`). Parsing is applied to attacker-controlled `.mobi` files, including raw pointer/length trust at **two** sites:
 
 ```rust
-// folio-core/src/mobi/mod.rs:193
+// carrel-core/src/mobi/mod.rs:193
 let data = slice::from_raw_parts(rec_ref.data, rec_ref.size);
-// folio-core/src/mobi/mod.rs:314
+// carrel-core/src/mobi/mod.rs:314
 unsafe { slice::from_raw_parts(part.data, part.size) }
 ```
 

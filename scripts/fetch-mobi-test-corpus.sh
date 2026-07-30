@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch the MOBI test corpus used by folio-core's fixture-gated tests.
+# Fetch the MOBI test corpus used by carrel-core's fixture-gated tests.
 #
 # The corpus lives under `src-tauri/test-fixtures/` (gitignored) and is
 # pulled on demand rather than checked in — MOBI files are a few hundred

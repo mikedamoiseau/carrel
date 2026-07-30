@@ -22,13 +22,13 @@ Content-Type: application/json
 { "pin": "1234" }
 ```
 
-Returns `{ "token": "uuid" }` and sets an `HttpOnly` cookie (`folio_session`).
+Returns `{ "token": "uuid" }` and sets an `HttpOnly` cookie (`carrel_session`).
 
 Rate limited: 5 attempts per 5 minutes per IP. Returns `429 Too Many Requests` when exceeded.
 
 ### Session Cookie
 
-After login, the `folio_session` cookie is sent automatically by browsers. Valid for 24 hours.
+After login, the `carrel_session` cookie is sent automatically by browsers. Valid for 24 hours.
 
 ### HTTP Basic Auth (OPDS clients)
 
@@ -132,7 +132,7 @@ Switching changes the served library, so refetch anything cached client-side
 afterwards. Book ids are per-profile, so clients that cache book content by id
 must scope that cache by profile name.
 
-Every response carries an `x-folio-profile` header identifying the active profile
+Every response carries an `x-carrel-profile` header identifying the active profile
 (the profile name, hex-encoded — arbitrary names can't be sent verbatim in a
 header). It is meant for comparison, not decoding: record the value your client
 first sees, and when a later response differs, the active profile moved (another
@@ -178,7 +178,7 @@ Open `http://<your-ip>:7788/` in a browser for a built-in reading interface. It 
 - Book detail page with a progress bar and Continue / Start-over
 - EPUB reader with chapter navigation (neighbouring chapters are prefetched in the background, so turning to the next chapter on a phone is instant); PDF/CBZ/CBR page-image reader with animated swipe page-turns on touch devices (reduced-motion aware)
 - Table-of-contents navigation for reflowable books: the reader consumes `GET /api/books/:id/chapters` and offers a **Contents** panel (replacing the numeric chapter slider) to jump to any chapter; degrades to a plain chapter label when the TOC has ≤1 entry or can't be fetched
-- Adjustable reading typography for reflowable books (EPUB/MOBI) via an **Aa** toolbar control: font size, line spacing, reading font (Lora, Literata, DM Sans, OpenDyslexic), and column width. Settings are stored client-side (one `folio-web-typography` localStorage key, global across books) and reading position is preserved across the reflow. The four faces are embedded, content-addressed `woff2` served from `/fonts/*.woff2` as public, `immutable` shell assets and precached by the service worker (best-effort, so a font hiccup never blocks the SW install)
+- Adjustable reading typography for reflowable books (EPUB/MOBI) via an **Aa** toolbar control: font size, line spacing, reading font (Lora, Literata, DM Sans, OpenDyslexic), and column width. Settings are stored client-side (one `carrel-web-typography` localStorage key, global across books) and reading position is preserved across the reflow. The four faces are embedded, content-addressed `woff2` served from `/fonts/*.woff2` as public, `immutable` shell assets and precached by the service worker (best-effort, so a font hiccup never blocks the SW install)
 - Reading progress syncs back to the library, so a book picks up where a desktop or other device session left off
 - Installable as a PWA (web app manifest, service worker) and supports iOS "Add to Home Screen". The service worker only registers on a secure context (`https` or `localhost`), so offline shell caching does not activate over a plain-HTTP LAN URL — Add-to-Home-Screen and the manifest still work there
 - **Save for offline** (secure context only): per-book download into browser storage (Cache Storage for content, IndexedDB for the manifest/progress queue). When the server is unreachable the app boots into a library of downloaded books and reads them fully offline; progress made offline syncs back with a compare-then-push rule on reconnect; evicted downloads are detected and pruned on next launch. The service worker serves saved-book requests network-first (cache only on failure/offline), so online auth and freshness are unchanged

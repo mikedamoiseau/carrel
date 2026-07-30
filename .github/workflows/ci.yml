@@ -73,9 +73,9 @@ jobs:
         run: cargo test --features mobi
 
       # `cargo test` from src-tauri/ only builds src-tauri's test binary —
-      # folio-core's unit tests (which carry the MOBI adapter smoke suite)
+      # carrel-core's unit tests (which carry the MOBI adapter smoke suite)
       # are not compiled by that invocation even with `--features mobi`.
-      # Run them explicitly so regressions in folio-core actually fail CI.
+      # Run them explicitly so regressions in carrel-core actually fail CI.
       #
       # The fetch step pulls the gitignored MOBI corpus from Project
       # Gutenberg; without it the fixture-gated smoke tests skip silently
@@ -97,13 +97,13 @@ jobs:
       - name: Fetch MOBI test corpus
         run: ./scripts/fetch-mobi-test-corpus.sh
 
-      - name: Run cargo test (folio-core, --features mobi)
+      - name: Run cargo test (carrel-core, --features mobi)
         # libmobi's C-side cleanup races across threads on Linux — when the
         # test runner opens multiple MOBIs in parallel, drop ordering can
         # double-free shared internal state and SIGABRT after a passing
         # test. Serialise the suite to avoid the flake. The crate is tiny,
         # so the overhead is minimal.
-        run: cargo test -p folio-core --features mobi -- --test-threads=1
+        run: cargo test -p carrel-core --features mobi -- --test-threads=1
 
   lint:
     name: Rust Lint
@@ -139,7 +139,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # Lint the mobi feature too so clippy catches regressions in the
-      # libmobi-gated code paths. --workspace --all-targets so folio-core
+      # libmobi-gated code paths. --workspace --all-targets so carrel-core
       # and test/example targets are linted, not just the carrel crate's lib.
       - name: cargo clippy (--features mobi)
         run: cargo clippy --workspace --all-targets --features mobi -- -D warnings
@@ -191,12 +191,12 @@ jobs:
         working-directory: src-tauri
         run: cargo test --features mobi
 
-      # The folio-core MOBI smoke tests are intentionally only wired
+      # The carrel-core MOBI smoke tests are intentionally only wired
       # into the Linux job. When they ran here on macos-latest the
       # test process reliably SIGKILLed partway through — libmobi's
       # iconv code path crashes on macOS Tahoe arm64 at process exit
       # (the same bug MobiBook already works around for single-string
-      # decodes by avoiding the PalmDB name field; the full folio-core
+      # decodes by avoiding the PalmDB name field; the full carrel-core
       # test binary re-opens many MOBIs in sequence and the crash
       # resurfaces at cleanup). The src-tauri step above already
       # verifies libmobi links and loads correctly on this runner;
@@ -206,7 +206,7 @@ jobs:
     # Catches MSVC + libmobi FFI regressions on PRs rather than at
     # tag-push time. Linux remains the authoritative MOBI smoke-test
     # home; this job only proves the Windows build pipeline (CMake
-    # build of libmobi → bindgen → MSVC link → folio-core unit tests)
+    # build of libmobi → bindgen → MSVC link → carrel-core unit tests)
     # still works. Smoke tests gated on the MOBI corpus are not run
     # here — they require the Project Gutenberg fetch script which
     # hits the network from Windows runners and adds time without
@@ -335,17 +335,17 @@ jobs:
             throw "Unexpected mobi.dll at $expectedDll — cache contains a shared (DLL) build, but ci expects a static (mobi.lib) one. Bump the cache-key suffix."
           }
 
-      # folio-core/build.rs uses pkg-config first, then falls back to
+      # carrel-core/build.rs uses pkg-config first, then falls back to
       # LIBMOBI_INCLUDE_DIR + LIBMOBI_LIB_DIR. Windows MSVC has no
       # pkg-config in PATH by default, so the fallback is the path
       # actually exercised here. Static linkage means the test binary
       # has no runtime DLL dependency — no PATH manipulation needed.
-      - name: Run cargo test (folio-core, --features mobi)
+      - name: Run cargo test (carrel-core, --features mobi)
         shell: pwsh
         run: |
           $env:LIBMOBI_INCLUDE_DIR = "$env:GITHUB_WORKSPACE\.libmobi-windows\include"
           $env:LIBMOBI_LIB_DIR = "$env:GITHUB_WORKSPACE\.libmobi-windows\lib"
-          cargo test -p folio-core --features mobi
+          cargo test -p carrel-core --features mobi
 
   frontend-check:
     name: Frontend TypeScript Check

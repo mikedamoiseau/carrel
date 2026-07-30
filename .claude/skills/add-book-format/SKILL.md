@@ -11,12 +11,12 @@ Formats are an enum-driven pipeline. The compiler is your checklist: add a
 `BookFormat` variant and every `match` on it becomes a non-exhaustive error
 until you handle the new arm. Follow the errors.
 
-Existing parsers to copy from: `folio-core/src/{epub,pdf,cbz,cbr}.rs` and the
-`folio-core/src/mobi/` module (the feature-gated example).
+Existing parsers to copy from: `carrel-core/src/{epub,pdf,cbz,cbr}.rs` and the
+`carrel-core/src/mobi/` module (the feature-gated example).
 
 ## Steps
 
-### 1. Add the enum variant — `folio-core/src/models.rs`
+### 1. Add the enum variant — `carrel-core/src/models.rs`
 
 ```rust
 pub enum BookFormat {
@@ -29,12 +29,12 @@ Also extend the `Display` impl in the same file (`BookFormat::Fb2 => write!(f, "
 This alone produces compiler errors at every other match site — that list IS
 your remaining work.
 
-### 2. Create the parser module — `folio-core/src/fb2.rs`
+### 2. Create the parser module — `carrel-core/src/fb2.rs`
 
 Mirror an existing parser's public surface. A parser extracts: metadata
 (title/author/etc.), content (sanitized HTML chapters for text formats, or
 sorted image bytes for comic formats), and a cover image. Register the module
-in `folio-core/src/lib.rs` (`pub mod fb2;`).
+in `carrel-core/src/lib.rs` (`pub mod fb2;`).
 
 - Text/HTML formats MUST sanitize server-side with `ammonia` (see `epub.rs`).
 - Heavy/optional native deps: gate behind a Cargo feature like `mobi` does, and
@@ -66,14 +66,14 @@ Add the extension to `supported_import_extensions()` so the import dialog and
 ## Verify
 
 ```bash
-cargo test -p folio-core                                # core parser tests
+cargo test -p carrel-core                                # core parser tests
 cargo clippy --workspace --all-targets -- -D warnings
 # feature-gated parser? also:
-cargo test -p folio-core --features <feature>
+cargo test -p carrel-core --features <feature>
 ```
 
 Add a fixture-backed test (real sample file) following the parser tests in
-`folio-core/src/`. Gate it to skip cleanly when the fixture is absent (see the
+`carrel-core/src/`. Gate it to skip cleanly when the fixture is absent (see the
 MOBI corpus pattern in CLAUDE.md) so fresh clones stay green.
 
 ## Common Mistakes
@@ -84,4 +84,4 @@ MOBI corpus pattern in CLAUDE.md) so fresh clones stay green.
 | Used catch-all `_ =>` for new variant | Silently wrong behavior; handle the variant explicitly |
 | No HTML sanitization on a text format | XSS risk — `ammonia` server-side is mandatory |
 | Forgot `supported_import_extensions()` | File type not offered in the import dialog |
-| Forgot `pub mod fb2;` in folio-core lib.rs | "unresolved module" build error |
+| Forgot `pub mod fb2;` in carrel-core lib.rs | "unresolved module" build error |

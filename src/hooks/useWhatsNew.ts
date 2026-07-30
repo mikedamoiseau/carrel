@@ -4,8 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { releaseNotes, appVersion } from "virtual:release-notes";
 import type { ReleaseVersion } from "../../vite-plugin-release-notes";
 
-const DISMISSED_KEY = "folio-whats-new-dismissed";
-const ONBOARDING_KEY = "folio-onboarding-complete";
+const DISMISSED_KEY = "carrel-whats-new-dismissed";
+const ONBOARDING_KEY = "carrel-onboarding-complete";
 
 export interface UseWhatsNew {
   showBanner: boolean;
