@@ -5,6 +5,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-07-30
+
+The first release under the Carrel name. The major version reflects the one
+thing this release asks of you: on most platforms the installer leaves the old
+Folio app in place, so you have to remove it yourself. Nothing about your
+library changes.
+
 ### Changed
 - **Folio is now called Carrel.** The app, its window title, its icon, and its
   GitHub home have all been renamed. Your library, reading progress, highlights,
