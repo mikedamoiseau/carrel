@@ -28,6 +28,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "wix": {
+        "upgradeCode": "21c2cdba-327a-5023-94aa-a2fbf307774c"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

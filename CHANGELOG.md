@@ -10,12 +10,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   GitHub home have all been renamed. Your library, reading progress, highlights,
   settings, profiles, and offline downloads are untouched and carry over as-is —
   nothing to migrate and nothing to re-import.
-  - macOS and Windows install the new app *alongside* the old one rather than
-    replacing it, because the application name is part of what the installer
-    matches on. After installing, delete the old **Folio** app: drag
-    `Folio.app` to the Trash on macOS, or uninstall "Folio" from
-    **Settings → Apps** on Windows. On Linux the `.deb` / `.AppImage` replace
-    the old package normally.
+  - Most installers treat a renamed app as a new one, so Carrel generally arrives
+    *next to* Folio instead of replacing it. The Windows `.msi` is the exception
+    and upgrades in place. Everywhere else, remove the old app once Carrel is
+    running — drag `Folio.app` to the Trash on macOS, uninstall "Folio" from
+    **Settings → Apps** if you used the Windows `-setup.exe`, or
+    `sudo apt remove folio` on Linux. Removing it does not touch your library.
   - If you connect to the app from a phone or tablet, the web reader is
     unchanged — the same address, the same PIN, and anything you saved for
     offline reading stays saved.

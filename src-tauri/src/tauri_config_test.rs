@@ -71,6 +71,31 @@ mod tests {
         );
     }
 
+    /// The WiX upgrade code must stay pinned to the value every shipped Folio
+    /// MSI carries. Tauri derives it from `uuid5(DNS, "{productName}.exe.app.x64")`
+    /// when unset, so leaving it unset makes any `productName` change (like the
+    /// Folio → Carrel rename) silently produce MSIs that install *side-by-side*
+    /// with the user's existing install instead of upgrading it. `MajorUpgrade`
+    /// matches on this code alone, so pinning it is what keeps in-place upgrades
+    /// working across the rename. See CLAUDE.md, "Legacy `folio` identifiers".
+    #[test]
+    fn wix_upgrade_code_is_pinned_to_the_folio_era_value() {
+        const FOLIO_ERA_UPGRADE_CODE: &str = "21c2cdba-327a-5023-94aa-a2fbf307774c";
+        let base = parse(BASE);
+        let code = base
+            .pointer("/bundle/windows/wix/upgradeCode")
+            .and_then(Value::as_str)
+            .expect(
+                "tauri.conf.json must pin bundle.windows.wix.upgradeCode; without it \
+                 Tauri derives it from productName and the MSI stops upgrading in place",
+            );
+        assert_eq!(
+            code, FOLIO_ERA_UPGRADE_CODE,
+            "the WiX upgrade code must never change — it is what links a new MSI to \
+             the user's existing install"
+        );
+    }
+
     #[test]
     fn overlay_is_schema_valid_for_tauri_merge() {
         // The overlay must have the `$schema` key so IDE tooling picks it up

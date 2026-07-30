@@ -4,10 +4,10 @@ How to install, import books, and read them. Covers all formats, collections, hi
 
 > **Carrel was previously called Folio.** If you are upgrading from Folio, your
 > library, reading progress, highlights, settings, and profiles carry over
-> automatically — there is nothing to migrate. On macOS and Windows the new app
-> installs alongside the old one, so delete the old **Folio** app once Carrel is
-> running (drag `Folio.app` to the Trash, or uninstall "Folio" from
-> **Settings → Apps** on Windows).
+> automatically — there is nothing to migrate. Most installers treat a renamed
+> app as a new one, so Carrel usually arrives next to Folio instead of replacing
+> it; see [Upgrading from Folio](#upgrading-from-folio) for how to remove the
+> old app on your platform.
 
 To open this guide from inside the app, click the **?** button in the top bar,
 or choose **User Guide** from the system-tray menu.
@@ -71,6 +71,29 @@ Go to the [GitHub Releases page](https://github.com/mikedamoiseau/carrel/release
 **Linux (AppImage):** Make the file executable (`chmod +x Carrel.AppImage`), then run it.
 
 **Linux (.deb):** Run `sudo dpkg -i carrel.deb`.
+
+### Upgrading from Folio
+
+Carrel used to be called Folio. Your library, reading progress, highlights,
+bookmarks, settings, profiles, and offline downloads all carry over on their
+own — there is nothing to migrate and nothing to re-import.
+
+What you do have to do is get rid of the old app. Installers identify an app by
+its name, and the name changed, so most of them treat Carrel as a brand-new
+program and leave Folio sitting right where it was. Removing Folio is safe: your
+books and reading data live outside the app, and Carrel is already using them.
+
+| Upgrading via | What happens | What to do |
+|---|---|---|
+| Windows `.msi` | Upgrades in place | Nothing — Folio is replaced |
+| Windows `-setup.exe` | Installs alongside | Uninstall "Folio" from **Settings → Apps** |
+| macOS `.dmg` | Installs alongside | Drag `Folio.app` from Applications to the Trash |
+| Linux `.deb` | Installs alongside | `sudo apt remove folio` |
+| Linux `.rpm` | Installs alongside | `sudo dnf remove folio` |
+| Linux `.AppImage` | Separate file | Delete the old `Folio…AppImage` |
+
+If you skip this, nothing breaks — you just end up with two icons that open the
+same library, and whichever one you launch shows the same books.
 
 ### First launch
 

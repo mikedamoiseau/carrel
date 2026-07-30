@@ -4,12 +4,17 @@
 > library, reading progress, highlights, bookmarks, settings, profiles, and
 > offline downloads. There is nothing to migrate and nothing to re-import.
 >
-> On **macOS and Windows** the installer adds Carrel *alongside* Folio instead of
-> replacing it, because the installers match on the application name and that
-> name changed. Once Carrel is running, delete the old app: drag `Folio.app` to
-> the Trash, or uninstall "Folio" from **Settings → Apps** on Windows. Deleting it
-> does not touch your library. On **Linux** the `.deb` / `.AppImage` replace the
-> old package normally.
+> Most installers treat a renamed app as a *new* app, so on most platforms Carrel
+> arrives next to Folio rather than replacing it. Removing the old one is safe:
+> your library and reading data live outside the app.
+>
+> | Upgrading from Folio via | What happens | What to do |
+> |---|---|---|
+> | Windows `.msi` | Upgrades in place | Nothing |
+> | Windows `-setup.exe` | Installs alongside | Uninstall "Folio" from **Settings → Apps** |
+> | macOS `.dmg` | Installs alongside | Drag `Folio.app` to the Trash |
+> | Linux `.deb` / `.rpm` | Installs alongside | `sudo apt remove folio` (or `dnf remove folio`) |
+> | Linux `.AppImage` | Separate file | Delete the old `Folio…AppImage` |
 
 A local-first desktop app for people who want to read and organize the books they already own.
 

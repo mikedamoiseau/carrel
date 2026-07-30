@@ -49,6 +49,18 @@ the exact string. Never run a blind `s/folio/carrel/g`.
 | `folio-*` / `folio_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
 | `FOLIO_APTABASE_KEY`, `FOLIO_LOG`, `FOLIO_DEBUG_PAGES`, `FOLIO_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
 | `folio-core`, `FolioError`, `FolioResult`, `FolioEvent` | `folio-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
+| `21c2cdba-327a-5023-94aa-a2fbf307774c` | `tauri.conf.json` `bundle.windows.wix.upgradeCode` | make every Windows MSI install **side-by-side** with the user's existing install instead of upgrading it in place |
+
+The WiX upgrade code deserves a note, since it is the one entry that is a bare
+UUID rather than a readable string. Tauri derives it by default from
+`uuid5(DNS, "{productName}.exe.app.x64")` — so it *changed* when `productName`
+went Folio → Carrel. `21c2cdba…` is `uuid5(DNS, "Folio.exe.app.x64")`, the value
+every shipped Folio MSI actually carries (verified by reading the `UpgradeCode`
+property out of `Folio_2.11.1_x64_en-US.msi`). Pinning it means WiX
+`MajorUpgrade` still recognizes the old install — it matches on upgrade code
+alone, so the changed `ProductName` no longer matters. Check it with
+`npx tauri inspect wix-upgrade-code`, which prints both the derived default and
+the override. Never change this value, including on any future rename.
 
 `CHANGELOG.md`, `docs/superpowers/`, and `src-tauri/.pr-reviews/` keep saying
 Folio too: they are historical records of releases and work that shipped under
