@@ -25,10 +25,31 @@ async function saveBookOffline(page: Page, bookId: string) {
 // book/content fetches bypass the cache and hit the (offline) network — the
 // detail then dead-ends on the error view instead of rendering. Real installed
 // PWAs are controlled from launch; this just makes the test deterministic.
-async function reloadControlled(page: Page) {
+//
+// Waiting for an ACTIVE registration BEFORE reloading is load-bearing, not
+// belt-and-braces. app.js registers fire-and-forget (`register().catch(() => {})`,
+// deliberately never awaited — see its comment), so a reload issued shortly
+// after the first navigation can outrun the install: the reloaded page then
+// starts life uncontrolled, and `clients.claim()` only lands once install
+// finishes, which on a loaded CI runner can fall outside the budget below.
+// A navigation into a scope that already has an active worker is controlled
+// from the start, so this makes the wait below deterministic instead of a race.
+//
+// Callers that pass through a slow, SW-dependent step first (saveBookOffline,
+// switchProfile) satisfied this by accident. The callers that reload within
+// milliseconds of a goto did not, and flaked on CI.
+async function reloadControlled(page: Page, controllerTimeout = 15_000) {
+  // Note `!!registration.active` is NOT sufficient here: `active` is already
+  // populated while the worker is still `activating`, and a navigation is only
+  // taken over by an *activated* worker. Waiting for the current page to be
+  // controlled is the honest signal — sw.js calls `clients.claim()`, so the
+  // already-open page gets claimed the moment activation completes.
+  await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, {
+    timeout: 30_000,
+  });
   await page.reload();
   await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, {
-    timeout: 15_000,
+    timeout: controllerTimeout,
   });
 }
 
@@ -54,6 +75,29 @@ async function openReaderAtZero(page: Page, bookId: string) {
 // exactly as it does on the HTTPS deployments offline mode targets.
 
 test.describe("offline mode — service worker foundations", () => {
+  // Regression guard for reloadControlled()'s pre-reload wait. Stalls one
+  // best-effort font so the install handler — which awaits
+  // Promise.allSettled(fonts) — is still running when the reload is issued,
+  // reproducing the CI flake deterministically. The tight controller budget is
+  // what gives the test teeth: without the pre-reload wait for an active
+  // worker, the controller only arrives once the stall clears and this fails.
+  test("a reload issued mid-install still ends up controlled", async ({ page, context }) => {
+    const STALL_MS = 3_000;
+    await context.route("**/fonts/opendyslexic-italic-*.woff2", async (route) => {
+      if (!route.request().serviceWorker()) return route.continue();
+      await new Promise((r) => setTimeout(r, STALL_MS));
+      await route.continue();
+    });
+
+    await page.goto("/#/");
+    // Precondition: the SW really is mid-install here, or the test proves nothing.
+    expect(
+      await page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())?.active),
+    ).toBe(false);
+
+    await reloadControlled(page, 1_000);
+  });
+
   test("activation purge spares offline book caches, kills stale shell caches", async ({
     page,
   }) => {
