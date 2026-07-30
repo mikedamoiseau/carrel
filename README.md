@@ -1,5 +1,7 @@
 # Carrel
 
+> Formerly named Folio, renamed to Carrel in 2.11.x.
+
 A local-first desktop app for people who want to read and organize the books they already own.
 
 ![Carrel library](screenshots/01-library-light.png)
@@ -173,7 +175,7 @@ don't invest much effort in one without asking first.
 
 ## Installation
 
-Pre-built binaries are available on the [GitHub Releases page](https://github.com/mikedamoiseau/folio/releases).
+Pre-built binaries are available on the [GitHub Releases page](https://github.com/mikedamoiseau/carrel/releases).
 
 ### macOS
 
@@ -324,7 +326,7 @@ suite stays green on fresh clones.
 
 ## CI
 
-![CI](https://github.com/mikedamoiseau/folio/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/mikedamoiseau/carrel/actions/workflows/ci.yml/badge.svg)
 
 ## License
 

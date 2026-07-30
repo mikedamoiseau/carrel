@@ -2,6 +2,16 @@
 
 How to install, import books, and read them. Covers all formats, collections, highlights, catalog browsing, and more.
 
+> **Carrel was previously called Folio.** If you are upgrading from Folio, your
+> library, reading progress, highlights, settings, and profiles carry over
+> automatically — there is nothing to migrate. On macOS and Windows the new app
+> installs alongside the old one, so delete the old **Folio** app once Carrel is
+> running (drag `Folio.app` to the Trash, or uninstall "Folio" from
+> **Settings → Apps** on Windows).
+
+To open this guide from inside the app, click the **?** button in the top bar,
+or choose **User Guide** from the system-tray menu.
+
 ---
 
 ## Table of Contents
@@ -38,7 +48,7 @@ No extra runtimes or dependencies needed. The installer is self-contained.
 
 ### Downloading
 
-Go to the [GitHub Releases page](https://github.com/mikedamoiseau/folio/releases) and grab the package for your OS:
+Go to the [GitHub Releases page](https://github.com/mikedamoiseau/carrel/releases) and grab the package for your OS:
 
 - macOS: `.dmg`
 - Windows: `.msi`
@@ -950,7 +960,7 @@ Whatever surfaces were enabled when you last closed Carrel start automatically t
 
 ### Tray menu
 
-The system tray shows the same two toggles (Web UI: ON/OFF, OPDS: ON/OFF). Click either to flip its state without opening Settings. The menu also has **Check for Updates** (see [Checking for updates](#checking-for-updates)) and **What's New**.
+The system tray shows the same two toggles (Web UI: ON/OFF, OPDS: ON/OFF). Click either to flip its state without opening Settings. The menu also has **Check for Updates** (see [Checking for updates](#checking-for-updates)), **What's New**, and **User Guide** (opens this guide online in your browser).
 
 ### Security
 

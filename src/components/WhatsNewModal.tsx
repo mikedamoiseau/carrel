@@ -8,7 +8,7 @@ interface WhatsNewModalProps {
   onClose: () => void;
 }
 
-const CHANGELOG_URL = "https://github.com/mikedamoiseau/folio/blob/main/CHANGELOG.md";
+const CHANGELOG_URL = "https://github.com/mikedamoiseau/carrel/blob/main/CHANGELOG.md";
 
 export default function WhatsNewModal({ release, onClose }: WhatsNewModalProps) {
   const { t } = useTranslation();

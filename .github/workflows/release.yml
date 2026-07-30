@@ -380,7 +380,7 @@ jobs:
           releaseBody: |
             See the assets below to download and install this version.
 
-            > **macOS note:** Because this app is not notarized, macOS Gatekeeper may show a "damaged" or "unidentified developer" warning. See the [installation guide](https://github.com/mikedamoiseau/folio/blob/main/docs/USER_GUIDE.md#installing) for the one-line fix.
+            > **macOS note:** Because this app is not notarized, macOS Gatekeeper may show a "damaged" or "unidentified developer" warning. See the [installation guide](https://github.com/mikedamoiseau/carrel/blob/main/docs/USER_GUIDE.md#installing) for the one-line fix.
             >
             > **MOBI / AZW / AZW3 support:** MOBI import is included on Linux, arm64 macOS, and Windows. The arm64 macOS and Windows builds statically link libmobi, so no extra install is needed. Linux dynamically links against libmobi — install it before first MOBI open with `sudo apt install libmobi0` (Debian / Ubuntu). EPUB / PDF / CBZ / CBR do not need libmobi. The x86_64 (Intel) macOS build does not include MOBI support — use a different format on that platform.
           releaseDraft: false
