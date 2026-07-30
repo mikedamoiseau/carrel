@@ -18,8 +18,8 @@ const sample: UpdateCheck = {
   update_available: true,
   current_version: "2.7.0",
   latest_version: "2.8.0",
-  release_url: "https://github.com/mikedamoiseau/folio/releases/tag/v2.8.0",
-  changelog_url: "https://github.com/mikedamoiseau/folio/releases",
+  release_url: "https://github.com/mikedamoiseau/carrel/releases/tag/v2.8.0",
+  changelog_url: "https://github.com/mikedamoiseau/carrel/releases",
   release_notes: "Line one\nLine two",
 };
 
@@ -30,17 +30,17 @@ describe("trusted-URL validation", () => {
     expect(isTrustedChangelogUrl(sample.changelog_url + "/")).toBe(true); // trailing slash ok
   });
   it("rejects deceptive hosts and schemes", () => {
-    expect(isTrustedReleaseUrl("https://github.com.evil.org/mikedamoiseau/folio/releases/tag/v1")).toBe(false);
-    expect(isTrustedReleaseUrl("http://github.com/mikedamoiseau/folio/releases/tag/v1")).toBe(false);
-    expect(isTrustedReleaseUrl("https://evil.com/mikedamoiseau/folio/releases/tag/v1")).toBe(false);
+    expect(isTrustedReleaseUrl("https://github.com.evil.org/mikedamoiseau/carrel/releases/tag/v1")).toBe(false);
+    expect(isTrustedReleaseUrl("http://github.com/mikedamoiseau/carrel/releases/tag/v1")).toBe(false);
+    expect(isTrustedReleaseUrl("https://evil.com/mikedamoiseau/carrel/releases/tag/v1")).toBe(false);
     expect(isTrustedReleaseUrl("not a url")).toBe(false);
   });
   it("rejects other repo paths (issues, PRs, bare repo, releases page as a release URL)", () => {
-    expect(isTrustedReleaseUrl("https://github.com/mikedamoiseau/folio/issues/1")).toBe(false);
-    expect(isTrustedReleaseUrl("https://github.com/mikedamoiseau/folio/pull/1")).toBe(false);
-    expect(isTrustedReleaseUrl("https://github.com/mikedamoiseau/folio/releases")).toBe(false);
-    expect(isTrustedChangelogUrl("https://github.com/mikedamoiseau/folio/releases/tag/v1")).toBe(false);
-    expect(isTrustedChangelogUrl("https://github.com/mikedamoiseau/folio/issues")).toBe(false);
+    expect(isTrustedReleaseUrl("https://github.com/mikedamoiseau/carrel/issues/1")).toBe(false);
+    expect(isTrustedReleaseUrl("https://github.com/mikedamoiseau/carrel/pull/1")).toBe(false);
+    expect(isTrustedReleaseUrl("https://github.com/mikedamoiseau/carrel/releases")).toBe(false);
+    expect(isTrustedChangelogUrl("https://github.com/mikedamoiseau/carrel/releases/tag/v1")).toBe(false);
+    expect(isTrustedChangelogUrl("https://github.com/mikedamoiseau/carrel/issues")).toBe(false);
   });
 });
 

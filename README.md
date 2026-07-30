@@ -1,5 +1,21 @@
 # Carrel
 
+> **Carrel was previously called Folio.** Everything carries over automatically —
+> library, reading progress, highlights, bookmarks, settings, profiles, and
+> offline downloads. There is nothing to migrate and nothing to re-import.
+>
+> Most installers treat a renamed app as a *new* app, so on most platforms Carrel
+> arrives next to Folio rather than replacing it. Removing the old one is safe:
+> your library and reading data live outside the app.
+>
+> | Upgrading from Folio via | What happens | What to do |
+> |---|---|---|
+> | Windows `.msi` | Upgrades in place | Nothing |
+> | Windows `-setup.exe` | Installs alongside | Uninstall "Folio" from **Settings → Apps** |
+> | macOS `.dmg` | Installs alongside | Drag `Folio.app` to the Trash |
+> | Linux `.deb` / `.rpm` | Installs alongside | `sudo apt remove folio` (or `dnf remove folio`) |
+> | Linux `.AppImage` | Separate file | Delete the old `Folio…AppImage` |
+
 A local-first desktop app for people who want to read and organize the books they already own.
 
 ![Carrel library](screenshots/01-library-light.png)
@@ -173,7 +189,7 @@ don't invest much effort in one without asking first.
 
 ## Installation
 
-Pre-built binaries are available on the [GitHub Releases page](https://github.com/mikedamoiseau/folio/releases).
+Pre-built binaries are available on the [GitHub Releases page](https://github.com/mikedamoiseau/carrel/releases).
 
 ### macOS
 
@@ -324,7 +340,7 @@ suite stays green on fresh clones.
 
 ## CI
 
-![CI](https://github.com/mikedamoiseau/folio/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/mikedamoiseau/carrel/actions/workflows/ci.yml/badge.svg)
 
 ## License
 

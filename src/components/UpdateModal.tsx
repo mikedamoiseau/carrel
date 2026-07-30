@@ -31,11 +31,11 @@ function trusted(raw: string, pathOk: (p: string) => boolean): boolean {
 }
 
 export function isTrustedReleaseUrl(raw: string): boolean {
-  return trusted(raw, (p) => p.startsWith("/mikedamoiseau/folio/releases/tag/"));
+  return trusted(raw, (p) => p.startsWith("/mikedamoiseau/carrel/releases/tag/"));
 }
 
 export function isTrustedChangelogUrl(raw: string): boolean {
-  return trusted(raw, (p) => p === "/mikedamoiseau/folio/releases" || p === "/mikedamoiseau/folio/releases/");
+  return trusted(raw, (p) => p === "/mikedamoiseau/carrel/releases" || p === "/mikedamoiseau/carrel/releases/");
 }
 
 interface Props {

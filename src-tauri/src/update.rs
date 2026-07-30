@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 /// Static full-changelog target (never derived from GitHub data).
-pub const CHANGELOG_URL: &str = "https://github.com/mikedamoiseau/folio/releases";
+pub const CHANGELOG_URL: &str = "https://github.com/mikedamoiseau/carrel/releases";
 
-const RELEASE_TAG_PATH_PREFIX: &str = "/mikedamoiseau/folio/releases/tag/";
+const RELEASE_TAG_PATH_PREFIX: &str = "/mikedamoiseau/carrel/releases/tag/";
 
 /// Minimal DTO. `body` is `Option` — GitHub release bodies can be null/absent;
 /// deserializing into `String` would error a valid release.
@@ -72,12 +72,12 @@ fn validate_release_url(raw: &str) -> Result<(), String> {
     }
 }
 
-// The GitHub repo is still `mikedamoiseau/folio` after the Carrel rename, and
-// the slug is load-bearing in more than this URL: it is also what
-// `isTrustedReleaseUrl` (frontend) and `RELEASE_TAG_PATH_PREFIX` below allow-list.
-// See CLAUDE.md, "Legacy `folio` identifiers".
+// The GitHub repo itself was renamed `mikedamoiseau/folio` -> `mikedamoiseau/carrel`
+// (2026-07-30), so this slug tracks the real repo name now. It's load-bearing
+// in more than this URL: it is also what `isTrustedReleaseUrl` (frontend) and
+// `RELEASE_TAG_PATH_PREFIX` below allow-list — keep all three in sync.
 const RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/mikedamoiseau/folio/releases/latest";
+    "https://api.github.com/repos/mikedamoiseau/carrel/releases/latest";
 
 /// Shared client + endpoint + tunable TTL/timeout + single-flight/cache state.
 /// The mutable part lives behind an `Arc` so the detached fetch task can own it.
@@ -212,7 +212,7 @@ async fn fetch_latest(
     timeout: Duration,
     current: &Version,
 ) -> Result<GitHubRelease, String> {
-    let user_agent = format!("Carrel/{current} (+https://github.com/mikedamoiseau/folio)");
+    let user_agent = format!("Carrel/{current} (+https://github.com/mikedamoiseau/carrel)");
     let resp = client
         .get(releases_url)
         .header(USER_AGENT, user_agent)
@@ -260,7 +260,7 @@ mod tests {
     fn rel(tag: &str, body: Option<&str>) -> GitHubRelease {
         GitHubRelease {
             tag_name: tag.to_string(),
-            html_url: "https://github.com/mikedamoiseau/folio/releases/tag/v2.8.0".to_string(),
+            html_url: "https://github.com/mikedamoiseau/carrel/releases/tag/v2.8.0".to_string(),
             body: body.map(|b| b.to_string()),
         }
     }
@@ -360,7 +360,7 @@ mod tests {
     fn deceptive_host_rejected() {
         let mut r = rel("v2.8.0", None);
         r.html_url =
-            "https://github.com.example.org/mikedamoiseau/folio/releases/tag/v2.8.0".into();
+            "https://github.com.example.org/mikedamoiseau/carrel/releases/tag/v2.8.0".into();
         assert_eq!(
             map_release(&r, &Version::parse("2.7.0").unwrap()).unwrap_err(),
             "malformed_response"
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn http_scheme_rejected() {
         let mut r = rel("v2.8.0", None);
-        r.html_url = "http://github.com/mikedamoiseau/folio/releases/tag/v2.8.0".into();
+        r.html_url = "http://github.com/mikedamoiseau/carrel/releases/tag/v2.8.0".into();
         assert_eq!(
             map_release(&r, &Version::parse("2.7.0").unwrap()).unwrap_err(),
             "malformed_response"
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn wrong_path_prefix_rejected() {
         let mut r = rel("v2.8.0", None);
-        r.html_url = "https://github.com/mikedamoiseau/folio/issues/1".into();
+        r.html_url = "https://github.com/mikedamoiseau/carrel/issues/1".into();
         assert_eq!(
             map_release(&r, &Version::parse("2.7.0").unwrap()).unwrap_err(),
             "malformed_response"
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn userinfo_spoof_rejected() {
         let mut r = rel("v2.8.0", None);
-        r.html_url = "https://github.com@evil.com/mikedamoiseau/folio/releases/tag/v2.8.0".into();
+        r.html_url = "https://github.com@evil.com/mikedamoiseau/carrel/releases/tag/v2.8.0".into();
         assert_eq!(
             map_release(&r, &Version::parse("2.7.0").unwrap()).unwrap_err(),
             "malformed_response"
@@ -404,7 +404,7 @@ mod tests {
     fn body_json(tag: &str) -> serde_json::Value {
         serde_json::json!({
             "tag_name": tag,
-            "html_url": "https://github.com/mikedamoiseau/folio/releases/tag/v2.8.0",
+            "html_url": "https://github.com/mikedamoiseau/carrel/releases/tag/v2.8.0",
             "body": "release notes"
         })
     }

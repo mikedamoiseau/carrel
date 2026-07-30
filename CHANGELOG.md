@@ -5,7 +5,25 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Folio is now called Carrel.** The app, its window title, its icon, and its
+  GitHub home have all been renamed. Your library, reading progress, highlights,
+  settings, profiles, and offline downloads are untouched and carry over as-is —
+  nothing to migrate and nothing to re-import.
+  - Most installers treat a renamed app as a new one, so Carrel generally arrives
+    *next to* Folio instead of replacing it. The Windows `.msi` is the exception
+    and upgrades in place. Everywhere else, remove the old app once Carrel is
+    running — drag `Folio.app` to the Trash on macOS, uninstall "Folio" from
+    **Settings → Apps** if you used the Windows `-setup.exe`, or
+    `sudo apt remove folio` on Linux. Removing it does not touch your library.
+  - If you connect to the app from a phone or tablet, the web reader is
+    unchanged — the same address, the same PIN, and anything you saved for
+    offline reading stays saved.
+
 ### Added
+- **A User Guide link in the app.** A **?** button in the top bar and a
+  **User Guide** item in the tray menu open the online user guide in your
+  browser.
 - **The web API can list and switch profiles.** `GET /api/profiles` reports each
   profile with whether it's active, has a lock, and can be switched into;
   `POST /api/profile` switches the active profile for the whole server (desktop

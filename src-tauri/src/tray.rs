@@ -6,6 +6,10 @@ use tauri::{
 
 use crate::commands::AppState;
 
+/// damoiseau.xyz path is mid-migration from `folio` to `carrel` — this is the
+/// post-migration URL, prepared ahead of the site catching up.
+const USER_GUIDE_URL: &str = "https://damoiseau.xyz/docs/carrel/user-guide/";
+
 /// Build (or rebuild) the tray menu showing both surface toggles.
 pub fn build_tray_menu(
     app: &AppHandle,
@@ -16,6 +20,7 @@ pub fn build_tray_menu(
     let show_item = MenuItemBuilder::with_id("show", "Show Carrel").build(app)?;
     let whats_new = MenuItemBuilder::with_id("whats_new", "What's New").build(app)?;
     let check_update = MenuItemBuilder::with_id("check_update", "Check for Updates").build(app)?;
+    let user_guide = MenuItemBuilder::with_id("user_guide", "User Guide").build(app)?;
 
     let open_webui = MenuItemBuilder::with_id("open_webui", "Open Web UI")
         .enabled(server_running && web_ui_enabled)
@@ -45,6 +50,7 @@ pub fn build_tray_menu(
         .item(&show_item)
         .item(&whats_new)
         .item(&check_update)
+        .item(&user_guide)
         .item(&open_webui)
         .item(&sep1)
         .item(&web_ui_toggle)
@@ -133,6 +139,9 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                         let _ = w.emit("check-update-open", ());
                     }
                 }
+            }
+            "user_guide" => {
+                let _ = open::that(USER_GUIDE_URL);
             }
             "open_webui" => {
                 let state = app.state::<AppState>();

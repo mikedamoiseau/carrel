@@ -6740,7 +6740,7 @@ pub async fn set_setting_value(
 /// is pinned in [`DICTIONARY_SHA256`]. Rebuild the artifact with
 /// `scripts/build-dictionary-artifact.sh` if it ever needs regenerating.
 const DICTIONARY_URL: &str =
-    "https://github.com/mikedamoiseau/folio/releases/download/dictionary-v1/dictionary-v1.db.gz";
+    "https://github.com/mikedamoiseau/carrel/releases/download/dictionary-v1/dictionary-v1.db.gz";
 
 /// SHA-256 of the gzipped artifact (`dictionary-v1.db.gz`), verified against the
 /// live `dictionary-v1` release asset (see [`DICTIONARY_URL`]). A checksum

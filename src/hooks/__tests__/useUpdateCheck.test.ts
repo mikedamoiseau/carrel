@@ -20,8 +20,8 @@ const AVAILABLE = {
   update_available: true,
   current_version: "2.7.0",
   latest_version: "2.8.0",
-  release_url: "https://github.com/mikedamoiseau/folio/releases/tag/v2.8.0",
-  changelog_url: "https://github.com/mikedamoiseau/folio/releases",
+  release_url: "https://github.com/mikedamoiseau/carrel/releases/tag/v2.8.0",
+  changelog_url: "https://github.com/mikedamoiseau/carrel/releases",
   release_notes: "notes",
 };
 

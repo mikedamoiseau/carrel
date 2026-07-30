@@ -17,7 +17,7 @@
 #
 # Release step (run manually once the asset is built, gh authenticated):
 #   gh release create dictionary-v1 build/dictionary/dictionary-v1.db.gz \
-#       --repo mikedamoiseau/folio --latest=false \
+#       --repo mikedamoiseau/carrel --latest=false \
 #       --title "Dictionary v1 (WordNet 3.1)" \
 #       --notes "Offline dictionary artifact. Definitions from Princeton WordNet 3.1."
 #

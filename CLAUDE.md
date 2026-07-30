@@ -30,7 +30,8 @@ The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, 
 
 ### Legacy `folio` identifiers — do not rename
 
-The app was renamed Folio → Carrel in 2.11.x. Identifiers below still say
+The app was renamed Folio → Carrel on `main` after `v2.11.1` (the last release
+that shipped as Folio). Identifiers below still say
 `folio` **on purpose**, because something outside this repo already depends on
 the exact string. Never run a blind `s/folio/carrel/g`.
 
@@ -46,13 +47,33 @@ the exact string. Never run a blind `s/folio/carrel/g`.
 | `folio_session` cookie, `x-folio-profile` header | `web_server/` + `static/` | break offline-cached `app.js`/`sw.js`, which still send and read the old names |
 | `folio-shell-*`, `folio-offline-book-*`, `folio-offline-scope` | `static/sw.js`, `static/app.js` | orphan every offline-saved book on every user's device |
 | `folio-*` / `folio_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
-| `mikedamoiseau/folio` | `src-tauri/src/update.rs` | break the update-check release-URL allowlist (the GitHub repo is not renamed) |
 | `FOLIO_APTABASE_KEY`, `FOLIO_LOG`, `FOLIO_DEBUG_PAGES`, `FOLIO_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
 | `folio-core`, `FolioError`, `FolioResult`, `FolioEvent` | `folio-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
+| `21c2cdba-327a-5023-94aa-a2fbf307774c` | `tauri.conf.json` `bundle.windows.wix.upgradeCode` | make every Windows MSI install **side-by-side** with the user's existing install instead of upgrading it in place |
+
+The WiX upgrade code deserves a note, since it is the one entry that is a bare
+UUID rather than a readable string. Tauri derives it by default from
+`uuid5(DNS, "{productName}.exe.app.x64")` — so it *changed* when `productName`
+went Folio → Carrel. `21c2cdba…` is `uuid5(DNS, "Folio.exe.app.x64")`, the value
+every shipped Folio MSI actually carries (verified by reading the `UpgradeCode`
+property out of `Folio_2.11.1_x64_en-US.msi`). Pinning it means WiX
+`MajorUpgrade` still recognizes the old install — it matches on upgrade code
+alone, so the changed `ProductName` no longer matters. Check it with
+`npx tauri inspect wix-upgrade-code`, which prints both the derived default and
+the override. Never change this value, including on any future rename.
 
 `CHANGELOG.md`, `docs/superpowers/`, and `src-tauri/.pr-reviews/` keep saying
 Folio too: they are historical records of releases and work that shipped under
 that name.
+
+**Update (2026-07-30):** the GitHub repo itself was renamed `mikedamoiseau/folio`
+→ `mikedamoiseau/carrel`. `mikedamoiseau/folio` was removed from the table above
+and updated to `mikedamoiseau/carrel` everywhere it was load-bearing
+(`src-tauri/src/update.rs`'s release-URL allowlist, `UpdateModal.tsx`'s
+`isTrustedReleaseUrl`/`isTrustedChangelogUrl`, the dictionary-download URL in
+`commands.rs`, and doc links). GitHub 301-redirects the old slug, but don't rely
+on that — it isn't guaranteed to last. The local `origin` remote still points at
+the old URL; update it with `git remote set-url origin git@github.com:mikedamoiseau/carrel.git`.
 
 The embedded web UI (`src-tauri/src/web_server/static/`: `index.html` + `app.js` + `app.css`, served via `include_str!`/`include_bytes!`) is a hand-written vanilla-JS SPA, independent of the React desktop frontend — it shares no code or styling with `src/`. Its service worker's `CACHE_VERSION` (`static/sw.js`) is a content hash of the shell assets, enforced by a test — bump it whenever those files change.
 

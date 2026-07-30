@@ -2900,7 +2900,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               <p className="text-xs text-ink-muted pt-1">
                 {t("settings.aboutFullNotice")}{" "}
                 <a
-                  href="https://github.com/mikedamoiseau/folio/blob/main/THIRD_PARTY_LICENSES.md"
+                  href="https://github.com/mikedamoiseau/carrel/blob/main/THIRD_PARTY_LICENSES.md"
                   target="_blank"
                   rel="noreferrer"
                   className="text-accent hover:underline"

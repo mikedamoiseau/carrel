@@ -204,6 +204,27 @@ function AppShell() {
           </button>
           <PrivateModeToggle />
           <LanguageSwitcher />
+          {/* damoiseau.xyz path is mid-migration from folio to carrel; this is the post-migration URL */}
+          <a
+            href="https://damoiseau.xyz/docs/carrel/user-guide/"
+            target="_blank"
+            rel="noreferrer"
+            className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
+            aria-label="User guide"
+            title="User guide"
+          >
+            <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+              <circle cx="10" cy="10" r="7.5" stroke="currentColor" strokeWidth="1.5" />
+              <path
+                d="M7.6 7.8a2.4 2.4 0 114.15 1.65c-.5.5-1.15.85-1.15 1.85"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <circle cx="10" cy="14" r="0.9" fill="currentColor" />
+            </svg>
+          </a>
           <button
             onClick={() => setSettingsOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
