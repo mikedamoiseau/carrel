@@ -61,7 +61,7 @@ snake_case params.
 ```bash
 cargo test                                              # from src-tauri/
 cargo clippy --workspace --all-targets -- -D warnings   # from repo root
-npm run type-check
+pnpm run type-check                                     # from repo root
 ```
 
 ## Common Mistakes

@@ -13,12 +13,16 @@ cargo fmt --all --check
 
 The toolchain is pinned in `rust-toolchain.toml` (currently `1.96.0`); CI uses the same version via `dtolnay/rust-toolchain@1.96.0`, so local and CI rustfmt/clippy never drift. Bump both together.
 
-Running `cargo test` from `src-tauri/` only exercises the `carrel` crate — `carrel-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
+Running `cargo test` from `src-tauri/` only exercises the `carrel` crate with *default* features — `carrel-core` has its own test binary that is not compiled by that invocation, and the `mobi` feature changes which assertions compile. There are therefore **three** distinct Rust test invocations, and CI runs all three:
 ```bash
-cargo test -p carrel-core --features mobi
+cd src-tauri && cargo test                                  # carrel, default features
+cd src-tauri && cargo test --features mobi                  # carrel, libmobi-gated arms
+cargo test -p carrel-core --features mobi -- --test-threads=1   # carrel-core (workspace root)
 ```
 
-`npm run test:e2e` runs against a seeded harness (`src-tauri/examples/web_e2e_server.rs`); Playwright manages the server's lifecycle (build, start, health-check, teardown), so no manual setup is needed.
+The middle one is easy to miss and is not redundant: `src-tauri/src/commands.rs` and `web_server/api.rs` carry paired `#[cfg(feature = "mobi")]` / `#[cfg(not(feature = "mobi"))]` test arms, so the default run and the `--features mobi` run assert *different* things. The `--test-threads=1` on the carrel-core run mirrors CI's Linux job, which serialises it because libmobi's C-side cleanup races across threads there — parallel drops can double-free shared internal state and SIGABRT *after* a passing test (see the comment on that step in `ci.yml`). CI's Windows job omits the flag; keeping it locally is harmless and matches the strictest job.
+
+`pnpm run test:e2e` runs against a seeded harness (`src-tauri/examples/web_e2e_server.rs`); Playwright manages the server's lifecycle (build, start, health-check, teardown), so no manual setup is needed. First run in a fresh clone needs `pnpm exec playwright install --with-deps chromium`.
 
 MOBI tests require a public-domain test corpus under `src-tauri/test-fixtures/` (gitignored). Populate once with `./scripts/fetch-mobi-test-corpus.sh`. Fixture-gated tests skip with a clear message when fixtures are absent, so fresh clones stay green without the corpus.
 
@@ -99,7 +103,7 @@ Covered by project skills — invoke them instead of working from memory: `add-t
 
 ## Format Support
 
-PDF support requires pdfium binaries bundled in `src-tauri/resources/`. The `scripts/download-pdfium.sh` script fetches them. Run `./scripts/download-pdfium.sh` before first `npm run tauri dev` — PDF import/rendering won't work without it.
+PDF support requires pdfium binaries bundled in `src-tauri/resources/`. The `scripts/download-pdfium.sh` script fetches them. Run `./scripts/download-pdfium.sh` before first `pnpm run tauri dev` — PDF import/rendering won't work without it.
 
 ### macOS Tahoe C++ Header Fix
 
@@ -119,7 +123,7 @@ This is added to Mike's `~/.zshrc`. If builds fail with `fatal error: 'new' file
 
 **Surgical changes only.** Every changed line should trace directly to what was asked. Don't improve adjacent code, comments, or formatting. Don't refactor things that aren't broken. Match existing style. If you notice unrelated issues, mention them — don't fix them silently.
 
-**Verify before claiming done.** Transform tasks into verifiable goals: "fix the bug" means write a test that reproduces it, then make it pass. Run the actual commands (`cargo test`, `npm run test`, `npm run type-check`) and confirm output before saying something works. Evidence before assertions.
+**Verify before claiming done.** Transform tasks into verifiable goals: "fix the bug" means write a test that reproduces it, then make it pass. Run the actual commands (the gate table under "CI" below) and confirm output before saying something works. Evidence before assertions.
 
 ## Security
 
@@ -132,5 +136,36 @@ This is added to Mike's `~/.zshrc`. If builds fail with `fatal error: 'new' file
 
 ## CI
 
-**Before pushing:** Always run the full CI check suite locally. A pre-push git hook enforces this:
-`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` (from repo root — both cover carrel-core), then `cargo test` (in `src-tauri/`), then `npm run type-check && npm run test` (in root). When touching MOBI code also run `cargo test -p carrel-core --features mobi` from the workspace root — `src-tauri/`'s `cargo test` does not compile carrel-core's test binary.
+**The package manager is `pnpm`, not npm.** CI runs `pnpm install` and `pnpm run …`; `pnpm-lock.yaml` is the lockfile CI resolves against. A stale `package-lock.json` is also checked in and `package.json` has no `packageManager` field, so nothing stops `npm install` from succeeding locally with a *different* dependency tree than CI installed. Use pnpm.
+
+### The full gate set
+
+This is the authoritative list — every command CI runs, and the directory it runs from. Run all of them before pushing:
+
+| Gate | Command | From |
+|---|---|---|
+| Format | `cargo fmt --all --check` | repo root |
+| Lint | `cargo clippy --workspace --all-targets -- -D warnings` | repo root |
+| Lint (mobi) | `cargo clippy --workspace --all-targets --features mobi -- -D warnings` | repo root |
+| Rust tests | `cargo test` | `src-tauri/` |
+| Rust tests (mobi) | `cargo test --features mobi` | `src-tauri/` |
+| Core tests (mobi) | `cargo test -p carrel-core --features mobi -- --test-threads=1` | repo root |
+| Type-check | `pnpm run type-check` | repo root |
+| Frontend tests | `pnpm run test` (Vitest) | repo root |
+| Web UI e2e | `pnpm run test:e2e` (Playwright) | repo root |
+
+Two `--workspace`/`-p` distinctions bite anything that scopes to one crate: clippy run inside `src-tauri/` never sees `carrel-core`, and `cargo test` inside `src-tauri/` never compiles carrel-core's test binary. Both need the workspace-level invocation above.
+
+### The pre-push hook is weaker than CI
+
+A pre-push hook runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, `cargo test` (in `src-tauri/`), `npm run type-check`, `npm run test`. That is **five of the nine gates** — it does not run either mobi clippy/test variant, the carrel-core test binary, or the e2e suite, and it still shells out to `npm`. A green hook is not a green CI. Run the table above yourself; do not treat the hook as the gate, and never bypass it with `--no-verify`.
+
+### CI only triggers on `main`
+
+`.github/workflows/ci.yml` is `on: push: branches: [main]` and `pull_request: branches: [main]`. **Pushing a feature or epic branch triggers no run at all.** An absent run looks identical to a passing one in `gh run list` output, so a branch push with no PR reads as "no failures" when it means "nothing was checked". To get CI on a branch, open a PR targeting `main` (a draft PR is enough) and watch `gh pr checks <branch>`.
+
+Jobs: `Rust Tests` (ubuntu), `Rust Lint`, `Rust Tests (macOS, --features mobi)`, `Rust Tests (Windows, --features mobi)`, `Frontend TypeScript Check`, `Web UI E2E`.
+
+### User-facing docs to update alongside a change
+
+There is no `ROADMAP.md` in this repo. The docs that track user-visible change are `CHANGELOG.md` (entries accrue under `## [Unreleased]` until a release is cut), `README.md` (only if the feature list or a documented behavior changed), `docs/USER_GUIDE.md`, and `docs/backlog/` for deferred work.
