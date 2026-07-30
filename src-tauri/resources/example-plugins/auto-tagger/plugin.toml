@@ -3,7 +3,7 @@ id = "auto-tagger"
 name = "Auto Tagger"
 version = "1.0.0"
 description = "Tags newly imported books automatically by format."
-author = "Folio"
+author = "Carrel"
 min_app_version = "2.3.0"
 
 [events]

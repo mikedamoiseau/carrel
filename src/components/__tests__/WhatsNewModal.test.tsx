@@ -6,7 +6,7 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, string>) => {
       const map: Record<string, string> = {
-        "whatsNew.modalTitle": `What's New in Folio ${opts?.version ?? ""}`,
+        "whatsNew.modalTitle": `What's New in Carrel ${opts?.version ?? ""}`,
         "whatsNew.modalFullChangelog": "See full changelog",
       };
       return map[key] ?? key;
@@ -39,7 +39,7 @@ afterEach(() => cleanup());
 describe("WhatsNewModal", () => {
   it("renders title with version", () => {
     render(<WhatsNewModal release={release} onClose={() => {}} />);
-    expect(screen.getByText("What's New in Folio 2.0.3")).toBeInTheDocument();
+    expect(screen.getByText("What's New in Carrel 2.0.3")).toBeInTheDocument();
   });
 
   it("renders category headings", () => {

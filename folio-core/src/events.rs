@@ -150,7 +150,7 @@ impl EventBus {
         // The thread exits when every sender is dropped (recv() errs), so a
         // test-local bus tears down with the bus itself.
         thread::Builder::new()
-            .name("folio-events".into())
+            .name("carrel-events".into())
             .spawn(move || {
                 while let Ok(event) = receiver.recv() {
                     let mut listeners = thread_listeners
@@ -168,7 +168,7 @@ impl EventBus {
                     }
                 }
             })
-            .expect("failed to spawn folio-events dispatch thread");
+            .expect("failed to spawn carrel-events dispatch thread");
 
         Self {
             sender,

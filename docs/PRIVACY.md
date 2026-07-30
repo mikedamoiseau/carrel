@@ -1,11 +1,11 @@
 # Privacy
 
-Folio is a local-first desktop app. Your library, reading progress, highlights,
+Carrel is a local-first desktop app. Your library, reading progress, highlights,
 and settings stay on your device.
 
 ## Usage analytics (opt-in, off by default)
 
-To understand how many people use Folio, the app can send a single anonymous
+To understand how many people use Carrel, the app can send a single anonymous
 event — `app_started` — once per launch, but **only after you explicitly opt in**.
 Nothing is sent until you choose "Enable" on the first-run prompt or in Settings.
 
@@ -14,7 +14,7 @@ acting as our data processor. **Legal basis:** your consent (GDPR Art. 6(1)(a)),
 which you can withdraw at any time.
 
 **What is sent** (by the Aptabase SDK, with the `app_started` event):
-operating system name and version, Folio's app version, your locale, the webview
+operating system name and version, Carrel's app version, your locale, the webview
 engine name/version, a short-lived random session id, and two pieces of
 non-identifying technical metadata — a debug-build flag (`isDebug`) and the
 Aptabase SDK's own name and version (`sdkVersion`).
@@ -22,7 +22,7 @@ Aptabase SDK's own name and version (`sdkVersion`).
 **What is never sent:** book titles, authors, file paths, library contents,
 reading progress, highlights, or any stable identifier for you or your install.
 
-**Identity:** Folio transmits no user or install identifier. Aptabase derives a
+**Identity:** Carrel transmits no user or install identifier. Aptabase derives a
 short-lived, salted **pseudonymous** identifier server-side from your IP address
 and user agent to approximate unique-client counts. Data is retained by Aptabase
 per their [privacy policy](https://aptabase.com/legal/privacy).

@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn validate_write_grants_rejects_missing_path() {
-        let missing = std::env::temp_dir().join("folio-no-such-dir-1234567890");
+        let missing = std::env::temp_dir().join("carrel-no-such-dir-1234567890");
         let grants = vec![(
             Permission::WriteFiles,
             Some(missing.to_string_lossy().to_string()),

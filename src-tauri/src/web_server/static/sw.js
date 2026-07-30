@@ -16,13 +16,18 @@
 // asset worth precaching separately from `/favicon.png`.
 //
 // Secure-context caveat: service workers only register on secure contexts
-// (https, or http://localhost). Folio's primary LAN use case — a phone
+// (https, or http://localhost). Carrel's primary LAN use case — a phone
 // hitting http://192.168.x.x:7788 — is plain HTTP and NOT a secure context,
 // so the service worker will not register there and this cache never
 // activates; app.js's registration call is feature-detected/try-catched so
 // this is silent, not an error. The manifest + icons still work for iOS
 // Safari "Add to Home Screen" over plain HTTP.
-const CACHE_VERSION = "folio-shell-95a6b61eae7f";
+//
+// The `folio-` prefix on this and the two cache names below outlived the Carrel
+// rename on purpose: these name caches already sitting in every user's browser,
+// and renaming them orphans every offline-saved book. Only the trailing content
+// hash is meant to change. See CLAUDE.md, "Legacy `folio` identifiers".
+const CACHE_VERSION = "folio-shell-bafd953daae5";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW

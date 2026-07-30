@@ -1,4 +1,4 @@
-// Highlight Exporter — example Folio plugin.
+// Highlight Exporter — example Carrel plugin.
 //
 // Reacts to HighlightCreated and appends the new highlight to a Markdown
 // file named after the book, inside the export folder you chose when you

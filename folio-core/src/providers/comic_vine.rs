@@ -3,7 +3,7 @@ use super::{EnrichmentData, EnrichmentProvider, ProviderConfig};
 use crate::error::{FolioError, FolioResult};
 
 const BASE_URL: &str = "https://comicvine.gamespot.com/api";
-const USER_AGENT: &str = "Folio/1.0 (Desktop eBook Reader)";
+const USER_AGENT: &str = "Carrel/1.0 (Desktop eBook Reader)";
 
 #[derive(Default)]
 pub struct ComicVineProvider {

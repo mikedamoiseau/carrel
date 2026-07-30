@@ -1,6 +1,6 @@
 ---
 name: db-schema-migration
-description: Use when changing Folio's SQLite schema — adding a table or column, altering the books/collections/etc. tables, or modifying db.rs::run_schema. Also when an existing install must keep working after the change (no destructive migrations).
+description: Use when changing Carrel's SQLite schema — adding a table or column, altering the books/collections/etc. tables, or modifying db.rs::run_schema. Also when an existing install must keep working after the change (no destructive migrations).
 ---
 
 # Database Schema Migration

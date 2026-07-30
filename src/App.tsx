@@ -165,7 +165,7 @@ function AppShell() {
             to="/"
             className="font-serif text-xl font-semibold tracking-tight text-ink hover:text-accent transition-colors duration-150"
           >
-            Folio
+            Carrel
           </Link>
           <ProfileSwitcher onSwitch={handleProfileSwitch} />
           <div className="flex-1" />

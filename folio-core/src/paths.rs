@@ -7,6 +7,11 @@ use crate::error::{FolioError, FolioResult};
 /// Default library folder for book storage. Resolves to
 /// `~/Documents/Folio Library` on every supported platform.
 ///
+/// The folder name still says "Folio" after the Carrel rename, deliberately:
+/// this is an unwritten *fallback*, not a stored setting, so every install that
+/// never changed `library_folder` would silently lose its library if the string
+/// moved. See CLAUDE.md, "Legacy `folio` identifiers".
+///
 /// Returns a `FolioError::Internal` when the user's home directory cannot be
 /// resolved (very rare — typically means `$HOME` is unset and no platform
 /// fallback worked).

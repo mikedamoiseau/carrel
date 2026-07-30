@@ -51,7 +51,7 @@ pub fn is_available() -> bool {
 // ---- Internal helpers ----
 
 /// Global lock serializing every pdfium operation. pdfium (the C library) is
-/// not thread-safe, and folio links the crate's default single-threaded
+/// not thread-safe, and carrel links the crate's default single-threaded
 /// bindings, so two renders touching pdfium's global state concurrently is
 /// undefined behavior. Renders run on the blocking pool (foreground page loads
 /// and the background prerender pass), which can overlap — so each pdfium user

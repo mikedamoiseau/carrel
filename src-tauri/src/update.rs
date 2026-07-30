@@ -72,6 +72,10 @@ fn validate_release_url(raw: &str) -> Result<(), String> {
     }
 }
 
+// The GitHub repo is still `mikedamoiseau/folio` after the Carrel rename, and
+// the slug is load-bearing in more than this URL: it is also what
+// `isTrustedReleaseUrl` (frontend) and `RELEASE_TAG_PATH_PREFIX` below allow-list.
+// See CLAUDE.md, "Legacy `folio` identifiers".
 const RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/mikedamoiseau/folio/releases/latest";
 
@@ -208,7 +212,7 @@ async fn fetch_latest(
     timeout: Duration,
     current: &Version,
 ) -> Result<GitHubRelease, String> {
-    let user_agent = format!("Folio/{current} (+https://github.com/mikedamoiseau/folio)");
+    let user_agent = format!("Carrel/{current} (+https://github.com/mikedamoiseau/folio)");
     let resp = client
         .get(releases_url)
         .header(USER_AGENT, user_agent)
@@ -416,7 +420,7 @@ mod tests {
             .and(path("/x"))
             .and(header("accept", "application/vnd.github+json"))
             .and(header("x-github-api-version", "2022-11-28"))
-            .and(header_regex("user-agent", "^Folio/"))
+            .and(header_regex("user-agent", "^Carrel/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body_json("v2.8.0")))
             .expect(1)
             .mount(&server)

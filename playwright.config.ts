@@ -3,7 +3,7 @@ import { defineConfig } from "@playwright/test";
 // Single source of truth for the web-UI end-to-end suite. Playwright
 // auto-discovers this root config, so both `npx playwright test` and
 // `pnpm run test:e2e` run the same specs against the same deterministic,
-// seeded Folio web server — see `src-tauri/examples/web_e2e_server.rs` for
+// seeded Carrel web server — see `src-tauri/examples/web_e2e_server.rs` for
 // the exact fixture set (130 books, known progress / zero-chapter / CBZ
 // books) the specs in `e2e/` assert against.
 //

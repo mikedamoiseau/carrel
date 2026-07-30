@@ -845,6 +845,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrel"
+version = "2.11.1"
+dependencies = [
+ "ammonia",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "dirs 5.0.1",
+ "folio-core",
+ "form_urlencoded",
+ "image",
+ "keyring",
+ "libc",
+ "log",
+ "mime_guess",
+ "objc2",
+ "objc2-app-kit",
+ "open",
+ "opendal",
+ "pdfium-render",
+ "qrcode",
+ "quick-xml 0.36.2",
+ "r2d2",
+ "r2d2_sqlite",
+ "regex",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "secrecy",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-aptabase",
+ "tauri-plugin-autostart",
+ "tauri-plugin-clipboard-manager",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tauri-plugin-webdriver-automation",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unrar",
+ "url",
+ "urlencoding",
+ "uuid",
+ "wiremock",
+ "zip",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1859,63 +1916,6 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
-name = "folio"
-version = "2.11.1"
-dependencies = [
- "ammonia",
- "axum",
- "base64 0.22.1",
- "chrono",
- "dirs 5.0.1",
- "folio-core",
- "form_urlencoded",
- "image",
- "keyring",
- "libc",
- "log",
- "mime_guess",
- "objc2",
- "objc2-app-kit",
- "open",
- "opendal",
- "pdfium-render",
- "qrcode",
- "quick-xml 0.36.2",
- "r2d2",
- "r2d2_sqlite",
- "regex",
- "reqwest 0.12.28",
- "rusqlite",
- "secrecy",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-aptabase",
- "tauri-plugin-autostart",
- "tauri-plugin-clipboard-manager",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tauri-plugin-webdriver-automation",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "unrar",
- "url",
- "urlencoding",
- "uuid",
- "wiremock",
- "zip",
-]
 
 [[package]]
 name = "folio-core"

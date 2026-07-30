@@ -3,7 +3,7 @@ id = "stats-notifier"
 name = "Stats Notifier"
 version = "1.0.0"
 description = "Shows a desktop notification when you finish a book."
-author = "Folio"
+author = "Carrel"
 min_app_version = "2.3.0"
 
 [events]

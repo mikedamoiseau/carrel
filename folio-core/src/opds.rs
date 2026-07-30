@@ -14,9 +14,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// with `Mozilla/`. The "compatible" pattern is the long-standing way
 /// for non-browser clients to identify themselves while still passing
 /// these filters — feedreaders like NewsBlur and Feedbin use the same
-/// shape. Server logs still see "Folio" so honest identification is
+/// shape. Server logs still see "Carrel" so honest identification is
 /// preserved.
-const OPDS_USER_AGENT: &str = "Mozilla/5.0 (compatible; Folio/1.4; OPDS reader)";
+const OPDS_USER_AGENT: &str = "Mozilla/5.0 (compatible; Carrel/1.4; OPDS reader)";
 
 /// Maximum response body size (5 MB) to prevent DoS via large feeds.
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;

@@ -1,4 +1,4 @@
-//! Unified error type for the Folio backend (#55).
+//! Unified error type for the Carrel backend (#55).
 //!
 //! All fallible operations across the Rust backend return
 //! [`FolioResult<T>`] = `Result<T, FolioError>`. The enum is categorized so
@@ -42,7 +42,7 @@
 use serde::{Serialize, Serializer};
 use std::fmt;
 
-/// Categorized error for all Folio backend operations.
+/// Categorized error for all Carrel backend operations.
 #[derive(Debug)]
 pub enum FolioError {
     /// Entity does not exist (book, file, setting row, page index, etc.).
@@ -306,7 +306,7 @@ impl From<image::ImageError> for FolioError {
     }
 }
 
-/// Canonical `Result` alias for the Folio backend.
+/// Canonical `Result` alias for the Carrel backend.
 pub type FolioResult<T> = Result<T, FolioError>;
 
 #[cfg(test)]

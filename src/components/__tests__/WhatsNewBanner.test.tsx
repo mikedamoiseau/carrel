@@ -8,7 +8,7 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, string>) => {
       const map: Record<string, string> = {
-        "whatsNew.bannerTitle": `Folio ${opts?.version ?? ""}`,
+        "whatsNew.bannerTitle": `Carrel ${opts?.version ?? ""}`,
         "whatsNew.bannerSummary": `${opts?.title ?? ""} and more`,
         "whatsNew.bannerCta": "See what's new",
         "reader.dismiss": "Dismiss",
@@ -30,7 +30,7 @@ describe("WhatsNewBanner", () => {
 
   it("renders version and summary", () => {
     render(<WhatsNewBanner {...props} />);
-    expect(screen.getByText("Folio 2.0.3")).toBeInTheDocument();
+    expect(screen.getByText("Carrel 2.0.3")).toBeInTheDocument();
     expect(screen.getByText("OPDS feed primitives and more")).toBeInTheDocument();
   });
 

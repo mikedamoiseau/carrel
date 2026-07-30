@@ -105,8 +105,8 @@ async fn data_export(State(state): State<WebState>) -> Result<Response, (StatusC
     let json = serde_json::to_string_pretty(&value).map_err(folio_status)?;
 
     let date = export_datestamp();
-    let inner_name = format!("folio-export-{date}.json");
-    let zip_name = format!("folio-export-{date}.zip");
+    let inner_name = format!("carrel-export-{date}.json");
+    let zip_name = format!("carrel-export-{date}.zip");
 
     let buf = {
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));

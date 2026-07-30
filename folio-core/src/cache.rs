@@ -1,4 +1,4 @@
-//! Reusable cache machinery shared by the desktop app and folio-server.
+//! Reusable cache machinery shared by the desktop app and Carrel Server.
 //!
 //! `LruCache` is the in-memory LRU (moved here from the app crate);
 //! `ManagedCache` + adapters arrive in later tasks.

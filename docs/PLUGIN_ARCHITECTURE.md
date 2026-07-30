@@ -1,6 +1,6 @@
 # Plugin system architecture
 
-How the plugin/hook system is built, for people working on Folio itself. If
+How the plugin/hook system is built, for people working on Carrel itself. If
 you just want to write a plugin, read [PLUGINS.md](./PLUGINS.md) instead — this
 document is about the machinery underneath it.
 
@@ -18,7 +18,7 @@ matters:
   permission model. It has no idea Tauri exists. Everything here is testable
   with a `tempfile` SQLite pool and a mock for the one trait it can't provide
   itself.
-- `src-tauri` (the `folio` crate) is the desktop shell. It supplies the OS
+- `src-tauri` (the `carrel` crate) is the desktop shell. It supplies the OS
   notification + book-import implementation, owns the manager instance, wires
   it onto the bus, and exposes the IPC commands the Settings UI calls.
 
@@ -391,7 +391,7 @@ uses (dedup, copy-on-import, `ImportSource::Download`).
 
 The manager itself lives in a `ManagerSlot` —
 `Arc<Mutex<Option<Arc<PluginManager>>>>`. The reason it's swappable is profiles.
-Folio supports multiple library profiles, each with its own database and
+Carrel supports multiple library profiles, each with its own database and
 plugins folder. Switching profiles has to rebuild the manager against the new
 DB, and an earlier version got this wrong by pinning the manager to the default
 profile's database (caught in the M2 review).
@@ -428,9 +428,10 @@ which fires `AppStarted` at one plugin (the bundled OPDS auto-downloader works
 this way). `run_now` refuses any plugin not subscribed to `AppStarted`, so the
 button can't be used to poke arbitrary scripts.
 
-A real scheduler is recorded as a follow-up in ROADMAP #47 because it depends on
-a background job queue (F-2-2) that doesn't exist yet. It was deferred on
-purpose, not forgotten.
+**Follow-up (do not lose):** recurring/scheduled plugin triggers — e.g. periodic
+OPDS auto-download — were deferred from plugins v1 on purpose, not forgotten.
+They depend on a background job queue (research report F-2-2) that doesn't
+exist yet. v1 ships `AppStarted` plus the manual **Run now** button only.
 
 ## Where things live
 

@@ -1,6 +1,6 @@
 ---
 name: add-book-format
-description: Use when adding support for a new e-book or comic format to Folio (e.g. FB2, DJVU, a new archive type) — creating a format parser module, adding a BookFormat variant, or wiring import/render dispatch for a file type the app can't yet open.
+description: Use when adding support for a new e-book or comic format to Carrel (e.g. FB2, DJVU, a new archive type) — creating a format parser module, adding a BookFormat variant, or wiring import/render dispatch for a file type the app can't yet open.
 ---
 
 # Add a Book Format

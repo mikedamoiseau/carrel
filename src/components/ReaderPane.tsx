@@ -80,7 +80,7 @@ interface ReadingProgress {
 // progress, navigation history, bookmarks, search, etc.) and the
 // content-area JSX. It receives `bookId` as a prop rather than reading
 // the route so the surrounding Reader screen can mount more than one
-// pane (for the upcoming split-view feature — see ROADMAP #40).
+// pane (for split view — see CHANGELOG 2.1.0).
 //
 // Global concerns that are not yet per-pane (settings panel, focus
 // mode, keyboard shortcuts help) still live inside this component for

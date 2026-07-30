@@ -1,4 +1,4 @@
-//! Tracing subscriber initialization for the Folio backend (F-2-3).
+//! Tracing subscriber initialization for the Carrel backend (F-2-3).
 //!
 //! The library crate (`folio-core`) only emits events/spans; this module —
 //! living in the binary — owns the single global subscriber. The

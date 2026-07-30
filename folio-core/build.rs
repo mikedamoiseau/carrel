@@ -27,7 +27,7 @@ fn build_libmobi_bindings() {
     // next to it that the OS loader (or an absolute Homebrew path)
     // must resolve at runtime. We link statically when:
     //   * Windows — always (release ships a single self-contained
-    //     `folio.exe`), or
+    //     `carrel.exe`), or
     //   * `LIBMOBI_STATIC` is set — the macOS release build points this
     //     at a from-source static `libmobi.a` so end users no longer
     //     need `brew install libmobi` (without it the app crashed on

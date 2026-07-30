@@ -1,6 +1,6 @@
 ---
 name: add-tauri-command
-description: Use when adding a new Tauri IPC command to Folio — exposing backend Rust to the React frontend, wiring invoke(), or when a newly written command returns "command not found" / isn't callable from the frontend.
+description: Use when adding a new Tauri IPC command to Carrel — exposing backend Rust to the React frontend, wiring invoke(), or when a newly written command returns "command not found" / isn't callable from the frontend.
 ---
 
 # Add a Tauri Command

@@ -3,7 +3,7 @@ import { expect } from "@wdio/globals";
 describe("Window Management", () => {
   it("should report the correct window title", async () => {
     const title = await browser.getTitle();
-    expect(title).toBe("Folio");
+    expect(title).toBe("Carrel");
   });
 
   it("should have a valid window size", async () => {

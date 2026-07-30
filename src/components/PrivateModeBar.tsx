@@ -12,7 +12,7 @@ import { usePrivateMode } from "../hooks/usePrivateMode";
  * and its popover. This strip's job is purely to make the app *look*
  * different while tracking is paused (cf. a browser's incognito chrome),
  * using the cool indigo `--private` hue that sits deliberately outside
- * Folio's warm palette.
+ * Carrel's warm palette.
  */
 export default function PrivateModeBar() {
   const { t } = useTranslation();

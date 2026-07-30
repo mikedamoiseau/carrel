@@ -156,6 +156,9 @@ fn book_to_entry(book: &Book) -> String {
         r#"<link rel="http://opds-spec.org/acquisition" href="/api/books/{id}/download/{id}.{ext}" type="{mime}" title="{title}.{ext}"/>"#
     );
 
+    // `urn:folio:*` ids throughout this module keep their pre-Carrel spelling:
+    // OPDS clients cache and dedupe on feed and entry ids. See CLAUDE.md,
+    // "Legacy `folio` identifiers".
     format!(
         r#"<entry>
   <title>{title}</title>
@@ -225,7 +228,7 @@ async fn root_catalog() -> Response {
     );
 
     let xml = wrap_feed(
-        "Folio Library",
+        "Carrel Library",
         "urn:folio:root",
         &entries,
         "/opds",

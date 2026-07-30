@@ -27,8 +27,11 @@ use std::fmt::Write as _;
 use crate::error::{FolioError, FolioResult};
 
 /// Keychain service prefix (Decision 10): namespaces profile-lock entries so
-/// they never collide with other Folio keychain users (backup secrets, the
+/// they never collide with other Carrel keychain users (backup secrets, the
 /// web PIN).
+///
+/// Still says `folio` after the Carrel rename — it keys profile-lock passwords
+/// already in the keychain. See CLAUDE.md, "Legacy `folio` identifiers".
 const KEYRING_SERVICE_PREFIX: &str = "com.mike.folio.profile-lock";
 /// Fixed account name — the service string (see [`keyring_key`]) is what
 /// varies per profile, mirroring the `backup.rs` convention of a

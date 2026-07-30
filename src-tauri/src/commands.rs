@@ -707,7 +707,7 @@ pub(crate) fn probe_dir_writable(dir: &std::path::Path) -> bool {
         return false;
     }
 
-    let probe = dir.join(format!(".folio-write-test-{}", Uuid::new_v4()));
+    let probe = dir.join(format!(".carrel-write-test-{}", Uuid::new_v4()));
     let result = std::fs::write(&probe, b"0").is_ok();
     // Best-effort cleanup regardless of whether the write succeeded.
     let _ = std::fs::remove_file(&probe);
@@ -3957,7 +3957,7 @@ const DEFAULT_CATALOGS: &[(&str, &str, &str)] = &[
 ];
 
 /// Build the trusted-host list for OPDS network calls. Every catalog the user
-/// (or Folio's defaults) has configured contributes its `host:port`, which
+/// (or Carrel's defaults) has configured contributes its `host:port`, which
 /// lets `is_safe_url_with_trusted` allow LAN/loopback servers the user
 /// explicitly added — without weakening SSRF protection on arbitrary
 /// feed-derived URLs from untrusted hosts.
@@ -4361,7 +4361,7 @@ pub(crate) fn import_book_from_url(state: &AppState, url: &str) -> FolioResult<S
             .unwrap_or_else(|| "import".to_string())
     };
 
-    let temp_path = std::env::temp_dir().join(format!("folio-plugin-{}.{}", Uuid::new_v4(), ext));
+    let temp_path = std::env::temp_dir().join(format!("carrel-plugin-{}.{}", Uuid::new_v4(), ext));
     let temp_str = temp_path.to_string_lossy().to_string();
     // SSRF-guarded on every redirect hop, with NO trusted-host relaxation:
     // a plugin must not reach the user's LAN catalogs, only public URLs.
@@ -4430,7 +4430,7 @@ pub async fn download_opds_book(
     _app: AppHandle,
 ) -> FolioResult<OpdsImportResult> {
     // Determine the file extension for the temp import path. Precedence:
-    //   1. URL suffix — Folio's own feed and many well-behaved feeds put the
+    //   1. URL suffix — Carrel's own feed and many well-behaved feeds put the
     //      extension in the path; this is the only signal that disambiguates
     //      the AZW / AZW3 pair since they share
     //      `application/vnd.amazon.ebook`.
@@ -4469,7 +4469,7 @@ pub async fn download_opds_book(
 
     // Download to a temp file
     let temp_dir = std::env::temp_dir();
-    let temp_name = format!("folio-opds-{}.{}", Uuid::new_v4(), ext);
+    let temp_name = format!("carrel-opds-{}.{}", Uuid::new_v4(), ext);
     let temp_path = temp_dir.join(&temp_name);
     let temp_str = temp_path.to_string_lossy().to_string();
 
@@ -7511,7 +7511,7 @@ fn friendly_sync_error(e: &crate::sync::SyncError) -> String {
                 .to_string()
         }
         crate::sync::SyncError::Malformed(_) => {
-            "Remote sync data is unreadable. It may have been created by a newer version of Folio."
+            "Remote sync data is unreadable. It may have been created by a newer version of Carrel."
                 .to_string()
         }
     }
@@ -9104,20 +9104,20 @@ mod tests {
     }
 
     #[test]
-    fn opds_url_disambiguates_folio_acquisition_urls() {
-        // Folio's own OPDS feed emits `/api/books/{id}/download/{id}.{ext}`
+    fn opds_url_disambiguates_carrel_acquisition_urls() {
+        // Carrel's own OPDS feed emits `/api/books/{id}/download/{id}.{ext}`
         // specifically so URL-based detection can disambiguate AZW from AZW3
         // when the MIME is the ambiguous `application/vnd.amazon.ebook`.
         assert_eq!(
-            opds_extension_from_url("https://folio.local/api/books/abc123/download/abc123.azw"),
+            opds_extension_from_url("https://carrel.local/api/books/abc123/download/abc123.azw"),
             Some("azw")
         );
         assert_eq!(
-            opds_extension_from_url("https://folio.local/api/books/abc123/download/abc123.azw3"),
+            opds_extension_from_url("https://carrel.local/api/books/abc123/download/abc123.azw3"),
             Some("azw3")
         );
         assert_eq!(
-            opds_extension_from_url("https://folio.local/api/books/abc123/download/abc123.mobi"),
+            opds_extension_from_url("https://carrel.local/api/books/abc123/download/abc123.mobi"),
             Some("mobi")
         );
     }
@@ -10981,7 +10981,7 @@ mod quote_card_tests {
 
     #[tokio::test]
     async fn save_quote_card_png_writes_bytes_to_path() {
-        let path = std::env::temp_dir().join(format!("folio-test-{}.png", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("carrel-test-{}.png", Uuid::new_v4()));
         let path_str = path.to_string_lossy().to_string();
         let bytes = vec![137, 80, 78, 71, 1, 2, 3];
 

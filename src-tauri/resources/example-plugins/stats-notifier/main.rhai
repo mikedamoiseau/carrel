@@ -1,4 +1,4 @@
-// Stats Notifier — example Folio plugin.
+// Stats Notifier — example Carrel plugin.
 //
 // Reacts to BookFinished (fired when you reach the last chapter of a book)
 // and shows a desktop notification.

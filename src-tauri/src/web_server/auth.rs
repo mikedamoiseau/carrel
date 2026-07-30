@@ -11,6 +11,11 @@ use super::WebState;
 use crate::db;
 use crate::error::{FolioError, FolioResult};
 
+// `folio-web-server` and the `folio_session` cookie name (see
+// `extract_cookie_token`) keep their pre-Carrel spelling: the first keys the
+// stored web PIN in the user's keychain, the second is still sent by
+// offline-cached copies of `static/app.js`. See CLAUDE.md, "Legacy `folio`
+// identifiers".
 const KEYRING_SERVICE: &str = "folio-web-server";
 const KEYRING_USER: &str = "pin";
 const SESSION_TTL_SECS: u64 = 86400; // 24 hours

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Folio's offline dictionary artifact from a WordNet 3.1 (WNdb-3.1) tarball.
+"""Build Carrel's offline dictionary artifact from a WordNet 3.1 (WNdb-3.1) tarball.
 
 Reads the `dict/` payload of `wn3.1.dict.tar.gz` and emits a self-contained,
 read-only SQLite database with the schema documented in

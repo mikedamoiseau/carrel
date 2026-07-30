@@ -105,7 +105,7 @@ cat <<EOF
 
 ==> libmobi installed to ${PREFIX}
 
-To build Folio with MOBI support using this local libmobi, export one of the
+To build Carrel with MOBI support using this local libmobi, export one of the
 following in your shell before running 'cargo' or 'npm run tauri':
 
   # Option A — pkg-config (preferred):

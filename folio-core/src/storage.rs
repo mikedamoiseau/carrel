@@ -1,8 +1,8 @@
-//! Storage abstraction for Folio's persistent artifacts.
+//! Storage abstraction for Carrel's persistent artifacts.
 //!
 //! Book files, covers, and related blobs are accessed through a `Storage`
 //! trait so the backend can be swapped (local filesystem today, S3 or other
-//! object stores in the paid `folio-server`). The desktop app uses
+//! object stores in the paid Carrel Server). The desktop app uses
 //! [`LocalStorage`] rooted at the library folder; on-disk layout stays
 //! identical to the pre-refactor code, with the one behavior *improvement*
 //! that overwriting writes are now atomic (temp-file + rename) so a failed
@@ -20,7 +20,7 @@
 //!
 //! # Roadmap
 //!
-//! See `docs/ROADMAP.md` #64.
+//! See CHANGELOG 2.0.0, "Pluggable `Storage` trait".
 
 use std::fs;
 use std::io::Write;
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{FolioError, FolioResult};
 
-/// Backend-agnostic interface for reading and writing Folio's persistent
+/// Backend-agnostic interface for reading and writing Carrel's persistent
 /// artifacts.
 ///
 /// All implementations must be thread-safe (`Send + Sync`). Keys must pass
@@ -69,7 +69,7 @@ pub trait Storage: Send + Sync {
     ///
     /// For [`LocalStorage`] this returns the underlying path directly.
     /// Remote backends must first materialize the object to a local cache
-    /// — those implementations are introduced in the paid `folio-server`
+    /// — those implementations are introduced in the paid Carrel Server
     /// crate.
     fn local_path(&self, key: &str) -> FolioResult<PathBuf>;
 }
@@ -251,7 +251,7 @@ impl Storage for LocalStorage {
 ///
 /// Public so callers outside this module with their own already-resolved
 /// absolute paths (e.g. the web server's cover-thumbnail cache in
-/// `folio::web_server::api`) can reuse the same atomicity guarantee instead
+/// `carrel::web_server::api`) can reuse the same atomicity guarantee instead
 /// of duplicating the temp-file-plus-rename dance.
 pub fn write_atomic<F>(dest: &Path, write: F) -> FolioResult<()>
 where
@@ -265,7 +265,9 @@ where
     // Unique sibling temp name so we can rename atomically onto `dest`.
     let tmp_name = format!(
         ".{}.tmp.{}",
-        dest.file_name().and_then(|n| n.to_str()).unwrap_or("folio"),
+        dest.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("carrel"),
         uuid::Uuid::new_v4()
     );
     let tmp_path = parent.join(tmp_name);

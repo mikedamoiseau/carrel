@@ -42,7 +42,7 @@ const SOURCE_CACHE_TMP_DIR: &str = "tmp";
 /// in parallel.
 ///
 /// This is an **in-process** primitive: `STAGE_LOCKS` is process-local, so two
-/// OS processes staging the same file would not serialize. Folio runs as a
+/// OS processes staging the same file would not serialize. Carrel runs as a
 /// single process (the embedded web server shares it), so this holds for the
 /// app as-is. Entries are kept for the process lifetime — one small
 /// `Arc<Mutex<()>>` per distinct file ever staged, bounded by the library size.

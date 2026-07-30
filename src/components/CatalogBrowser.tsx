@@ -187,7 +187,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
   }, [feed, searchQuery, t]);
 
   const handleDownload = useCallback(async (entry: OpdsEntry) => {
-    // Walk the Folio preference order (EPUB → PDF → CBZ → CBR → AZW3 → MOBI
+    // Walk the Carrel preference order (EPUB → PDF → CBZ → CBR → AZW3 → MOBI
     // → AZW) and pick the first matching link. If nothing matches, the UI
     // should already have hidden the button; bail out rather than pulling an
     // arbitrary non-importable link.

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Development Commands
 
-Lint and formatting are checked workspace-wide from the repo root (CI-enforced). Running them scoped to `src-tauri/` only covers the `folio` crate, not `folio-core`; omitting `--all-targets` skips test/example targets:
+Lint and formatting are checked workspace-wide from the repo root (CI-enforced). Running them scoped to `src-tauri/` only covers the `carrel` crate, not `folio-core`; omitting `--all-targets` skips test/example targets:
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy --workspace --all-targets --features mobi -- -D warnings  # libmobi-gated paths
@@ -13,7 +13,7 @@ cargo fmt --all --check
 
 The toolchain is pinned in `rust-toolchain.toml` (currently `1.96.0`); CI uses the same version via `dtolnay/rust-toolchain@1.96.0`, so local and CI rustfmt/clippy never drift. Bump both together.
 
-Running `cargo test` from `src-tauri/` only exercises the `folio` crate — `folio-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
+Running `cargo test` from `src-tauri/` only exercises the `carrel` crate — `folio-core` has its own test binary that is not compiled by that invocation. For MOBI changes always also run (from the workspace root):
 ```bash
 cargo test -p folio-core --features mobi
 ```
@@ -24,15 +24,41 @@ MOBI tests require a public-domain test corpus under `src-tauri/test-fixtures/` 
 
 ## Architecture
 
-**Tauri v2 desktop app** (branded "Folio") — Rust backend + React 19 frontend communicating via IPC. All data flows through Tauri's `invoke()` IPC bridge. Commands are registered in `src-tauri/src/lib.rs` via `invoke_handler` — every new command must be added there.
+**Tauri v2 desktop app** (branded "Carrel") — Rust backend + React 19 frontend communicating via IPC. All data flows through Tauri's `invoke()` IPC bridge. Commands are registered in `src-tauri/src/lib.rs` via `invoke_handler` — every new command must be added there.
 
-The backend is two crates: **`folio`** (`src-tauri/src/`) — the Tauri shell, IPC commands, and web server — and **`folio-core`** (`folio-core/src/`) — parsing, DB, and models, with no Tauri dependency.
+The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, IPC commands, and web server — and **`folio-core`** (`folio-core/src/`) — parsing, DB, and models, with no Tauri dependency.
+
+### Legacy `folio` identifiers — do not rename
+
+The app was renamed Folio → Carrel in 2.11.x. Identifiers below still say
+`folio` **on purpose**, because something outside this repo already depends on
+the exact string. Never run a blind `s/folio/carrel/g`.
+
+| Identifier | Where | Renaming it would… |
+|---|---|---|
+| `com.mike.folio` | `tauri.conf.json` `identifier` | orphan every install's app-data dir, macOS prefs domain, and keychain entries |
+| `com.mike.folio.profile-lock` | `folio-core/src/profile_lock.rs` | orphan every profile-lock password |
+| `folio-backup-{provider}-{key}` | `folio-core/src/backup.rs` | orphan every configured backup's stored SFTP/S3 credentials |
+| `folio-web-server` | `web_server/auth.rs` | orphan the stored web-UI PIN |
+| `Folio Library` | `folio-core/src/paths.rs` | silently relocate the library for every install that never set `library_folder` (it is an unwritten *fallback*, not a stored setting) |
+| `.folio-sync/…` | `folio-core/src/sync.rs` | orphan sync state already written to the user's own remote |
+| `urn:folio:*` | `web_server/opds_feed.rs` | break OPDS clients, which cache on feed/entry ids |
+| `folio_session` cookie, `x-folio-profile` header | `web_server/` + `static/` | break offline-cached `app.js`/`sw.js`, which still send and read the old names |
+| `folio-shell-*`, `folio-offline-book-*`, `folio-offline-scope` | `static/sw.js`, `static/app.js` | orphan every offline-saved book on every user's device |
+| `folio-*` / `folio_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
+| `mikedamoiseau/folio` | `src-tauri/src/update.rs` | break the update-check release-URL allowlist (the GitHub repo is not renamed) |
+| `FOLIO_APTABASE_KEY`, `FOLIO_LOG`, `FOLIO_DEBUG_PAGES`, `FOLIO_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
+| `folio-core`, `FolioError`, `FolioResult`, `FolioEvent` | `folio-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
+
+`CHANGELOG.md`, `docs/superpowers/`, and `src-tauri/.pr-reviews/` keep saying
+Folio too: they are historical records of releases and work that shipped under
+that name.
 
 The embedded web UI (`src-tauri/src/web_server/static/`: `index.html` + `app.js` + `app.css`, served via `include_str!`/`include_bytes!`) is a hand-written vanilla-JS SPA, independent of the React desktop frontend — it shares no code or styling with `src/`. Its service worker's `CACHE_VERSION` (`static/sw.js`) is a content hash of the shell assets, enforced by a test — bump it whenever those files change.
 
 ### Book Storage
 
-Books are copied into an app-managed library folder (default `~/Documents/folio/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
+Books are copied into an app-managed library folder (default `~/Documents/Folio Library/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
 
 ## Adding Common Things
 

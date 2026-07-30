@@ -1,4 +1,4 @@
-// OPDS Auto-Download — example Folio plugin.
+// OPDS Auto-Download — example Carrel plugin.
 //
 // Fetches an OPDS acquisition feed and imports books that aren't already in
 // your library. Triggered at app start (AppStarted) and by the "Run now"

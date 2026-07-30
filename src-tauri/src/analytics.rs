@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn absent_file_is_unset() {
         let dir =
-            std::env::temp_dir().join(format!("folio-analytics-absent-{}", std::process::id()));
+            std::env::temp_dir().join(format!("carrel-analytics-absent-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(consent_path(&dir));
         assert_eq!(read_consent(&dir), Consent::Unset);
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn malformed_file_is_unset() {
-        let dir = std::env::temp_dir().join(format!("folio-analytics-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("carrel-analytics-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(consent_path(&dir), b"not json").unwrap();
         assert_eq!(read_consent(&dir), Consent::Unset);
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn round_trip_enabled_then_disabled() {
-        let dir = std::env::temp_dir().join(format!("folio-analytics-rt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("carrel-analytics-rt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         write_consent(&dir, Consent::Enabled).unwrap();
         assert_eq!(read_consent(&dir), Consent::Enabled);

@@ -19,7 +19,7 @@ interface ReaderProps {
 /**
  * Reader screen — layout shell that mounts the per-book reading view.
  *
- * Single-pane today by default; split view (ROADMAP #40) mounts two
+ * Single-pane today by default; split view mounts two
  * panes side-by-side at a fixed 50/50 split. The user picks the
  * companion book through the BookPickerModal opened from the
  * companion pane's header. Active-pane focus is tracked here so

@@ -294,7 +294,7 @@ body:not(:has(.header))::before {
 .header h1 { font-size: 1.3rem; color: var(--accent); white-space: nowrap; }
 /* Reader + detail headers show the (potentially long) book title: let it grow
    into the row and wrap onto multiple lines instead of overflowing/truncating,
-   at an understated size so the content leads. (Library "Folio" h1 keeps the
+   at an understated size so the content leads. (Library "Carrel" h1 keeps the
    base 1.3rem accent style — it has no .nav-book-title class.) */
 .header h1.nav-book-title { flex: 1; min-width: 0; white-space: normal; overflow-wrap: anywhere; font-size: 0.95rem; font-weight: 600; line-height: 1.3; }
 .header input[type="search"] { flex: 1; padding: 8px 12px; background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius); color: var(--ink); font-size: 0.95rem; }

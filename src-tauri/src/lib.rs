@@ -31,7 +31,7 @@ use tauri::{Emitter, Manager};
 pub fn run() {
     // tauri-plugin-aptabase spawns its background flush task via bare
     // `tokio::spawn` at plugin-init, which requires an *entered* Tokio runtime
-    // on the current thread. Folio otherwise uses `tauri::async_runtime::spawn`
+    // on the current thread. Carrel otherwise uses `tauri::async_runtime::spawn`
     // (handle-based — no entered context needed), so the main thread has no
     // entered runtime by default and the plugin panics ("there is no reactor
     // running"). Enter Tauri's own runtime handle here and hold the guard for
