@@ -43,8 +43,22 @@ mkdir -p "${FIXTURES_DIR}"
 # example) surfaces as a checksum failure rather than a mysterious
 # smoke-test regression. Re-run with `FORCE=1` and update the hash
 # deliberately when Project Gutenberg reissues a file.
+#
+# Note on CI: ci.yml keys its fixture cache on `hashFiles()` of THIS script,
+# so *any* edit here — including a comment — invalidates the cache and forces
+# a real download. That is what surfaced the 2026-07-30 KF8 reissue below:
+# the pin had been stale for an unknown period, hidden behind cache hits.
+#
+# 2026-07-30: `pg11-images-kf8.mobi` was reissued upstream (now 256038 bytes).
+# Before repinning, the new file was verified to be the right book in the right
+# format — PalmDB name `Alice's_Adventures_in_Wonderlan`, type/creator
+# BOOK/MOBI, MOBI header file-version **8** (the whole point of the `-kf8`
+# URL), and Carroll/Alice/Wonderland present in the body — and then confirmed
+# functionally by `cargo test -p carrel-core --features mobi`, whose
+# fixture-gated KF8 tests all pass against it. `pg11.mobi` (legacy v6) was
+# unchanged and keeps its original hash.
 declare -a FILES=(
-  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|6749a1b88a96e6901d929ba3257efdf51443707310dad88fb38b58bb9230dd18"
+  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|816d542bb9396c53b0c8fb6215aee7145ebc935af9a7c68533103ea8e0f0a4c0"
   "alice-legacy.mobi|https://www.gutenberg.org/cache/epub/11/pg11.mobi|c6de8f83459904177eac2623aa653ef57483ed6968078c8fc3d3171f20e06408"
 )
 
