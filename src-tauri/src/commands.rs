@@ -4396,6 +4396,136 @@ fn upsert_opds_auth_inner(conn: &rusqlite::Connection, rec: OpdsAuthRecord) -> C
     write_opds_auth(conn, &all)
 }
 
+/// Builds the per-request [`opds::OpdsContext`] for an OPDS network call:
+/// the trusted-host list (unchanged from [`trusted_hosts_from_db`]) plus —
+/// only when rules 1-4 below all admit it — the provenance of `catalog_url`
+/// and its credential. Supersedes `trusted_hosts_from_catalogs`/
+/// `trusted_hosts_from_db` as the context builder; those two are left in
+/// place because their existing callers are converted in a later task, not
+/// this one.
+///
+/// Enforces rules 1-4 of the design spec's "Provenance rules" section (rule
+/// 5 — dropping provenance when the *response's effective* URL leaves the
+/// origin — is enforced inside carrel-core's `stamp_provenance`, which is the
+/// only code that sees the post-redirect URL):
+///
+/// 1. `catalog_url == None` -> no provenance, no credential. An operation
+///    that does not name an initiating catalog has no authority to
+///    authenticate.
+/// 2. `catalog_url` not in the configured-catalog list -> no provenance, no
+///    credential. Only a catalog the user configured can confer authority.
+/// 3. `origin_from_url(request_url) != origin_from_url(catalog_url)` -> no
+///    provenance, no credential. This is the cross-origin bounce guard: a
+///    feed that links off-origin cannot bounce authority back to itself.
+/// 4. Otherwise provenance IS set, even with no stored credential at all —
+///    public catalogs must still be stampable, and the user must still be
+///    able to sign in after a 401.
+///
+/// A credential is attached only when a matching `opds_auth` record exists,
+/// its `kind` is recognized, AND the keychain read succeeds. A failed
+/// keychain read is logged with `log::warn!` (never the secret, the key, or
+/// the record) and degrades to "no credential" while leaving provenance
+/// intact — a denied keychain must never break public catalogs. This
+/// function returns no `Result`, so every fallible step here degrades rather
+/// than propagates.
+///
+/// Does NOT lock `OPDS_AUTH_LOCK` — it is a helper called from within
+/// commands that already hold it, and `std::sync::Mutex` is not reentrant.
+///
+/// `#[allow(dead_code)]`: not yet called from production code — the next
+/// task converts the six call sites that currently build a context from
+/// `trusted_hosts_from_catalogs`/`trusted_hosts_from_db` to use this
+/// instead. Only exercised by tests until then.
+#[allow(dead_code)]
+fn opds_context_for(
+    conn: &rusqlite::Connection,
+    store: &dyn CredentialStore,
+    profile: &str,
+    catalog_url: Option<&str>,
+    request_url: &str,
+) -> opds::OpdsContext {
+    let trusted = trusted_hosts_from_db(conn);
+
+    // Rule 1: no initiating catalog named -> no authority.
+    let Some(catalog_url) = catalog_url else {
+        return opds::OpdsContext {
+            trusted,
+            provenance: None,
+            cred: None,
+        };
+    };
+
+    // Rule 2: the catalog URL must be one the user actually configured.
+    let is_configured = configured_catalog_urls(conn)
+        .map(|urls| urls.iter().any(|u| u == catalog_url))
+        .unwrap_or(false);
+    if !is_configured {
+        return opds::OpdsContext {
+            trusted,
+            provenance: None,
+            cred: None,
+        };
+    }
+
+    // Rule 3: the request must still be on the catalog's own origin.
+    let catalog_origin = opds::origin_from_url(catalog_url);
+    let request_origin = opds::origin_from_url(request_url);
+    if catalog_origin.is_none() || request_origin != catalog_origin {
+        return opds::OpdsContext {
+            trusted,
+            provenance: None,
+            cred: None,
+        };
+    }
+    let origin = catalog_origin.expect("checked non-None above");
+
+    // Rule 4: provenance is admitted regardless of whether a credential
+    // exists or can be read.
+    let provenance = Some(opds::OpdsProvenance {
+        catalog_url: catalog_url.to_string(),
+        origin,
+    });
+
+    // Credential lookup: only attach one for a record matching this exact
+    // catalog URL, whose secret is readable, whose `kind` is recognized.
+    //
+    // The record's own `origin` field is not consulted here — the origin
+    // used for the rule-3 check above is `origin_from_url(catalog_url)`,
+    // recomputed from the live configured URL rather than trusted from
+    // whatever was written into the record. A record's stored `origin` is
+    // data the record itself asserts about its own catalog_url; re-deriving
+    // it from the URL currently configured is the safer source of truth for
+    // a security decision; a stale or hand-edited `origin` column then can't
+    // silently relax or tighten the check.
+    let cred = read_opds_auth(conn)
+        .into_iter()
+        .find(|r| r.catalog_url == catalog_url)
+        .and_then(|record| match store.get(profile, catalog_url) {
+            Ok(Some(secret)) => match record.kind.as_str() {
+                "basic" => Some(opds::OpdsCredential::Basic {
+                    username: record.username,
+                    password: secret,
+                }),
+                "bearer" => Some(opds::OpdsCredential::Bearer(secret)),
+                _ => None,
+            },
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!(
+                    "OPDS catalog credential could not be read from the keychain \
+                     (profile '{profile}'): {e}"
+                );
+                None
+            }
+        });
+
+    opds::OpdsContext {
+        trusted,
+        provenance,
+        cred,
+    }
+}
+
 #[cfg(test)]
 fn rec(catalog_url: &str, kind: &str, username: &str) -> OpdsAuthRecord {
     OpdsAuthRecord {
@@ -10331,6 +10461,140 @@ mod tests {
         state.mark_unlocked("default").unwrap();
         let (name, _pool) = active_profile_and_db(&state).unwrap();
         assert_eq!(name, "default");
+    }
+
+    #[test]
+    fn context_admits_provenance_for_a_configured_same_origin_catalog_without_a_credential() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        let ctx = opds_context_for(
+            &conn,
+            &store,
+            "p",
+            Some("https://h/opds"),
+            "https://h/opds?page=2",
+        );
+        assert_eq!(
+            ctx.provenance.as_ref().map(|p| p.catalog_url.as_str()),
+            Some("https://h/opds"),
+            "public catalogs must still be stampable"
+        );
+        assert!(ctx.cred.is_none());
+    }
+
+    #[test]
+    fn context_drops_provenance_for_an_unconfigured_catalog_url() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        let ctx = opds_context_for(
+            &conn,
+            &store,
+            "p",
+            Some("https://evil/opds"),
+            "https://evil/opds",
+        );
+        assert!(ctx.provenance.is_none() && ctx.cred.is_none());
+    }
+
+    #[test]
+    fn context_drops_provenance_after_a_cross_origin_request() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        let ctx = opds_context_for(
+            &conn,
+            &store,
+            "p",
+            Some("https://h/opds"),
+            "https://other/feed",
+        );
+        assert!(
+            ctx.provenance.is_none(),
+            "request origin differs from the catalog origin"
+        );
+        assert!(ctx.cred.is_none());
+    }
+
+    #[test]
+    fn context_carries_nothing_when_no_catalog_url_is_supplied() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        let ctx = opds_context_for(&conn, &store, "p", None, "https://h/opds");
+        assert!(ctx.provenance.is_none() && ctx.cred.is_none());
+    }
+
+    #[test]
+    fn context_keeps_provenance_when_the_secret_cannot_be_read() {
+        // A stored record whose secret is missing from the store: provenance stays
+        // (so entries are stamped and the user can sign in), credential is absent.
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        upsert_opds_auth_inner(&conn, rec("https://h/opds", "basic", "u")).unwrap();
+        let ctx = opds_context_for(&conn, &store, "p", Some("https://h/opds"), "https://h/opds");
+        assert!(ctx.provenance.is_some());
+        assert!(ctx.cred.is_none());
+        assert!(
+            !ctx.trusted.is_empty(),
+            "the trusted list must survive a missing secret"
+        );
+    }
+
+    #[test]
+    fn context_attaches_basic_and_bearer_credentials_and_rejects_unknown_kind() {
+        // The brief's five tests never exercise the actual credential-mapping
+        // arm (kind == "basic"/"bearer" -> the right OpdsCredential variant,
+        // anything else -> None) — added per the task instructions to cover a
+        // spec rule ("Map the stored record...") the required tests don't
+        // reach.
+        let (conn, _tmp) = test_conn_with_catalog("https://h/basic");
+        add_opds_catalog_inner(&conn, "Bearer".into(), "https://h/bearer".into(), None).unwrap();
+        add_opds_catalog_inner(&conn, "Weird".into(), "https://h/weird".into(), None).unwrap();
+        let store = MemoryCredentialStore::default();
+
+        upsert_opds_auth_inner(&conn, rec("https://h/basic", "basic", "alice")).unwrap();
+        store.set("p", "https://h/basic", "secret1").unwrap();
+        let ctx = opds_context_for(
+            &conn,
+            &store,
+            "p",
+            Some("https://h/basic"),
+            "https://h/basic",
+        );
+        match ctx.cred {
+            Some(opds::OpdsCredential::Basic { username, password }) => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "secret1");
+            }
+            _ => panic!("expected a Basic credential"),
+        }
+
+        upsert_opds_auth_inner(&conn, rec("https://h/bearer", "bearer", "")).unwrap();
+        store.set("p", "https://h/bearer", "token1").unwrap();
+        let ctx = opds_context_for(
+            &conn,
+            &store,
+            "p",
+            Some("https://h/bearer"),
+            "https://h/bearer",
+        );
+        match ctx.cred {
+            Some(opds::OpdsCredential::Bearer(token)) => assert_eq!(token, "token1"),
+            _ => panic!("expected a Bearer credential"),
+        }
+
+        upsert_opds_auth_inner(&conn, rec("https://h/weird", "digest", "u")).unwrap();
+        store.set("p", "https://h/weird", "s").unwrap();
+        let ctx = opds_context_for(
+            &conn,
+            &store,
+            "p",
+            Some("https://h/weird"),
+            "https://h/weird",
+        );
+        assert!(
+            ctx.cred.is_none(),
+            "an unrecognized credential kind must not be guessed into a variant"
+        );
+        assert!(ctx.provenance.is_some());
     }
 
     #[test]
