@@ -1,5 +1,5 @@
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -239,8 +239,12 @@ fn parse_feed_with_trusted(
     base_url: &str,
     trusted: &[String],
 ) -> CarrelResult<OpdsFeed> {
+    // Deliberately *not* `trim_text(true)`: that trims every text event
+    // individually, and quick-xml emits an entity reference as its own event,
+    // so `Fish &amp; Chips` would arrive as three events and come back out as
+    // `Fish&Chips`. Whitespace is trimmed per completed character-data run
+    // below instead, which is what the reader-level option was standing in for.
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut feed_title = String::new();
     let mut entries: Vec<OpdsEntry> = Vec::new();
@@ -286,8 +290,31 @@ fn parse_feed_with_trusted(
     };
 
     let mut buf = Vec::new();
+    // Adjacent `Text` and `GeneralRef` events form one character-data run;
+    // collect them untrimmed and route the trimmed result when the run ends.
+    let mut run = String::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        if !matches!(event, Ok(Event::Text(_)) | Ok(Event::GeneralRef(_))) {
+            let text = run.trim();
+            if !text.is_empty() {
+                if in_feed_title && !in_entry {
+                    feed_title = text.to_string();
+                    in_feed_title = false;
+                }
+                if in_entry {
+                    match current_tag.as_str() {
+                        "title" => entry_title.push_str(text),
+                        "id" => entry_id.push_str(text),
+                        "author_name" => entry_author.push_str(text),
+                        "summary" => entry_summary.push_str(text),
+                        _ => {}
+                    }
+                }
+            }
+            run.clear();
+        }
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let ln = e.local_name();
                 let local = std::str::from_utf8(ln.as_ref()).unwrap_or("");
@@ -325,7 +352,10 @@ fn parse_feed_with_trusted(
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
                             if key == "url" {
-                                let url = attr.unescape_value().unwrap_or_default().to_string();
+                                let url = attr
+                                    .normalized_value(XmlVersion::Implicit1_0)
+                                    .unwrap_or_default()
+                                    .to_string();
                                 let url = resolve(&url);
                                 entry_cover = Some(maybe_upgrade_http(&url, trusted));
                             }
@@ -338,7 +368,10 @@ fn parse_feed_with_trusted(
                         let mut size_bytes: Option<u64> = None;
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                            let val = attr.unescape_value().unwrap_or_default().to_string();
+                            let val = attr
+                                .normalized_value(XmlVersion::Implicit1_0)
+                                .unwrap_or_default()
+                                .to_string();
                             match key {
                                 "href" => href = resolve(&val),
                                 "rel" => rel = val,
@@ -396,20 +429,10 @@ fn parse_feed_with_trusted(
                 }
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().unwrap_or_default().to_string();
-                if in_feed_title && !in_entry {
-                    feed_title = text.clone();
-                    in_feed_title = false;
-                }
-                if in_entry {
-                    match current_tag.as_str() {
-                        "title" => entry_title.push_str(&text),
-                        "id" => entry_id.push_str(&text),
-                        "author_name" => entry_author.push_str(&text),
-                        "summary" => entry_summary.push_str(&text),
-                        _ => {}
-                    }
-                }
+                run.push_str(&e.decode().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                run.push_str(&crate::epub::decode_general_ref(e).unwrap_or_default());
             }
             Ok(Event::End(ref e)) => {
                 let ln = e.local_name();
@@ -497,7 +520,10 @@ pub fn resolve_search_url_with_trusted(url: &str, trusted: &[String]) -> Option<
                     let mut url_type = String::new();
                     for attr in e.attributes().flatten() {
                         let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                        let val = attr.unescape_value().unwrap_or_default().to_string();
+                        let val = attr
+                            .normalized_value(XmlVersion::Implicit1_0)
+                            .unwrap_or_default()
+                            .to_string();
                         match key {
                             "template" => template = val,
                             "type" => url_type = val,
@@ -610,6 +636,34 @@ pub fn download_file_ssrf_guarded(url: &str, dest: &str) -> CarrelResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Character and general entity references have to survive parsing into the
+    /// decoded text, in both element content and attribute values. quick-xml
+    /// reports them as a separate event from the surrounding text, so a reader
+    /// loop that only accumulates text events silently drops them.
+    #[test]
+    fn parse_feed_decodes_entities_in_text_and_attributes() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>Fish &amp; Chips</title>
+          <entry>
+            <id>urn:uuid:1</id>
+            <title>Alice &amp; Bob &#38; Carol</title>
+            <author><name>R&#xE9;my</name></author>
+            <summary>Costs &lt; 5 &amp; &gt; 1</summary>
+            <link href="/d/a&amp;b.epub" type="application/epub+zip" rel="http://opds-spec.org/acquisition"/>
+          </entry>
+        </feed>"#;
+
+        let feed = parse_feed(xml, "https://example.com/opds").unwrap();
+        assert_eq!(feed.title, "Fish & Chips");
+
+        let entry = &feed.entries[0];
+        assert_eq!(entry.title, "Alice & Bob & Carol");
+        assert_eq!(entry.author, "Rémy");
+        assert_eq!(entry.summary, "Costs < 5 & > 1");
+        assert_eq!(entry.links[0].href, "https://example.com/d/a&b.epub");
+    }
 
     #[test]
     fn parse_feed_basic_entry() {

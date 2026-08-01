@@ -231,12 +231,6 @@ impl From<zip::result::ZipError> for CarrelError {
     }
 }
 
-impl From<quick_xml::Error> for CarrelError {
-    fn from(e: quick_xml::Error) -> Self {
-        Self::InvalidInput(format!("XML parse error: {e}"))
-    }
-}
-
 impl From<keyring::Error> for CarrelError {
     fn from(e: keyring::Error) -> Self {
         match e {

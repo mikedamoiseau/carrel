@@ -34,7 +34,7 @@ r2d2_sqlite = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 zip = "2"
-quick-xml = "0.36"
+quick-xml = "0.41"
 ammonia = "4"
 base64 = "0.22"
 form_urlencoded = "1"

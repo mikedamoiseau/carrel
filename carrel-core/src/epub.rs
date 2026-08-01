@@ -362,6 +362,21 @@ fn decode_entities(s: &str) -> String {
         .unwrap_or_else(|_| s.to_string())
 }
 
+/// Replacement text for a `GeneralRef` event.
+///
+/// quick-xml reports every `&name;` / `&#nn;` reference as its own event rather
+/// than leaving it inside the surrounding `Text`, and the event carries only
+/// what sits between the `&` and the `;`. Re-wrapping and unescaping resolves
+/// the predefined names and both numeric forms through the same code path as
+/// [`decode_entities`]. An unrecognised entity yields `None` and is dropped —
+/// only that reference is lost, not the text around it.
+pub(crate) fn decode_general_ref(e: &quick_xml::events::BytesRef) -> Option<String> {
+    let name = e.decode().ok()?;
+    quick_xml::escape::unescape(&format!("&{name};"))
+        .ok()
+        .map(|cow| cow.into_owned())
+}
+
 /// Like [`extract_tag_text`] but decodes character entities in the result.
 /// Use for human-readable free-text fields (title, description, summary,
 /// series, publisher, …); numeric/identifier fields (Year, Volume,
@@ -1405,9 +1420,26 @@ fn parse_nav_toc(nav: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
     let mut anchor_depth = 0u32;
     let mut current_href: Option<String> = None;
     let mut current_label = String::new();
+    // Character data reaches us as a *run* of adjacent `Text` and `GeneralRef`
+    // events — quick-xml splits every entity reference out of the surrounding
+    // text. Pieces are collected here untrimmed and folded into the label only
+    // when the run ends, so `R&#233;sum&#233;` stays one word while genuinely
+    // separate runs (split by a nested element) still get a space between them.
+    let mut current_run = String::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        if !matches!(event, Ok(Event::Text(_)) | Ok(Event::GeneralRef(_))) {
+            let trimmed = current_run.trim();
+            if in_anchor && !trimmed.is_empty() {
+                if !current_label.is_empty() {
+                    current_label.push(' ');
+                }
+                current_label.push_str(trimmed);
+            }
+            current_run.clear();
+        }
+        match event {
             Ok(Event::Start(ref e)) => {
                 let local = e.local_name();
                 if !in_toc_nav {
@@ -1439,16 +1471,11 @@ fn parse_nav_toc(nav: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
                     }
                 }
             }
-            Ok(Event::Text(ref e)) if in_anchor => {
-                if let Ok(text) = e.unescape() {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        if !current_label.is_empty() {
-                            current_label.push(' ');
-                        }
-                        current_label.push_str(trimmed);
-                    }
-                }
+            Ok(Event::Text(ref e)) => {
+                current_run.push_str(&e.decode().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                current_run.push_str(&decode_general_ref(e).unwrap_or_default());
             }
             Ok(Event::End(ref e)) if in_toc_nav => {
                 if in_anchor {
@@ -1502,9 +1529,21 @@ fn parse_ncx_toc(ncx: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
     }
 
     let mut stack: Vec<NavState> = Vec::new();
+    // See `parse_nav_toc` — character data arrives as a run of `Text` and
+    // `GeneralRef` events and is only trimmed once the run is complete.
+    let mut run = String::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        let event = reader.read_event_into(&mut buf);
+        if !matches!(event, Ok(Event::Text(_)) | Ok(Event::GeneralRef(_))) {
+            if let Some(state) = stack.last_mut() {
+                if state.in_text {
+                    state.label.push_str(run.trim());
+                }
+            }
+            run.clear();
+        }
+        match event {
             Ok(Event::Start(ref e)) => {
                 match e.local_name().as_ref() {
                     b"navPoint" => stack.push(NavState::default()),
@@ -1540,16 +1579,10 @@ fn parse_ncx_toc(ncx: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
                 _ => {}
             },
             Ok(Event::Text(ref e)) => {
-                if let Some(state) = stack.last_mut() {
-                    if state.in_text {
-                        if let Ok(text) = e.unescape() {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                state.label.push_str(trimmed);
-                            }
-                        }
-                    }
-                }
+                run.push_str(&e.decode().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                run.push_str(&decode_general_ref(e).unwrap_or_default());
             }
             Ok(Event::End(ref e)) => match e.local_name().as_ref() {
                 b"text" => {
@@ -2401,6 +2434,27 @@ pub(crate) mod tests {
         ch0: Vec<u8>,
         extra: Vec<(String, Vec<u8>)>,
     ) -> String {
+        build_bounds_epub_with(
+            dir,
+            name,
+            BOUNDS_CONTAINER_XML.to_vec(),
+            BOUNDS_CONTENT_OPF.to_vec(),
+            ch0,
+            extra,
+        )
+    }
+
+    /// Like [`build_bounds_epub`], but lets a test supply its own
+    /// `META-INF/container.xml` and `OEBPS/content.opf` bytes — needed to drive
+    /// the XML parsers with hostile markup rather than hostile zip metadata.
+    fn build_bounds_epub_with(
+        dir: &std::path::Path,
+        name: &str,
+        container: Vec<u8>,
+        opf: Vec<u8>,
+        ch0: Vec<u8>,
+        extra: Vec<(String, Vec<u8>)>,
+    ) -> String {
         let zip_path = dir.join(name);
         let file = std::fs::File::create(&zip_path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
@@ -2412,8 +2466,8 @@ pub(crate) mod tests {
         std::io::Write::write_all(&mut writer, b"application/epub+zip").unwrap();
 
         for (entry_name, bytes) in [
-            ("META-INF/container.xml", BOUNDS_CONTAINER_XML.to_vec()),
-            ("OEBPS/content.opf", BOUNDS_CONTENT_OPF.to_vec()),
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
             ("OEBPS/ch0.xhtml", ch0),
         ] {
             writer.start_file(entry_name, deflated).unwrap();
@@ -2464,6 +2518,188 @@ pub(crate) mod tests {
     /// read, a few KB on disk.
     fn filler(len: usize) -> Vec<u8> {
         vec![b'A'; len]
+    }
+
+    // ---- Entity references in TOC labels ----
+    //
+    // quick-xml reports `&amp;` / `&#38;` as their own event rather than as part
+    // of the surrounding text, so a reader loop that only accumulates text
+    // events drops them silently. These pin the decoded result for both TOC
+    // flavours.
+
+    fn toc_href_index() -> HashMap<String, usize> {
+        HashMap::from([("ch0.xhtml".to_string(), 0), ("ch1.xhtml".to_string(), 1)])
+    }
+
+    #[test]
+    fn test_parse_nav_toc_decodes_entities_in_labels() {
+        let nav = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="toc">
+      <ol>
+        <li><a href="ch0.xhtml">Tom &amp; Jerry</a></li>
+        <li><a href="ch1.xhtml">R&#xE9;sum&#233; &lt;draft&gt;</a></li>
+      </ol>
+    </nav>
+  </body>
+</html>"#;
+
+        let entries = parse_nav_toc(nav, &toc_href_index());
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, vec!["Tom & Jerry", "Résumé <draft>"]);
+    }
+
+    #[test]
+    fn test_parse_ncx_toc_decodes_entities_in_labels() {
+        let ncx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+    <navPoint id="n0" playOrder="1">
+      <navLabel><text>Tom &amp; Jerry</text></navLabel>
+      <content src="ch0.xhtml"/>
+    </navPoint>
+    <navPoint id="n1" playOrder="2">
+      <navLabel><text>R&#xE9;sum&#233; &lt;draft&gt;</text></navLabel>
+      <content src="ch1.xhtml"/>
+    </navPoint>
+  </navMap>
+</ncx>"#;
+
+        let entries = parse_ncx_toc(ncx, &toc_href_index());
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, vec!["Tom & Jerry", "Résumé <draft>"]);
+    }
+
+    // ---- Attribute-flood bounds (RUSTSEC-2026-0194) ----
+
+    /// Number of junk attributes crammed onto one start tag by the flood tests.
+    /// At ~14 bytes each that is ~1.1 MB — well under `MAX_TEXT_ENTRY_SIZE`, so
+    /// the size caps cannot reject it and the XML parser has to survive it on
+    /// its own.
+    const FLOOD_ATTRS: usize = 80_000;
+
+    /// Wall-clock budget for parsing one attribute-flooded document. Generous
+    /// on purpose: the failure this guards against is super-linear, so a real
+    /// regression overshoots by orders of magnitude, not by a few percent. On
+    /// quick-xml 0.36.2 the 40,000-attribute case already took 12.6 s in a debug
+    /// build; at 80,000 the quadratic term makes that roughly 50 s, against
+    /// milliseconds once attribute checking is linear.
+    const FLOOD_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `count` distinct junk attributes, to be spliced into a start tag *ahead*
+    /// of the attributes the parser is actually looking for — so the parser has
+    /// to walk every one of them rather than short-circuiting on an early hit.
+    fn attribute_flood(count: usize) -> String {
+        let mut s = String::with_capacity(count * 13);
+        for i in 0..count {
+            s.push_str(&format!(" a{i}=\"1\""));
+        }
+        s
+    }
+
+    /// Run `f` on a worker thread and fail if it has not finished within
+    /// `FLOOD_BUDGET`. A hung worker is left running — the point is that the
+    /// suite reports the stall in bounded time instead of hanging with it.
+    fn within_flood_budget<T: Send + 'static>(
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let out = f();
+            let _ = tx.send((out, started.elapsed()));
+        });
+        match rx.recv_timeout(FLOOD_BUDGET) {
+            Ok((out, elapsed)) => {
+                eprintln!("{what}: {FLOOD_ATTRS} attributes parsed in {elapsed:?}");
+                out
+            }
+            Err(_) => panic!(
+                "{what}: parsing a start tag with {FLOOD_ATTRS} attributes did not \
+                 finish within {FLOOD_BUDGET:?} — attribute handling is super-linear \
+                 in the attribute count (RUSTSEC-2026-0194)"
+            ),
+        }
+    }
+
+    /// A `container.xml` whose `<rootfile>` carries `FLOOD_ATTRS` junk attributes
+    /// before the real `full-path`. Nothing about it is invalid XML; it is just
+    /// large in one dimension the parser used to handle quadratically.
+    fn flooded_container_xml() -> Vec<u8> {
+        format!(
+            r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile{flood} full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"#,
+            flood = attribute_flood(FLOOD_ATTRS)
+        )
+        .into_bytes()
+    }
+
+    /// An OPF whose `<item>` carries `FLOOD_ATTRS` junk attributes before its
+    /// real `id`/`href`, exercising the manifest parser rather than the
+    /// container parser.
+    fn flooded_content_opf() -> Vec<u8> {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Flood Test</dc:title>
+    <dc:creator>Flood Author</dc:creator>
+    <dc:language>en</dc:language>
+  </metadata>
+  <manifest>
+    <item{flood} id="ch0" href="ch0.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch0"/>
+  </spine>
+</package>"#,
+            flood = attribute_flood(FLOOD_ATTRS)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn test_parse_epub_metadata_survives_attribute_flooded_container_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = build_bounds_epub_with(
+            tmp.path(),
+            "attr-flood-container.epub",
+            flooded_container_xml(),
+            BOUNDS_CONTENT_OPF.to_vec(),
+            bounds_chapter("<p>hello</p>"),
+            vec![],
+        );
+
+        let meta = within_flood_budget("container.xml", move || parse_epub_metadata(&path))
+            .expect("flooded container.xml should still parse");
+        assert_eq!(meta.title, "Bounds Test");
+    }
+
+    #[test]
+    fn test_get_chapter_list_survives_attribute_flooded_opf() {
+        // `parse_epub_metadata` reads the OPF with the string extractors, not
+        // quick-xml — `get_chapter_list` is the entry point that actually runs
+        // `parse_manifest`/`parse_spine_idrefs` over the manifest's start tags.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = build_bounds_epub_with(
+            tmp.path(),
+            "attr-flood-opf.epub",
+            BOUNDS_CONTAINER_XML.to_vec(),
+            flooded_content_opf(),
+            bounds_chapter("<p>hello</p>"),
+            vec![],
+        );
+
+        let chapters = within_flood_budget("content.opf", move || get_chapter_list(&path))
+            .expect("flooded OPF should still parse");
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].href, "ch0.xhtml");
     }
 
     #[test]
