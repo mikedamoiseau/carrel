@@ -5355,8 +5355,16 @@ pub async fn switch_profile(
     switch_active_profile(&app, state.inner(), name).await
 }
 
-#[tauri::command]
-pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelResult<()> {
+/// [`delete_profile`] with the OPDS credential store injected. The only
+/// production caller passes `&KeyringCredentialStore`; tests pass
+/// `MemoryCredentialStore`/`FlakyCredentialStore` so the credential-cleanup
+/// failure path (and the retryability it's meant to guarantee) is
+/// deterministic without touching the real keychain.
+async fn delete_profile_with(
+    state: &AppState,
+    name: String,
+    store: &dyn CredentialStore,
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
@@ -5397,7 +5405,7 @@ pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelR
     // lock without preserving that invariant.
     if let Some(pool) = &pool {
         let conn = pool.get()?;
-        clear_profile_opds_credentials(&conn, &KeyringCredentialStore, &name)?;
+        clear_profile_opds_credentials(&conn, store, &name)?;
     }
 
     {
@@ -5417,6 +5425,11 @@ pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelR
     state.mark_locked(&name)?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelResult<()> {
+    delete_profile_with(state.inner(), name, &KeyringCredentialStore).await
 }
 
 // --- Profile soft-lock (A-M2) ---
@@ -11728,12 +11741,24 @@ mod tests {
 
     #[tokio::test]
     async fn delete_profile_clears_unlocked_set_entry() {
-        let (app, _dir) = mock_app_with_state();
+        // Also the mirror-image positive case for Task 10's ordering fix:
+        // goes through `delete_profile_with` (rather than duplicating this
+        // test) with a real on-disk DB and a seeded OPDS credential, so a
+        // successful run is proven to remove the pool, delete the DB file,
+        // AND clear the credential it owned — not just the unlocked-set
+        // entry this test originally covered.
+        let (app, dir) = mock_app_with_state();
         let handle = app.handle().clone();
+        let db_path = dir.path().join("library-carol.db");
         {
             let state = handle.state::<AppState>();
             let mut ps = state.profile_state.lock().unwrap();
-            let pool = db::create_pool(&std::path::PathBuf::from(":memory:")).unwrap();
+            let pool = db::create_pool(&db_path).unwrap();
+            let conn = pool.get().unwrap();
+            add_opds_catalog_inner(&conn, "Carol's".into(), "https://h/carol".into(), None)
+                .unwrap();
+            upsert_opds_auth_inner(&conn, rec("https://h/carol", "basic", "u")).unwrap();
+            drop(conn);
             ps.pools.insert("carol".to_string(), pool);
             drop(ps);
             // Simulate a previously-unlocked session for this profile, as
@@ -11741,9 +11766,13 @@ mod tests {
             state.mark_unlocked("carol").unwrap();
             assert!(state.is_unlocked("carol"));
         }
+        assert!(db_path.exists(), "fixture must actually create the DB file");
+
+        let store = MemoryCredentialStore::default();
+        store.set("carol", "https://h/carol", "s").unwrap();
 
         let state = handle.state::<AppState>();
-        delete_profile("carol".to_string(), state)
+        delete_profile_with(state.inner(), "carol".to_string(), &store)
             .await
             .expect("deleting a non-active profile should succeed");
 
@@ -11758,6 +11787,70 @@ mod tests {
             .unwrap()
             .pools
             .contains_key("carol"));
+        assert!(!db_path.exists(), "the profile's DB file must be removed");
+        assert!(
+            store.get("carol", "https://h/carol").unwrap().is_none(),
+            "the credential the profile owned must be cleared from the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_profile_with_leaves_everything_intact_when_credential_cleanup_fails() {
+        // The load-bearing property behind Task 10's ordering fix: if
+        // clearing OPDS credentials fails, `delete_profile_with` must not
+        // have removed the profile's pool from `profile_state`, nor deleted
+        // its DB file. Otherwise the operation isn't actually retryable —
+        // `switch_active_profile_with` refuses any profile not in
+        // `ps.pools` (pools are never re-created lazily), and a retry that
+        // found no pool would skip cleanup silently and delete the DB file
+        // anyway, leaving the secrets this task exists to remove sitting in
+        // the keychain. A future refactor that re-merges the two
+        // `profile_state` critical sections in `delete_profile_with` would
+        // break exactly this.
+        let (app, dir) = mock_app_with_state();
+        let handle = app.handle().clone();
+        let db_path = dir.path().join("library-carol.db");
+        {
+            let state = handle.state::<AppState>();
+            let mut ps = state.profile_state.lock().unwrap();
+            let pool = db::create_pool(&db_path).unwrap();
+            let conn = pool.get().unwrap();
+            add_opds_catalog_inner(&conn, "Carol's".into(), "https://h/carol".into(), None)
+                .unwrap();
+            upsert_opds_auth_inner(&conn, rec("https://h/carol", "basic", "u")).unwrap();
+            drop(conn);
+            ps.pools.insert("carol".to_string(), pool);
+        }
+        assert!(db_path.exists(), "fixture must actually create the DB file");
+
+        let store = FlakyCredentialStore {
+            inner: MemoryCredentialStore::default(),
+            fail_set: false,
+            fail_delete: true,
+        };
+        let state = handle.state::<AppState>();
+        let err = delete_profile_with(state.inner(), "carol".to_string(), &store)
+            .await
+            .expect_err("a failed credential cleanup must fail the whole operation");
+        assert!(
+            err.to_string().to_lowercase().contains("flaky"),
+            "got: {err}"
+        );
+
+        let state = handle.state::<AppState>();
+        assert!(
+            state
+                .profile_state
+                .lock()
+                .unwrap()
+                .pools
+                .contains_key("carol"),
+            "the profile's pool must still be present so the operation is retryable"
+        );
+        assert!(
+            db_path.exists(),
+            "the DB file must not be deleted when credential cleanup failed"
+        );
     }
 
     #[tokio::test]
