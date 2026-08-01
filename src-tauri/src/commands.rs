@@ -4248,29 +4248,43 @@ fn configured_catalog_urls(conn: &rusqlite::Connection) -> CarrelResult<Vec<Stri
 /// to construct a `tauri::State`. The URL validation lives at the
 /// command boundary, not here, so callers must validate first.
 ///
-/// Rejects a URL that is already configured (exact string match against
-/// [`configured_catalog_urls`], covering both default and custom catalogs —
-/// same comparison `remove_opds_catalog_inner`/`configured_catalog_urls`
-/// already use elsewhere, so nothing here introduces normalization the rest
-/// of the module doesn't have). This isn't just tidiness: `remove_opds_catalog`
+/// Rejects a URL that is already configured — exact string match, same
+/// comparison `remove_opds_catalog_inner`/`configured_catalog_urls` already
+/// use elsewhere, so nothing here introduces normalization the rest of the
+/// module doesn't have. This isn't just tidiness: `remove_opds_catalog`
 /// removes *every* custom entry matching a URL, so adding a URL that's
 /// already configured and then rolling that add back would silently delete
 /// the user's pre-existing catalog. Rejecting the duplicate up front makes
 /// that scenario impossible.
+///
+/// Checked in two steps, not via [`configured_catalog_urls`]'s merged list,
+/// so the error message can tell the two duplicate cases apart: a URL that
+/// already matches a built-in [`DEFAULT_CATALOGS`] entry gets a message
+/// saying so (the user hasn't actually configured anything — it just doesn't
+/// need adding), while a URL that already matches a *custom* catalog gets
+/// the ordinary "already configured" message.
 fn add_opds_catalog_inner(
     conn: &rusqlite::Connection,
     name: String,
     url: String,
     preset_id: Option<String>,
 ) -> CarrelResult<()> {
-    if configured_catalog_urls(conn)?.contains(&url) {
+    if DEFAULT_CATALOGS
+        .iter()
+        .any(|(_, default_url, _)| *default_url == url)
+    {
         return Err(CarrelError::invalid(format!(
-            "'{url}' is already configured as a catalog."
+            "'{url}' is already available as a built-in catalog."
         )));
     }
     let custom_json =
         db::get_setting(conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
     let mut custom: Vec<OpdsCatalogSource> = serde_json::from_str(&custom_json).unwrap_or_default();
+    if custom.iter().any(|c| c.url == url) {
+        return Err(CarrelError::invalid(format!(
+            "'{url}' is already configured as a catalog."
+        )));
+    }
     custom.push(OpdsCatalogSource {
         name,
         url,
@@ -5351,24 +5365,44 @@ pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelR
         return Err(CarrelError::invalid("Cannot delete the default profile"));
     }
     let pool = {
-        let mut ps = state.profile_state.lock()?;
+        let ps = state.profile_state.lock()?;
         if ps.active == name {
             return Err(CarrelError::invalid(
                 "Cannot delete the active profile. Switch to another profile first.",
             ));
         }
-        ps.pools.remove(&name)
+        ps.pools.get(&name).cloned()
     };
 
-    // Clear any OPDS catalog credentials this profile owned (Task 10), while
-    // its pool — captured above — is still alive: this needs a live
-    // connection to read the profile's `opds_auth` row, and must run before
-    // the DB file is deleted below. A cleanup failure is reported rather than
-    // swallowed, since a silently-skipped cleanup would leave the user's
-    // secrets in the keychain with nothing left pointing at them.
+    // Clear any OPDS catalog credentials this profile owned (Task 10),
+    // BEFORE the pool is removed from `profile_state` below. Nothing has
+    // been mutated yet at this point, so a failure here (propagated, not
+    // swallowed) leaves the profile fully intact and the operation
+    // retryable — rather than orphaning it. The alternative (clearing after
+    // the pool is removed) is worse than merely "fail loud": once the pool
+    // is out of `profile_state.pools`, `switch_active_profile_with` refuses
+    // to switch into the profile (pools are only ever created at startup or
+    // profile creation, never lazily), so the profile becomes permanently
+    // unreachable until an app restart; and a retried `delete_profile` would
+    // then find no pool at all, skip credential cleanup silently, and
+    // delete the DB file anyway — leaving exactly the secrets this task
+    // exists to remove sitting in the keychain.
+    //
+    // Locking `profile_state` twice in this function (here, and again below
+    // to actually remove the pool) is safe specifically because `_lifecycle`
+    // is held for this entire function body, and `switch_active_profile_with`
+    // takes that same `profile_lifecycle` lock for its entire body too — so
+    // no switch, and no other profile-lifecycle command, can run between
+    // this section and the one below. Do not "simplify" this back into one
+    // lock without preserving that invariant.
     if let Some(pool) = &pool {
         let conn = pool.get()?;
         clear_profile_opds_credentials(&conn, &KeyringCredentialStore, &name)?;
+    }
+
+    {
+        let mut ps = state.profile_state.lock()?;
+        ps.pools.remove(&name);
     }
 
     // Remove DB file
@@ -10228,6 +10262,42 @@ mod tests {
         clear_profile_opds_credentials(&conn, &store, "Classics").unwrap();
         assert!(store.get("Classics", "https://h/a").unwrap().is_none());
         assert!(store.get("Classics", "https://h/b").unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_profile_opds_credentials_propagates_a_store_failure() {
+        // This is the property `delete_profile`'s ordering fix relies on:
+        // credential cleanup runs BEFORE the profile's pool is removed from
+        // `profile_state`, specifically so a failure here can abort the
+        // whole operation before anything is mutated. That only protects
+        // anyone if a failing `CredentialStore::delete` actually surfaces as
+        // an `Err` here rather than being swallowed — this pins that
+        // contract.
+        //
+        // `delete_profile` itself cannot be exercised end-to-end with this
+        // failure: it hardcodes `&KeyringCredentialStore` with no store
+        // parameter to inject a test double into, and a keychain-touching
+        // test is forbidden regardless (see task-10-report.md for why this
+        // wasn't refactored into an injectable `_with` variant). This test
+        // therefore pins the contract at the level that IS testable without
+        // touching the real keychain.
+        let (conn, _tmp) = test_conn_with_catalog("https://h/a");
+        upsert_opds_auth_inner(&conn, rec("https://h/a", "basic", "u")).unwrap();
+        let store = FlakyCredentialStore {
+            inner: MemoryCredentialStore::default(),
+            fail_set: false,
+            fail_delete: true,
+        };
+        let err = clear_profile_opds_credentials(&conn, &store, "Classics").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("flaky"),
+            "got: {err}"
+        );
+        // The failure changed nothing: `clear_profile_opds_credentials`
+        // never touches the `opds_auth` row (Task 10's decision — the
+        // caller deletes the whole profile DB right after), so the record
+        // is exactly as it was before the failed attempt.
+        assert_eq!(read_opds_auth(&conn).len(), 1);
     }
 
     #[test]
