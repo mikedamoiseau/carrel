@@ -4673,11 +4673,10 @@ fn clear_opds_auth_inner(
 /// Clears every OPDS credential secret that `profile` owned, for
 /// `delete_profile` to call right before the profile's DB file is removed.
 /// Must run while the profile's pool is still alive — it needs a connection
-/// to read the `opds_auth` row. Does NOT lock `OPDS_AUTH_LOCK`: its only
-/// caller, `delete_profile`, is itself a `#[tauri::command]` that holds
-/// `profile_lifecycle` for its whole body, so a second lock here would be
-/// redundant at best and, if `delete_profile` ever called through a path
-/// that already held `OPDS_AUTH_LOCK`, would self-deadlock.
+/// to read the `opds_auth` row. Does NOT lock `OPDS_AUTH_LOCK` itself: its
+/// only caller, `delete_profile_with`, already takes `OPDS_AUTH_LOCK` (after
+/// `profile_lifecycle`) for its whole body, so a second lock here would
+/// self-deadlock — `std::sync::Mutex` is not reentrant.
 ///
 /// Deliberately leaves the `opds_auth` row itself untouched — the caller
 /// deletes the profile's entire DB file immediately after this returns, so
@@ -5675,6 +5674,24 @@ async fn delete_profile_with(
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
     let _lifecycle = state.profile_lifecycle.lock().await;
+    // OPDS_AUTH_LOCK, taken *after* `_lifecycle` and held to the end of this
+    // function: without it, a credential write (`set_opds_auth` et al., which
+    // hold OPDS_AUTH_LOCK but not `profile_lifecycle`) can snapshot this
+    // profile before `clear_profile_opds_credentials` below runs and then
+    // re-create a secret for it after the profile's DB and keychain entries
+    // have been removed — turning Task 10's fail-loud cleanup into a silent
+    // fail-open. Lock order `profile_lifecycle` -> `OPDS_AUTH_LOCK` is
+    // deadlock-free: no current OPDS_AUTH_LOCK holder (`add_opds_catalog`,
+    // `remove_opds_catalog`, `set_opds_auth`, `clear_opds_auth`,
+    // `add_opds_catalog_with_auth` — `get_opds_auth` deliberately doesn't
+    // lock at all, see its own comment) ever takes `profile_lifecycle`, so
+    // the two locks are never acquired in the
+    // opposite order anywhere in this module — verified by grepping every
+    // `profile_lifecycle` site (`create_profile`, `switch_active_profile_with`,
+    // this function, `set_profile_lock`, `remove_profile_lock`,
+    // `unlock_profile`, `reset_profile_lock`) against every `OPDS_AUTH_LOCK`
+    // site: the two sets are disjoint. Do not reorder these two acquisitions.
+    let _opds_guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if name == "default" {
         return Err(CarrelError::invalid("Cannot delete the default profile"));
     }
