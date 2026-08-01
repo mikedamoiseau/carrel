@@ -342,6 +342,23 @@ pub fn same_origin_redirect_policy(origin: String) -> reqwest::redirect::Policy 
     })
 }
 
+/// Map 401/403 to a distinct auth-required error; any other status yields
+/// `None` and falls through to the caller's generic handling.
+///
+/// The message carries the exact `OPDS auth required` substring that
+/// `src/lib/errors.ts`'s `MESSAGE_KEYS` matches on, so the frontend can tell an
+/// auth failure from an unreachable host and offer a sign-in prompt. Without
+/// this the status became `CarrelError::network("HTTP 401 …")` and reached the
+/// user as "Could not connect to the server."
+///
+/// 403 is treated like 401 because OPDS servers return it for a missing or
+/// wrong credential at least as often, and a wrong guess costs one dismissible
+/// prompt.
+fn auth_error_for(status: reqwest::StatusCode) -> Option<CarrelError> {
+    matches!(status.as_u16(), 401 | 403)
+        .then(|| CarrelError::permission(format!("OPDS auth required: HTTP {status}")))
+}
+
 /// Pick the client for a request that may carry a credential: the strict
 /// same-origin policy when one is attached, otherwise the caller's default.
 fn client_for(
@@ -381,6 +398,9 @@ pub fn fetch_feed_with_context(url: &str, ctx: &OpdsContext) -> CarrelResult<Opd
     )
     .send()
     .map_err(|e| CarrelError::network(format!("HTTP error: {e}")))?;
+    if let Some(err) = auth_error_for(response.status()) {
+        return Err(err);
+    }
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
@@ -750,6 +770,9 @@ pub fn download_file_with_context(url: &str, dest: &str, ctx: &OpdsContext) -> C
     let response = apply_auth(client.get(url), url, ctx)
         .send()
         .map_err(|e| CarrelError::network(format!("Download failed: {e}")))?;
+    if let Some(err) = auth_error_for(response.status()) {
+        return Err(err);
+    }
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
@@ -795,6 +818,10 @@ pub fn download_file_ssrf_guarded(url: &str, dest: &str) -> CarrelResult<()> {
         .get(url)
         .send()
         .map_err(|e| CarrelError::network(format!("Download failed: {e}")))?;
+    // Deliberately no `auth_error_for` here: this is the plugin / dictionary
+    // download path, which never carries a catalog credential, so a 401 from it
+    // is not something a sign-in prompt could fix. Its error mapping is
+    // unchanged.
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
@@ -1326,6 +1353,15 @@ mod tests {
     }
 
     #[test]
+    fn auth_status_maps_to_permission_error_with_the_frontend_substring() {
+        let err = auth_error_for(reqwest::StatusCode::UNAUTHORIZED).expect("401 must map");
+        assert!(err.to_string().contains("OPDS auth required"));
+        assert!(auth_error_for(reqwest::StatusCode::FORBIDDEN).is_some());
+        assert!(auth_error_for(reqwest::StatusCode::NOT_FOUND).is_none());
+        assert!(auth_error_for(reqwest::StatusCode::OK).is_none());
+    }
+
+    #[test]
     fn credential_requires_both_provenance_and_secret() {
         let mut ctx = basic_ctx("https://h");
         ctx.cred = None;
@@ -1529,6 +1565,22 @@ mod http_tests {
             1,
             "B must have served the feed"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_401_feed_surfaces_the_auth_error_not_a_network_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = trusting_ctx(&url);
+        let err = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("OPDS auth required"), "got: {err}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
