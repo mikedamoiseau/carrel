@@ -4722,7 +4722,14 @@ pub async fn get_opds_auth(
     catalog_url: String,
     state: State<'_, AppState>,
 ) -> CarrelResult<Option<OpdsAuthInfo>> {
-    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // Deliberately does NOT take `OPDS_AUTH_LOCK`: this is a single-row read
+    // of `opds_auth`, and `read_opds_auth` already tolerates a missing or
+    // corrupt row (:4365-4372). SQLite's own row read is atomic, so this can
+    // only ever observe the row before or after a concurrent writer's commit
+    // — never a torn value — and both outcomes are a valid answer to "what
+    // is stored right now". Skipping the write lock here is what keeps a
+    // per-catalog `Promise.all` of these reads (`CatalogBrowser.tsx`) from
+    // queueing behind a same-mutex writer that may be mid network I/O.
     let (_profile, pool) = active_profile_and_db(&state)?;
     let conn = pool.get()?;
     Ok(read_opds_auth(&conn)
