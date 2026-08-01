@@ -4009,6 +4009,141 @@ fn trusted_hosts_from_db(conn: &rusqlite::Connection) -> Vec<String> {
     hosts
 }
 
+/// Keychain service for OPDS catalog credentials. STABLE IDENTIFIER — changing
+/// it orphans every stored credential (see the CLAUDE.md table).
+const OPDS_AUTH_SERVICE: &str = "carrel-opds-auth";
+
+/// Serializes every writer of `opds_custom_catalogs` and `opds_auth`. Both are
+/// single array-valued settings rows, so an unsynchronized writer is a lost
+/// update — and the authenticated-add rollback window spans a network call.
+///
+/// LOCKING DISCIPLINE: only `#[tauri::command]` entry points lock. Helpers are
+/// `*_inner` and never lock; `std::sync::Mutex` is not reentrant.
+#[allow(dead_code)] // acquired by Task 9's set/get/clear_opds_auth commands
+static OPDS_AUTH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Builds the keychain account string for an OPDS catalog credential. A
+/// profile name may contain any character — validation only trims and
+/// rejects empty/"default" (commands.rs:4574) — so a delimiter-joined key
+/// would be ambiguous. Length prefixing is not.
+///
+/// STABLE IDENTIFIER — this encoding, together with [`OPDS_AUTH_SERVICE`], is
+/// how a credential is looked up. Changing it orphans every stored credential.
+fn opds_secret_key(profile: &str, catalog_url: &str) -> String {
+    format!("{}:{}{}", profile.len(), profile, catalog_url)
+}
+
+/// Storage seam for OPDS catalog credentials, so tests never touch the real
+/// OS keychain — a keychain-touching test is platform-dependent, can prompt
+/// the user, and leaves credentials behind.
+#[allow(dead_code)] // implemented here, consumed by Task 8–14's *_inner helpers
+trait CredentialStore: Send + Sync {
+    fn get(&self, profile: &str, catalog_url: &str) -> CarrelResult<Option<String>>;
+    fn set(&self, profile: &str, catalog_url: &str, secret: &str) -> CarrelResult<()>;
+    fn delete(&self, profile: &str, catalog_url: &str) -> CarrelResult<()>;
+}
+
+/// Production `CredentialStore`, backed by the OS keychain. Follows
+/// `backup.rs:26-86`'s error-mapping pattern, with two deliberate
+/// differences: `get` maps a missing entry to `Ok(None)` (no secret stored
+/// yet is not exceptional here), and `delete` propagates a keychain failure
+/// instead of swallowing it, unlike `remove_secrets`.
+#[allow(dead_code)] // constructed by Task 9's set/get/clear_opds_auth commands
+struct KeyringCredentialStore;
+
+impl CredentialStore for KeyringCredentialStore {
+    fn get(&self, profile: &str, catalog_url: &str) -> CarrelResult<Option<String>> {
+        let account = opds_secret_key(profile, catalog_url);
+        let entry = keyring::Entry::new(OPDS_AUTH_SERVICE, &account).map_err(|e| {
+            CarrelError::internal(format!("Failed to access keychain for OPDS catalog: {e}"))
+        })?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(CarrelError::internal(format!(
+                "Failed to load OPDS catalog credential from keychain: {e}"
+            ))),
+        }
+    }
+
+    fn set(&self, profile: &str, catalog_url: &str, secret: &str) -> CarrelResult<()> {
+        let account = opds_secret_key(profile, catalog_url);
+        let entry = keyring::Entry::new(OPDS_AUTH_SERVICE, &account).map_err(|e| {
+            CarrelError::internal(format!("Failed to access keychain for OPDS catalog: {e}"))
+        })?;
+        entry.set_password(secret).map_err(|e| match e {
+            keyring::Error::PlatformFailure(err) => CarrelError::permission(format!(
+                "Keychain access denied while storing OPDS catalog credential: {err}"
+            )),
+            _ => CarrelError::internal(format!(
+                "Failed to store OPDS catalog credential in keychain: {e}"
+            )),
+        })
+    }
+
+    fn delete(&self, profile: &str, catalog_url: &str) -> CarrelResult<()> {
+        let account = opds_secret_key(profile, catalog_url);
+        let entry = keyring::Entry::new(OPDS_AUTH_SERVICE, &account).map_err(|e| {
+            CarrelError::internal(format!("Failed to access keychain for OPDS catalog: {e}"))
+        })?;
+        entry.delete_credential().map_err(|e| match e {
+            keyring::Error::PlatformFailure(err) => CarrelError::permission(format!(
+                "Keychain access denied while removing OPDS catalog credential: {err}"
+            )),
+            _ => CarrelError::internal(format!(
+                "Failed to remove OPDS catalog credential from keychain: {e}"
+            )),
+        })
+    }
+}
+
+/// In-memory `CredentialStore` for tests. Never touches the OS keychain (see
+/// the module-level constraint on `CredentialStore`).
+#[cfg(test)]
+#[derive(Default)]
+struct MemoryCredentialStore {
+    entries: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+#[cfg(test)]
+impl CredentialStore for MemoryCredentialStore {
+    fn get(&self, profile: &str, catalog_url: &str) -> CarrelResult<Option<String>> {
+        let key = opds_secret_key(profile, catalog_url);
+        Ok(self.entries.lock()?.get(&key).cloned())
+    }
+
+    fn set(&self, profile: &str, catalog_url: &str, secret: &str) -> CarrelResult<()> {
+        let key = opds_secret_key(profile, catalog_url);
+        self.entries.lock()?.insert(key, secret.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, profile: &str, catalog_url: &str) -> CarrelResult<()> {
+        let key = opds_secret_key(profile, catalog_url);
+        self.entries.lock()?.remove(&key);
+        Ok(())
+    }
+}
+
+/// Active profile name and its pool from ONE `profile_state` snapshot.
+/// `shared_active_profile_name` (lib.rs:179) is a web-server mirror updated in
+/// a separate critical section during a switch (commands.rs:4740, :4757), so
+/// reading the name from there could pair profile A's settings with profile
+/// B's secret. Mirrors `AppState::active_db_unchecked`'s single-lock pattern.
+#[allow(dead_code)] // called by Task 8–14's *_inner helpers
+fn active_profile_and_db(state: &AppState) -> CarrelResult<(String, DbPool)> {
+    let ps = state.profile_state.lock()?;
+    let pool = if ps.active == "default" {
+        state.db.clone()
+    } else {
+        ps.pools
+            .get(&ps.active)
+            .cloned()
+            .ok_or_else(|| CarrelError::not_found(format!("Profile '{}' not found", ps.active)))?
+    };
+    Ok((ps.active.clone(), pool))
+}
+
 #[tauri::command]
 pub async fn get_opds_catalogs(state: State<'_, AppState>) -> CarrelResult<Vec<OpdsCatalogSource>> {
     let conn = state.active_db()?.get()?;
@@ -9305,6 +9440,35 @@ mod tests {
             .find(|c| c.url == "https://www.gutenberg.org/ebooks.opds/")
             .expect("default Project Gutenberg missing");
         assert_eq!(gutenberg.preset_id.as_deref(), Some("project-gutenberg"));
+    }
+
+    #[test]
+    fn opds_secret_key_is_length_prefixed_and_unambiguous() {
+        // A profile name may contain any character — validation only trims and
+        // rejects empty/"default" (commands.rs:4574) — so a delimiter-joined key
+        // would be ambiguous. Length prefixing is not.
+        assert_eq!(
+            opds_secret_key("Classics", "https://h/opds"),
+            "8:Classicshttps://h/opds"
+        );
+        assert_ne!(
+            opds_secret_key("a", "b:https://h/opds"),
+            opds_secret_key("a:b", "https://h/opds"),
+            "these must not collide"
+        );
+    }
+
+    #[test]
+    fn memory_store_round_trips_and_deletes() {
+        let store = MemoryCredentialStore::default();
+        assert!(store.get("p", "https://h/opds").unwrap().is_none());
+        store.set("p", "https://h/opds", "s").unwrap();
+        assert_eq!(
+            store.get("p", "https://h/opds").unwrap().as_deref(),
+            Some("s")
+        );
+        store.delete("p", "https://h/opds").unwrap();
+        assert!(store.get("p", "https://h/opds").unwrap().is_none());
     }
 
     #[test]
