@@ -97,6 +97,113 @@ describe("CatalogBrowser add-catalog validation", () => {
   });
 });
 
+async function openSignIn() {
+  await act(async () => fireEvent.click(screen.getByText("catalog.addSignIn")));
+}
+
+async function fillBasicCredentials(username: string, password: string) {
+  await act(async () => {
+    fireEvent.change(screen.getByPlaceholderText("catalog.authUsername"), { target: { value: username } });
+    fireEvent.change(screen.getByPlaceholderText("catalog.authPassword"), { target: { value: password } });
+  });
+}
+
+describe("CatalogBrowser add-catalog credentials", () => {
+  it("adds a catalog and its credentials through one command", async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    await openAddForm();
+    await fillForm("Secure Feed", "https://secure.example/opds");
+    await openSignIn();
+    await fillBasicCredentials("alice", "hunter2");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "common.add" })));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("add_opds_catalog_with_auth", {
+        name: "Secure Feed",
+        url: "https://secure.example/opds",
+        presetId: null,
+        kind: "basic",
+        username: "alice",
+        secret: "hunter2",
+        allowInsecure: false,
+      }),
+    );
+    expect(invoke).not.toHaveBeenCalledWith("add_opds_catalog", expect.anything());
+    expect(invoke).not.toHaveBeenCalledWith("browse_opds", expect.anything());
+  });
+
+  it("keeps the credential-free path on the two-step add", async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    await openAddForm();
+    await fillForm("Public Feed", "https://public.example/opds");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "common.add" })));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("add_opds_catalog", { name: "Public Feed", url: "https://public.example/opds" }),
+    );
+    expect(invoke).toHaveBeenCalledWith("browse_opds", {
+      url: "https://public.example/opds",
+      catalogUrl: "https://public.example/opds",
+    });
+    expect(invoke).not.toHaveBeenCalledWith("add_opds_catalog_with_auth", expect.anything());
+  });
+
+  it("requires acknowledging cleartext before sending a credential to a LAN host", async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    await openAddForm();
+    await fillForm("LAN Feed", "http://192.168.0.50:8080/opds");
+    await openSignIn();
+    await fillBasicCredentials("bob", "s3cret");
+
+    expect(screen.getByText("catalog.insecureCredentialWarning")).toBeInTheDocument();
+    const addBtn = screen.getByRole("button", { name: "common.add" });
+    expect(addBtn).toBeDisabled();
+
+    await act(async () => fireEvent.click(screen.getByRole("checkbox")));
+    expect(addBtn).not.toBeDisabled();
+    await act(async () => fireEvent.click(addBtn));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "add_opds_catalog_with_auth",
+        expect.objectContaining({ allowInsecure: true }),
+      ),
+    );
+  });
+
+  it("does not warn for a loopback URL", async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    await openAddForm();
+    await fillForm("Local Feed", "http://localhost:8080/opds");
+    await openSignIn();
+    await fillBasicCredentials("bob", "s3cret");
+
+    expect(screen.queryByText("catalog.insecureCredentialWarning")).not.toBeInTheDocument();
+    const addBtn = screen.getByRole("button", { name: "common.add" });
+    expect(addBtn).not.toBeDisabled();
+    await act(async () => fireEvent.click(addBtn));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "add_opds_catalog_with_auth",
+        expect.objectContaining({ allowInsecure: false }),
+      ),
+    );
+  });
+});
+
 describe("CatalogBrowser empty state", () => {
   it("shows the no-catalogs empty state only after a successful empty load, not while loading", async () => {
     // Hold the load open so we can assert the empty state is NOT shown until

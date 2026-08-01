@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { friendlyError } from "../lib/errors";
-import { pickSupportedOpdsLink, isValidHttpUrl, formatBytes } from "../lib/utils";
+import { pickSupportedOpdsLink, isValidHttpUrl, isLoopbackHost, formatBytes } from "../lib/utils";
 import { FALLBACK_FORMATS, useSupportedFormats } from "../lib/supportedFormats";
 import OpdsPresetPicker from "./OpdsPresetPicker";
 import ConfirmDialog from "./ConfirmDialog";
@@ -121,6 +121,26 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
   const [addingCatalog, setAddingCatalog] = useState(false);
   const [addCatalogError, setAddCatalogError] = useState<string | null>(null);
   const [removeCatalogTarget, setRemoveCatalogTarget] = useState<{ name: string; url: string } | null>(null);
+  // Optional sign-in for the catalog being added — disclosed on demand so the
+  // common (public catalog) path stays a two-field form.
+  const [showCredentials, setShowCredentials] = useState(false);
+  const [authKind, setAuthKind] = useState<"basic" | "bearer">("basic");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authSecret, setAuthSecret] = useState("");
+  const [insecureAcknowledged, setInsecureAcknowledged] = useState(false);
+  // True when a credential would be sent over cleartext HTTP to a non-loopback
+  // host — mirrors the backend's `is_loopback_host` gate (opds.rs) so the
+  // warning only appears where the backend would actually demand `allowInsecure`.
+  const needsInsecureAck = (() => {
+    if (!showCredentials) return false;
+    const trimmed = newCatalogUrl.trim();
+    if (!/^http:\/\//i.test(trimmed)) return false;
+    try {
+      return !isLoopbackHost(new URL(trimmed).hostname);
+    } catch {
+      return false;
+    }
+  })();
 
   // Search (per-catalog and unified)
   const [searchQuery, setSearchQuery] = useState("");
@@ -228,6 +248,27 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     }
   }, [onBookImported, t, supportedFormats]);
 
+  const resetAddForm = () => {
+    setNewCatalogName("");
+    setNewCatalogUrl("");
+    setShowAddCatalog(false);
+    setShowCredentials(false);
+    setAuthKind("basic");
+    setAuthUsername("");
+    setAuthSecret("");
+    setInsecureAcknowledged(false);
+  };
+
+  const handleCancelAddCatalog = () => {
+    setShowAddCatalog(false);
+    setAddCatalogError(null);
+    // Never let a typed secret linger in state once the form is dismissed.
+    setShowCredentials(false);
+    setAuthUsername("");
+    setAuthSecret("");
+    setInsecureAcknowledged(false);
+  };
+
   const handleAddCatalog = async () => {
     if (addingCatalog) return; // guard re-entry (Enter key / double-click while testing)
     const name = newCatalogName.trim();
@@ -240,26 +281,44 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       return;
     }
 
+    const username = authUsername.trim();
+    const secret = authSecret;
+    const hasCredentials = showCredentials && secret !== "" && (authKind === "bearer" || username !== "");
+    if (hasCredentials && needsInsecureAck && !insecureAcknowledged) return; // guards the Enter-key path too
+
     setAddCatalogError(null);
     setAddingCatalog(true);
     try {
-      // Save first, then connection-test. `browse_opds` only relaxes its
-      // private/loopback SSRF guard for hosts already in the saved catalog
-      // list, so a LAN/localhost feed must be saved before it can be tested.
-      // `add_opds_catalog` intentionally trusts the user-entered URL.
-      await invoke("add_opds_catalog", { name, url });
-      try {
-        // Provisional connection test is a root browse of the catalog being
-        // added, so its provenance is its own (about-to-be-configured) URL.
-        await invoke("browse_opds", { url, catalogUrl: url });
-      } catch (testErr) {
-        // Roll back the provisional add so a broken feed isn't kept.
-        await invoke("remove_opds_catalog", { url }).catch(() => {});
-        throw testErr;
+      if (hasCredentials) {
+        // The backend connection-tests the feed with the new credential and
+        // rolls back both the catalog row and the keychain entry atomically
+        // on failure — no separate browse_opds call here.
+        await invoke("add_opds_catalog_with_auth", {
+          name,
+          url,
+          presetId: null,
+          kind: authKind,
+          username: authKind === "basic" ? username : "",
+          secret,
+          allowInsecure: insecureAcknowledged,
+        });
+      } else {
+        // Save first, then connection-test. `browse_opds` only relaxes its
+        // private/loopback SSRF guard for hosts already in the saved catalog
+        // list, so a LAN/localhost feed must be saved before it can be tested.
+        // `add_opds_catalog` intentionally trusts the user-entered URL.
+        await invoke("add_opds_catalog", { name, url });
+        try {
+          // Provisional connection test is a root browse of the catalog being
+          // added, so its provenance is its own (about-to-be-configured) URL.
+          await invoke("browse_opds", { url, catalogUrl: url });
+        } catch (testErr) {
+          // Roll back the provisional add so a broken feed isn't kept.
+          await invoke("remove_opds_catalog", { url }).catch(() => {});
+          throw testErr;
+        }
       }
-      setNewCatalogName("");
-      setNewCatalogUrl("");
-      setShowAddCatalog(false);
+      resetAddForm();
       await loadCatalogs();
     } catch (err) {
       setAddCatalogError(t("catalog.connectionTestFailed", { error: friendlyError(err, t) }));
@@ -558,20 +617,75 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
                     className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
                   />
                   <input
-                    type="url" value={newCatalogUrl} onChange={(e) => { setNewCatalogUrl(e.target.value); setAddCatalogError(null); }}
+                    type="url" value={newCatalogUrl}
+                    onChange={(e) => { setNewCatalogUrl(e.target.value); setAddCatalogError(null); setInsecureAcknowledged(false); }}
                     placeholder={t("catalog.opdsFeedUrl")}
                     onKeyDown={(e) => { if (e.key === "Enter") handleAddCatalog(); }}
                     className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
                   />
+
+                  <button
+                    type="button"
+                    onClick={() => setShowCredentials((v) => !v)}
+                    className="text-xs font-medium text-accent hover:text-accent/80 transition-colors"
+                  >
+                    {showCredentials ? t("catalog.hideSignIn") : t("catalog.addSignIn")}
+                  </button>
+
+                  {showCredentials && (
+                    <div className="space-y-2 pl-3 border-l-2 border-warm-border">
+                      <div className="flex gap-3 text-xs text-ink">
+                        <label className="flex items-center gap-1.5">
+                          <input type="radio" name="opds-auth-kind" checked={authKind === "basic"} onChange={() => setAuthKind("basic")} />
+                          {t("catalog.authBasic")}
+                        </label>
+                        <label className="flex items-center gap-1.5">
+                          <input type="radio" name="opds-auth-kind" checked={authKind === "bearer"} onChange={() => setAuthKind("bearer")} />
+                          {t("catalog.authBearer")}
+                        </label>
+                      </div>
+                      {authKind === "basic" && (
+                        <input
+                          type="text" value={authUsername} onChange={(e) => setAuthUsername(e.target.value)}
+                          placeholder={t("catalog.authUsername")} autoComplete="off"
+                          className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
+                        />
+                      )}
+                      <input
+                        type="password" value={authSecret} onChange={(e) => setAuthSecret(e.target.value)}
+                        placeholder={authKind === "basic" ? t("catalog.authPassword") : t("catalog.authToken")}
+                        autoComplete="off"
+                        className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
+                      />
+                      {needsInsecureAck && (
+                        <label className="flex items-start gap-1.5 text-xs text-amber-700">
+                          <input
+                            type="checkbox" checked={insecureAcknowledged}
+                            onChange={(e) => setInsecureAcknowledged(e.target.checked)}
+                            className="mt-0.5"
+                          />
+                          {t("catalog.insecureCredentialWarning")}
+                        </label>
+                      )}
+                    </div>
+                  )}
+
                   {addCatalogError && (
                     <p className="text-xs text-red-600">{addCatalogError}</p>
                   )}
                   <div className="flex gap-2">
-                    <button onClick={handleAddCatalog} disabled={!newCatalogName.trim() || !newCatalogUrl.trim() || addingCatalog}
+                    <button
+                      onClick={handleAddCatalog}
+                      disabled={
+                        !newCatalogName.trim() ||
+                        !newCatalogUrl.trim() ||
+                        addingCatalog ||
+                        (needsInsecureAck && !insecureAcknowledged)
+                      }
                       className="flex-1 py-1.5 text-xs font-medium text-white bg-accent hover:bg-accent-hover rounded-lg transition-colors disabled:opacity-40">
                       {addingCatalog ? t("catalog.testingConnection") : t("common.add")}
                     </button>
-                    <button onClick={() => { setShowAddCatalog(false); setAddCatalogError(null); }} disabled={addingCatalog}
+                    <button onClick={handleCancelAddCatalog} disabled={addingCatalog}
                       className="flex-1 py-1.5 text-xs text-ink-muted hover:text-ink transition-colors disabled:opacity-40">
                       {t("common.cancel")}
                     </button>
