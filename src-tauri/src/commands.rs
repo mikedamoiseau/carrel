@@ -4742,6 +4742,152 @@ pub async fn clear_opds_auth(catalog_url: String, state: State<'_, AppState>) ->
     clear_opds_auth_inner(&conn, &KeyringCredentialStore, &profile, &catalog_url)
 }
 
+/// Persistence body for `add_opds_catalog_with_auth` — implements the
+/// spec's write protocol (docs/superpowers/specs/2026-08-01-opds-catalog-auth-design.md,
+/// "Write protocol", `add_opds_catalog_with_auth` section):
+///
+/// 1. Validate — `add_opds_catalog_inner` rejects a duplicate URL and
+///    `set_opds_auth_inner` validates kind/secret/username/origin/cleartext.
+///    Both run inside the transaction below, catalog first, so by the time
+///    `set_opds_auth_inner` checks "is this catalog configured?" the answer
+///    is yes — the catalog write is visible to later reads on this same
+///    (uncommitted) connection even though no other connection can see it
+///    yet.
+/// 2. Retain any previous secret for `url`, for restoration if the
+///    connection test in step 4 fails. A plain read — harmless that
+///    `set_opds_auth_inner` performs the same read again below for its own
+///    narrower compensation window (a failed row write, which can't happen
+///    here since nothing else writes `opds_auth` concurrently).
+/// 3. In one `unchecked_transaction`, snapshot the *raw* serialized values of
+///    `opds_custom_catalogs` and `opds_auth` (as `Option<String>`, not
+///    parsed — byte-for-byte restoration in step 5 depends on writing back
+///    the exact string, not a re-serialized equivalent), add the catalog,
+///    write the credential, and commit.
+/// 4. Connection-test the feed with the new credential. The catalog is now
+///    committed, so `opds_context_for` sees it as configured and trusted
+///    (via `trusted_hosts_from_db`), and attaches the credential just
+///    stored.
+/// 5. On test failure: write the two retained values back verbatim in one
+///    transaction — deleting the row if it did not exist before, rather
+///    than writing an empty array, since a row that never existed must not
+///    start existing — then restore or delete the secret as in
+///    `set_opds_auth` step 5, and return the test's error (not the
+///    rollback's).
+///
+/// TRANSACTION RECEIVER: `Connection::transaction()` needs `&mut Connection`,
+/// which this `&Connection` helper cannot provide, so this uses
+/// `unchecked_transaction()` (takes `&self`) instead. Safe here because no
+/// outer transaction is ever active on `conn`: every caller is a
+/// `#[tauri::command]` holding `OPDS_AUTH_LOCK` for the call's entire
+/// duration, so nothing else can be mid-transaction on this connection.
+///
+/// Does NOT lock `OPDS_AUTH_LOCK` — see the module note on
+/// `add_opds_catalog_inner`/`set_opds_auth_inner` for why an inner fn
+/// locking would self-deadlock a caller that already holds it.
+#[allow(clippy::too_many_arguments)]
+fn add_opds_catalog_with_auth_inner(
+    conn: &rusqlite::Connection,
+    store: &dyn CredentialStore,
+    profile: &str,
+    name: &str,
+    url: &str,
+    preset_id: Option<String>,
+    kind: &str,
+    username: &str,
+    secret: &str,
+    allow_insecure: bool,
+) -> CarrelResult<()> {
+    if !opds::is_user_addable_url(url) {
+        return Err(CarrelError::invalid(
+            "Invalid catalog URL — only http:// or https:// URLs are accepted.",
+        ));
+    }
+
+    // Step 2: retain whatever secret this catalog URL already owns.
+    let previous_secret = store.get(profile, url)?;
+
+    // Snapshot both settings rows verbatim, before anything is written.
+    let cats_before = db::get_setting(conn, "opds_custom_catalogs")?;
+    let auth_before = db::get_setting(conn, "opds_auth")?;
+
+    // Step 1 + Step 3: validate and write the catalog and the credential in
+    // one transaction. Nothing commits unless both succeed.
+    let tx = conn.unchecked_transaction()?;
+    add_opds_catalog_inner(&tx, name.to_string(), url.to_string(), preset_id)?;
+    set_opds_auth_inner(
+        &tx,
+        store,
+        profile,
+        url,
+        kind,
+        username,
+        secret,
+        allow_insecure,
+    )?;
+    tx.commit()?;
+
+    // Step 4: connection-test the feed with the new credential.
+    let ctx = opds_context_for(conn, store, profile, Some(url), url);
+    if let Err(test_err) = opds::fetch_feed_with_context(url, &ctx) {
+        // Step 5: the connection test failed after commit — undo both rows,
+        // verbatim, in one transaction.
+        let restore_tx = conn.unchecked_transaction()?;
+        match &cats_before {
+            Some(v) => db::set_setting(&restore_tx, "opds_custom_catalogs", v)?,
+            None => db::delete_setting(&restore_tx, "opds_custom_catalogs")?,
+        }
+        match &auth_before {
+            Some(v) => db::set_setting(&restore_tx, "opds_auth", v)?,
+            None => db::delete_setting(&restore_tx, "opds_auth")?,
+        }
+        restore_tx.commit()?;
+
+        let restore_result = match &previous_secret {
+            Some(prev) => store.set(profile, url, prev),
+            None => store.delete(profile, url),
+        };
+        return match restore_result {
+            Ok(()) => Err(test_err),
+            Err(restore_err) => Err(CarrelError::internal(format!(
+                "The new catalog's connection test failed ({test_err}), and the previous \
+                 credential could not be restored ({restore_err}) — the credential is now in \
+                 an unknown state and should be re-entered."
+            ))),
+        };
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn add_opds_catalog_with_auth(
+    name: String,
+    url: String,
+    preset_id: Option<String>,
+    kind: String,
+    username: String,
+    secret: String,
+    allow_insecure: bool,
+    state: State<'_, AppState>,
+) -> CarrelResult<()> {
+    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (profile, pool) = active_profile_and_db(&state)?;
+    let conn = pool.get()?;
+    add_opds_catalog_with_auth_inner(
+        &conn,
+        &KeyringCredentialStore,
+        &profile,
+        &name,
+        &url,
+        preset_id,
+        &kind,
+        &username,
+        &secret,
+        allow_insecure,
+    )
+}
+
 /// Live progress for a single catalog during a unified `search_all_catalogs`
 /// run. Emitted (as `catalog-search-progress`) once per catalog the moment its
 /// fan-out thread finishes. `query` lets the UI ignore stale events from a
@@ -10411,6 +10557,121 @@ mod tests {
         let err = add_opds_catalog_inner(&conn, "A again".into(), "https://h/opds".into(), None)
             .unwrap_err();
         assert!(err.to_string().contains("already"), "got: {err}");
+    }
+
+    #[test]
+    fn a_failed_connection_test_restores_both_settings_rows_byte_for_byte() {
+        let (conn, _tmp) = test_conn_with_catalog("https://existing/opds");
+        upsert_opds_auth_inner(&conn, rec("https://existing/opds", "basic", "keepme")).unwrap();
+        let store = MemoryCredentialStore::default();
+        store
+            .set("p", "https://existing/opds", "keepme-secret")
+            .unwrap();
+
+        // Snapshot the exact serialized rows before the attempt.
+        let cats_before = db::get_setting(&conn, "opds_custom_catalogs").unwrap();
+        let auth_before = db::get_setting(&conn, "opds_auth").unwrap();
+
+        // 127.0.0.1:1 — nothing listens, so the in-backend connection test fails.
+        let err = add_opds_catalog_with_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "New",
+            "http://127.0.0.1:1/opds",
+            None,
+            "basic",
+            "u",
+            "s",
+            true,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+
+        // Verbatim equality — an implementation that parses, reorders or
+        // re-normalizes the rows would fail here, and should.
+        assert_eq!(
+            db::get_setting(&conn, "opds_custom_catalogs").unwrap(),
+            cats_before
+        );
+        assert_eq!(db::get_setting(&conn, "opds_auth").unwrap(), auth_before);
+        // The unrelated secret is untouched; the new one is gone.
+        assert_eq!(
+            store.get("p", "https://existing/opds").unwrap().as_deref(),
+            Some("keepme-secret")
+        );
+        assert!(store.get("p", "http://127.0.0.1:1/opds").unwrap().is_none());
+    }
+
+    /// Success path: the connection test passes, so the catalog, the
+    /// credential row, and the keychain secret all end up persisted. Uses a
+    /// real `wiremock` server rather than an unreachable URL, matching the
+    /// pattern `carrel-core/src/opds.rs`'s `http_tests` module uses for the
+    /// same reason: credential handling (which `Authorization` header goes
+    /// out) is only observable on the wire. `flavor = "multi_thread"` +
+    /// `spawn_blocking` for the same reason as there — the call under test
+    /// blocks synchronously on the network, and the mock server's own accept
+    /// loop needs a free worker thread to answer it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn add_opds_catalog_with_auth_inner_succeeds_when_the_feed_fetch_succeeds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const MINIMAL_FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <title>T</title>
+              <entry><id>1</id><title>Book</title></entry>
+            </feed>"#;
+
+        let server = MockServer::start().await;
+        // base64("u:s") == "dTpz" — an unmatched header 404s, so a
+        // successful add proves this exact credential reached the server.
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .and(wiremock::matchers::header("authorization", "Basic dTpz"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = db::create_pool(&tmp.path().join("library.db")).unwrap();
+        let conn = pool.get().unwrap();
+        let store = MemoryCredentialStore::default();
+
+        let url_for_call = url.clone();
+        tokio::task::spawn_blocking(move || {
+            add_opds_catalog_with_auth_inner(
+                &conn,
+                &store,
+                "p",
+                "New",
+                &url_for_call,
+                None,
+                "basic",
+                "u",
+                "s",
+                true,
+            )
+            .unwrap();
+
+            assert!(
+                configured_catalog_urls(&conn)
+                    .unwrap()
+                    .iter()
+                    .any(|u| u == &url_for_call),
+                "catalog must be configured after a successful add"
+            );
+            let record = read_opds_auth(&conn)
+                .into_iter()
+                .find(|r| r.catalog_url == url_for_call)
+                .expect("credential row must be present after a successful add");
+            assert_eq!(record.kind, "basic");
+            assert_eq!(record.username, "u");
+            assert_eq!(store.get("p", &url_for_call).unwrap().as_deref(), Some("s"));
+        })
+        .await
+        .unwrap();
     }
 
     #[test]

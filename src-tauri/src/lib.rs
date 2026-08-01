@@ -509,6 +509,7 @@ pub fn run() {
             commands::enrich_book_from_openlibrary,
             commands::get_opds_catalogs,
             commands::add_opds_catalog,
+            commands::add_opds_catalog_with_auth,
             commands::remove_opds_catalog,
             commands::set_opds_auth,
             commands::get_opds_auth,
