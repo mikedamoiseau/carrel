@@ -543,7 +543,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
             className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
           />
           {authPromptNeedsInsecureAck && (
-            <label className="flex items-start gap-1.5 text-xs text-amber-700">
+            <label className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
               <input
                 type="checkbox" checked={authPrompt.allowInsecure}
                 onChange={(e) => setAuthPrompt((p) => (p ? { ...p, allowInsecure: e.target.checked } : p))}
@@ -877,7 +877,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
                         className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
                       />
                       {needsInsecureAck && (
-                        <label className="flex items-start gap-1.5 text-xs text-amber-700">
+                        <label className="flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
                           <input
                             type="checkbox" checked={insecureAcknowledged}
                             onChange={(e) => setInsecureAcknowledged(e.target.checked)}
