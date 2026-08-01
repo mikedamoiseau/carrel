@@ -4044,10 +4044,17 @@ trait CredentialStore: Send + Sync {
 }
 
 /// Production `CredentialStore`, backed by the OS keychain. Follows
-/// `backup.rs:26-86`'s error-mapping pattern, with two deliberate
-/// differences: `get` maps a missing entry to `Ok(None)` (no secret stored
-/// yet is not exceptional here), and `delete` propagates a keychain failure
-/// instead of swallowing it, unlike `remove_secrets`.
+/// `backup.rs:26-86`'s error-mapping pattern, with deliberate differences in
+/// all three methods' treatment of "no entry":
+/// - `get` maps `NoEntry` to `Ok(None)` — no secret stored yet is not
+///   exceptional here.
+/// - `set` has no "no entry" case (a write always creates/overwrites).
+/// - `delete` maps `NoEntry` to `Ok(())` — deleting an already-absent
+///   credential is idempotent, not a failure, so a caller removing a
+///   catalog that never had one (or clearing every credential a deleted
+///   profile might own) doesn't have to special-case it. Every *other*
+///   keychain error is still propagated rather than swallowed, unlike
+///   `remove_secrets`'s `let _ = entry.delete_credential();`.
 #[allow(dead_code)] // constructed by Task 9's set/get/clear_opds_auth commands
 struct KeyringCredentialStore;
 
@@ -4086,14 +4093,16 @@ impl CredentialStore for KeyringCredentialStore {
         let entry = keyring::Entry::new(OPDS_AUTH_SERVICE, &account).map_err(|e| {
             CarrelError::internal(format!("Failed to access keychain for OPDS catalog: {e}"))
         })?;
-        entry.delete_credential().map_err(|e| match e {
-            keyring::Error::PlatformFailure(err) => CarrelError::permission(format!(
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(keyring::Error::PlatformFailure(err)) => Err(CarrelError::permission(format!(
                 "Keychain access denied while removing OPDS catalog credential: {err}"
-            )),
-            _ => CarrelError::internal(format!(
+            ))),
+            Err(e) => Err(CarrelError::internal(format!(
                 "Failed to remove OPDS catalog credential from keychain: {e}"
-            )),
-        })
+            ))),
+        }
     }
 }
 
@@ -4125,23 +4134,43 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
-/// Active profile name and its pool from ONE `profile_state` snapshot.
+/// Active profile name and its pool from ONE `profile_state` snapshot, gated
+/// by the same soft-lock check as `AppState::active_db` (:170-178) — OPDS
+/// catalog credentials are data-bearing, so a locked-and-not-yet-unlocked
+/// profile must not be able to read or write them via this seam.
+///
 /// `shared_active_profile_name` (lib.rs:179) is a web-server mirror updated in
 /// a separate critical section during a switch (commands.rs:4740, :4757), so
 /// reading the name from there could pair profile A's settings with profile
-/// B's secret. Mirrors `AppState::active_db_unchecked`'s single-lock pattern.
+/// B's secret. Mirrors `AppState::active_db_unchecked`'s single-lock pattern
+/// for the name+pool snapshot.
+///
+/// The lock gate is checked *after* releasing `profile_state`, against the
+/// name just snapshotted — never held together with `unlocked_profiles`,
+/// which must stay a leaf lock (:165-169). Checking against the snapshotted
+/// name (rather than re-reading `profile_state.active`) keeps the returned
+/// pair self-consistent even if a switch races between the snapshot and the
+/// gate check: the gate always answers for the same profile the pool came
+/// from, not for whatever is active by the time the gate runs.
 #[allow(dead_code)] // called by Task 8–14's *_inner helpers
 fn active_profile_and_db(state: &AppState) -> CarrelResult<(String, DbPool)> {
-    let ps = state.profile_state.lock()?;
-    let pool = if ps.active == "default" {
-        state.db.clone()
-    } else {
-        ps.pools
-            .get(&ps.active)
-            .cloned()
-            .ok_or_else(|| CarrelError::not_found(format!("Profile '{}' not found", ps.active)))?
+    let (name, pool) = {
+        let ps = state.profile_state.lock()?;
+        let pool = if ps.active == "default" {
+            state.db.clone()
+        } else {
+            ps.pools.get(&ps.active).cloned().ok_or_else(|| {
+                CarrelError::not_found(format!("Profile '{}' not found", ps.active))
+            })?
+        };
+        (ps.active.clone(), pool)
     };
-    Ok((ps.active.clone(), pool))
+    if !state.is_unlocked(&name) {
+        return Err(CarrelError::lock_required(format!(
+            "Profile '{name}' is locked"
+        )));
+    }
+    Ok((name, pool))
 }
 
 #[tauri::command]
@@ -9469,6 +9498,26 @@ mod tests {
         );
         store.delete("p", "https://h/opds").unwrap();
         assert!(store.get("p", "https://h/opds").unwrap().is_none());
+    }
+
+    #[test]
+    fn active_profile_and_db_denied_when_active_profile_locked_and_not_unlocked() {
+        // Mirrors active_db_denied_when_active_profile_locked_and_not_unlocked:
+        // OPDS catalog credentials are data-bearing, so this seam must be
+        // gated by the same soft-lock check as active_db, not just
+        // active_db_unchecked's name+pool snapshot.
+        let (app, _dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        state.unlocked_profiles.lock().unwrap().clear();
+
+        let err = active_profile_and_db(&state)
+            .expect_err("locked active profile must refuse active_profile_and_db");
+        assert_eq!(err.kind(), "LockRequired");
+
+        // Unlocking (as `unlock_profile`/`switch_profile` would) restores access.
+        state.mark_unlocked("default").unwrap();
+        let (name, _pool) = active_profile_and_db(&state).unwrap();
+        assert_eq!(name, "default");
     }
 
     #[test]
