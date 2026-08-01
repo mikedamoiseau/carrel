@@ -3968,26 +3968,12 @@ const DEFAULT_CATALOGS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Build the trusted-host list for OPDS network calls. Every catalog the user
-/// (or Carrel's defaults) has configured contributes its `host:port`, which
-/// lets `is_safe_url_with_trusted` allow LAN/loopback servers the user
-/// explicitly added — without weakening SSRF protection on arbitrary
-/// feed-derived URLs from untrusted hosts.
-fn trusted_hosts_from_catalogs(catalogs: &[OpdsCatalogSource]) -> Vec<String> {
-    let mut hosts: Vec<String> = Vec::new();
-    for cat in catalogs {
-        if let Some(hp) = opds::host_port_from_url(&cat.url) {
-            if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&hp)) {
-                hosts.push(hp);
-            }
-        }
-    }
-    hosts
-}
-
-/// Same as [`trusted_hosts_from_catalogs`] but reads directly from the DB
-/// connection so callers that don't already have the catalog list don't pay
-/// the cost of an extra `get_opds_catalogs` round-trip.
+/// Build the trusted-host list for OPDS network calls, reading catalogs
+/// directly from the DB connection. Every catalog the user (or Carrel's
+/// defaults) has configured contributes its `host:port`, which lets
+/// `is_safe_url_with_trusted` allow LAN/loopback servers the user explicitly
+/// added — without weakening SSRF protection on arbitrary feed-derived URLs
+/// from untrusted hosts. Used internally by [`opds_context_for`].
 fn trusted_hosts_from_db(conn: &rusqlite::Connection) -> Vec<String> {
     let mut hosts: Vec<String> = DEFAULT_CATALOGS
         .iter()
@@ -4406,10 +4392,9 @@ fn upsert_opds_auth_inner(conn: &rusqlite::Connection, rec: OpdsAuthRecord) -> C
 /// Builds the per-request [`opds::OpdsContext`] for an OPDS network call:
 /// the trusted-host list (unchanged from [`trusted_hosts_from_db`]) plus —
 /// only when rules 1-4 below all admit it — the provenance of `catalog_url`
-/// and its credential. Supersedes `trusted_hosts_from_catalogs`/
-/// `trusted_hosts_from_db` as the context builder; those two are left in
-/// place because their existing callers are converted in a later task, not
-/// this one.
+/// and its credential. Supersedes `trusted_hosts_from_catalogs` (deleted —
+/// its only two callers now build a context through this function instead)
+/// and reuses `trusted_hosts_from_db` internally rather than superseding it.
 ///
 /// Enforces rules 1-4 of the design spec's "Provenance rules" section (rule
 /// 5 — dropping provenance when the *response's effective* URL leaves the
@@ -4438,12 +4423,6 @@ fn upsert_opds_auth_inner(conn: &rusqlite::Connection, rec: OpdsAuthRecord) -> C
 ///
 /// Does NOT lock `OPDS_AUTH_LOCK` — it is a helper called from within
 /// commands that already hold it, and `std::sync::Mutex` is not reentrant.
-///
-/// `#[allow(dead_code)]`: not yet called from production code — the next
-/// task converts the six call sites that currently build a context from
-/// `trusted_hosts_from_catalogs`/`trusted_hosts_from_db` to use this
-/// instead. Only exercised by tests until then.
-#[allow(dead_code)]
 fn opds_context_for(
     conn: &rusqlite::Connection,
     store: &dyn CredentialStore,
@@ -4784,9 +4763,13 @@ pub async fn search_all_catalogs(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CarrelResult<Vec<opds::OpdsEntry>> {
-    // Collect all catalog URLs
+    // Provenance is per-catalog: each catalog in the loop below authenticates
+    // with its own credential and gets its own origin check, using its own
+    // `cat.url` as both the initiating catalog and the request URL. Passing
+    // one catalog's provenance while requesting another's feed would be
+    // exactly the credential-laundering `opds_context_for`'s rules forbid.
+    let (profile, pool) = active_profile_and_db(&state)?;
     let catalogs = get_opds_catalogs(state).await?;
-    let trusted = trusted_hosts_from_catalogs(&catalogs);
 
     // Fetch root feeds in parallel to discover search URLs
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -4797,39 +4780,53 @@ pub async fn search_all_catalogs(
         let q = query.clone();
         let tx = result_tx.clone();
         let cat_name = cat.name.clone();
-        let trusted = trusted.clone();
         let app = app.clone();
+        let profile = profile.clone();
+        let pool = pool.clone();
         tauri::async_runtime::spawn_blocking(move || {
             // Search this catalog. `ok` distinguishes a network/parse failure
             // (surfaced to the user as "failed") from a catalog that simply
             // has no search endpoint or returned nothing (shown as "no
-            // results") — both yield an empty `entries` list.
+            // results") — both yield an empty `entries` list. A connection
+            // failure here degrades the same way: this catalog's leg reports
+            // "failed" while the others still complete.
             let mut ok = true;
-            let ctx = opds::OpdsContext {
-                trusted,
-                ..Default::default()
-            };
-            let entries = match opds::fetch_feed_with_context(&url, &ctx) {
-                Ok(root) => match root.search_url {
-                    // Resolve OpenSearch description if needed, then search.
-                    Some(raw) => match opds::resolve_search_url_with_context(&raw, &ctx) {
-                        Some(template) => {
-                            let search_url =
-                                template.replace("{searchTerms}", &opds::url_encode(&q));
-                            match opds::fetch_feed_with_context(&search_url, &ctx) {
-                                Ok(f) => f.entries,
-                                Err(_) => {
-                                    ok = false;
-                                    Vec::new()
+            let entries = match pool.get() {
+                Ok(conn) => {
+                    let ctx = opds_context_for(
+                        &conn,
+                        &KeyringCredentialStore,
+                        &profile,
+                        Some(&url),
+                        &url,
+                    );
+                    match opds::fetch_feed_with_context(&url, &ctx) {
+                        Ok(root) => match root.search_url {
+                            // Resolve OpenSearch description if needed, then search.
+                            Some(raw) => match opds::resolve_search_url_with_context(&raw, &ctx) {
+                                Some(template) => {
+                                    let search_url =
+                                        template.replace("{searchTerms}", &opds::url_encode(&q));
+                                    match opds::fetch_feed_with_context(&search_url, &ctx) {
+                                        Ok(f) => f.entries,
+                                        Err(_) => {
+                                            ok = false;
+                                            Vec::new()
+                                        }
+                                    }
                                 }
-                            }
+                                // No resolvable search template — nothing to search.
+                                None => Vec::new(),
+                            },
+                            // Catalog exposes no search — contributes zero results.
+                            None => Vec::new(),
+                        },
+                        Err(_) => {
+                            ok = false;
+                            Vec::new()
                         }
-                        // No resolvable search template — nothing to search.
-                        None => Vec::new(),
-                    },
-                    // Catalog exposes no search — contributes zero results.
-                    None => Vec::new(),
-                },
+                    }
+                }
                 Err(_) => {
                     ok = false;
                     Vec::new()
@@ -4920,7 +4917,8 @@ fn dedup_discover_entries(
 /// Results are cached for 24 hours in the settings DB to avoid slowing down startup.
 #[tauri::command]
 pub async fn get_discover_books(state: State<'_, AppState>) -> CarrelResult<Vec<opds::OpdsEntry>> {
-    let conn = state.active_db()?.get()?;
+    let (profile, pool) = active_profile_and_db(&state)?;
+    let conn = pool.get()?;
 
     // Library title/author pairs, used to drop books the user already owns.
     // Applied to both the cached and freshly-fetched paths.
@@ -4952,9 +4950,11 @@ pub async fn get_discover_books(state: State<'_, AppState>) -> CarrelResult<Vec<
         }
     }
 
-    // Cache miss or stale — fetch from catalogs in parallel
+    // Cache miss or stale — fetch from catalogs in parallel. Provenance is
+    // per-catalog, same as `search_all_catalogs`: each catalog authenticates
+    // with its own credential against its own origin, using its own
+    // `cat.url` as both the initiating catalog and the request URL.
     let catalogs = get_opds_catalogs(state).await?;
-    let trusted = trusted_hosts_from_catalogs(&catalogs);
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let mut thread_count = 0;
 
@@ -4962,26 +4962,35 @@ pub async fn get_discover_books(state: State<'_, AppState>) -> CarrelResult<Vec<
         let url = cat.url.clone();
         let tx = result_tx.clone();
         let cat_name = cat.name.clone();
-        let trusted = trusted.clone();
+        let profile = profile.clone();
+        let pool = pool.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let ctx = opds::OpdsContext {
-                trusted,
-                ..Default::default()
-            };
-            let entries = match opds::fetch_feed_with_context(&url, &ctx) {
-                Ok(feed) => feed
-                    .entries
-                    .into_iter()
-                    .filter(|e| !e.links.is_empty() && e.nav_url.is_none())
-                    .take(20)
-                    .map(|mut e| {
-                        // Tag with catalog source
-                        if e.summary.is_empty() {
-                            e.summary = format!("From {}", cat_name);
-                        }
-                        e
-                    })
-                    .collect::<Vec<_>>(),
+            let entries = match pool.get() {
+                Ok(conn) => {
+                    let ctx = opds_context_for(
+                        &conn,
+                        &KeyringCredentialStore,
+                        &profile,
+                        Some(&url),
+                        &url,
+                    );
+                    match opds::fetch_feed_with_context(&url, &ctx) {
+                        Ok(feed) => feed
+                            .entries
+                            .into_iter()
+                            .filter(|e| !e.links.is_empty() && e.nav_url.is_none())
+                            .take(20)
+                            .map(|mut e| {
+                                // Tag with catalog source
+                                if e.summary.is_empty() {
+                                    e.summary = format!("From {}", cat_name);
+                                }
+                                e
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(_) => Vec::new(),
+                    }
+                }
                 Err(_) => Vec::new(),
             };
             let _ = tx.send(entries);
@@ -5116,18 +5125,26 @@ fn opds_extension_from_mime(mime: &str) -> Option<&'static str> {
 }
 
 #[tauri::command]
-pub async fn browse_opds(url: String, state: State<'_, AppState>) -> CarrelResult<opds::OpdsFeed> {
-    let trusted = {
-        let conn = state.active_db()?.get()?;
-        trusted_hosts_from_db(&conn)
-    };
+pub async fn browse_opds(
+    url: String,
+    catalog_url: Option<String>,
+    state: State<'_, AppState>,
+) -> CarrelResult<opds::OpdsFeed> {
+    let (profile, pool) = active_profile_and_db(&state)?;
     let (tx, rx) = std::sync::mpsc::channel();
     tauri::async_runtime::spawn_blocking(move || {
-        let ctx = opds::OpdsContext {
-            trusted,
-            ..Default::default()
-        };
-        let _ = tx.send(opds::fetch_feed_with_context(&url, &ctx));
+        let result = (|| -> CarrelResult<opds::OpdsFeed> {
+            let conn = pool.get()?;
+            let ctx = opds_context_for(
+                &conn,
+                &KeyringCredentialStore,
+                &profile,
+                catalog_url.as_deref(),
+                &url,
+            );
+            opds::fetch_feed_with_context(&url, &ctx)
+        })();
+        let _ = tx.send(result);
     });
     rx.recv()?
 }
@@ -5136,6 +5153,7 @@ pub async fn browse_opds(url: String, state: State<'_, AppState>) -> CarrelResul
 pub async fn download_opds_book(
     download_url: String,
     mime_type: Option<String>,
+    catalog_url: Option<String>,
     state: State<'_, AppState>,
     _app: AppHandle,
 ) -> CarrelResult<OpdsImportResult> {
@@ -5186,17 +5204,21 @@ pub async fn download_opds_book(
     {
         let dl_url = download_url.clone();
         let dl_dest = temp_str.clone();
-        let trusted = {
-            let conn = state.active_db()?.get()?;
-            trusted_hosts_from_db(&conn)
-        };
+        let (profile, pool) = active_profile_and_db(&state)?;
         let (tx, rx) = std::sync::mpsc::channel();
         tauri::async_runtime::spawn_blocking(move || {
-            let ctx = opds::OpdsContext {
-                trusted,
-                ..Default::default()
-            };
-            let _ = tx.send(opds::download_file_with_context(&dl_url, &dl_dest, &ctx));
+            let result = (|| -> CarrelResult<()> {
+                let conn = pool.get()?;
+                let ctx = opds_context_for(
+                    &conn,
+                    &KeyringCredentialStore,
+                    &profile,
+                    catalog_url.as_deref(),
+                    &dl_url,
+                );
+                opds::download_file_with_context(&dl_url, &dl_dest, &ctx)
+            })();
+            let _ = tx.send(result);
         });
         rx.recv()??;
     }
@@ -10645,6 +10667,54 @@ mod tests {
             "an unrecognized credential kind must not be guessed into a variant"
         );
         assert!(ctx.provenance.is_some());
+    }
+
+    #[test]
+    fn discover_and_unified_search_use_each_catalog_as_its_own_provenance() {
+        // Pins the shape search_all_catalogs/get_discover_books now build inside
+        // their per-catalog loop: opds_context_for(&conn, &store, &profile,
+        // Some(&cat.url), &cat.url) is called once per catalog, using that
+        // catalog's own URL as both the initiating catalog and the request
+        // URL — never a single ambient catalog shared across the whole
+        // operation. Two catalogs on different origins, only one with a
+        // stored credential: the context built for A must carry A's own
+        // provenance and credential, and the context built for B must carry
+        // B's provenance and none of A's — passing one catalog's provenance
+        // while requesting another's feed is exactly the laundering
+        // `opds_context_for`'s rules forbid.
+        let url_a = "https://catalog-a.example/opds";
+        let url_b = "https://catalog-b.example/opds";
+        let (conn, _tmp) = test_conn_with_catalog(url_a);
+        add_opds_catalog_inner(&conn, "B".into(), url_b.to_string(), None).unwrap();
+
+        let store = MemoryCredentialStore::default();
+        upsert_opds_auth_inner(&conn, rec(url_a, "basic", "alice")).unwrap();
+        store.set("p", url_a, "secret-a").unwrap();
+
+        let ctx_a = opds_context_for(&conn, &store, "p", Some(url_a), url_a);
+        assert_eq!(
+            ctx_a.provenance.as_ref().map(|p| p.catalog_url.as_str()),
+            Some(url_a),
+            "catalog A's context must name A"
+        );
+        match ctx_a.cred {
+            Some(opds::OpdsCredential::Basic { username, password }) => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "secret-a");
+            }
+            _ => panic!("catalog A's context must carry A's own stored credential"),
+        }
+
+        let ctx_b = opds_context_for(&conn, &store, "p", Some(url_b), url_b);
+        assert_eq!(
+            ctx_b.provenance.as_ref().map(|p| p.catalog_url.as_str()),
+            Some(url_b),
+            "catalog B's context must name B, not A"
+        );
+        assert!(
+            ctx_b.cred.is_none(),
+            "catalog B must not inherit catalog A's credential"
+        );
     }
 
     #[test]
