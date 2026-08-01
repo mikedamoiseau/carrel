@@ -31,13 +31,13 @@ vi.mock("react-i18next", () => ({
 // Per-command IPC responses; each test seeds what it needs. Unlisted commands
 // resolve to []. download_opds_book stays pending so the "Adding…" state holds.
 const invokeResponses: Record<string, unknown> = {};
-const invokeMock = vi.fn((cmd: string) => {
+const invokeMock = vi.fn((cmd: string, _args?: unknown) => {
   if (cmd === "download_opds_book") return new Promise(() => {}); // never resolves
   if (cmd in invokeResponses) return Promise.resolve(invokeResponses[cmd]);
   return Promise.resolve([]);
 });
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (cmd: string) => invokeMock(cmd),
+  invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
   convertFileSrc: (p: string) => p,
 }));
 vi.mock("@tauri-apps/api/webview", () => ({
@@ -153,5 +153,29 @@ describe("Library — Discover section", () => {
     fireEvent.click(addBtn);
     const adding = await screen.findByText(en.library.adding);
     expect(adding.closest("button")).toBeDisabled();
+  });
+});
+
+describe("Library — manual URL import", () => {
+  it("imports a manually typed URL with no catalogUrl", async () => {
+    invokeResponses["get_library_grid"] = [libraryBook];
+    invokeResponses["get_discover_books"] = [];
+    render(<Library />);
+    await screen.findByText(en.import.addBooks);
+
+    fireEvent.click(screen.getByText(en.import.addBooks));
+    fireEvent.click(screen.getByText(en.import.importFromUrl));
+    const input = screen.getByPlaceholderText(en.import.urlPlaceholder);
+    fireEvent.change(input, { target: { value: "https://example.com/book.epub" } });
+    fireEvent.click(screen.getByText(en.common.import));
+
+    // A user-typed URL must never inherit a stored credential — no
+    // catalogUrl in the payload at all (undefined key is also acceptable,
+    // but it must not be a real string).
+    const call = invokeMock.mock.calls.find(([cmd]) => cmd === "download_opds_book");
+    expect(call).toBeDefined();
+    const args = call?.[1] as Record<string, unknown> | undefined;
+    expect(args?.downloadUrl).toBe("https://example.com/book.epub");
+    expect(args?.catalogUrl).toBeUndefined();
   });
 });

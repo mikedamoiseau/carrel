@@ -72,7 +72,9 @@ describe("CatalogBrowser add-catalog validation", () => {
     await fillForm("My Feed", "https://example.com/opds");
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "common.add" })));
 
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("browse_opds", { url: "https://example.com/opds" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("browse_opds", { url: "https://example.com/opds", catalogUrl: "https://example.com/opds" }),
+    );
     expect(invoke).toHaveBeenCalledWith("add_opds_catalog", { name: "My Feed", url: "https://example.com/opds" });
     // success → no rollback
     expect(invoke).not.toHaveBeenCalledWith("remove_opds_catalog", expect.anything());
@@ -286,5 +288,65 @@ describe("CatalogBrowser unified search live progress", () => {
       timeout: 3000,
     });
     expect(screen.queryByText("catalog.searchingAll")).not.toBeInTheDocument();
+  });
+});
+
+describe("CatalogBrowser pagination provenance", () => {
+  it("paginates with the provenance the feed carried", async () => {
+    invoke.mockImplementation((cmd: string, args?: { url?: string }) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "https://a/opds" }]);
+      if (cmd === "browse_opds") {
+        if (args?.url === "https://a/opds") {
+          return Promise.resolve({
+            title: "A", entries: [], nextUrl: "https://a/opds?page=2", searchUrl: null, catalogUrl: "https://a/opds",
+          });
+        }
+        return Promise.resolve({ title: "A p2", entries: [], nextUrl: null, searchUrl: null, catalogUrl: "https://a/opds" });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    await act(async () => fireEvent.click(screen.getByText("A")));
+    await screen.findByText("catalog.loadMore");
+
+    invoke.mockClear();
+    await act(async () => fireEvent.click(screen.getByText("catalog.loadMore")));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("browse_opds", { url: "https://a/opds?page=2", catalogUrl: "https://a/opds" }),
+    );
+  });
+
+  it("paginates with null once the backend cleared provenance", async () => {
+    invoke.mockImplementation((cmd: string, args?: { url?: string }) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "https://a/opds" }]);
+      if (cmd === "browse_opds") {
+        if (args?.url === "https://a/opds") {
+          // Backend dropped provenance on this fetch (e.g. a cross-origin
+          // hop) — catalogUrl comes back null even though we passed one in.
+          return Promise.resolve({
+            title: "A", entries: [], nextUrl: "https://other.example/opds?page=2", searchUrl: null, catalogUrl: null,
+          });
+        }
+        return Promise.resolve({ title: "A p2", entries: [], nextUrl: null, searchUrl: null, catalogUrl: null });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    await act(async () => fireEvent.click(screen.getByText("A")));
+    await screen.findByText("catalog.loadMore");
+
+    invoke.mockClear();
+    await act(async () => fireEvent.click(screen.getByText("catalog.loadMore")));
+
+    // Must NOT re-assert the catalog's own URL as provenance — the component
+    // has no "current catalog" memory to fall back on.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("browse_opds", { url: "https://other.example/opds?page=2", catalogUrl: null }),
+    );
   });
 });

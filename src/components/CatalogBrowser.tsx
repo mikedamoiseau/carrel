@@ -29,6 +29,10 @@ interface OpdsEntry {
   coverUrl: string | null;
   links: OpdsLink[];
   navUrl: string | null;
+  // Catalog this entry's provenance is scoped to. Backend-set; null once a
+  // cross-origin hop drops it. Must be passed back verbatim when acting on
+  // this entry (navUrl / download) — never re-derived or remembered.
+  catalogUrl?: string | null;
 }
 
 interface OpdsFeed {
@@ -36,6 +40,9 @@ interface OpdsFeed {
   entries: OpdsEntry[];
   nextUrl: string | null;
   searchUrl: string | null;
+  // Same rule as OpdsEntry.catalogUrl, for the feed itself — pass back
+  // verbatim when following nextUrl/searchUrl.
+  catalogUrl?: string | null;
 }
 
 // Live per-catalog progress emitted by the backend during a unified search.
@@ -97,7 +104,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       mountedRef.current = false;
     };
   }, []);
-  const [history, setHistory] = useState<{ url: string; title: string }[]>([]);
+  const [history, setHistory] = useState<{ url: string; title: string; catalogUrl?: string | null }[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadedIds, setDownloadedIds] = useState<Set<string>>(new Set());
   // Backend-supported formats for this build. `null` until the first fetch
@@ -137,15 +144,20 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
 
   useEffect(() => { loadCatalogs(); }, [loadCatalogs]);
 
-  const browseTo = useCallback(async (url: string, title?: string) => {
+  // `catalogUrl` is the provenance to send with this request — the caller
+  // must pass it explicitly (the configured catalog for a root browse,
+  // entry.catalogUrl for a nav hop, feed.catalogUrl for pagination). Never
+  // defaulted from remembered state: once the backend drops provenance on a
+  // cross-origin hop, there is nothing here to re-assert it from.
+  const browseTo = useCallback(async (url: string, title?: string, catalogUrl?: string | null) => {
     setLoading(true);
     setFeedLoadingLabel(null); // plain navigation → generic "Loading…"
     setError(null);
-    lastActionRef.current = () => browseTo(url, title);
+    lastActionRef.current = () => browseTo(url, title, catalogUrl);
     try {
-      const f = await invoke<OpdsFeed>("browse_opds", { url });
+      const f = await invoke<OpdsFeed>("browse_opds", { url, catalogUrl });
       setFeed(f);
-      setHistory((prev) => [...prev, { url, title: title ?? f.title }]);
+      setHistory((prev) => [...prev, { url, title: title ?? f.title, catalogUrl: f.catalogUrl ?? null }]);
     } catch (err) {
       setError(friendlyError(err, t));
     } finally {
@@ -162,22 +174,25 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     const newHistory = history.slice(0, -2);
     const prev = history[history.length - 2];
     setHistory(newHistory);
-    browseTo(prev.url, prev.title);
+    browseTo(prev.url, prev.title, prev.catalogUrl);
   }, [history, browseTo]);
 
   const handleSearch = useCallback(async () => {
     if (!feed?.searchUrl || !searchQuery.trim()) return;
     const searchUrl = feed.searchUrl;
+    // Provenance for a search_url follow comes from the feed that carried it,
+    // never a remembered "current catalog".
+    const catalogUrl = feed.catalogUrl;
     const url = searchUrl.replace("{searchTerms}", encodeURIComponent(searchQuery.trim()));
     setLoading(true);
     setFeedLoadingLabel(t("catalog.searchingServer", { name: feed.title || t("catalog.catalog") }));
     setError(null);
     try {
-      const f = await invoke<OpdsFeed>("browse_opds", { url });
+      const f = await invoke<OpdsFeed>("browse_opds", { url, catalogUrl });
       // Preserve the parent's searchUrl so the search bar stays visible
       if (!f.searchUrl) f.searchUrl = searchUrl;
       setFeed(f);
-      setHistory((prev) => [...prev, { url, title: `Search: ${searchQuery}` }]);
+      setHistory((prev) => [...prev, { url, title: `Search: ${searchQuery}`, catalogUrl: f.catalogUrl ?? null }]);
     } catch (err) {
       setError(friendlyError(err, t));
     } finally {
@@ -197,10 +212,12 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     setDownloading(entry.id);
     try {
       // Pass the MIME type so the backend can derive the file extension even
-      // when the acquisition URL is opaque (e.g. `/download/123`).
+      // when the acquisition URL is opaque (e.g. `/download/123`). Provenance
+      // is the entry's own catalogUrl — never re-derived.
       const result = await invoke<{ id: string; newly_imported: boolean }>("download_opds_book", {
         downloadUrl: picked.link.href,
         mimeType: picked.link.mimeType,
+        catalogUrl: entry.catalogUrl,
       });
       setDownloadedIds((prev) => new Set(prev).add(entry.id));
       onBookImported(result.newly_imported ? result.id : null);
@@ -232,7 +249,9 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       // `add_opds_catalog` intentionally trusts the user-entered URL.
       await invoke("add_opds_catalog", { name, url });
       try {
-        await invoke("browse_opds", { url });
+        // Provisional connection test is a root browse of the catalog being
+        // added, so its provenance is its own (about-to-be-configured) URL.
+        await invoke("browse_opds", { url, catalogUrl: url });
       } catch (testErr) {
         // Roll back the provisional add so a broken feed isn't kept.
         await invoke("remove_opds_catalog", { url }).catch(() => {});
@@ -504,7 +523,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
                 // inside a button is invalid HTML and breaks click handling.
                 <div key={cat.url} className="relative flex items-center group">
                   <button
-                    onClick={() => browseTo(cat.url, cat.name)}
+                    onClick={() => browseTo(cat.url, cat.name, cat.url)}
                     className="w-full flex items-center gap-3 px-5 py-3 text-left hover:bg-warm-subtle transition-colors"
                   >
                     <div className="w-8 h-8 rounded-lg bg-accent-light flex items-center justify-center shrink-0">
@@ -655,7 +674,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
                   <div
                     key={entry.id}
                     className={`flex items-start gap-3 px-5 py-3 border-b border-warm-border/50 ${isNav ? "hover:bg-warm-subtle cursor-pointer" : ""} transition-colors`}
-                    onClick={isNav ? () => browseTo(entry.navUrl!, entry.title) : undefined}
+                    onClick={isNav ? () => browseTo(entry.navUrl!, entry.title, entry.catalogUrl) : undefined}
                   >
                     {/* Cover thumbnail — only for book entries, not nav */}
                     {!isNav && entry.coverUrl ? (
@@ -726,7 +745,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
             {/* Next page */}
             {feed.nextUrl && !loading && (
               <button
-                onClick={() => browseTo(feed.nextUrl!)}
+                onClick={() => browseTo(feed.nextUrl!, undefined, feed.catalogUrl)}
                 className="w-full py-3 text-sm text-accent hover:bg-warm-subtle transition-colors"
               >
                 {t("catalog.loadMore")}
