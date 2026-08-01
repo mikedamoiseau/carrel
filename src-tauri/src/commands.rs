@@ -4247,12 +4247,27 @@ fn configured_catalog_urls(conn: &rusqlite::Connection) -> CarrelResult<Vec<Stri
 /// exercise the exact code path the Tauri command runs without needing
 /// to construct a `tauri::State`. The URL validation lives at the
 /// command boundary, not here, so callers must validate first.
+///
+/// Rejects a URL that is already configured (exact string match against
+/// [`configured_catalog_urls`], covering both default and custom catalogs —
+/// same comparison `remove_opds_catalog_inner`/`configured_catalog_urls`
+/// already use elsewhere, so nothing here introduces normalization the rest
+/// of the module doesn't have). This isn't just tidiness: `remove_opds_catalog`
+/// removes *every* custom entry matching a URL, so adding a URL that's
+/// already configured and then rolling that add back would silently delete
+/// the user's pre-existing catalog. Rejecting the duplicate up front makes
+/// that scenario impossible.
 fn add_opds_catalog_inner(
     conn: &rusqlite::Connection,
     name: String,
     url: String,
     preset_id: Option<String>,
 ) -> CarrelResult<()> {
+    if configured_catalog_urls(conn)?.contains(&url) {
+        return Err(CarrelError::invalid(format!(
+            "'{url}' is already configured as a catalog."
+        )));
+    }
     let custom_json =
         db::get_setting(conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
     let mut custom: Vec<OpdsCatalogSource> = serde_json::from_str(&custom_json).unwrap_or_default();
@@ -4281,15 +4296,35 @@ pub async fn add_opds_catalog(
     add_opds_catalog_inner(&conn, name, url, preset_id)
 }
 
+/// Persistence body for `remove_opds_catalog`, factored out like
+/// `add_opds_catalog_inner`. Removes every custom-catalog entry matching
+/// `catalog_url` and, since nothing will ever authenticate to that URL again
+/// once it's gone, also clears any credential it owned — reusing
+/// `clear_opds_auth_inner`'s row-then-keychain removal so a removed catalog
+/// never leaves an orphaned secret behind. Does NOT lock `OPDS_AUTH_LOCK`;
+/// see the module note on `add_opds_catalog_inner`/`add_opds_catalog` for why
+/// an inner fn locking would self-deadlock a caller that already holds it.
+fn remove_opds_catalog_inner(
+    conn: &rusqlite::Connection,
+    store: &dyn CredentialStore,
+    profile: &str,
+    catalog_url: &str,
+) -> CarrelResult<()> {
+    let custom_json =
+        db::get_setting(conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
+    let mut custom: Vec<OpdsCatalogSource> = serde_json::from_str(&custom_json).unwrap_or_default();
+    custom.retain(|c| c.url != catalog_url);
+    let json = serde_json::to_string(&custom)?;
+    db::set_setting(conn, "opds_custom_catalogs", &json)?;
+    clear_opds_auth_inner(conn, store, profile, catalog_url)
+}
+
 #[tauri::command]
 pub async fn remove_opds_catalog(url: String, state: State<'_, AppState>) -> CarrelResult<()> {
-    let conn = state.active_db()?.get()?;
-    let custom_json =
-        db::get_setting(&conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
-    let mut custom: Vec<OpdsCatalogSource> = serde_json::from_str(&custom_json).unwrap_or_default();
-    custom.retain(|c| c.url != url);
-    let json = serde_json::to_string(&custom)?;
-    Ok(db::set_setting(&conn, "opds_custom_catalogs", &json)?)
+    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (profile, pool) = active_profile_and_db(&state)?;
+    let conn = pool.get()?;
+    remove_opds_catalog_inner(&conn, &KeyringCredentialStore, &profile, &url)
 }
 
 /// Persisted credential metadata for one OPDS catalog. Stored as JSON under
@@ -4502,6 +4537,30 @@ fn clear_opds_auth_inner(
              ({e}) — sign-out did not fully complete."
         ))
     })
+}
+
+/// Clears every OPDS credential secret that `profile` owned, for
+/// `delete_profile` to call right before the profile's DB file is removed.
+/// Must run while the profile's pool is still alive — it needs a connection
+/// to read the `opds_auth` row. Does NOT lock `OPDS_AUTH_LOCK`: its only
+/// caller, `delete_profile`, is itself a `#[tauri::command]` that holds
+/// `profile_lifecycle` for its whole body, so a second lock here would be
+/// redundant at best and, if `delete_profile` ever called through a path
+/// that already held `OPDS_AUTH_LOCK`, would self-deadlock.
+///
+/// Deliberately leaves the `opds_auth` row itself untouched — the caller
+/// deletes the profile's entire DB file immediately after this returns, so
+/// there is no row left to clear once the profile is actually gone. Clearing
+/// it here would be dead work on the very data about to be discarded.
+fn clear_profile_opds_credentials(
+    conn: &rusqlite::Connection,
+    store: &dyn CredentialStore,
+    profile: &str,
+) -> CarrelResult<()> {
+    for r in read_opds_auth(conn) {
+        store.delete(profile, &r.catalog_url)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5291,15 +5350,27 @@ pub async fn delete_profile(name: String, state: State<'_, AppState>) -> CarrelR
     if name == "default" {
         return Err(CarrelError::invalid("Cannot delete the default profile"));
     }
-    {
+    let pool = {
         let mut ps = state.profile_state.lock()?;
         if ps.active == name {
             return Err(CarrelError::invalid(
                 "Cannot delete the active profile. Switch to another profile first.",
             ));
         }
-        ps.pools.remove(&name);
+        ps.pools.remove(&name)
+    };
+
+    // Clear any OPDS catalog credentials this profile owned (Task 10), while
+    // its pool — captured above — is still alive: this needs a live
+    // connection to read the profile's `opds_auth` row, and must run before
+    // the DB file is deleted below. A cleanup failure is reported rather than
+    // swallowed, since a silently-skipped cleanup would leave the user's
+    // secrets in the keychain with nothing left pointing at them.
+    if let Some(pool) = &pool {
+        let conn = pool.get()?;
+        clear_profile_opds_credentials(&conn, &KeyringCredentialStore, &name)?;
     }
+
     // Remove DB file
     let db_path = state.data_dir.join(format!("library-{name}.db"));
     let _ = std::fs::remove_file(db_path);
@@ -10124,6 +10195,39 @@ mod tests {
             read_opds_auth(&conn).is_empty(),
             "row must be gone even though the keychain delete failed"
         );
+    }
+
+    #[test]
+    fn add_opds_catalog_rejects_a_duplicate_url() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let err = add_opds_catalog_inner(&conn, "A again".into(), "https://h/opds".into(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("already"), "got: {err}");
+    }
+
+    #[test]
+    fn remove_opds_catalog_also_drops_its_credential() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        upsert_opds_auth_inner(&conn, rec("https://h/opds", "basic", "u")).unwrap();
+        store.set("p", "https://h/opds", "s").unwrap();
+        remove_opds_catalog_inner(&conn, &store, "p", "https://h/opds").unwrap();
+        assert!(read_opds_auth(&conn).is_empty());
+        assert!(store.get("p", "https://h/opds").unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_a_profile_clears_every_opds_credential_it_owned() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/a");
+        add_opds_catalog_inner(&conn, "B".into(), "https://h/b".into(), None).unwrap();
+        let store = MemoryCredentialStore::default();
+        for u in ["https://h/a", "https://h/b"] {
+            upsert_opds_auth_inner(&conn, rec(u, "basic", "u")).unwrap();
+            store.set("Classics", u, "s").unwrap();
+        }
+        clear_profile_opds_credentials(&conn, &store, "Classics").unwrap();
+        assert!(store.get("Classics", "https://h/a").unwrap().is_none());
+        assert!(store.get("Classics", "https://h/b").unwrap().is_none());
     }
 
     #[test]
