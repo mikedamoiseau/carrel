@@ -14,11 +14,16 @@ use crate::models::BookFormat;
 use carrel_core::events::{self, CarrelEvent};
 
 /// Settings keys excluded from the GDPR export. Defense-in-depth: the web PIN
-/// and backup credentials live in the OS keyring (not in settings), but two
-/// settings DO carry sensitive data and are never exported:
+/// and OPDS/backup credential secrets live in the OS keyring (not in
+/// settings), but three settings DO carry sensitive data and are never
+/// exported:
 /// - `backup_config`: remote endpoint details / pre-keyring secret values
 /// - `enrichment_providers`: per-provider config including plaintext API keys
-const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_providers"];
+/// - `opds_auth`: per-catalog credential metadata — no secret (that's
+///   keychain-only), but `username` is the account identity used to sign in
+///   (for Carrel Server, the user's account email), which is not worth
+///   surfacing in a PIN-gated export reachable over the network
+const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_providers", "opds_auth"];
 
 /// Build the full GDPR export document: the shared core metadata plus the
 /// activity log and a redacted settings map.
@@ -1875,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn gdpr_export_redacts_backup_config() {
+    fn gdpr_export_redacts_denylisted_settings() {
         // `run_schema` is private to carrel-core; build a schema-migrated
         // in-memory connection through the pool helper (same as `test_state`).
         let pool = crate::db::create_pool(&std::path::PathBuf::from(":memory:")).unwrap();
@@ -1885,6 +1890,12 @@ mod tests {
             &conn,
             "enrichment_providers",
             "{\"google\":{\"enabled\":true,\"apiKey\":\"SECRET\"}}",
+        )
+        .unwrap();
+        db::set_setting(
+            &conn,
+            "opds_auth",
+            "[{\"catalogUrl\":\"http://localhost/opds\",\"origin\":\"http://localhost\",\"kind\":\"basic\",\"username\":\"mike@buzzwoo.de\"}]",
         )
         .unwrap();
         db::set_setting(&conn, "import_mode", "copy").unwrap();
@@ -1899,11 +1910,19 @@ mod tests {
             !settings.contains_key("enrichment_providers"),
             "enrichment_providers (carries API keys) must be redacted"
         );
+        assert!(
+            !settings.contains_key("opds_auth"),
+            "opds_auth (carries catalog account usernames) must be redacted"
+        );
         assert_eq!(settings["import_mode"], "copy");
         assert!(value["activity_log"].is_array());
 
         let serialized = serde_json::to_string(&value).unwrap();
         assert!(!serialized.contains("SECRET"), "API key leaked into export");
+        assert!(
+            !serialized.contains("mike@buzzwoo.de"),
+            "OPDS catalog username leaked into export"
+        );
     }
 
     #[test]
