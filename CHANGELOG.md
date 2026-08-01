@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-08-01
+
 ### Security
 - **A malicious e-book can no longer stall the app while its details are being
   read.** The XML parser Carrel uses (quick-xml) had a flaw where checking a
