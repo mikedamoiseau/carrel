@@ -8,6 +8,9 @@ use crate::error::{CarrelError, CarrelResult};
 /// Maximum time to wait for an OPDS HTTP response.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Longer timeout for file downloads than for feed fetches.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// User-Agent for OPDS catalog fetches. Wrapped in `Mozilla/5.0
 /// (compatible; …)` because several legitimate public catalogs
 /// (OpenEdition, Atramenta, others) reject any UA that doesn't start
@@ -277,6 +280,82 @@ fn http_client() -> CarrelResult<reqwest::blocking::Client> {
         .map_err(|e| CarrelError::network(format!("HTTP client error: {e}")))
 }
 
+/// Build a client with an explicit timeout and redirect policy. Used for the
+/// authenticated variants; [`http_client`] remains the unauthenticated feed
+/// default so public catalogs behave exactly as before.
+fn build_client(
+    timeout: Duration,
+    policy: reqwest::redirect::Policy,
+) -> CarrelResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(policy)
+        .build()
+        .map_err(|e| CarrelError::network(format!("HTTP client error: {e}")))
+}
+
+/// The credential to use for `url`: `Some` only when the context has both
+/// provenance and a credential, and `url`'s origin equals the provenance
+/// origin.
+///
+/// This is the whole attachment rule. A feed can name any URL it likes; unless
+/// that URL is on the origin of the catalog the operation started from, it gets
+/// no credential.
+fn credential_for_url<'a>(url: &str, ctx: &'a OpdsContext) -> Option<&'a OpdsCredential> {
+    let prov = ctx.provenance.as_ref()?;
+    let cred = ctx.cred.as_ref()?;
+    (origin_from_url(url)? == prov.origin).then_some(cred)
+}
+
+/// Attach the credential registered for `url`, if any.
+fn apply_auth(
+    rb: reqwest::blocking::RequestBuilder,
+    url: &str,
+    ctx: &OpdsContext,
+) -> reqwest::blocking::RequestBuilder {
+    match credential_for_url(url, ctx) {
+        Some(OpdsCredential::Basic { username, password }) => {
+            rb.basic_auth(username, Some(password))
+        }
+        Some(OpdsCredential::Bearer(token)) => rb.bearer_auth(token),
+        None => rb,
+    }
+}
+
+/// Follow up to 5 redirects, but only within `origin`.
+///
+/// Required whenever an `Authorization` header is attached: reqwest scrubs that
+/// header when a redirect changes host or port, but **not** when it changes
+/// scheme (`remove_sensitive_headers`, reqwest-0.12 `redirect.rs:239-241`), so
+/// an HTTPS→HTTP hop on one host would carry the credential out in cleartext.
+/// An authenticated request should not silently continue to another origin in
+/// any case.
+pub fn same_origin_redirect_policy(origin: String) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        match origin_from_url(attempt.url().as_str()) {
+            Some(next) if next == origin => attempt.follow(),
+            _ => attempt.error("authenticated request redirected to another origin"),
+        }
+    })
+}
+
+/// Pick the client for a request that may carry a credential: the strict
+/// same-origin policy when one is attached, otherwise the caller's default.
+fn client_for(
+    url: &str,
+    ctx: &OpdsContext,
+    timeout: Duration,
+    unauthenticated: impl FnOnce() -> CarrelResult<reqwest::blocking::Client>,
+) -> CarrelResult<reqwest::blocking::Client> {
+    match (credential_for_url(url, ctx), origin_from_url(url)) {
+        (Some(_), Some(origin)) => build_client(timeout, same_origin_redirect_policy(origin)),
+        _ => unauthenticated(),
+    }
+}
+
 /// Fetch and parse an OPDS feed from a URL.
 pub fn fetch_feed(url: &str) -> CarrelResult<OpdsFeed> {
     fetch_feed_with_context(url, &OpdsContext::default())
@@ -292,12 +371,16 @@ pub fn fetch_feed_with_context(url: &str, ctx: &OpdsContext) -> CarrelResult<Opd
             "URL blocked: only public HTTP/HTTPS URLs are allowed.",
         ));
     }
-    let client = http_client()?;
-    let response = client
-        .get(url)
-        .header("User-Agent", OPDS_USER_AGENT)
-        .send()
-        .map_err(|e| CarrelError::network(format!("HTTP error: {e}")))?;
+    // Select the credential first: the redirect policy depends on whether one
+    // is attached, and a client's policy is fixed at build time.
+    let client = client_for(url, ctx, HTTP_TIMEOUT, http_client)?;
+    let response = apply_auth(
+        client.get(url).header("User-Agent", OPDS_USER_AGENT),
+        url,
+        ctx,
+    )
+    .send()
+    .map_err(|e| CarrelError::network(format!("HTTP error: {e}")))?;
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
@@ -579,12 +662,15 @@ pub fn resolve_search_url_with_context(url: &str, ctx: &OpdsContext) -> Option<S
     if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return None;
     }
-    let client = http_client().ok()?;
-    let response = client
-        .get(url)
-        .header("User-Agent", OPDS_USER_AGENT)
-        .send()
-        .ok()?;
+    // This function returns Option, so a Result cannot be propagated with `?`.
+    let client = client_for(url, ctx, HTTP_TIMEOUT, http_client).ok()?;
+    let response = apply_auth(
+        client.get(url).header("User-Agent", OPDS_USER_AGENT),
+        url,
+        ctx,
+    )
+    .send()
+    .ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -655,12 +741,13 @@ pub fn download_file_with_context(url: &str, dest: &str, ctx: &OpdsContext) -> C
             "URL blocked: only public HTTP/HTTPS URLs are allowed.",
         ));
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120)) // longer timeout for file downloads
-        .build()
-        .map_err(|e| CarrelError::network(format!("HTTP client error: {e}")))?;
-    let response = client
-        .get(url)
+    // Downloads keep their longer timeout and reqwest's default redirect policy
+    // when unauthenticated; an authenticated download gets the same timeout with
+    // the strict same-origin policy.
+    let client = client_for(url, ctx, DOWNLOAD_TIMEOUT, || {
+        build_client(DOWNLOAD_TIMEOUT, reqwest::redirect::Policy::default())
+    })?;
+    let response = apply_auth(client.get(url), url, ctx)
         .send()
         .map_err(|e| CarrelError::network(format!("Download failed: {e}")))?;
     if !response.status().is_success() {
@@ -1205,6 +1292,48 @@ mod tests {
         assert!(!is_loopback_host("192.168.0.50"));
         assert!(!is_loopback_host("books.example.org"));
     }
+
+    fn basic_ctx(origin: &str) -> OpdsContext {
+        OpdsContext {
+            trusted: vec![],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{origin}/opds"),
+                origin: origin.to_string(),
+            }),
+            cred: Some(OpdsCredential::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn credential_applies_only_to_the_provenance_origin() {
+        let ctx = basic_ctx("https://books.example.org");
+        assert!(credential_for_url("https://books.example.org/opds/all", &ctx).is_some());
+        assert!(
+            credential_for_url("http://books.example.org/opds", &ctx).is_none(),
+            "scheme downgrade"
+        );
+        assert!(
+            credential_for_url("https://books.example.org:8443/opds", &ctx).is_none(),
+            "port change"
+        );
+        assert!(
+            credential_for_url("https://evil.example.net/opds", &ctx).is_none(),
+            "host change"
+        );
+    }
+
+    #[test]
+    fn credential_requires_both_provenance_and_secret() {
+        let mut ctx = basic_ctx("https://h");
+        ctx.cred = None;
+        assert!(credential_for_url("https://h/x", &ctx).is_none());
+        let mut ctx = basic_ctx("https://h");
+        ctx.provenance = None;
+        assert!(credential_for_url("https://h/x", &ctx).is_none());
+    }
 }
 
 /// Tests that need a real HTTP server.
@@ -1240,6 +1369,166 @@ mod http_tests {
             trusted: vec![host_port_from_url(url).unwrap()],
             ..Default::default()
         }
+    }
+
+    /// Context that trusts `url`'s host and carries `cred` for `url`'s origin.
+    fn authed_ctx(url: &str, cred: OpdsCredential) -> OpdsContext {
+        OpdsContext {
+            trusted: vec![host_port_from_url(url).unwrap()],
+            provenance: Some(OpdsProvenance {
+                catalog_url: url.to_string(),
+                origin: origin_from_url(url).unwrap(),
+            }),
+            cred: Some(cred),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn basic_credentials_reach_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            // base64("u:p") == "dTpw" — an unmatched header 404s, so a parsed
+            // feed proves this exact header was sent.
+            .and(wiremock::matchers::header("authorization", "Basic dTpw"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = authed_ctx(
+            &url,
+            OpdsCredential::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            },
+        );
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bearer_token_reaches_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer ck_live_abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = authed_ctx(&url, OpdsCredential::Bearer("ck_live_abc".into()));
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_credential_is_sent_to_another_origin_on_the_same_host() {
+        // The scheme-downgrade guard, end to end: a credential registered for
+        // the https origin must not go out over http, even to the same host and
+        // port. Here provenance names an https origin while the request is
+        // http, so the header must be absent.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .and(wiremock::matchers::header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let mut ctx = authed_ctx(&url, OpdsCredential::Bearer("t".into()));
+        // Same host:port, https instead of http.
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.replace("http://", "https://"),
+            origin: origin_from_url(&url)
+                .unwrap()
+                .replace("http://", "https://"),
+        });
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.title, "T",
+            "an https credential must not go out over http"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_request_refuses_a_cross_origin_redirect() {
+        // A 302s to B. With a credential for A the fetch must ERROR rather than
+        // follow, and B must never be hit.
+        //
+        // Deliberately NOT using `.expect(0)` on B: during the red phase the
+        // assertion panics, MockServer verifies expectations in Drop, and a
+        // second panic while unwinding aborts the process instead of producing
+        // a clean red test. `received_requests()` avoids that.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/feed", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let url = format!("{}/opds", a.uri());
+        let mut ctx = authed_ctx(&url, OpdsCredential::Bearer("t".into()));
+        ctx.trusted.push(host_port_from_url(&b.uri()).unwrap());
+        let res = blocking(move || fetch_feed_with_context(&url, &ctx)).await;
+        let b_hits = b.received_requests().await.unwrap_or_default().len();
+        assert!(
+            res.is_err() && b_hits == 0,
+            "authenticated cross-origin redirect must not be followed (is_err={}, B hits={b_hits})",
+            res.is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unauthenticated_request_still_follows_a_cross_origin_redirect() {
+        // Public catalogs (Gutenberg mirrors) redirect across hosts and must
+        // keep working unchanged when no credential is involved.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/feed", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let url = format!("{}/opds", a.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.trusted.push(host_port_from_url(&b.uri()).unwrap());
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+        assert_eq!(
+            b.received_requests().await.unwrap_or_default().len(),
+            1,
+            "B must have served the feed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
