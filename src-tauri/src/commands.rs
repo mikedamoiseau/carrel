@@ -4019,7 +4019,6 @@ const OPDS_AUTH_SERVICE: &str = "carrel-opds-auth";
 ///
 /// LOCKING DISCIPLINE: only `#[tauri::command]` entry points lock. Helpers are
 /// `*_inner` and never lock; `std::sync::Mutex` is not reentrant.
-#[allow(dead_code)] // acquired by Task 9's set/get/clear_opds_auth commands
 static OPDS_AUTH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Builds the keychain account string for an OPDS catalog credential. A
@@ -4036,7 +4035,6 @@ fn opds_secret_key(profile: &str, catalog_url: &str) -> String {
 /// Storage seam for OPDS catalog credentials, so tests never touch the real
 /// OS keychain — a keychain-touching test is platform-dependent, can prompt
 /// the user, and leaves credentials behind.
-#[allow(dead_code)] // implemented here, consumed by Task 8–14's *_inner helpers
 trait CredentialStore: Send + Sync {
     fn get(&self, profile: &str, catalog_url: &str) -> CarrelResult<Option<String>>;
     fn set(&self, profile: &str, catalog_url: &str, secret: &str) -> CarrelResult<()>;
@@ -4055,7 +4053,6 @@ trait CredentialStore: Send + Sync {
 ///   profile might own) doesn't have to special-case it. Every *other*
 ///   keychain error is still propagated rather than swallowed, unlike
 ///   `remove_secrets`'s `let _ = entry.delete_credential();`.
-#[allow(dead_code)] // constructed by Task 9's set/get/clear_opds_auth commands
 struct KeyringCredentialStore;
 
 impl CredentialStore for KeyringCredentialStore {
@@ -4134,6 +4131,39 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
+/// A store whose `get`/`set` delegate to an in-memory backing map but whose
+/// `set` and `delete` can be forced to fail, for exercising
+/// `set_opds_auth_inner`'s compensation paths (a failed row write must
+/// restore or clear the keychain, and the compensation itself can fail too).
+#[cfg(test)]
+#[derive(Default)]
+struct FlakyCredentialStore {
+    inner: MemoryCredentialStore,
+    fail_set: bool,
+    fail_delete: bool,
+}
+
+#[cfg(test)]
+impl CredentialStore for FlakyCredentialStore {
+    fn get(&self, profile: &str, catalog_url: &str) -> CarrelResult<Option<String>> {
+        self.inner.get(profile, catalog_url)
+    }
+
+    fn set(&self, profile: &str, catalog_url: &str, secret: &str) -> CarrelResult<()> {
+        if self.fail_set {
+            return Err(CarrelError::internal("flaky store: set failed"));
+        }
+        self.inner.set(profile, catalog_url, secret)
+    }
+
+    fn delete(&self, profile: &str, catalog_url: &str) -> CarrelResult<()> {
+        if self.fail_delete {
+            return Err(CarrelError::internal("flaky store: delete failed"));
+        }
+        self.inner.delete(profile, catalog_url)
+    }
+}
+
 /// Active profile name and its pool from ONE `profile_state` snapshot, gated
 /// by the same soft-lock check as `AppState::active_db` (:170-178) — OPDS
 /// catalog credentials are data-bearing, so a locked-and-not-yet-unlocked
@@ -4152,7 +4182,6 @@ impl CredentialStore for MemoryCredentialStore {
 /// pair self-consistent even if a switch races between the snapshot and the
 /// gate check: the gate always answers for the same profile the pool came
 /// from, not for whatever is active by the time the gate runs.
-#[allow(dead_code)] // called by Task 8–14's *_inner helpers
 fn active_profile_and_db(state: &AppState) -> CarrelResult<(String, DbPool)> {
     let (name, pool) = {
         let ps = state.profile_state.lock()?;
@@ -4190,6 +4219,24 @@ pub async fn get_opds_catalogs(state: State<'_, AppState>) -> CarrelResult<Vec<O
         .collect();
     result.extend(custom);
     Ok(result)
+}
+
+/// Synchronous mirror of [`get_opds_catalogs`]'s URL list, for callers that
+/// hold a bare connection rather than a `State` (that command is `async` and
+/// takes `State<'_, AppState>`, which `set_opds_auth_inner` does not have).
+fn configured_catalog_urls(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut urls: Vec<String> = DEFAULT_CATALOGS
+        .iter()
+        .map(|(_, url, _)| url.to_string())
+        .collect();
+    let custom_json = db::get_setting(conn, "opds_custom_catalogs")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "[]".to_string());
+    if let Ok(custom) = serde_json::from_str::<Vec<OpdsCatalogSource>>(&custom_json) {
+        urls.extend(custom.into_iter().map(|c| c.url));
+    }
+    urls
 }
 
 /// Persistence body for `add_opds_catalog`, factored out so tests can
@@ -4262,10 +4309,9 @@ struct OpdsAuthRecord {
 /// IPC-facing view of an [`OpdsAuthRecord`]: omits `catalog_url`/`origin`
 /// and, more importantly, never carries the secret — the secret lives only
 /// in the OS keychain and is never read back out over IPC.
-#[allow(dead_code)] // constructed by Task 9's get_opds_auth command
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OpdsAuthInfo {
+pub struct OpdsAuthInfo {
     kind: String,
     username: String,
 }
@@ -4273,7 +4319,6 @@ struct OpdsAuthInfo {
 /// Reads the `opds_auth` settings row, tolerating a missing or corrupt row by
 /// returning an empty list rather than erroring — same tolerance pattern as
 /// the custom-catalog read in `get_opds_catalogs` (:4179-4181).
-#[allow(dead_code)] // consumed by Task 9's get_opds_auth command
 fn read_opds_auth(conn: &rusqlite::Connection) -> Vec<OpdsAuthRecord> {
     let json = db::get_setting(conn, "opds_auth")
         .ok()
@@ -4283,7 +4328,6 @@ fn read_opds_auth(conn: &rusqlite::Connection) -> Vec<OpdsAuthRecord> {
 }
 
 /// Writes the full `opds_auth` settings row.
-#[allow(dead_code)] // consumed by Task 9's set/clear_opds_auth commands
 fn write_opds_auth(conn: &rusqlite::Connection, recs: &[OpdsAuthRecord]) -> CarrelResult<()> {
     let json = serde_json::to_string(recs)?;
     Ok(db::set_setting(conn, "opds_auth", &json)?)
@@ -4292,7 +4336,6 @@ fn write_opds_auth(conn: &rusqlite::Connection, recs: &[OpdsAuthRecord]) -> Carr
 /// Inserts or replaces the credential metadata for `rec.catalog_url`, keyed
 /// by catalog URL (not origin) — two catalogs on the same origin keep
 /// independent credential records.
-#[allow(dead_code)] // consumed by Task 9's set_opds_auth command
 fn upsert_opds_auth_inner(conn: &rusqlite::Connection, rec: OpdsAuthRecord) -> CarrelResult<()> {
     let mut all = read_opds_auth(conn);
     all.retain(|r| r.catalog_url != rec.catalog_url);
@@ -4325,6 +4368,182 @@ fn test_conn_with_catalog(
     let conn = pool.get().unwrap();
     add_opds_catalog_inner(&conn, "Test".into(), url.to_string(), None).unwrap();
     (conn, tmp)
+}
+
+/// Persistence body for `set_opds_auth` — implements the spec's write
+/// protocol (docs/superpowers/specs/2026-08-01-opds-catalog-auth-design.md,
+/// "Write protocol"):
+///
+/// 1. Validate (nothing is written on rejection).
+/// 2. Retain the previous secret for this `(profile, catalog_url)`, if any.
+/// 3. Write the new secret to the keychain.
+/// 4. Write the `opds_auth` row.
+/// 5. On row-write failure: restore the retained secret, or delete the new
+///    one if there wasn't a previous secret; return the original error — or,
+///    if the restore itself fails, an error naming both failures, since the
+///    credential is then in an unknown state.
+/// 6. Invalidate the Discover cache row.
+#[allow(clippy::too_many_arguments)]
+fn set_opds_auth_inner(
+    conn: &rusqlite::Connection,
+    store: &dyn CredentialStore,
+    profile: &str,
+    catalog_url: &str,
+    kind: &str,
+    username: &str,
+    secret: &str,
+    allow_insecure: bool,
+) -> CarrelResult<()> {
+    // Step 1: validate. Nothing below this point may write anywhere.
+    if kind != "basic" && kind != "bearer" {
+        return Err(CarrelError::invalid(format!(
+            "Unsupported credential kind '{kind}' — must be 'basic' or 'bearer'."
+        )));
+    }
+    if secret.is_empty() {
+        return Err(CarrelError::invalid("Credential secret must not be empty."));
+    }
+    if kind == "basic" && username.is_empty() {
+        return Err(CarrelError::invalid("Basic auth requires a username."));
+    }
+    let origin = opds::origin_from_url(catalog_url).ok_or_else(|| {
+        CarrelError::invalid(format!("'{catalog_url}' is not a valid catalog URL."))
+    })?;
+    if !configured_catalog_urls(conn)
+        .iter()
+        .any(|u| u == catalog_url)
+    {
+        return Err(CarrelError::invalid(format!(
+            "'{catalog_url}' is not a configured catalog."
+        )));
+    }
+    let is_https = catalog_url.starts_with("https://");
+    let is_loopback = url::Url::parse(catalog_url)
+        .ok()
+        .and_then(|u| u.host_str().map(opds::is_loopback_host))
+        .unwrap_or(false);
+    if !is_https && !is_loopback && !allow_insecure {
+        return Err(CarrelError::invalid(
+            "This catalog's URL is not encrypted (http) — pass allow_insecure to confirm the \
+             credential may be sent in cleartext.",
+        ));
+    }
+
+    // Step 2: retain the previous secret, if any, so a failed row write can
+    // be undone.
+    let previous_secret = store.get(profile, catalog_url)?;
+
+    // Step 3: write the new secret to the keychain.
+    store.set(profile, catalog_url, secret)?;
+
+    // Step 4: write the opds_auth row.
+    let row_result = upsert_opds_auth_inner(
+        conn,
+        OpdsAuthRecord {
+            catalog_url: catalog_url.to_string(),
+            origin,
+            kind: kind.to_string(),
+            username: username.to_string(),
+        },
+    );
+
+    if let Err(row_err) = row_result {
+        // Step 5: the row write failed — the keychain must not end up
+        // holding a secret with no matching row, so undo it.
+        let restore_result = match &previous_secret {
+            Some(prev) => store.set(profile, catalog_url, prev),
+            None => store.delete(profile, catalog_url),
+        };
+        return match restore_result {
+            Ok(()) => Err(row_err),
+            Err(restore_err) => Err(CarrelError::internal(format!(
+                "Failed to save the catalog credential ({row_err}), and failed to restore the \
+                 previous keychain state ({restore_err}) — the credential is now in an unknown \
+                 state and should be re-entered."
+            ))),
+        };
+    }
+
+    // Step 6: invalidate the Discover cache — a newly authenticated catalog
+    // may expose different content than the anonymous fetch cached earlier.
+    let _ = db::delete_setting(conn, "discover_cache_v4");
+
+    Ok(())
+}
+
+/// Persistence body for `clear_opds_auth`: removes the `opds_auth` row
+/// **first**, then the keychain secret, per the spec's write protocol. The
+/// row is gone even when the keychain delete fails — a keychain failure
+/// leaves a secret nothing reads, recoverable but not silently swallowed, so
+/// its error is returned rather than dropped.
+fn clear_opds_auth_inner(
+    conn: &rusqlite::Connection,
+    store: &dyn CredentialStore,
+    profile: &str,
+    catalog_url: &str,
+) -> CarrelResult<()> {
+    let mut all = read_opds_auth(conn);
+    all.retain(|r| r.catalog_url != catalog_url);
+    write_opds_auth(conn, &all)?;
+
+    let delete_result = store.delete(profile, catalog_url);
+    let _ = db::delete_setting(conn, "discover_cache_v4");
+
+    delete_result.map_err(|e| {
+        CarrelError::internal(format!(
+            "Removed the stored catalog credential, but failed to remove it from the keychain \
+             ({e}) — sign-out did not fully complete."
+        ))
+    })
+}
+
+#[tauri::command]
+pub async fn set_opds_auth(
+    catalog_url: String,
+    kind: String,
+    username: String,
+    secret: String,
+    allow_insecure: bool,
+    state: State<'_, AppState>,
+) -> CarrelResult<()> {
+    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (profile, pool) = active_profile_and_db(&state)?;
+    let conn = pool.get()?;
+    set_opds_auth_inner(
+        &conn,
+        &KeyringCredentialStore,
+        &profile,
+        &catalog_url,
+        &kind,
+        &username,
+        &secret,
+        allow_insecure,
+    )
+}
+
+#[tauri::command]
+pub async fn get_opds_auth(
+    catalog_url: String,
+    state: State<'_, AppState>,
+) -> CarrelResult<Option<OpdsAuthInfo>> {
+    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (_profile, pool) = active_profile_and_db(&state)?;
+    let conn = pool.get()?;
+    Ok(read_opds_auth(&conn)
+        .into_iter()
+        .find(|r| r.catalog_url == catalog_url)
+        .map(|r| OpdsAuthInfo {
+            kind: r.kind,
+            username: r.username,
+        }))
+}
+
+#[tauri::command]
+pub async fn clear_opds_auth(catalog_url: String, state: State<'_, AppState>) -> CarrelResult<()> {
+    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (profile, pool) = active_profile_and_db(&state)?;
+    let conn = pool.get()?;
+    clear_opds_auth_inner(&conn, &KeyringCredentialStore, &profile, &catalog_url)
 }
 
 /// Live progress for a single catalog during a unified `search_all_catalogs`
@@ -9639,6 +9858,210 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({"kind": "basic", "username": "alice"})
+        );
+    }
+
+    #[test]
+    fn set_opds_auth_rejects_cleartext_for_non_loopback_without_acknowledgement() {
+        let (conn, _tmp) = test_conn_with_catalog("http://192.168.0.50:8080/opds");
+        let store = MemoryCredentialStore::default();
+        let err = set_opds_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "http://192.168.0.50:8080/opds",
+            "basic",
+            "u",
+            "s",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("not encrypted"),
+            "got: {err}"
+        );
+        assert!(
+            store
+                .get("p", "http://192.168.0.50:8080/opds")
+                .unwrap()
+                .is_none(),
+            "must not write on rejection"
+        );
+        set_opds_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "http://192.168.0.50:8080/opds",
+            "basic",
+            "u",
+            "s",
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_opds_auth_allows_loopback_cleartext_without_acknowledgement() {
+        let (conn, _tmp) = test_conn_with_catalog("http://localhost:8080/opds");
+        let store = MemoryCredentialStore::default();
+        set_opds_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "http://localhost:8080/opds",
+            "basic",
+            "u",
+            "s",
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_opds_auth_rejects_unconfigured_catalog_url() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        let err = set_opds_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "https://other/opds",
+            "bearer",
+            "",
+            "t",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a configured catalog"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_opds_auth_validates_kind_and_required_fields() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = MemoryCredentialStore::default();
+        assert!(set_opds_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "https://h/opds",
+            "digest",
+            "u",
+            "s",
+            false
+        )
+        .is_err());
+        assert!(
+            set_opds_auth_inner(
+                &conn,
+                &store,
+                "p",
+                "https://h/opds",
+                "basic",
+                "",
+                "s",
+                false
+            )
+            .is_err(),
+            "basic needs a username"
+        );
+        assert!(
+            set_opds_auth_inner(
+                &conn,
+                &store,
+                "p",
+                "https://h/opds",
+                "bearer",
+                "",
+                "",
+                false
+            )
+            .is_err(),
+            "empty secret"
+        );
+    }
+
+    #[test]
+    fn a_failed_row_write_restores_the_previous_secret() {
+        // A preset catalog URL is used (rather than test_conn_with_catalog's
+        // custom one) so the configured-catalog check keeps passing after the
+        // `settings` table is dropped — that check reads DEFAULT_CATALOGS,
+        // which is a Rust constant, not a settings row.
+        let url = "https://www.gutenberg.org/ebooks.opds/";
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = db::create_pool(&tmp.path().join("library.db")).unwrap();
+        let conn = pool.get().unwrap();
+        let store = MemoryCredentialStore::default();
+
+        set_opds_auth_inner(&conn, &store, "p", url, "basic", "u", "old-secret", false).unwrap();
+        assert_eq!(store.get("p", url).unwrap().as_deref(), Some("old-secret"));
+
+        conn.execute("DROP TABLE settings", [])
+            .expect("must actually break the row write for this test to mean anything");
+
+        let err = set_opds_auth_inner(&conn, &store, "p", url, "basic", "u", "new-secret", false)
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("settings"),
+            "expected the row-write failure to surface, got: {err}"
+        );
+        assert_eq!(
+            store.get("p", url).unwrap().as_deref(),
+            Some("old-secret"),
+            "a failed row write must restore the previous secret, not leave the new one"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_reports_both_failures() {
+        // No previous secret exists, so a failed row write falls back to
+        // `store.delete` as the compensation — which also fails here
+        // (`fail_delete: true`), so the credential is left in an unknown
+        // state and the error must say so.
+        let url = "https://www.gutenberg.org/ebooks.opds/";
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = db::create_pool(&tmp.path().join("library.db")).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute("DROP TABLE settings", [])
+            .expect("must actually break the row write for this test to mean anything");
+
+        let store = FlakyCredentialStore {
+            inner: MemoryCredentialStore::default(),
+            fail_set: false,
+            fail_delete: true,
+        };
+        let err =
+            set_opds_auth_inner(&conn, &store, "p", url, "bearer", "", "t", false).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("settings"),
+            "must mention the original row-write failure: {err}"
+        );
+        assert!(
+            msg.contains("keychain"),
+            "must mention the failed keychain restore: {err}"
+        );
+    }
+
+    #[test]
+    fn clear_removes_the_row_before_the_secret_and_propagates_keychain_failure() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        let store = FlakyCredentialStore {
+            inner: MemoryCredentialStore::default(),
+            fail_set: false,
+            fail_delete: true,
+        };
+        upsert_opds_auth_inner(&conn, rec("https://h/opds", "basic", "u")).unwrap();
+        let err = clear_opds_auth_inner(&conn, &store, "p", "https://h/opds").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("keychain"),
+            "got: {err}"
+        );
+        assert!(
+            read_opds_auth(&conn).is_empty(),
+            "row must be gone even though the keychain delete failed"
         );
     }
 
