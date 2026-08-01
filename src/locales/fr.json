@@ -920,6 +920,7 @@
     "incorrectPassword": "Mot de passe incorrect.",
     "currentPasswordRequired": "Saisissez le mot de passe actuel pour effectuer ce changement.",
     "profileNotLocked": "Ce profil n\u2019a pas de verrou \u00e0 supprimer.",
+    "opdsAuthRequired": "Ce catalogue n\u00e9cessite une connexion.",
     "generic": "Une erreur s\u2019est produite. Veuillez r\u00e9essayer."
   },
 

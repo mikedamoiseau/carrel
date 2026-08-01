@@ -935,6 +935,7 @@
     "incorrectPassword": "Incorrect password.",
     "currentPasswordRequired": "Enter the current password to make this change.",
     "profileNotLocked": "This profile has no lock to remove.",
+    "opdsAuthRequired": "This catalog requires sign-in.",
     "generic": "Something went wrong. Please try again."
   },
 
