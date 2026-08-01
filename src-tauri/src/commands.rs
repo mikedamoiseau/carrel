@@ -4224,19 +4224,23 @@ pub async fn get_opds_catalogs(state: State<'_, AppState>) -> CarrelResult<Vec<O
 /// Synchronous mirror of [`get_opds_catalogs`]'s URL list, for callers that
 /// hold a bare connection rather than a `State` (that command is `async` and
 /// takes `State<'_, AppState>`, which `set_opds_auth_inner` does not have).
-fn configured_catalog_urls(conn: &rusqlite::Connection) -> Vec<String> {
+///
+/// Mirrors `get_opds_catalogs` (:4207-4209) in propagating a genuine
+/// `opds_custom_catalogs` read failure with `?` rather than swallowing it —
+/// only an *absent* row (no custom catalogs saved yet) falls back to `"[]"`.
+/// The two helpers disagreeing here would make a real DB failure look like
+/// "catalog not configured" instead of surfacing as the DB error it is.
+fn configured_catalog_urls(conn: &rusqlite::Connection) -> CarrelResult<Vec<String>> {
     let mut urls: Vec<String> = DEFAULT_CATALOGS
         .iter()
         .map(|(_, url, _)| url.to_string())
         .collect();
-    let custom_json = db::get_setting(conn, "opds_custom_catalogs")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "[]".to_string());
+    let custom_json =
+        db::get_setting(conn, "opds_custom_catalogs")?.unwrap_or_else(|| "[]".to_string());
     if let Ok(custom) = serde_json::from_str::<Vec<OpdsCatalogSource>>(&custom_json) {
         urls.extend(custom.into_iter().map(|c| c.url));
     }
-    urls
+    Ok(urls)
 }
 
 /// Persistence body for `add_opds_catalog`, factored out so tests can
@@ -4409,7 +4413,7 @@ fn set_opds_auth_inner(
     let origin = opds::origin_from_url(catalog_url).ok_or_else(|| {
         CarrelError::invalid(format!("'{catalog_url}' is not a valid catalog URL."))
     })?;
-    if !configured_catalog_urls(conn)
+    if !configured_catalog_urls(conn)?
         .iter()
         .any(|u| u == catalog_url)
     {
@@ -4417,7 +4421,10 @@ fn set_opds_auth_inner(
             "'{catalog_url}' is not a configured catalog."
         )));
     }
-    let is_https = catalog_url.starts_with("https://");
+    // `origin` is already scheme-lowercased by `origin_from_url`, so this
+    // agrees with a mixed-case scheme (`HTTPS://...`) instead of spuriously
+    // demanding `allow_insecure` for it.
+    let is_https = origin.starts_with("https://");
     let is_loopback = url::Url::parse(catalog_url)
         .ok()
         .and_then(|u| u.host_str().map(opds::is_loopback_host))
@@ -9983,12 +9990,34 @@ mod tests {
         );
     }
 
+    /// Installs a `BEFORE INSERT ON settings` trigger that aborts every
+    /// insert (including the `ON CONFLICT DO UPDATE` upserts `set_setting`
+    /// issues) with a distinctive message. Reads (`SELECT`) are untouched, so
+    /// `configured_catalog_urls`'s membership check still succeeds and only
+    /// the row *write* fails — unlike `DROP TABLE settings`, which broke both
+    /// and made these tests fail at membership validation instead of the
+    /// write, silently testing the wrong thing.
+    #[cfg(test)]
+    const BLOCK_SETTINGS_WRITES_MSG: &str = "test-only: settings writes blocked";
+
+    #[cfg(test)]
+    fn block_settings_writes(conn: &rusqlite::Connection) {
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER block_settings_writes BEFORE INSERT ON settings \
+                 BEGIN SELECT RAISE(ABORT, '{BLOCK_SETTINGS_WRITES_MSG}'); END"
+            ),
+            [],
+        )
+        .expect("must actually be able to install the write-blocking trigger");
+    }
+
     #[test]
     fn a_failed_row_write_restores_the_previous_secret() {
         // A preset catalog URL is used (rather than test_conn_with_catalog's
-        // custom one) so the configured-catalog check keeps passing after the
-        // `settings` table is dropped — that check reads DEFAULT_CATALOGS,
-        // which is a Rust constant, not a settings row.
+        // custom one), but `configured_catalog_urls` still runs a `settings`
+        // SELECT for the custom-catalog half of its list even for preset
+        // URLs — so the fixture below only blocks writes, not reads.
         let url = "https://www.gutenberg.org/ebooks.opds/";
         let tmp = tempfile::tempdir().unwrap();
         let pool = db::create_pool(&tmp.path().join("library.db")).unwrap();
@@ -9998,14 +10027,20 @@ mod tests {
         set_opds_auth_inner(&conn, &store, "p", url, "basic", "u", "old-secret", false).unwrap();
         assert_eq!(store.get("p", url).unwrap().as_deref(), Some("old-secret"));
 
-        conn.execute("DROP TABLE settings", [])
-            .expect("must actually break the row write for this test to mean anything");
+        block_settings_writes(&conn);
+        // Prove the fixture does what it claims before relying on it: reads
+        // still succeed, so a subsequent failure can only be the write.
+        assert!(
+            db::get_setting(&conn, "opds_custom_catalogs").is_ok(),
+            "reads must still work; only writes are meant to fail"
+        );
 
         let err = set_opds_auth_inner(&conn, &store, "p", url, "basic", "u", "new-secret", false)
             .unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("settings"),
-            "expected the row-write failure to surface, got: {err}"
+            err.to_string().contains(BLOCK_SETTINGS_WRITES_MSG),
+            "expected the row-write failure specifically (not a membership-check \
+             failure, which would not mention the trigger) to surface, got: {err}"
         );
         assert_eq!(
             store.get("p", url).unwrap().as_deref(),
@@ -10024,8 +10059,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pool = db::create_pool(&tmp.path().join("library.db")).unwrap();
         let conn = pool.get().unwrap();
-        conn.execute("DROP TABLE settings", [])
-            .expect("must actually break the row write for this test to mean anything");
+        block_settings_writes(&conn);
+        assert!(
+            db::get_setting(&conn, "opds_custom_catalogs").is_ok(),
+            "reads must still work; only writes are meant to fail"
+        );
 
         let store = FlakyCredentialStore {
             inner: MemoryCredentialStore::default(),
@@ -10034,15 +10072,38 @@ mod tests {
         };
         let err =
             set_opds_auth_inner(&conn, &store, "p", url, "bearer", "", "t", false).unwrap_err();
-        let msg = err.to_string().to_lowercase();
+        let msg = err.to_string();
         assert!(
-            msg.contains("settings"),
-            "must mention the original row-write failure: {err}"
+            msg.contains(BLOCK_SETTINGS_WRITES_MSG),
+            "must mention the original row-write failure specifically (not a \
+             membership-check failure), got: {err}"
         );
         assert!(
-            msg.contains("keychain"),
+            msg.to_lowercase().contains("keychain"),
             "must mention the failed keychain restore: {err}"
         );
+    }
+
+    #[test]
+    fn set_opds_auth_recognizes_mixed_case_https_scheme_without_allow_insecure() {
+        // `origin_from_url` lowercases the scheme, so a registered catalog
+        // URL that isn't already lowercase (`HTTPS://...`) must still be
+        // recognized as https without needing `allow_insecure` — checking
+        // `catalog_url.starts_with("https://")` directly (case-sensitive)
+        // would wrongly demand it.
+        let (conn, _tmp) = test_conn_with_catalog("HTTPS://h/opds");
+        let store = MemoryCredentialStore::default();
+        set_opds_auth_inner(
+            &conn,
+            &store,
+            "p",
+            "HTTPS://h/opds",
+            "bearer",
+            "",
+            "t",
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
