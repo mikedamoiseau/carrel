@@ -110,6 +110,51 @@ pub fn host_port_from_url(url: &str) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+/// Canonical origin for credential identity: `scheme://host[:port]`, scheme and
+/// host lowercased, port omitted when it is the scheme default. `None` for
+/// non-http(s) or hostless URLs.
+///
+/// Deliberately distinct from [`host_port_from_url`], which ignores the scheme
+/// and keys the SSRF trusted list: a credential stored for `https://h:443` must
+/// NOT be sent to `http://h:443`, so credential identity has to carry the
+/// scheme. reqwest does not help here — it scrubs `Authorization` across a
+/// host/port change on redirect but not across a scheme downgrade.
+pub fn origin_from_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    match parsed.port() {
+        Some(p) if p != default_port => Some(format!("{scheme}://{host}:{p}")),
+        _ => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// True for `localhost`, `*.localhost`, and loopback IPs.
+///
+/// Used only to decide whether a cleartext credential needs an explicit
+/// acknowledgement from the user — NOT a general "is this address private"
+/// test. The SSRF guard's IPv6 branch below blocks only loopback and
+/// unspecified addresses (neither unique-local nor link-local), so a
+/// `is_private_host` helper claiming those ranges would not match the code it
+/// was extracted from. Restricting the silent exception to loopback avoids the
+/// mismatch: every other cleartext credential goes through the acknowledgement.
+pub fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") || bare.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Upgrade a cover URL from `http://` to `https://` so it satisfies the
 /// renderer's CSP — unless the host is in `trusted`, in which case the
 /// upgrade is skipped (LAN/loopback servers typically don't speak TLS, so
@@ -1076,5 +1121,46 @@ mod tests {
             "https://example.com/jenny.epub"
         );
         assert_eq!(feed.entries[0].links[0].mime_type, "application/epub+zip");
+    }
+
+    #[test]
+    fn origin_from_url_omits_default_ports_and_lowercases() {
+        assert_eq!(
+            origin_from_url("https://Books.Example.org:443/opds").as_deref(),
+            Some("https://books.example.org")
+        );
+        assert_eq!(
+            origin_from_url("http://Example.com:80/x").as_deref(),
+            Some("http://example.com")
+        );
+        assert_eq!(
+            origin_from_url("http://localhost:8080/opds").as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn origin_from_url_distinguishes_scheme() {
+        assert_ne!(
+            origin_from_url("http://h:443/x"),
+            origin_from_url("https://h:443/x")
+        );
+    }
+
+    #[test]
+    fn origin_from_url_rejects_hostless_and_non_http() {
+        assert!(origin_from_url("file:///etc/passwd").is_none());
+        assert!(origin_from_url("javascript:alert(1)").is_none());
+        assert!(origin_from_url("not a url").is_none());
+    }
+
+    #[test]
+    fn is_loopback_host_matches_localhost_and_loopback_ips() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("app.localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.0.50"));
+        assert!(!is_loopback_host("books.example.org"));
     }
 }
