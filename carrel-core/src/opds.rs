@@ -205,6 +205,14 @@ pub struct OpdsEntry {
     pub links: Vec<OpdsLink>,
     /// Navigation links (for sub-catalogs)
     pub nav_url: Option<String>,
+    /// Catalog this entry came from, when the fetch that produced it was still
+    /// on that catalog's own origin. `None` otherwise — including for entries
+    /// fetched after a cross-origin hop, so provenance cannot be laundered back
+    /// into credential eligibility. Set by [`stamp_provenance`], never by the
+    /// parser. `serde(default)` keeps Discover's cached entries, written before
+    /// this field existed, deserializable.
+    #[serde(default)]
+    pub catalog_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +236,13 @@ pub struct OpdsFeed {
     pub next_url: Option<String>,
     /// Search URL template (OpenSearch)
     pub search_url: Option<String>,
+    /// Same rule as [`OpdsEntry::catalog_url`], for the feed itself.
+    ///
+    /// `next_url` and `search_url` are feed-level, so without this a caller
+    /// following them would have no provenance to pass back and would have to
+    /// re-assert one from its own memory — which is exactly how a cross-origin
+    /// hop gets laundered. Callers must pass back what the response carried.
+    pub catalog_url: Option<String>,
 }
 
 /// Which catalog an OPDS operation is following, and that catalog's origin.
@@ -342,6 +357,29 @@ pub fn same_origin_redirect_policy(origin: String) -> reqwest::redirect::Policy 
     })
 }
 
+/// Stamp the catalog this data came from onto the feed and every entry — but
+/// only when the response's **effective** URL (after redirects) is still on the
+/// provenance origin.
+///
+/// The effective URL is what makes this safe. Consider a catalog A with no
+/// readable secret whose feed redirects, unauthenticated, to origin B. The
+/// request URL was A's, so a naive stamp would mark the response as A's data;
+/// B could then hand back an A-origin link, and once a credential existed that
+/// B-chosen URL would be fetched with A's credential. Clearing provenance at the
+/// hop means nothing downstream carries a catalog to name.
+fn stamp_provenance(feed: &mut OpdsFeed, ctx: &OpdsContext, effective_url: &str) {
+    let effective_origin = origin_from_url(effective_url);
+    let value = ctx
+        .provenance
+        .as_ref()
+        .filter(|p| effective_origin.as_deref() == Some(p.origin.as_str()))
+        .map(|p| p.catalog_url.clone());
+    feed.catalog_url = value.clone();
+    for entry in &mut feed.entries {
+        entry.catalog_url = value.clone();
+    }
+}
+
 /// Map 401/403 to a distinct auth-required error; any other status yields
 /// `None` and falls through to the caller's generic handling.
 ///
@@ -404,6 +442,9 @@ pub fn fetch_feed_with_context(url: &str, ctx: &OpdsContext) -> CarrelResult<Opd
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
+    // Capture the URL the response actually came from before consuming it —
+    // `stamp_provenance` needs it, and it is gone once the body is read.
+    let effective_url = response.url().to_string();
     let bytes = response
         .bytes()
         .map_err(|e| CarrelError::network(format!("Read error: {e}")))?;
@@ -411,7 +452,12 @@ pub fn fetch_feed_with_context(url: &str, ctx: &OpdsContext) -> CarrelResult<Opd
         return Err(CarrelError::invalid("Response too large (limit: 5 MB)."));
     }
     let xml = String::from_utf8_lossy(&bytes).to_string();
-    parse_feed_with_context(&xml, url, ctx)
+    // Relative links still resolve against the requested URL, as before — the
+    // effective URL is used only for the provenance decision, so this change
+    // cannot alter how any existing feed's links are built.
+    let mut feed = parse_feed_with_context(&xml, url, ctx)?;
+    stamp_provenance(&mut feed, ctx, &effective_url);
+    Ok(feed)
 }
 
 /// Parse OPDS/Atom XML into structured data.
@@ -635,6 +681,7 @@ fn parse_feed_with_context(xml: &str, base_url: &str, ctx: &OpdsContext) -> Carr
                             cover_url: entry_cover.clone(),
                             links: entry_links.clone(),
                             nav_url: entry_nav.clone(),
+                            catalog_url: None, // stamped by the caller, not the parser
                         });
                     }
                     "author" => {
@@ -655,13 +702,15 @@ fn parse_feed_with_context(xml: &str, base_url: &str, ctx: &OpdsContext) -> Carr
     }
 
     // Resolve OpenSearch description URLs to direct search templates
-    let resolved_search = search_url.and_then(|u| resolve_search_url(&u));
+    let resolved_search = search_url.and_then(|u| resolve_search_url_with_context(&u, ctx));
 
     Ok(OpdsFeed {
         title: feed_title,
         entries,
         next_url,
         search_url: resolved_search,
+        catalog_url: None, // stamped by fetch_feed_with_context, which sees the
+                           // effective URL after redirects
     })
 }
 
@@ -673,7 +722,22 @@ pub fn resolve_search_url(url: &str) -> Option<String> {
 
 /// Like [`resolve_search_url`], but carries an [`OpdsContext`] so trusted
 /// `host:port` entries are allowed and credentials can be attached.
+/// When `ctx.provenance` is set, three origin checks apply — a cross-origin
+/// descriptor is not fetched, a descriptor that *redirects* off-origin is
+/// discarded, and a template must be on the effective descriptor origin. All
+/// three exist because a template ends up being fetched with the catalog's
+/// credential later, so whoever chose that URL is choosing an authenticated
+/// request. The no-context wrapper keeps the old permissive behavior.
 pub fn resolve_search_url_with_context(url: &str, ctx: &OpdsContext) -> Option<String> {
+    let provenance_origin = ctx.provenance.as_ref().map(|p| p.origin.as_str());
+
+    // 1. A cross-origin descriptor or direct template is refused outright.
+    if let Some(origin) = provenance_origin {
+        if origin_from_url(url).as_deref() != Some(origin) {
+            return None;
+        }
+    }
+
     // If it already contains {searchTerms}, it's a direct template
     if url.contains("{searchTerms}") {
         return Some(url.to_string());
@@ -693,6 +757,18 @@ pub fn resolve_search_url_with_context(url: &str, ctx: &OpdsContext) -> Option<S
     .ok()?;
     if !response.status().is_success() {
         return None;
+    }
+
+    // 2. The descriptor's EFFECTIVE URL after redirects must also be on the
+    //    provenance origin. Without this, A's descriptor can 302 to B (followed
+    //    normally, since no credential was attached) and B can return a template
+    //    on A — checks 1 and 3 would both pass against the original URL, and a
+    //    later search would send A's credential to a URL B chose.
+    let effective_origin = origin_from_url(response.url().as_str());
+    if let Some(origin) = provenance_origin {
+        if effective_origin.as_deref() != Some(origin) {
+            return None;
+        }
     }
     let xml = response.text().ok()?;
 
@@ -724,6 +800,14 @@ pub fn resolve_search_url_with_context(url: &str, ctx: &OpdsContext) -> Option<S
                     if !template.is_empty()
                         && (url_type.contains("atom") || url_type.contains("opds"))
                     {
+                        // 3. The template must be on the effective descriptor
+                        //    origin, so a descriptor cannot point the eventual
+                        //    authenticated search somewhere else.
+                        if provenance_origin.is_some()
+                            && origin_from_url(&template) != effective_origin
+                        {
+                            return None;
+                        }
                         return Some(template);
                     }
                 }
@@ -1353,6 +1437,35 @@ mod tests {
     }
 
     #[test]
+    fn cached_entry_json_without_catalog_url_still_deserializes() {
+        // Discover caches entries as JSON; rows written before this field
+        // existed must keep loading.
+        let json = r#"{"id":"1","title":"T","author":"A","summary":"","coverUrl":null,"links":[],"navUrl":null}"#;
+        let e: OpdsEntry = serde_json::from_str(json).unwrap();
+        assert!(e.catalog_url.is_none());
+    }
+
+    #[test]
+    fn opensearch_rejects_a_cross_origin_descriptor_or_direct_template() {
+        let ctx = OpdsContext {
+            provenance: Some(OpdsProvenance {
+                catalog_url: "https://a/opds".into(),
+                origin: "https://a".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(resolve_search_url_with_context("https://b/os.xml", &ctx).is_none());
+        assert!(
+            resolve_search_url_with_context("https://b/search?q={searchTerms}", &ctx).is_none(),
+            "a direct template must be origin-checked too"
+        );
+        assert_eq!(
+            resolve_search_url_with_context("https://a/search?q={searchTerms}", &ctx).as_deref(),
+            Some("https://a/search?q={searchTerms}")
+        );
+    }
+
+    #[test]
     fn auth_status_maps_to_permission_error_with_the_frontend_substring() {
         let err = auth_error_for(reqwest::StatusCode::UNAUTHORIZED).expect("401 must map");
         assert!(err.to_string().contains("OPDS auth required"));
@@ -1564,6 +1677,209 @@ mod http_tests {
             b.received_requests().await.unwrap_or_default().len(),
             1,
             "B must have served the feed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_origin_response_is_stamped_with_its_catalog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.clone(),
+            origin: origin_from_url(&url).unwrap(),
+        });
+        // No credential: a PUBLIC catalog must still be stamped, or the user
+        // could never sign in to it later.
+        let expected = url.clone();
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.catalog_url.as_deref(), Some(expected.as_str()));
+        assert!(feed
+            .entries
+            .iter()
+            .all(|e| e.catalog_url.as_deref() == Some(expected.as_str())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unauthenticated_cross_origin_redirect_clears_provenance() {
+        // Stamping rule 5. A has no readable secret, so the hop to B is followed
+        // normally — but the response must NOT be stamped A, or B's links
+        // inherit A's provenance and a later credential would authenticate a
+        // URL B chose.
+        //
+        // This is the paired negative of the test above: "never stamp anything"
+        // satisfies this one alone, so judge the two together.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/feed", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let url = format!("{}/opds", a.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.trusted.push(host_port_from_url(&b.uri()).unwrap());
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.clone(),
+            origin: origin_from_url(&url).unwrap(),
+        });
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert!(
+            feed.catalog_url.is_none(),
+            "provenance must not survive a cross-origin hop"
+        );
+        assert!(feed.entries.iter().all(|e| e.catalog_url.is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parse_feed_forwards_the_context_to_opensearch_resolution() {
+        // Regression test for the missed opds.rs:471 call site: the root feed's
+        // search link is an OpenSearch descriptor on the same 127.0.0.1 server.
+        // Before the fix, parse_feed resolved it through the no-trusted wrapper,
+        // so the SSRF guard blocked the descriptor and search_url was always
+        // None for LAN and loopback catalogs.
+        let server = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&server)
+            .await;
+        let root = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+               <feed xmlns="http://www.w3.org/2005/Atom"><title>T</title>
+                 <link rel="search" type="application/opensearchdescription+xml" href="{}/os.xml"/>
+               </feed>"#,
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(root))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/opds", server.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.clone(),
+            origin: origin_from_url(&url).unwrap(),
+        });
+        let expected = template.clone();
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.search_url.as_deref(),
+            Some(expected.as_str()),
+            "the OpenSearch template must resolve when the context allows the descriptor host"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opensearch_descriptor_redirected_off_origin_yields_no_template() {
+        // A's descriptor 302s to B; B returns a template pointing back at A.
+        // Both the requested descriptor URL and the template are on A, so only
+        // the EFFECTIVE descriptor origin check catches this.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", a.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/os.xml", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let descriptor = format!("{}/os.xml", a.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(
+            got.is_none(),
+            "a descriptor redirected off-origin must not yield a template, got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opensearch_descriptor_redirected_off_origin_yields_no_off_origin_template_either() {
+        // Discriminates check 2 from check 3. Here A's descriptor 302s to B and
+        // B returns a template on B itself: the template *does* match the
+        // effective descriptor origin, so check 3 is satisfied and only the
+        // effective-origin check refuses it. Without this case, removing check 2
+        // leaves every test green.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", b.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/os.xml", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let descriptor = format!("{}/os.xml", a.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(
+            got.is_none(),
+            "a template from an off-origin descriptor must be refused whatever its own origin, got {got:?}"
         );
     }
 

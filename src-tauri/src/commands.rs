@@ -8226,6 +8226,7 @@ mod tests {
             cover_url: None,
             links: Vec::new(),
             nav_url: None,
+            catalog_url: None,
         }
     }
 
