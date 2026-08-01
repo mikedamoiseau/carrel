@@ -571,6 +571,31 @@ Two paths from the catalog list view:
 
 Custom catalogs can be removed at any time (with a confirmation). If you ever have no catalogs, the panel shows a shortcut to the preset picker.
 
+### Catalogs that require signing in
+
+Some catalogs don't allow anonymous access — for example, a Carrel Server instance you run yourself. Carrel supports two ways to sign in:
+
+- **Username / password** — the account's login credentials.
+- **Bearer token** — a single API key (Carrel Server calls its own key format `ck_live_…`), with no separate username.
+
+You can add credentials in either of two places:
+
+- **When adding the catalog** — click **"+ Sign-in required?"** on the add-catalog form to reveal a username/password or token field before saving. Carrel tests the feed with the new credential before saving anything; if the password or token is wrong, the add fails and nothing is stored — no broken catalog is left behind.
+- **When browsing hits a sign-in wall** — if a catalog you already added answers with "sign-in required," a panel appears offering to sign in on the spot. Enter your credentials and retry the same request.
+
+If the address is plain `http://` rather than `https://` and points anywhere other than your own machine (localhost/127.0.0.1), Carrel warns that the connection isn't encrypted and asks you to confirm before sending the credential. This is a warning, not a refusal — a NAS or home server on your LAN is often plain HTTP by design, and loopback traffic never leaves your machine, so it's allowed silently.
+
+The credential itself is stored in your operating system's keychain, not in Carrel's own database, and it's only ever sent to the catalog it was configured for — a link to a different site is never given it. Two catalogs on the same server but at different paths (say, a personal feed and a shared team feed) keep entirely separate credentials.
+
+**Signing out** of a catalog (from its entry in the catalog list) removes the stored credential. Removing the catalog, or deleting the profile it belongs to, also removes it.
+
+**Known limitations:**
+
+- Book covers don't appear for authenticated catalogs.
+- Unified search and the library's Discover row can only use a credential that's already stored — they can't prompt you to sign in themselves. An authenticated catalog only shows up in either one after you've added its credentials by browsing that catalog directly.
+- If a catalog's main feed is public but its search feature is itself protected, search for that catalog stops working with no error shown.
+- One credential per catalog: two catalogs on the same server are independent, but a single catalog can only hold one signed-in account at a time.
+
 ---
 
 ## 8. Profiles
