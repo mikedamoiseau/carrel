@@ -1897,6 +1897,113 @@ mod http_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("OPDS auth required"), "got: {err}");
+        // The kind matters as much as the message: the frontend's KIND_TO_KEY
+        // falls back on it, and `Network` is what produced the misleading
+        // "could not connect" copy.
+        assert_eq!(err.kind(), "PermissionDenied", "got kind {}", err.kind());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opensearch_refuses_a_template_pointing_at_another_origin() {
+        // Isolates check 3: the descriptor is served directly by A (no redirect,
+        // so check 2 passes) but hands back a template on B. Only the
+        // template-versus-effective-origin check refuses this.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", b.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&a)
+            .await;
+        let descriptor = format!("{}/os.xml", a.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(
+            got.is_none(),
+            "a same-origin descriptor must not hand the search off to another origin, got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cross_origin_descriptor_is_never_fetched() {
+        // Check 1, made independent of network failure. The descriptor exists
+        // and would answer; provenance names another origin, so no request may
+        // go out at all. Asserting zero received requests is the discriminating
+        // observation — an unreachable host would return None either way.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{}/search?q={{searchTerms}}"/>
+                   </OpenSearchDescription>"#,
+                b.uri()
+            )))
+            .mount(&b)
+            .await;
+        let descriptor = format!("{}/os.xml", b.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(got.is_none());
+        assert_eq!(
+            b.received_requests().await.unwrap_or_default().len(),
+            0,
+            "a cross-origin descriptor must not be requested at all"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_authenticated_same_origin_redirect_is_followed_with_the_credential() {
+        // The positive half of the redirect matrix: a same-origin hop must still
+        // work while authenticated — a feed at /opds redirecting to /opds/ is
+        // ordinary — and the credential must survive it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds/"))
+            .and(wiremock::matchers::header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/opds/"))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = authed_ctx(&url, OpdsCredential::Bearer("t".into()));
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.title, "T",
+            "same-origin redirects must still carry the credential"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
