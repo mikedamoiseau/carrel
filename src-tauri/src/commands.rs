@@ -4241,6 +4241,92 @@ pub async fn remove_opds_catalog(url: String, state: State<'_, AppState>) -> Car
     Ok(db::set_setting(&conn, "opds_custom_catalogs", &json)?)
 }
 
+/// Persisted credential metadata for one OPDS catalog. Stored as JSON under
+/// the `opds_auth` settings key; the secret itself is never part of this
+/// struct — it lives only in the OS keychain via `CredentialStore`, keyed by
+/// [`opds_secret_key`].
+///
+/// STABLE PERSISTENCE IDENTIFIER: under `#[serde(rename_all = "camelCase")]`
+/// these field names are the on-disk shape of the `opds_auth` settings row
+/// (e.g. `catalog_url` persists as `catalogUrl`). Renaming a field changes
+/// what's already on disk.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpdsAuthRecord {
+    catalog_url: String,
+    origin: String,
+    kind: String,
+    username: String,
+}
+
+/// IPC-facing view of an [`OpdsAuthRecord`]: omits `catalog_url`/`origin`
+/// and, more importantly, never carries the secret — the secret lives only
+/// in the OS keychain and is never read back out over IPC.
+#[allow(dead_code)] // constructed by Task 9's get_opds_auth command
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpdsAuthInfo {
+    kind: String,
+    username: String,
+}
+
+/// Reads the `opds_auth` settings row, tolerating a missing or corrupt row by
+/// returning an empty list rather than erroring — same tolerance pattern as
+/// the custom-catalog read in `get_opds_catalogs` (:4179-4181).
+#[allow(dead_code)] // consumed by Task 9's get_opds_auth command
+fn read_opds_auth(conn: &rusqlite::Connection) -> Vec<OpdsAuthRecord> {
+    let json = db::get_setting(conn, "opds_auth")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "[]".to_string());
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+/// Writes the full `opds_auth` settings row.
+#[allow(dead_code)] // consumed by Task 9's set/clear_opds_auth commands
+fn write_opds_auth(conn: &rusqlite::Connection, recs: &[OpdsAuthRecord]) -> CarrelResult<()> {
+    let json = serde_json::to_string(recs)?;
+    Ok(db::set_setting(conn, "opds_auth", &json)?)
+}
+
+/// Inserts or replaces the credential metadata for `rec.catalog_url`, keyed
+/// by catalog URL (not origin) — two catalogs on the same origin keep
+/// independent credential records.
+#[allow(dead_code)] // consumed by Task 9's set_opds_auth command
+fn upsert_opds_auth_inner(conn: &rusqlite::Connection, rec: OpdsAuthRecord) -> CarrelResult<()> {
+    let mut all = read_opds_auth(conn);
+    all.retain(|r| r.catalog_url != rec.catalog_url);
+    all.push(rec);
+    write_opds_auth(conn, &all)
+}
+
+#[cfg(test)]
+fn rec(catalog_url: &str, kind: &str, username: &str) -> OpdsAuthRecord {
+    OpdsAuthRecord {
+        catalog_url: catalog_url.to_string(),
+        origin: opds::origin_from_url(catalog_url).expect("test URLs must parse"),
+        kind: kind.to_string(),
+        username: username.to_string(),
+    }
+}
+
+/// A tempdir-backed connection with `url` registered as a custom catalog, so
+/// the configured-catalog membership check passes. The TempDir must be held
+/// by the caller — dropping it deletes the DB.
+#[cfg(test)]
+fn test_conn_with_catalog(
+    url: &str,
+) -> (
+    r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = db::create_pool(&tmp.path().join("library.db")).unwrap();
+    let conn = pool.get().unwrap();
+    add_opds_catalog_inner(&conn, "Test".into(), url.to_string(), None).unwrap();
+    (conn, tmp)
+}
+
 /// Live progress for a single catalog during a unified `search_all_catalogs`
 /// run. Emitted (as `catalog-search-progress`) once per catalog the moment its
 /// fan-out thread finishes. `query` lets the UI ignore stale events from a
@@ -9498,6 +9584,62 @@ mod tests {
         );
         store.delete("p", "https://h/opds").unwrap();
         assert!(store.get("p", "https://h/opds").unwrap().is_none());
+    }
+
+    #[test]
+    fn opds_auth_upsert_replaces_by_catalog_url() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/a");
+        upsert_opds_auth_inner(&conn, rec("https://h/a", "basic", "u1")).unwrap();
+        upsert_opds_auth_inner(&conn, rec("https://h/a", "bearer", "")).unwrap();
+        let all = read_opds_auth(&conn);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].kind, "bearer");
+    }
+
+    #[test]
+    fn two_catalogs_on_one_origin_keep_independent_credentials() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/private/opds");
+        add_opds_catalog_inner(&conn, "Team".into(), "https://h/team/opds".into(), None).unwrap();
+        upsert_opds_auth_inner(&conn, rec("https://h/private/opds", "basic", "alice")).unwrap();
+        upsert_opds_auth_inner(&conn, rec("https://h/team/opds", "basic", "bob")).unwrap();
+        let all = read_opds_auth(&conn);
+        assert_eq!(all.len(), 2);
+
+        let store = MemoryCredentialStore::default();
+        store.set("p", "https://h/private/opds", "s-alice").unwrap();
+        store.set("p", "https://h/team/opds", "s-bob").unwrap();
+        assert_eq!(
+            store.get("p", "https://h/private/opds").unwrap().as_deref(),
+            Some("s-alice")
+        );
+        assert_eq!(
+            store.get("p", "https://h/team/opds").unwrap().as_deref(),
+            Some("s-bob")
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_opds_auth_row_reads_as_empty() {
+        let (conn, _tmp) = test_conn_with_catalog("https://h/a");
+        assert!(read_opds_auth(&conn).is_empty());
+        db::set_setting(&conn, "opds_auth", "{not json").unwrap();
+        assert!(read_opds_auth(&conn).is_empty());
+    }
+
+    #[test]
+    fn get_opds_auth_never_returns_the_secret() {
+        // OpdsAuthInfo is the IPC return shape: only `kind` and `username`
+        // fields exist, so it structurally cannot carry the secret. Pins the
+        // exact camelCase JSON shape sent to the frontend.
+        let info = OpdsAuthInfo {
+            kind: "basic".to_string(),
+            username: "alice".to_string(),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "basic", "username": "alice"})
+        );
     }
 
     #[test]
