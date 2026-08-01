@@ -311,27 +311,40 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     // Provenance for a search_url follow comes from the feed that carried it,
     // never a remembered "current catalog".
     const catalogUrl = feed.catalogUrl;
-    const url = searchUrl.replace("{searchTerms}", encodeURIComponent(searchQuery.trim()));
-    setLoading(true);
-    setFeedLoadingLabel(t("catalog.searchingServer", { name: feed.title || t("catalog.catalog") }));
-    setError(null);
-    lastActionRef.current = () => handleSearch();
-    try {
-      const f = await invoke<OpdsFeed>("browse_opds", { url, catalogUrl });
-      // Preserve the parent's searchUrl so the search bar stays visible
-      if (!f.searchUrl) f.searchUrl = searchUrl;
-      setFeed(f);
-      setHistory((prev) => [...prev, { url, title: `Search: ${searchQuery}`, catalogUrl: f.catalogUrl ?? null }]);
-    } catch (err) {
-      if (isOpdsAuthError(err) && catalogUrl) {
-        openAuthPrompt(catalogUrl);
-      } else {
-        setError(friendlyError(err, t));
+    const query = searchQuery.trim();
+    const url = searchUrl.replace("{searchTerms}", encodeURIComponent(query));
+    const feedTitle = feed.title;
+
+    // Freeze this request's args in `run`'s closure so a retry (via
+    // lastActionRef, after a 401) replays the search that actually failed —
+    // not whatever is currently typed in the search box. The auth panel's
+    // backdrop only blocks pointer events, so the underlying input can still
+    // receive keystrokes while the panel is open; without this, retrying
+    // would silently search for something the user never submitted. Mirrors
+    // how `browseTo` and `handleDownload` already freeze their own args.
+    const run = async () => {
+      setLoading(true);
+      setFeedLoadingLabel(t("catalog.searchingServer", { name: feedTitle || t("catalog.catalog") }));
+      setError(null);
+      try {
+        const f = await invoke<OpdsFeed>("browse_opds", { url, catalogUrl });
+        // Preserve the parent's searchUrl so the search bar stays visible
+        if (!f.searchUrl) f.searchUrl = searchUrl;
+        setFeed(f);
+        setHistory((prev) => [...prev, { url, title: `Search: ${query}`, catalogUrl: f.catalogUrl ?? null }]);
+      } catch (err) {
+        if (isOpdsAuthError(err) && catalogUrl) {
+          openAuthPrompt(catalogUrl);
+        } else {
+          setError(friendlyError(err, t));
+        }
+      } finally {
+        setLoading(false);
+        setFeedLoadingLabel(null);
       }
-    } finally {
-      setLoading(false);
-      setFeedLoadingLabel(null);
-    }
+    };
+    lastActionRef.current = run;
+    await run();
   }, [feed, searchQuery, t, openAuthPrompt]);
 
   const handleDownload = useCallback(async (entry: OpdsEntry) => {

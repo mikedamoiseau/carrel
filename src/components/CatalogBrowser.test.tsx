@@ -583,6 +583,14 @@ describe("CatalogBrowser sign-in prompt on 401/403", () => {
 
     expect(await screen.findByText("catalog.signInRequired")).toBeInTheDocument();
 
+    // The auth panel's backdrop only intercepts pointer events, so nothing
+    // stops keystrokes reaching the search box underneath while it's open.
+    // The retry must replay the search that actually 401'd ("shakespeare"),
+    // not whatever ends up in the box by the time the user signs in.
+    act(() => {
+      fireEvent.change(screen.getByPlaceholderText("catalog.searchThisCatalog"), { target: { value: "different-query" } });
+    });
+
     await act(async () => {
       fireEvent.change(screen.getByPlaceholderText("catalog.authUsername"), { target: { value: "search-user" } });
       fireEvent.change(screen.getByPlaceholderText("catalog.authPassword"), { target: { value: "search-pass" } });
@@ -595,6 +603,49 @@ describe("CatalogBrowser sign-in prompt on 401/403", () => {
       }),
     );
     expect(searchCalls).toBe(2);
+    // Discriminating assertion: the retried browse_opds call must carry the
+    // frozen url/catalogUrl from the request that failed, not a re-derived
+    // one built from whatever is currently typed in the search box.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("browse_opds", {
+        url: "https://a/search?q=shakespeare", catalogUrl: "https://a/opds",
+      }),
+    );
+  });
+
+  it("shows the cleartext warning in the retry panel for a non-loopback http catalog", async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "http://192.168.0.50:8080/opds" }]);
+      if (cmd === "browse_opds") return Promise.reject(AUTH_REQUIRED_ERROR);
+      if (cmd === "get_opds_auth") return Promise.resolve(null);
+      if (cmd === "set_opds_auth") return Promise.resolve(undefined);
+      return Promise.resolve(null);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    await act(async () => fireEvent.click(screen.getByText("A")));
+
+    expect(await screen.findByText("catalog.signInRequired")).toBeInTheDocument();
+    expect(screen.getByText("catalog.insecureCredentialWarning")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("catalog.authUsername"), { target: { value: "lan-user" } });
+      fireEvent.change(screen.getByPlaceholderText("catalog.authPassword"), { target: { value: "lan-pass" } });
+    });
+    const signInBtn = screen.getByRole("button", { name: "catalog.signIn" });
+    expect(signInBtn).toBeDisabled();
+
+    await act(async () => fireEvent.click(screen.getByRole("checkbox")));
+    expect(signInBtn).not.toBeDisabled();
+    await act(async () => fireEvent.click(signInBtn));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "set_opds_auth",
+        expect.objectContaining({ catalogUrl: "http://192.168.0.50:8080/opds", allowInsecure: true }),
+      ),
+    );
   });
 });
 
