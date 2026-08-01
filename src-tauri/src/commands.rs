@@ -4878,21 +4878,39 @@ pub async fn add_opds_catalog_with_auth(
     allow_insecure: bool,
     state: State<'_, AppState>,
 ) -> CarrelResult<()> {
-    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (profile, pool) = active_profile_and_db(&state)?;
-    let conn = pool.get()?;
-    add_opds_catalog_with_auth_inner(
-        &conn,
-        &KeyringCredentialStore,
-        &profile,
-        &name,
-        &url,
-        preset_id,
-        &kind,
-        &username,
-        &secret,
-        allow_insecure,
-    )
+    let (tx, rx) = std::sync::mpsc::channel();
+    tauri::async_runtime::spawn_blocking(move || {
+        // `OPDS_AUTH_LOCK` is acquired *inside* the blocking task, not in the
+        // async command body above: it must stay held across the connection
+        // test's up-to-15s network fetch inside `add_opds_catalog_with_auth_inner`
+        // (that's the point — the snapshot-and-restore window is deliberately
+        // as long as the network call, so a plain `add_opds_catalog` can't
+        // land in the middle of it), and a `std::sync::MutexGuard` is `!Send`
+        // so it cannot be created before `spawn_blocking` and moved into this
+        // closure. Every sibling OPDS network command already runs its fetch
+        // via `spawn_blocking` (`browse_opds`, `download_opds_book`,
+        // `search_all_catalogs`, `get_discover_books`); this follows the same
+        // pattern, just with the mutex acquired first inside the closure.
+        let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let result = (|| -> CarrelResult<()> {
+            let conn = pool.get()?;
+            add_opds_catalog_with_auth_inner(
+                &conn,
+                &KeyringCredentialStore,
+                &profile,
+                &name,
+                &url,
+                preset_id,
+                &kind,
+                &username,
+                &secret,
+                allow_insecure,
+            )
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv()?
 }
 
 /// Live progress for a single catalog during a unified `search_all_catalogs`
