@@ -62,6 +62,9 @@ together with a migration.
 | `carrel-core`, `CarrelError`, `CarrelResult`, `CarrelEvent` | `carrel-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
 | `carrel-offline` IndexedDB database | `static/app.js` | orphan every offline-saved book's blobs (separate from the Cache Storage entry above) |
 | `21c2cdba-327a-5023-94aa-a2fbf307774c` | `tauri.conf.json` `bundle.windows.wix.upgradeCode` | make every Windows MSI install **side-by-side** with the user's existing install instead of upgrading it in place |
+| `carrel-opds-auth` | `src-tauri/src/commands.rs` (keychain service name) | orphan every stored OPDS catalog credential rather than migrating it |
+| `{profile.len()}:{profile}{catalog_url}` | `src-tauri/src/commands.rs` (keychain account encoding) | orphan every stored OPDS catalog credential rather than migrating it — the length prefix exists so a profile name containing a colon can't collide with a different profile/URL pair |
+| `opds_auth` | `src-tauri/src/commands.rs` (per-profile settings key) | orphan every stored OPDS catalog credential's metadata (which catalog, which kind, the username) rather than migrating it |
 
 The WiX upgrade code deserves a note, since it is the one entry that is a bare
 UUID rather than a readable string. Tauri derives it by default from
