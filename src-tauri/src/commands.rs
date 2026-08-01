@@ -4294,6 +4294,7 @@ pub async fn add_opds_catalog(
     preset_id: Option<String>,
     state: State<'_, AppState>,
 ) -> CarrelResult<()> {
+    let _guard = OPDS_AUTH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if !opds::is_user_addable_url(&url) {
         return Err(CarrelError::invalid(
             "Invalid catalog URL — only http:// or https:// URLs are accepted.",
@@ -10151,6 +10152,77 @@ mod tests {
             .find(|c| c.url == "https://example.com/opds")
             .unwrap();
         assert!(custom.preset_id.is_none());
+    }
+
+    /// I-1 (final-review.md) / design doc line 381: two concurrent
+    /// `add_opds_catalog` calls must not lose a catalog to a read-modify-write
+    /// race on the single `opds_custom_catalogs` row — the preset-picker
+    /// double-click bug (`OpdsPresetPicker.tsx:74-91`, whose per-preset
+    /// button only disables the clicked preset).
+    ///
+    /// This deliberately drives the real `#[tauri::command]` — not
+    /// `add_opds_catalog_inner` directly — across genuine OS threads (via
+    /// `mock_app_with_state`, defined later in this module and visible here
+    /// by item hoisting). A test built on `add_opds_catalog_inner` could only
+    /// ever prove the inner helper's own logic; it could not tell you whether
+    /// the *command* still acquires `OPDS_AUTH_LOCK`, since the inner helper
+    /// is deliberately lock-free (a second lock there would self-deadlock the
+    /// command that already holds one — see the module note on
+    /// `add_opds_catalog_inner`). Each thread gets its own tiny current-thread
+    /// runtime because `add_opds_catalog`'s body has no internal `.await`
+    /// point, so a single shared runtime would run each call to completion
+    /// before the next started, defeating the point of using real threads.
+    ///
+    /// This is a genuine race, not a fabricated one: before this fix landed,
+    /// running this test with the `OPDS_AUTH_LOCK` acquisition commented out
+    /// of `add_opds_catalog` reliably lost several of the `N` catalogs on
+    /// this machine (verified by hand while preparing this fix) — it is not
+    /// a test that would pass anyway.
+    #[test]
+    fn add_opds_catalog_concurrent_writers_do_not_lose_a_catalog() {
+        let (app, _dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        const N: usize = 12;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let state = state.clone();
+                    scope.spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .expect("build current-thread runtime");
+                        rt.block_on(add_opds_catalog(
+                            format!("Race Catalog {i}"),
+                            format!("https://race.example.com/cat{i}/opds"),
+                            None,
+                            state,
+                        ))
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join()
+                    .expect("add_opds_catalog thread panicked")
+                    .expect("add_opds_catalog returned an error");
+            }
+        });
+
+        let conn = state.active_db().unwrap().get().unwrap();
+        let cats = get_custom_catalogs(&conn);
+        for i in 0..N {
+            let url = format!("https://race.example.com/cat{i}/opds");
+            assert!(
+                cats.iter().any(|c| c.url == url),
+                "catalog {i} ({url}) was lost to a concurrent-write race — \
+                 add_opds_catalog is not serializing on OPDS_AUTH_LOCK"
+            );
+        }
+        assert_eq!(
+            cats.len(),
+            N,
+            "expected exactly {N} surviving catalogs, no drops or duplicates"
+        );
     }
 
     #[test]
