@@ -93,6 +93,7 @@ export const MESSAGE_KEYS: Record<string, string> = {
   "incorrect current password": "errors.incorrectPassword",
   "current password is required": "errors.currentPasswordRequired",
   "profile has no lock to remove": "errors.profileNotLocked",
+  "opds auth required": "errors.opdsAuthRequired",
 };
 
 /**
@@ -130,6 +131,17 @@ export function isBookFileMissing(raw: unknown): boolean {
  */
 export function isLockRequired(raw: unknown): boolean {
   return toCarrelError(raw).kind === "LockRequired";
+}
+
+/**
+ * Detect the OPDS auth-required error (`CarrelError::PermissionDenied` with
+ * the `OPDS auth required: HTTP <status>` message raised by
+ * `carrel-core/src/opds.rs` on a 401/403 response). Gates the sign-in prompt
+ * in `CatalogBrowser` instead of a generic error toast.
+ */
+export function isOpdsAuthError(raw: unknown): boolean {
+  const { message } = toCarrelError(raw);
+  return message.toLowerCase().includes("opds auth required");
 }
 
 export function isBookFileError(raw: unknown): boolean {

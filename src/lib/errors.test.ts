@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { TFunction } from "i18next";
-import { friendlyError, toCarrelError, isBookFileError, isBookFileMissing, isLockRequired } from "./errors";
+import { friendlyError, toCarrelError, isBookFileError, isBookFileMissing, isLockRequired, isOpdsAuthError } from "./errors";
 
 const mockT = ((key: string) => key) as TFunction;
 
@@ -207,6 +207,20 @@ describe("isBookFileMissing", () => {
 
     it("does NOT match generic NotFound (missing TOC entry)", () => {
         expect(isBookFileMissing({ kind: "NotFound", message: "Entry missing in archive" })).toBe(false);
+    });
+});
+
+describe("isOpdsAuthError", () => {
+    it("recognizes the backend's auth-required error in every wire shape", () => {
+        expect(isOpdsAuthError("OPDS auth required: HTTP 401 Unauthorized")).toBe(true);
+        expect(isOpdsAuthError(new Error("OPDS auth required: HTTP 403 Forbidden"))).toBe(true);
+        expect(isOpdsAuthError({ kind: "PermissionDenied", message: "OPDS auth required: HTTP 401" })).toBe(true);
+        expect(isOpdsAuthError("HTTP error: connection reset")).toBe(false);
+        expect(isOpdsAuthError(null)).toBe(false);
+    });
+
+    it("maps the auth-required message to its own copy", () => {
+        expect(friendlyError("OPDS auth required: HTTP 401", mockT)).toBe("errors.opdsAuthRequired");
     });
 });
 
