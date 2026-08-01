@@ -84,6 +84,11 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
   // defaults are disabled/removed, keeping the empty state correct rather
   // than misleading even though it's seldom hit.
   const [catalogsLoaded, setCatalogsLoaded] = useState(false);
+  // Which configured catalogs have a stored credential — drives the
+  // signed-in indicator and the sign-out action. Keyed by catalog URL;
+  // `null` means "checked, nothing stored" (as distinct from "not checked
+  // yet", which is simply absent from the map).
+  const [catalogAuth, setCatalogAuth] = useState<Record<string, { kind: "basic" | "bearer"; username: string } | null>>({});
   const [feed, setFeed] = useState<OpdsFeed | null>(null);
   const [loading, setLoading] = useState(false);
   // Non-null while a single-catalog search is in flight — names the catalog
@@ -176,6 +181,38 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
   }, []);
 
   useEffect(() => { loadCatalogs(); }, [loadCatalogs]);
+
+  // Refresh the signed-in indicator whenever the catalog list changes (initial
+  // load, or after an add/remove). A per-catalog failure just leaves that one
+  // catalog unmarked rather than failing the whole check.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const entries = await Promise.all(
+        catalogs.map(async (cat) => {
+          try {
+            const auth = await invoke<{ kind: "basic" | "bearer"; username: string } | null>("get_opds_auth", { catalogUrl: cat.url });
+            return [cat.url, auth] as const;
+          } catch {
+            return [cat.url, null] as const;
+          }
+        }),
+      );
+      if (!cancelled) setCatalogAuth(Object.fromEntries(entries));
+    })();
+    return () => { cancelled = true; };
+  }, [catalogs]);
+
+  const handleSignOut = async (catalogUrl: string) => {
+    try {
+      await invoke("clear_opds_auth", { catalogUrl });
+      setCatalogAuth((prev) => ({ ...prev, [catalogUrl]: null }));
+    } catch (err) {
+      // Surface the failure rather than silently leaving the indicator on —
+      // a rejected clear_opds_auth means the credential is still there.
+      setError(t("catalog.signOutFailed", { error: friendlyError(err, t) }));
+    }
+  };
 
   // Opens the sign-in panel bound to `catalogUrl`, pre-filled from whatever
   // credential (kind + username only — never the secret) is already stored
@@ -748,20 +785,45 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
                       </svg>
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-ink">{cat.name}</p>
+                      <p className="text-sm font-medium text-ink flex items-center gap-1.5">
+                        <span className="truncate">{cat.name}</span>
+                        {catalogAuth[cat.url] && (
+                          <svg
+                            width="11" height="11" viewBox="0 0 24 24" fill="none" className="text-accent shrink-0"
+                            role="img" aria-label={t("catalog.signedInAs", { name: cat.name })}
+                          >
+                            <title>{t("catalog.signedInAs", { name: cat.name })}</title>
+                            <path d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 11-12 0 6 6 0 0112 0zM3 21l6.75-6.75" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        )}
+                      </p>
                       <p className="text-[11px] text-ink-muted truncate">{cat.url}</p>
                     </div>
                   </button>
-                  <button
-                    onClick={() => setRemoveCatalogTarget({ name: cat.name, url: cat.url })}
-                    className="absolute right-3 p-1 text-ink-muted hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100 focus-visible:opacity-100 bg-surface rounded"
-                    aria-label={t("catalog.removeCatalog", { name: cat.name })}
-                    title={t("catalog.removeCatalogTitle")}
-                  >
-                    <svg width="12" height="12" viewBox="0 0 20 20" fill="none">
-                      <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                    </svg>
-                  </button>
+                  <div className="absolute right-3 flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                    {catalogAuth[cat.url] && (
+                      <button
+                        onClick={() => handleSignOut(cat.url)}
+                        className="p-1 text-ink-muted hover:text-ink transition-colors bg-surface rounded"
+                        aria-label={t("catalog.signOut", { name: cat.name })}
+                        title={t("catalog.signOutTitle")}
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                          <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </button>
+                    )}
+                    <button
+                      onClick={() => setRemoveCatalogTarget({ name: cat.name, url: cat.url })}
+                      className="p-1 text-ink-muted hover:text-red-500 transition-colors bg-surface rounded"
+                      aria-label={t("catalog.removeCatalog", { name: cat.name })}
+                      title={t("catalog.removeCatalogTitle")}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 20 20" fill="none">
+                        <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               ))}
 

@@ -597,3 +597,45 @@ describe("CatalogBrowser sign-in prompt on 401/403", () => {
     expect(searchCalls).toBe(2);
   });
 });
+
+describe("CatalogBrowser signed-in indicator and sign out", () => {
+  it("marks catalogs that have stored credentials", async () => {
+    invoke.mockImplementation((cmd: string, args?: { catalogUrl?: string }) => {
+      if (cmd === "get_opds_catalogs")
+        return Promise.resolve([
+          { name: "A", url: "https://a/opds" },
+          { name: "B", url: "https://b/opds" },
+        ]);
+      if (cmd === "get_opds_auth") {
+        if (args?.catalogUrl === "https://a/opds") return Promise.resolve({ kind: "basic", username: "u" });
+        return Promise.resolve(null);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    expect(screen.getByText("B")).toBeInTheDocument();
+
+    await waitFor(() => expect(screen.getByLabelText('catalog.signedInAs:{"name":"A"}')).toBeInTheDocument());
+    expect(screen.queryByLabelText('catalog.signedInAs:{"name":"B"}')).not.toBeInTheDocument();
+  });
+
+  it("signs out and surfaces a keychain failure", async () => {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "https://a/opds" }]);
+      if (cmd === "get_opds_auth") return Promise.resolve({ kind: "basic", username: "u" });
+      if (cmd === "clear_opds_auth") return Promise.reject(new Error("keychain locked"));
+      return Promise.resolve(undefined);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByLabelText('catalog.signedInAs:{"name":"A"}')).toBeInTheDocument());
+
+    await act(async () => fireEvent.click(screen.getByLabelText('catalog.signOut:{"name":"A"}')));
+
+    await waitFor(() => expect(screen.getByText(/catalog\.signOutFailed/)).toBeInTheDocument());
+    // A failed sign-out must not silently clear the indicator.
+    expect(screen.getByLabelText('catalog.signedInAs:{"name":"A"}')).toBeInTheDocument();
+  });
+});
