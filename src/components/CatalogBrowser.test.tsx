@@ -13,8 +13,10 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (k: string, p?: Record<string, unknown>) => (p ? `${k}:${JSON.stringify(p)}` : k) }),
 }));
 vi.mock("../lib/supportedFormats", () => ({
-  FALLBACK_FORMATS: ["epub"],
-  useSupportedFormats: () => ["epub", "pdf"],
+  // Real shape is a Set (pickSupportedOpdsLink calls `.has` on it) — an array
+  // mock would only work as long as no test exercised a download link.
+  FALLBACK_FORMATS: new Set(["epub"]),
+  useSupportedFormats: () => new Set(["epub", "pdf"]),
 }));
 vi.mock("./OpdsPresetPicker", () => ({ default: () => null }));
 vi.mock("../lib/useFocusTrap", () => ({ useFocusTrap: () => ({ current: null }) }));
@@ -455,5 +457,143 @@ describe("CatalogBrowser pagination provenance", () => {
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("browse_opds", { url: "https://other.example/opds?page=2", catalogUrl: null }),
     );
+  });
+});
+
+const AUTH_REQUIRED_ERROR = { kind: "PermissionDenied", message: "OPDS auth required: HTTP 401" };
+
+describe("CatalogBrowser sign-in prompt on 401/403", () => {
+  it("prompts for sign-in when browsing returns 401 and retries after submit", async () => {
+    let browseCalls = 0;
+    invoke.mockImplementation((cmd: string, args?: { url?: string; catalogUrl?: string }) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "https://a/opds" }]);
+      if (cmd === "browse_opds") {
+        browseCalls += 1;
+        if (browseCalls === 1) return Promise.reject(AUTH_REQUIRED_ERROR);
+        return Promise.resolve({ title: "A", entries: [], nextUrl: null, searchUrl: null, catalogUrl: args?.catalogUrl ?? null });
+      }
+      if (cmd === "get_opds_auth") return Promise.resolve(null);
+      if (cmd === "set_opds_auth") return Promise.resolve(undefined);
+      return Promise.resolve(null);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    await act(async () => fireEvent.click(screen.getByText("A")));
+
+    expect(await screen.findByText("catalog.signInRequired")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("catalog.authUsername"), { target: { value: "user1" } });
+      fireEvent.change(screen.getByPlaceholderText("catalog.authPassword"), { target: { value: "pass1" } });
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "catalog.signIn" })));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("set_opds_auth", {
+        catalogUrl: "https://a/opds", kind: "basic", username: "user1", secret: "pass1", allowInsecure: false,
+      }),
+    );
+    // Retried the same request that 401'd — same url and catalogUrl.
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("browse_opds", { url: "https://a/opds", catalogUrl: "https://a/opds" }),
+    );
+    expect(browseCalls).toBe(2);
+    expect(screen.queryByText("catalog.signInRequired")).not.toBeInTheDocument();
+  });
+
+  it("prompts bound to entry.catalogUrl when a download returns 403", async () => {
+    let downloadCalls = 0;
+    const entry = {
+      id: "e1", title: "Book One", author: "", summary: "", coverUrl: null,
+      links: [{ href: "https://a/dl/1.epub", mimeType: "application/epub+zip", rel: "http://opds-spec.org/acquisition" }],
+      navUrl: null, catalogUrl: "https://a/opds",
+    };
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "https://a/opds" }]);
+      if (cmd === "browse_opds") {
+        return Promise.resolve({ title: "A", entries: [entry], nextUrl: null, searchUrl: null, catalogUrl: "https://a/opds" });
+      }
+      if (cmd === "download_opds_book") {
+        downloadCalls += 1;
+        if (downloadCalls === 1) return Promise.reject({ kind: "PermissionDenied", message: "OPDS auth required: HTTP 403" });
+        return Promise.resolve({ id: "book-1", newly_imported: true });
+      }
+      if (cmd === "get_opds_auth") return Promise.resolve(null);
+      if (cmd === "set_opds_auth") return Promise.resolve(undefined);
+      return Promise.resolve(null);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    await act(async () => fireEvent.click(screen.getByText("A")));
+    await screen.findByText("Book One");
+
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /epub/i })));
+    expect(await screen.findByText("catalog.signInRequired")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("catalog.authUsername"), { target: { value: "dl-user" } });
+      fireEvent.change(screen.getByPlaceholderText("catalog.authPassword"), { target: { value: "dl-pass" } });
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "catalog.signIn" })));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("set_opds_auth", {
+        catalogUrl: "https://a/opds", kind: "basic", username: "dl-user", secret: "dl-pass", allowInsecure: false,
+      }),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("download_opds_book", {
+        downloadUrl: "https://a/dl/1.epub", mimeType: "application/epub+zip", catalogUrl: "https://a/opds",
+      }),
+    );
+    expect(downloadCalls).toBe(2);
+  });
+
+  it("prompts when a per-catalog search returns 401", async () => {
+    let searchCalls = 0;
+    invoke.mockImplementation((cmd: string, args?: { url?: string; catalogUrl?: string }) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([{ name: "A", url: "https://a/opds" }]);
+      if (cmd === "browse_opds") {
+        if (args?.url === "https://a/opds") {
+          return Promise.resolve({
+            title: "A", entries: [], nextUrl: null, searchUrl: "https://a/search?q={searchTerms}", catalogUrl: "https://a/opds",
+          });
+        }
+        // Any search-URL fetch: 401 once, then succeed.
+        searchCalls += 1;
+        if (searchCalls === 1) return Promise.reject(AUTH_REQUIRED_ERROR);
+        return Promise.resolve({ title: "Results", entries: [], nextUrl: null, searchUrl: null, catalogUrl: args?.catalogUrl ?? null });
+      }
+      if (cmd === "get_opds_auth") return Promise.resolve(null);
+      if (cmd === "set_opds_auth") return Promise.resolve(undefined);
+      return Promise.resolve(null);
+    });
+
+    render(<CatalogBrowser onClose={() => {}} onBookImported={() => {}} />);
+    await waitFor(() => expect(screen.getByText("A")).toBeInTheDocument());
+    await act(async () => fireEvent.click(screen.getByText("A")));
+    await screen.findByPlaceholderText("catalog.searchThisCatalog");
+
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("catalog.searchThisCatalog"), { target: { value: "shakespeare" } });
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "common.search" })));
+
+    expect(await screen.findByText("catalog.signInRequired")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("catalog.authUsername"), { target: { value: "search-user" } });
+      fireEvent.change(screen.getByPlaceholderText("catalog.authPassword"), { target: { value: "search-pass" } });
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "catalog.signIn" })));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("set_opds_auth", {
+        catalogUrl: "https://a/opds", kind: "basic", username: "search-user", secret: "search-pass", allowInsecure: false,
+      }),
+    );
+    expect(searchCalls).toBe(2);
   });
 });

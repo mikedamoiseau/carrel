@@ -691,6 +691,8 @@
     "authPassword": "Mot de passe",
     "authToken": "Jeton",
     "insecureCredentialWarning": "Cette adresse n’est pas chiffrée (http). Vos identifiants pourraient être exposés sur le réseau. Continuer quand même ?",
+    "signInRequired": "Ce catalogue nécessite une connexion",
+    "signIn": "Se connecter",
     "invalidUrl": "Saisissez une URL http(s) valide.",
     "testingConnection": "Test en cours…",
     "connectionTestFailed": "Impossible de joindre ce flux — {{error}}",

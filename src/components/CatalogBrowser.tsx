@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
-import { friendlyError } from "../lib/errors";
+import { friendlyError, isOpdsAuthError } from "../lib/errors";
 import { pickSupportedOpdsLink, isValidHttpUrl, isLoopbackHost, formatBytes } from "../lib/utils";
 import { FALLBACK_FORMATS, useSupportedFormats } from "../lib/supportedFormats";
 import OpdsPresetPicker from "./OpdsPresetPicker";
@@ -92,6 +92,19 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
   const [feedLoadingLabel, setFeedLoadingLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const lastActionRef = useRef<(() => void) | null>(null);
+  // Sign-in panel shown on a 401/403 (`OPDS auth required`). Bound to the
+  // catalogUrl of whatever request failed — never a remembered "current
+  // catalog" — so credentials always land on the catalog that actually asked
+  // for them. `secret` is always typed fresh: `get_opds_auth` never returns it.
+  const [authPrompt, setAuthPrompt] = useState<{
+    catalogUrl: string;
+    kind: "basic" | "bearer";
+    username: string;
+    secret: string;
+    allowInsecure: boolean;
+    submitting: boolean;
+    error: string | null;
+  } | null>(null);
   // Guards the post-search reveal delay: don't touch state if the modal was
   // closed during the ~2 s hold.
   const mountedRef = useRef(true);
@@ -164,6 +177,60 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
 
   useEffect(() => { loadCatalogs(); }, [loadCatalogs]);
 
+  // Opens the sign-in panel bound to `catalogUrl`, pre-filled from whatever
+  // credential (kind + username only — never the secret) is already stored
+  // for it. A fetch failure just leaves the panel blank; pre-fill is a
+  // convenience, not a requirement to sign in.
+  const openAuthPrompt = useCallback(async (catalogUrl: string) => {
+    setAuthPrompt({ catalogUrl, kind: "basic", username: "", secret: "", allowInsecure: false, submitting: false, error: null });
+    try {
+      const existing = await invoke<{ kind: "basic" | "bearer"; username: string } | null>("get_opds_auth", { catalogUrl });
+      if (existing) {
+        setAuthPrompt((prev) => (prev && prev.catalogUrl === catalogUrl ? { ...prev, kind: existing.kind, username: existing.username } : prev));
+      }
+    } catch {
+      // non-fatal — see comment above.
+    }
+  }, []);
+
+  // True when the credential about to be sent for `authPrompt` would cross a
+  // cleartext HTTP connection to a non-loopback host — same rule the backend
+  // enforces (`is_loopback_host` in opds.rs) and the add-catalog form above.
+  const authPromptNeedsInsecureAck = (() => {
+    if (!authPrompt) return false;
+    if (!/^http:\/\//i.test(authPrompt.catalogUrl)) return false;
+    try {
+      return !isLoopbackHost(new URL(authPrompt.catalogUrl).hostname);
+    } catch {
+      return false;
+    }
+  })();
+
+  const submitAuthPrompt = async () => {
+    if (!authPrompt || authPrompt.submitting) return;
+    const username = authPrompt.kind === "basic" ? authPrompt.username.trim() : "";
+    if (authPrompt.kind === "basic" && !username) return;
+    if (!authPrompt.secret) return;
+    if (authPromptNeedsInsecureAck && !authPrompt.allowInsecure) return;
+
+    setAuthPrompt((prev) => (prev ? { ...prev, submitting: true, error: null } : prev));
+    try {
+      await invoke("set_opds_auth", {
+        catalogUrl: authPrompt.catalogUrl,
+        kind: authPrompt.kind,
+        username,
+        secret: authPrompt.secret,
+        allowInsecure: authPrompt.allowInsecure,
+      });
+      setAuthPrompt(null);
+      // Redo whatever request 401'd — same url and catalogUrl, now with a
+      // credential the backend can attach.
+      lastActionRef.current?.();
+    } catch (err) {
+      setAuthPrompt((prev) => (prev ? { ...prev, submitting: false, error: friendlyError(err, t) } : prev));
+    }
+  };
+
   // `catalogUrl` is the provenance to send with this request — the caller
   // must pass it explicitly (the configured catalog for a root browse,
   // entry.catalogUrl for a nav hop, feed.catalogUrl for pagination). Never
@@ -179,11 +246,15 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       setFeed(f);
       setHistory((prev) => [...prev, { url, title: title ?? f.title, catalogUrl: f.catalogUrl ?? null }]);
     } catch (err) {
-      setError(friendlyError(err, t));
+      if (isOpdsAuthError(err) && catalogUrl) {
+        openAuthPrompt(catalogUrl);
+      } else {
+        setError(friendlyError(err, t));
+      }
     } finally {
       setLoading(false);
     }
-  }, [t]);
+  }, [t, openAuthPrompt]);
 
   const goBack = useCallback(() => {
     if (history.length <= 1) {
@@ -207,6 +278,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     setLoading(true);
     setFeedLoadingLabel(t("catalog.searchingServer", { name: feed.title || t("catalog.catalog") }));
     setError(null);
+    lastActionRef.current = () => handleSearch();
     try {
       const f = await invoke<OpdsFeed>("browse_opds", { url, catalogUrl });
       // Preserve the parent's searchUrl so the search bar stays visible
@@ -214,12 +286,16 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       setFeed(f);
       setHistory((prev) => [...prev, { url, title: `Search: ${searchQuery}`, catalogUrl: f.catalogUrl ?? null }]);
     } catch (err) {
-      setError(friendlyError(err, t));
+      if (isOpdsAuthError(err) && catalogUrl) {
+        openAuthPrompt(catalogUrl);
+      } else {
+        setError(friendlyError(err, t));
+      }
     } finally {
       setLoading(false);
       setFeedLoadingLabel(null);
     }
-  }, [feed, searchQuery, t]);
+  }, [feed, searchQuery, t, openAuthPrompt]);
 
   const handleDownload = useCallback(async (entry: OpdsEntry) => {
     // Walk the Carrel preference order (EPUB → PDF → CBZ → CBR → AZW3 → MOBI
@@ -230,6 +306,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     if (!picked) return;
 
     setDownloading(entry.id);
+    lastActionRef.current = () => handleDownload(entry);
     try {
       // Pass the MIME type so the backend can derive the file extension even
       // when the acquisition URL is opaque (e.g. `/download/123`). Provenance
@@ -242,11 +319,15 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       setDownloadedIds((prev) => new Set(prev).add(entry.id));
       onBookImported(result.newly_imported ? result.id : null);
     } catch (err) {
-      setError(t("catalog.downloadFailed", { title: entry.title, error: friendlyError(err, t) }));
+      if (isOpdsAuthError(err) && entry.catalogUrl) {
+        openAuthPrompt(entry.catalogUrl);
+      } else {
+        setError(t("catalog.downloadFailed", { title: entry.title, error: friendlyError(err, t) }));
+      }
     } finally {
       setDownloading(null);
     }
-  }, [onBookImported, t, supportedFormats]);
+  }, [onBookImported, t, supportedFormats, openAuthPrompt]);
 
   const resetAddForm = () => {
     setNewCatalogName("");
@@ -383,6 +464,82 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
     setUnifiedResults(null);
     setUnifiedQuery("");
   }, []);
+
+  // Sign-in panel — rendered above whichever view (catalog list or feed) is
+  // on screen when a request 401s/403s. Higher stacking context than the
+  // main modal so it sits on top of it.
+  const authPromptPanel = authPrompt && (
+    <>
+      <div className="fixed inset-0 bg-ink/40 z-[60]" onClick={() => setAuthPrompt(null)} />
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 pointer-events-none">
+        <div className="bg-surface rounded-2xl shadow-xl border border-warm-border w-full max-w-sm pointer-events-auto animate-fade-in p-5 space-y-3">
+          <h3 className="font-serif text-sm font-semibold text-ink">{t("catalog.signInRequired")}</h3>
+          <div className="flex gap-3 text-xs text-ink">
+            <label className="flex items-center gap-1.5">
+              <input
+                type="radio" name="opds-retry-auth-kind" checked={authPrompt.kind === "basic"}
+                onChange={() => setAuthPrompt((p) => (p ? { ...p, kind: "basic" } : p))}
+              />
+              {t("catalog.authBasic")}
+            </label>
+            <label className="flex items-center gap-1.5">
+              <input
+                type="radio" name="opds-retry-auth-kind" checked={authPrompt.kind === "bearer"}
+                onChange={() => setAuthPrompt((p) => (p ? { ...p, kind: "bearer" } : p))}
+              />
+              {t("catalog.authBearer")}
+            </label>
+          </div>
+          {authPrompt.kind === "basic" && (
+            <input
+              type="text" value={authPrompt.username}
+              onChange={(e) => setAuthPrompt((p) => (p ? { ...p, username: e.target.value } : p))}
+              placeholder={t("catalog.authUsername")} autoComplete="off"
+              className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
+            />
+          )}
+          <input
+            type="password" value={authPrompt.secret}
+            onChange={(e) => setAuthPrompt((p) => (p ? { ...p, secret: e.target.value } : p))}
+            placeholder={authPrompt.kind === "basic" ? t("catalog.authPassword") : t("catalog.authToken")}
+            autoComplete="off"
+            className="w-full text-sm bg-warm-subtle border border-warm-border rounded-lg px-3 py-2 text-ink placeholder-ink-muted/50 focus:outline-none focus:border-accent"
+          />
+          {authPromptNeedsInsecureAck && (
+            <label className="flex items-start gap-1.5 text-xs text-amber-700">
+              <input
+                type="checkbox" checked={authPrompt.allowInsecure}
+                onChange={(e) => setAuthPrompt((p) => (p ? { ...p, allowInsecure: e.target.checked } : p))}
+                className="mt-0.5"
+              />
+              {t("catalog.insecureCredentialWarning")}
+            </label>
+          )}
+          {authPrompt.error && <p className="text-xs text-red-600">{authPrompt.error}</p>}
+          <div className="flex gap-2">
+            <button
+              onClick={submitAuthPrompt}
+              disabled={
+                authPrompt.submitting ||
+                !authPrompt.secret ||
+                (authPrompt.kind === "basic" && !authPrompt.username.trim()) ||
+                (authPromptNeedsInsecureAck && !authPrompt.allowInsecure)
+              }
+              className="flex-1 py-1.5 text-xs font-medium text-white bg-accent hover:bg-accent-hover rounded-lg transition-colors disabled:opacity-40"
+            >
+              {authPrompt.submitting ? t("catalog.testingConnection") : t("catalog.signIn")}
+            </button>
+            <button
+              onClick={() => setAuthPrompt(null)} disabled={authPrompt.submitting}
+              className="flex-1 py-1.5 text-xs text-ink-muted hover:text-ink transition-colors disabled:opacity-40"
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
 
   // Catalog list view
   if (!feed) {
@@ -725,6 +882,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
             }}
           />
         )}
+        {authPromptPanel}
       </>
     );
   }
@@ -874,6 +1032,7 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
           )}
         </div>
       </div>
+      {authPromptPanel}
     </>
   );
 }

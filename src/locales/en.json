@@ -705,6 +705,8 @@
     "authPassword": "Password",
     "authToken": "Token",
     "insecureCredentialWarning": "This address is not encrypted (http). Your credential could be exposed on the network. Continue anyway?",
+    "signInRequired": "This catalog requires sign-in",
+    "signIn": "Sign in",
     "invalidUrl": "Enter a valid http(s) URL.",
     "testingConnection": "Testing…",
     "connectionTestFailed": "Couldn’t reach this feed — {{error}}",
