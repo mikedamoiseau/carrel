@@ -4119,14 +4119,18 @@ pub async fn search_all_catalogs(
             // has no search endpoint or returned nothing (shown as "no
             // results") — both yield an empty `entries` list.
             let mut ok = true;
-            let entries = match opds::fetch_feed_with_trusted(&url, &trusted) {
+            let ctx = opds::OpdsContext {
+                trusted,
+                ..Default::default()
+            };
+            let entries = match opds::fetch_feed_with_context(&url, &ctx) {
                 Ok(root) => match root.search_url {
                     // Resolve OpenSearch description if needed, then search.
-                    Some(raw) => match opds::resolve_search_url_with_trusted(&raw, &trusted) {
+                    Some(raw) => match opds::resolve_search_url_with_context(&raw, &ctx) {
                         Some(template) => {
                             let search_url =
                                 template.replace("{searchTerms}", &opds::url_encode(&q));
-                            match opds::fetch_feed_with_trusted(&search_url, &trusted) {
+                            match opds::fetch_feed_with_context(&search_url, &ctx) {
                                 Ok(f) => f.entries,
                                 Err(_) => {
                                     ok = false;
@@ -4274,7 +4278,11 @@ pub async fn get_discover_books(state: State<'_, AppState>) -> CarrelResult<Vec<
         let cat_name = cat.name.clone();
         let trusted = trusted.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let entries = match opds::fetch_feed_with_trusted(&url, &trusted) {
+            let ctx = opds::OpdsContext {
+                trusted,
+                ..Default::default()
+            };
+            let entries = match opds::fetch_feed_with_context(&url, &ctx) {
                 Ok(feed) => feed
                     .entries
                     .into_iter()
@@ -4429,7 +4437,11 @@ pub async fn browse_opds(url: String, state: State<'_, AppState>) -> CarrelResul
     };
     let (tx, rx) = std::sync::mpsc::channel();
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = tx.send(opds::fetch_feed_with_trusted(&url, &trusted));
+        let ctx = opds::OpdsContext {
+            trusted,
+            ..Default::default()
+        };
+        let _ = tx.send(opds::fetch_feed_with_context(&url, &ctx));
     });
     rx.recv()?
 }
@@ -4494,9 +4506,11 @@ pub async fn download_opds_book(
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tauri::async_runtime::spawn_blocking(move || {
-            let _ = tx.send(opds::download_file_with_trusted(
-                &dl_url, &dl_dest, &trusted,
-            ));
+            let ctx = opds::OpdsContext {
+                trusted,
+                ..Default::default()
+            };
+            let _ = tx.send(opds::download_file_with_context(&dl_url, &dl_dest, &ctx));
         });
         rx.recv()??;
     }

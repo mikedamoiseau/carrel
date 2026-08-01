@@ -227,6 +227,47 @@ pub struct OpdsFeed {
     pub search_url: Option<String>,
 }
 
+/// Which catalog an OPDS operation is following, and that catalog's origin.
+///
+/// Deliberately independent of whether a secret exists or could be read: a
+/// public catalog and a catalog whose keychain entry is unreadable both still
+/// have valid provenance, and the origin is needed for the cross-origin checks
+/// either way. Folding the origin into the credential would silently disable
+/// those checks whenever no secret happened to be loaded.
+pub struct OpdsProvenance {
+    /// Catalog URL exactly as configured, used to stamp returned data.
+    pub catalog_url: String,
+    /// `origin_from_url(catalog_url)`, resolved once by the caller.
+    pub origin: String,
+}
+
+/// A credential for exactly one OPDS catalog.
+///
+/// Derives nothing on purpose — no `Debug`, `Display`, `Serialize` or `Clone`.
+/// A derived `Debug` would print the password into any log line or panic
+/// message that formatted the enclosing context.
+pub enum OpdsCredential {
+    Basic { username: String, password: String },
+    Bearer(String),
+}
+
+/// Per-request context for OPDS network calls.
+///
+/// Replaces the bare `trusted: &[String]` parameter the `*_with_trusted`
+/// functions used to take, so the credential rules travel with the request
+/// rather than being re-derived at each site.
+#[derive(Default)]
+pub struct OpdsContext {
+    /// `host:port` entries that bypass the private-IP/loopback SSRF guard.
+    pub trusted: Vec<String>,
+    /// The catalog this operation follows. `None` when provenance was never
+    /// admitted (no catalog named, or one that is not configured) or was
+    /// dropped because the request left the catalog's origin.
+    pub provenance: Option<OpdsProvenance>,
+    /// Credential for `provenance`'s catalog, when one is stored and readable.
+    pub cred: Option<OpdsCredential>,
+}
+
 /// Build a reqwest client with timeout.
 fn http_client() -> CarrelResult<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
@@ -238,14 +279,15 @@ fn http_client() -> CarrelResult<reqwest::blocking::Client> {
 
 /// Fetch and parse an OPDS feed from a URL.
 pub fn fetch_feed(url: &str) -> CarrelResult<OpdsFeed> {
-    fetch_feed_with_trusted(url, &[])
+    fetch_feed_with_context(url, &OpdsContext::default())
 }
 
-/// Like [`fetch_feed`], but allows URLs whose `host:port` matches a trusted
-/// entry — lets user-added LAN catalogs work without disabling the SSRF
-/// guard for arbitrary feed-derived URLs.
-pub fn fetch_feed_with_trusted(url: &str, trusted: &[String]) -> CarrelResult<OpdsFeed> {
-    if !is_safe_url_with_trusted(url, trusted) {
+/// Like [`fetch_feed`], but carries an [`OpdsContext`]: URLs whose `host:port`
+/// matches a trusted entry are allowed (so user-added LAN catalogs work without
+/// disabling the SSRF guard for arbitrary feed-derived URLs), and the context's
+/// credential is attached when the request stays on its catalog's origin.
+pub fn fetch_feed_with_context(url: &str, ctx: &OpdsContext) -> CarrelResult<OpdsFeed> {
+    if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return Err(CarrelError::invalid(
             "URL blocked: only public HTTP/HTTPS URLs are allowed.",
         ));
@@ -266,24 +308,21 @@ pub fn fetch_feed_with_trusted(url: &str, trusted: &[String]) -> CarrelResult<Op
         return Err(CarrelError::invalid("Response too large (limit: 5 MB)."));
     }
     let xml = String::from_utf8_lossy(&bytes).to_string();
-    parse_feed_with_trusted(&xml, url, trusted)
+    parse_feed_with_context(&xml, url, ctx)
 }
 
 /// Parse OPDS/Atom XML into structured data.
 /// Test-only convenience wrapper; production callers route through
-/// [`parse_feed_with_trusted`] via [`fetch_feed_with_trusted`].
+/// [`parse_feed_with_context`] via [`fetch_feed_with_context`].
 #[cfg(test)]
 fn parse_feed(xml: &str, base_url: &str) -> CarrelResult<OpdsFeed> {
-    parse_feed_with_trusted(xml, base_url, &[])
+    parse_feed_with_context(xml, base_url, &OpdsContext::default())
 }
 
 /// Parse OPDS/Atom XML; skip the `http://` → `https://` cover upgrade when
 /// the cover URL targets a trusted host (LAN servers don't speak TLS).
-fn parse_feed_with_trusted(
-    xml: &str,
-    base_url: &str,
-    trusted: &[String],
-) -> CarrelResult<OpdsFeed> {
+fn parse_feed_with_context(xml: &str, base_url: &str, ctx: &OpdsContext) -> CarrelResult<OpdsFeed> {
+    let trusted = &ctx.trusted;
     // Deliberately *not* `trim_text(true)`: that trims every text event
     // individually, and quick-xml emits an entity reference as its own event,
     // so `Fish &amp; Chips` would arrive as three events and come back out as
@@ -526,18 +565,18 @@ fn parse_feed_with_trusted(
 /// Resolve a search URL — if it's an OpenSearch description XML, fetch it and
 /// extract the Atom/OPDS template URL. Otherwise return it as-is.
 pub fn resolve_search_url(url: &str) -> Option<String> {
-    resolve_search_url_with_trusted(url, &[])
+    resolve_search_url_with_context(url, &OpdsContext::default())
 }
 
-/// Like [`resolve_search_url`], but allows URLs whose `host:port` matches a
-/// trusted entry.
-pub fn resolve_search_url_with_trusted(url: &str, trusted: &[String]) -> Option<String> {
+/// Like [`resolve_search_url`], but carries an [`OpdsContext`] so trusted
+/// `host:port` entries are allowed and credentials can be attached.
+pub fn resolve_search_url_with_context(url: &str, ctx: &OpdsContext) -> Option<String> {
     // If it already contains {searchTerms}, it's a direct template
     if url.contains("{searchTerms}") {
         return Some(url.to_string());
     }
     // Try fetching as OpenSearch description
-    if !is_safe_url_with_trusted(url, trusted) {
+    if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return None;
     }
     let client = http_client().ok()?;
@@ -604,13 +643,14 @@ pub fn url_encode(s: &str) -> String {
 
 /// Download a file from a URL to a local path.
 pub fn download_file(url: &str, dest: &str) -> CarrelResult<()> {
-    download_file_with_trusted(url, dest, &[])
+    download_file_with_context(url, dest, &OpdsContext::default())
 }
 
-/// Like [`download_file`], but allows URLs whose `host:port` matches a
-/// trusted entry — required for downloading from user-added LAN catalogs.
-pub fn download_file_with_trusted(url: &str, dest: &str, trusted: &[String]) -> CarrelResult<()> {
-    if !is_safe_url_with_trusted(url, trusted) {
+/// Like [`download_file`], but carries an [`OpdsContext`]: trusted `host:port`
+/// entries are allowed (required for user-added LAN catalogs) and the context's
+/// credential is attached when the request stays on its catalog's origin.
+pub fn download_file_with_context(url: &str, dest: &str, ctx: &OpdsContext) -> CarrelResult<()> {
+    if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return Err(CarrelError::invalid(
             "URL blocked: only public HTTP/HTTPS URLs are allowed.",
         ));
@@ -1083,9 +1123,11 @@ mod tests {
             <link href="/api/books/123/cover" type="image/jpeg" rel="http://opds-spec.org/image"/>
           </entry>
         </feed>"#;
-        let trusted = vec!["192.168.0.12:7788".to_string()];
-        let feed =
-            parse_feed_with_trusted(xml, "http://192.168.0.12:7788/opds/all", &trusted).unwrap();
+        let ctx = OpdsContext {
+            trusted: vec!["192.168.0.12:7788".to_string()],
+            ..Default::default()
+        };
+        let feed = parse_feed_with_context(xml, "http://192.168.0.12:7788/opds/all", &ctx).unwrap();
         // Trusted LAN host — http preserved.
         assert_eq!(
             feed.entries[0].cover_url.as_deref(),
