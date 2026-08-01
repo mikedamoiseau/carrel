@@ -939,6 +939,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "wiremock",
  "zip",
 ]
 

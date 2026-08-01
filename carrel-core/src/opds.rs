@@ -1206,3 +1206,56 @@ mod tests {
         assert!(!is_loopback_host("books.example.org"));
     }
 }
+
+/// Tests that need a real HTTP server.
+///
+/// Credential handling is only observable on the wire: which `Authorization`
+/// header actually goes out, and which redirects are followed. Neither can be
+/// asserted by inspecting a `RequestBuilder`, so these use `wiremock`.
+///
+/// Two constraints apply to every test here. wiremock binds `127.0.0.1`, which
+/// `is_safe_url_with_trusted` blocks by design — so the server's `host:port`
+/// must go in `ctx.trusted`. And `OpdsContext` is deliberately not `Clone`, so
+/// each call gets a freshly built context.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    pub(super) const MINIMAL_FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>T</title>
+          <entry><id>1</id><title>Book</title></entry>
+        </feed>"#;
+
+    /// Run a blocking core call from an async test without stalling the runtime.
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    /// Context that trusts `url`'s host and carries nothing else.
+    fn trusting_ctx(url: &str) -> OpdsContext {
+        OpdsContext {
+            trusted: vec![host_port_from_url(url).unwrap()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_feed_reads_a_served_feed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = trusting_ctx(&url);
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+        assert_eq!(feed.entries.len(), 1);
+    }
+}
