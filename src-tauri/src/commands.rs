@@ -4131,21 +4131,28 @@ impl CredentialStore for MemoryCredentialStore {
     }
 }
 
-/// A store whose `get`/`set` delegate to an in-memory backing map but whose
-/// `set` and `delete` can be forced to fail, for exercising
+/// A store whose `get`/`set`/`delete` delegate to an in-memory backing map
+/// but each can be forced to fail — `fail_set`/`fail_delete` for exercising
 /// `set_opds_auth_inner`'s compensation paths (a failed row write must
-/// restore or clear the keychain, and the compensation itself can fail too).
+/// restore or clear the keychain, and the compensation itself can fail too),
+/// `fail_get` for exercising `opds_context_for`'s "keychain read failed"
+/// branch (a denied keychain must not strip provenance from a public
+/// catalog).
 #[cfg(test)]
 #[derive(Default)]
 struct FlakyCredentialStore {
     inner: MemoryCredentialStore,
     fail_set: bool,
     fail_delete: bool,
+    fail_get: bool,
 }
 
 #[cfg(test)]
 impl CredentialStore for FlakyCredentialStore {
     fn get(&self, profile: &str, catalog_url: &str) -> CarrelResult<Option<String>> {
+        if self.fail_get {
+            return Err(CarrelError::internal("flaky store: get failed"));
+        }
         self.inner.get(profile, catalog_url)
     }
 
@@ -10317,6 +10324,7 @@ mod tests {
             inner: MemoryCredentialStore::default(),
             fail_set: false,
             fail_delete: true,
+            fail_get: false,
         };
         let err =
             set_opds_auth_inner(&conn, &store, "p", url, "bearer", "", "t", false).unwrap_err();
@@ -10361,6 +10369,7 @@ mod tests {
             inner: MemoryCredentialStore::default(),
             fail_set: false,
             fail_delete: true,
+            fail_get: false,
         };
         upsert_opds_auth_inner(&conn, rec("https://h/opds", "basic", "u")).unwrap();
         let err = clear_opds_auth_inner(&conn, &store, "p", "https://h/opds").unwrap_err();
@@ -10430,6 +10439,7 @@ mod tests {
             inner: MemoryCredentialStore::default(),
             fail_set: false,
             fail_delete: true,
+            fail_get: false,
         };
         let err = clear_profile_opds_credentials(&conn, &store, "Classics").unwrap_err();
         assert!(
@@ -10523,9 +10533,13 @@ mod tests {
     }
 
     #[test]
-    fn context_keeps_provenance_when_the_secret_cannot_be_read() {
-        // A stored record whose secret is missing from the store: provenance stays
-        // (so entries are stamped and the user can sign in), credential is absent.
+    fn context_keeps_provenance_when_no_secret_is_stored() {
+        // A stored `opds_auth` record whose secret was never written to the
+        // store (as opposed to being unreadable, which
+        // `context_keeps_provenance_when_the_keychain_read_fails` below
+        // covers): `store.get` returns `Ok(None)`, not `Err`. Provenance
+        // stays (so entries are stamped and the user can sign in),
+        // credential is absent.
         let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
         let store = MemoryCredentialStore::default();
         upsert_opds_auth_inner(&conn, rec("https://h/opds", "basic", "u")).unwrap();
@@ -10535,6 +10549,42 @@ mod tests {
         assert!(
             !ctx.trusted.is_empty(),
             "the trusted list must survive a missing secret"
+        );
+    }
+
+    #[test]
+    fn context_keeps_provenance_when_the_keychain_read_fails() {
+        // Distinct from `context_keeps_provenance_when_no_secret_is_stored`
+        // above: here the store's `get` returns `Err` (a denied/unreachable
+        // keychain), not `Ok(None)` (no secret ever written). Both must
+        // degrade the same way — provenance kept, credential absent — but
+        // only a store that can actually fail proves the `Err` arm
+        // (`commands.rs`'s `opds_context_for`, the `Err(e) => { log::warn!
+        // ...; None }` branch) does the right thing, since
+        // `MemoryCredentialStore::get` can never return `Err` at all.
+        let (conn, _tmp) = test_conn_with_catalog("https://h/opds");
+        upsert_opds_auth_inner(&conn, rec("https://h/opds", "basic", "u")).unwrap();
+        let store = FlakyCredentialStore {
+            inner: MemoryCredentialStore::default(),
+            fail_set: false,
+            fail_delete: false,
+            fail_get: true,
+        };
+        // Prove the fixture actually fails the way this test relies on.
+        assert!(store.get("p", "https://h/opds").is_err());
+
+        let ctx = opds_context_for(&conn, &store, "p", Some("https://h/opds"), "https://h/opds");
+        assert!(
+            ctx.provenance.is_some(),
+            "a keychain failure must not strip authority — the user must still be able to sign in"
+        );
+        assert!(
+            ctx.cred.is_none(),
+            "no credential can be attached without a readable secret"
+        );
+        assert!(
+            !ctx.trusted.is_empty(),
+            "a keychain failure must not break public catalogs, which is the whole point"
         );
     }
 
@@ -12091,6 +12141,7 @@ mod tests {
             inner: MemoryCredentialStore::default(),
             fail_set: false,
             fail_delete: true,
+            fail_get: false,
         };
         let state = handle.state::<AppState>();
         let err = delete_profile_with(state.inner(), "carol".to_string(), &store)
