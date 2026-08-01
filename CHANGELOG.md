@@ -5,6 +5,52 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-08-01
+
+### Security
+- **A malicious e-book can no longer stall the app while its details are being
+  read.** The XML parser Carrel uses (quick-xml) had a flaw where checking a
+  single tag for repeated attributes took time proportional to the *square* of
+  how many attributes that tag had. Because an EPUB's structure files come out
+  of the book file itself, a book crafted with a tag carrying tens of thousands
+  of attributes could pin a CPU core for minutes to hours — long enough to make
+  the app appear frozen, and not something an I/O timeout can interrupt. The
+  parser has been updated to a version that does this check in linear time.
+
+  Scope, stated plainly so it is not mis-remembered later: `cargo audit`
+  reported **two** advisories against the old version, and only **one of them
+  was ever reachable from this project**.
+
+  - **RUSTSEC-2026-0194** (quadratic attribute checking) *was* reachable. Every
+    place Carrel reads XML attributes — the EPUB container, the package file,
+    both flavours of table of contents, and OPDS catalogue feeds — went through
+    the affected code path with the check enabled by default, on input that
+    ultimately comes from an untrusted file or a remote server.
+  - **RUSTSEC-2026-0195** (unbounded namespace allocation) was **not** reachable.
+    It only affects quick-xml's namespace-resolving reader, which this project
+    has never used. Upgrading did not close an exploitable namespace bug here,
+    because there was not one to close.
+
+  Two things did *not* change, both deliberately. Duplicate-attribute checking
+  is still enabled: turning it off would also have avoided the flaw, but it
+  changes which malformed documents are accepted, and the upgrade removes the
+  cost anyway. And no new attribute-count limit was added: with the check now
+  linear, the existing 16 MB cap on how much of a book's structure files Carrel
+  will read is already an effective bound.
+
+### Fixed
+- **Ampersands and accents in chapter titles and catalogue entries.** Escaped
+  characters such as `&amp;` or `&#233;` are now decoded correctly everywhere
+  they appear in a table of contents or an OPDS feed — previously a title like
+  *Résumé* or *Law & Order* could come back with the character dropped or an
+  unwanted space in the middle of a word.
+
+### Changed
+- **Internal:** `carrel-core` no longer converts a `quick_xml::Error` into a
+  `CarrelError`. The conversion was unused, and it was the only place the XML
+  library appeared in this crate's public API — removing it means future parser
+  upgrades no longer change that API.
+
 ## [3.0.1] - 2026-07-30
 
 ### Changed
