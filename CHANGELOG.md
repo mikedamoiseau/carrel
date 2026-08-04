@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-08-04
+
 ### Added
 - **Catalogs that require signing in.** Adding an OPDS catalog now has an
   optional sign-in section for servers that don't allow anonymous access —
