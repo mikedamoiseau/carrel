@@ -8,6 +8,9 @@ use crate::error::{CarrelError, CarrelResult};
 /// Maximum time to wait for an OPDS HTTP response.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Longer timeout for file downloads than for feed fetches.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// User-Agent for OPDS catalog fetches. Wrapped in `Mozilla/5.0
 /// (compatible; …)` because several legitimate public catalogs
 /// (OpenEdition, Atramenta, others) reject any UA that doesn't start
@@ -110,6 +113,51 @@ pub fn host_port_from_url(url: &str) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+/// Canonical origin for credential identity: `scheme://host[:port]`, scheme and
+/// host lowercased, port omitted when it is the scheme default. `None` for
+/// non-http(s) or hostless URLs.
+///
+/// Deliberately distinct from [`host_port_from_url`], which ignores the scheme
+/// and keys the SSRF trusted list: a credential stored for `https://h:443` must
+/// NOT be sent to `http://h:443`, so credential identity has to carry the
+/// scheme. reqwest does not help here — it scrubs `Authorization` across a
+/// host/port change on redirect but not across a scheme downgrade.
+pub fn origin_from_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    match parsed.port() {
+        Some(p) if p != default_port => Some(format!("{scheme}://{host}:{p}")),
+        _ => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// True for `localhost`, `*.localhost`, and loopback IPs.
+///
+/// Used only to decide whether a cleartext credential needs an explicit
+/// acknowledgement from the user — NOT a general "is this address private"
+/// test. The SSRF guard's IPv6 branch below blocks only loopback and
+/// unspecified addresses (neither unique-local nor link-local), so a
+/// `is_private_host` helper claiming those ranges would not match the code it
+/// was extracted from. Restricting the silent exception to loopback avoids the
+/// mismatch: every other cleartext credential goes through the acknowledgement.
+pub fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") || bare.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    bare.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Upgrade a cover URL from `http://` to `https://` so it satisfies the
 /// renderer's CSP — unless the host is in `trusted`, in which case the
 /// upgrade is skipped (LAN/loopback servers typically don't speak TLS, so
@@ -157,6 +205,14 @@ pub struct OpdsEntry {
     pub links: Vec<OpdsLink>,
     /// Navigation links (for sub-catalogs)
     pub nav_url: Option<String>,
+    /// Catalog this entry came from, when the fetch that produced it was still
+    /// on that catalog's own origin. `None` otherwise — including for entries
+    /// fetched after a cross-origin hop, so provenance cannot be laundered back
+    /// into credential eligibility. Set by [`stamp_provenance`], never by the
+    /// parser. `serde(default)` keeps Discover's cached entries, written before
+    /// this field existed, deserializable.
+    #[serde(default)]
+    pub catalog_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +236,54 @@ pub struct OpdsFeed {
     pub next_url: Option<String>,
     /// Search URL template (OpenSearch)
     pub search_url: Option<String>,
+    /// Same rule as [`OpdsEntry::catalog_url`], for the feed itself.
+    ///
+    /// `next_url` and `search_url` are feed-level, so without this a caller
+    /// following them would have no provenance to pass back and would have to
+    /// re-assert one from its own memory — which is exactly how a cross-origin
+    /// hop gets laundered. Callers must pass back what the response carried.
+    pub catalog_url: Option<String>,
+}
+
+/// Which catalog an OPDS operation is following, and that catalog's origin.
+///
+/// Deliberately independent of whether a secret exists or could be read: a
+/// public catalog and a catalog whose keychain entry is unreadable both still
+/// have valid provenance, and the origin is needed for the cross-origin checks
+/// either way. Folding the origin into the credential would silently disable
+/// those checks whenever no secret happened to be loaded.
+pub struct OpdsProvenance {
+    /// Catalog URL exactly as configured, used to stamp returned data.
+    pub catalog_url: String,
+    /// `origin_from_url(catalog_url)`, resolved once by the caller.
+    pub origin: String,
+}
+
+/// A credential for exactly one OPDS catalog.
+///
+/// Derives nothing on purpose — no `Debug`, `Display`, `Serialize` or `Clone`.
+/// A derived `Debug` would print the password into any log line or panic
+/// message that formatted the enclosing context.
+pub enum OpdsCredential {
+    Basic { username: String, password: String },
+    Bearer(String),
+}
+
+/// Per-request context for OPDS network calls.
+///
+/// Replaces the bare `trusted: &[String]` parameter the `*_with_trusted`
+/// functions used to take, so the credential rules travel with the request
+/// rather than being re-derived at each site.
+#[derive(Default)]
+pub struct OpdsContext {
+    /// `host:port` entries that bypass the private-IP/loopback SSRF guard.
+    pub trusted: Vec<String>,
+    /// The catalog this operation follows. `None` when provenance was never
+    /// admitted (no catalog named, or one that is not configured) or was
+    /// dropped because the request left the catalog's origin.
+    pub provenance: Option<OpdsProvenance>,
+    /// Credential for `provenance`'s catalog, when one is stored and readable.
+    pub cred: Option<OpdsCredential>,
 }
 
 /// Build a reqwest client with timeout.
@@ -191,29 +295,156 @@ fn http_client() -> CarrelResult<reqwest::blocking::Client> {
         .map_err(|e| CarrelError::network(format!("HTTP client error: {e}")))
 }
 
-/// Fetch and parse an OPDS feed from a URL.
-pub fn fetch_feed(url: &str) -> CarrelResult<OpdsFeed> {
-    fetch_feed_with_trusted(url, &[])
+/// Build a client with an explicit timeout and redirect policy. Used for the
+/// authenticated variants; [`http_client`] remains the unauthenticated feed
+/// default so public catalogs behave exactly as before.
+fn build_client(
+    timeout: Duration,
+    policy: reqwest::redirect::Policy,
+) -> CarrelResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(policy)
+        .build()
+        .map_err(|e| CarrelError::network(format!("HTTP client error: {e}")))
 }
 
-/// Like [`fetch_feed`], but allows URLs whose `host:port` matches a trusted
-/// entry — lets user-added LAN catalogs work without disabling the SSRF
-/// guard for arbitrary feed-derived URLs.
-pub fn fetch_feed_with_trusted(url: &str, trusted: &[String]) -> CarrelResult<OpdsFeed> {
-    if !is_safe_url_with_trusted(url, trusted) {
+/// The credential to use for `url`: `Some` only when the context has both
+/// provenance and a credential, and `url`'s origin equals the provenance
+/// origin.
+///
+/// This is the whole attachment rule. A feed can name any URL it likes; unless
+/// that URL is on the origin of the catalog the operation started from, it gets
+/// no credential.
+fn credential_for_url<'a>(url: &str, ctx: &'a OpdsContext) -> Option<&'a OpdsCredential> {
+    let prov = ctx.provenance.as_ref()?;
+    let cred = ctx.cred.as_ref()?;
+    (origin_from_url(url)? == prov.origin).then_some(cred)
+}
+
+/// Attach the credential registered for `url`, if any.
+fn apply_auth(
+    rb: reqwest::blocking::RequestBuilder,
+    url: &str,
+    ctx: &OpdsContext,
+) -> reqwest::blocking::RequestBuilder {
+    match credential_for_url(url, ctx) {
+        Some(OpdsCredential::Basic { username, password }) => {
+            rb.basic_auth(username, Some(password))
+        }
+        Some(OpdsCredential::Bearer(token)) => rb.bearer_auth(token),
+        None => rb,
+    }
+}
+
+/// Follow up to 5 redirects, but only within `origin`.
+///
+/// Required whenever an `Authorization` header is attached: reqwest scrubs that
+/// header when a redirect changes host or port, but **not** when it changes
+/// scheme (`remove_sensitive_headers`, reqwest-0.12 `redirect.rs:239-241`), so
+/// an HTTPS→HTTP hop on one host would carry the credential out in cleartext.
+/// An authenticated request should not silently continue to another origin in
+/// any case.
+pub fn same_origin_redirect_policy(origin: String) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        match origin_from_url(attempt.url().as_str()) {
+            Some(next) if next == origin => attempt.follow(),
+            _ => attempt.error("authenticated request redirected to another origin"),
+        }
+    })
+}
+
+/// Stamp the catalog this data came from onto the feed and every entry — but
+/// only when the response's **effective** URL (after redirects) is still on the
+/// provenance origin.
+///
+/// The effective URL is what makes this safe. Consider a catalog A with no
+/// readable secret whose feed redirects, unauthenticated, to origin B. The
+/// request URL was A's, so a naive stamp would mark the response as A's data;
+/// B could then hand back an A-origin link, and once a credential existed that
+/// B-chosen URL would be fetched with A's credential. Clearing provenance at the
+/// hop means nothing downstream carries a catalog to name.
+fn stamp_provenance(feed: &mut OpdsFeed, ctx: &OpdsContext, effective_url: &str) {
+    let effective_origin = origin_from_url(effective_url);
+    let value = ctx
+        .provenance
+        .as_ref()
+        .filter(|p| effective_origin.as_deref() == Some(p.origin.as_str()))
+        .map(|p| p.catalog_url.clone());
+    feed.catalog_url = value.clone();
+    for entry in &mut feed.entries {
+        entry.catalog_url = value.clone();
+    }
+}
+
+/// Map 401/403 to a distinct auth-required error; any other status yields
+/// `None` and falls through to the caller's generic handling.
+///
+/// The message carries the exact `OPDS auth required` substring that
+/// `src/lib/errors.ts`'s `MESSAGE_KEYS` matches on, so the frontend can tell an
+/// auth failure from an unreachable host and offer a sign-in prompt. Without
+/// this the status became `CarrelError::network("HTTP 401 …")` and reached the
+/// user as "Could not connect to the server."
+///
+/// 403 is treated like 401 because OPDS servers return it for a missing or
+/// wrong credential at least as often, and a wrong guess costs one dismissible
+/// prompt.
+fn auth_error_for(status: reqwest::StatusCode) -> Option<CarrelError> {
+    matches!(status.as_u16(), 401 | 403)
+        .then(|| CarrelError::permission(format!("OPDS auth required: HTTP {status}")))
+}
+
+/// Pick the client for a request that may carry a credential: the strict
+/// same-origin policy when one is attached, otherwise the caller's default.
+fn client_for(
+    url: &str,
+    ctx: &OpdsContext,
+    timeout: Duration,
+    unauthenticated: impl FnOnce() -> CarrelResult<reqwest::blocking::Client>,
+) -> CarrelResult<reqwest::blocking::Client> {
+    match (credential_for_url(url, ctx), origin_from_url(url)) {
+        (Some(_), Some(origin)) => build_client(timeout, same_origin_redirect_policy(origin)),
+        _ => unauthenticated(),
+    }
+}
+
+/// Fetch and parse an OPDS feed from a URL.
+pub fn fetch_feed(url: &str) -> CarrelResult<OpdsFeed> {
+    fetch_feed_with_context(url, &OpdsContext::default())
+}
+
+/// Like [`fetch_feed`], but carries an [`OpdsContext`]: URLs whose `host:port`
+/// matches a trusted entry are allowed (so user-added LAN catalogs work without
+/// disabling the SSRF guard for arbitrary feed-derived URLs), and the context's
+/// credential is attached when the request stays on its catalog's origin.
+pub fn fetch_feed_with_context(url: &str, ctx: &OpdsContext) -> CarrelResult<OpdsFeed> {
+    if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return Err(CarrelError::invalid(
             "URL blocked: only public HTTP/HTTPS URLs are allowed.",
         ));
     }
-    let client = http_client()?;
-    let response = client
-        .get(url)
-        .header("User-Agent", OPDS_USER_AGENT)
-        .send()
-        .map_err(|e| CarrelError::network(format!("HTTP error: {e}")))?;
+    // Select the credential first: the redirect policy depends on whether one
+    // is attached, and a client's policy is fixed at build time.
+    let client = client_for(url, ctx, HTTP_TIMEOUT, http_client)?;
+    let response = apply_auth(
+        client.get(url).header("User-Agent", OPDS_USER_AGENT),
+        url,
+        ctx,
+    )
+    .send()
+    .map_err(|e| CarrelError::network(format!("HTTP error: {e}")))?;
+    if let Some(err) = auth_error_for(response.status()) {
+        return Err(err);
+    }
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
+    // Capture the URL the response actually came from before consuming it —
+    // `stamp_provenance` needs it, and it is gone once the body is read.
+    let effective_url = response.url().to_string();
     let bytes = response
         .bytes()
         .map_err(|e| CarrelError::network(format!("Read error: {e}")))?;
@@ -221,24 +452,26 @@ pub fn fetch_feed_with_trusted(url: &str, trusted: &[String]) -> CarrelResult<Op
         return Err(CarrelError::invalid("Response too large (limit: 5 MB)."));
     }
     let xml = String::from_utf8_lossy(&bytes).to_string();
-    parse_feed_with_trusted(&xml, url, trusted)
+    // Relative links still resolve against the requested URL, as before — the
+    // effective URL is used only for the provenance decision, so this change
+    // cannot alter how any existing feed's links are built.
+    let mut feed = parse_feed_with_context(&xml, url, ctx)?;
+    stamp_provenance(&mut feed, ctx, &effective_url);
+    Ok(feed)
 }
 
 /// Parse OPDS/Atom XML into structured data.
 /// Test-only convenience wrapper; production callers route through
-/// [`parse_feed_with_trusted`] via [`fetch_feed_with_trusted`].
+/// [`parse_feed_with_context`] via [`fetch_feed_with_context`].
 #[cfg(test)]
 fn parse_feed(xml: &str, base_url: &str) -> CarrelResult<OpdsFeed> {
-    parse_feed_with_trusted(xml, base_url, &[])
+    parse_feed_with_context(xml, base_url, &OpdsContext::default())
 }
 
 /// Parse OPDS/Atom XML; skip the `http://` → `https://` cover upgrade when
 /// the cover URL targets a trusted host (LAN servers don't speak TLS).
-fn parse_feed_with_trusted(
-    xml: &str,
-    base_url: &str,
-    trusted: &[String],
-) -> CarrelResult<OpdsFeed> {
+fn parse_feed_with_context(xml: &str, base_url: &str, ctx: &OpdsContext) -> CarrelResult<OpdsFeed> {
+    let trusted = &ctx.trusted;
     // Deliberately *not* `trim_text(true)`: that trims every text event
     // individually, and quick-xml emits an entity reference as its own event,
     // so `Fish &amp; Chips` would arrive as three events and come back out as
@@ -448,6 +681,7 @@ fn parse_feed_with_trusted(
                             cover_url: entry_cover.clone(),
                             links: entry_links.clone(),
                             nav_url: entry_nav.clone(),
+                            catalog_url: None, // stamped by the caller, not the parser
                         });
                     }
                     "author" => {
@@ -468,41 +702,73 @@ fn parse_feed_with_trusted(
     }
 
     // Resolve OpenSearch description URLs to direct search templates
-    let resolved_search = search_url.and_then(|u| resolve_search_url(&u));
+    let resolved_search = search_url.and_then(|u| resolve_search_url_with_context(&u, ctx));
 
     Ok(OpdsFeed {
         title: feed_title,
         entries,
         next_url,
         search_url: resolved_search,
+        catalog_url: None, // stamped by fetch_feed_with_context, which sees the
+                           // effective URL after redirects
     })
 }
 
 /// Resolve a search URL — if it's an OpenSearch description XML, fetch it and
 /// extract the Atom/OPDS template URL. Otherwise return it as-is.
 pub fn resolve_search_url(url: &str) -> Option<String> {
-    resolve_search_url_with_trusted(url, &[])
+    resolve_search_url_with_context(url, &OpdsContext::default())
 }
 
-/// Like [`resolve_search_url`], but allows URLs whose `host:port` matches a
-/// trusted entry.
-pub fn resolve_search_url_with_trusted(url: &str, trusted: &[String]) -> Option<String> {
+/// Like [`resolve_search_url`], but carries an [`OpdsContext`] so trusted
+/// `host:port` entries are allowed and credentials can be attached.
+/// When `ctx.provenance` is set, three origin checks apply — a cross-origin
+/// descriptor is not fetched, a descriptor that *redirects* off-origin is
+/// discarded, and a template must be on the effective descriptor origin. All
+/// three exist because a template ends up being fetched with the catalog's
+/// credential later, so whoever chose that URL is choosing an authenticated
+/// request. The no-context wrapper keeps the old permissive behavior.
+pub fn resolve_search_url_with_context(url: &str, ctx: &OpdsContext) -> Option<String> {
+    let provenance_origin = ctx.provenance.as_ref().map(|p| p.origin.as_str());
+
+    // 1. A cross-origin descriptor or direct template is refused outright.
+    if let Some(origin) = provenance_origin {
+        if origin_from_url(url).as_deref() != Some(origin) {
+            return None;
+        }
+    }
+
     // If it already contains {searchTerms}, it's a direct template
     if url.contains("{searchTerms}") {
         return Some(url.to_string());
     }
     // Try fetching as OpenSearch description
-    if !is_safe_url_with_trusted(url, trusted) {
+    if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return None;
     }
-    let client = http_client().ok()?;
-    let response = client
-        .get(url)
-        .header("User-Agent", OPDS_USER_AGENT)
-        .send()
-        .ok()?;
+    // This function returns Option, so a Result cannot be propagated with `?`.
+    let client = client_for(url, ctx, HTTP_TIMEOUT, http_client).ok()?;
+    let response = apply_auth(
+        client.get(url).header("User-Agent", OPDS_USER_AGENT),
+        url,
+        ctx,
+    )
+    .send()
+    .ok()?;
     if !response.status().is_success() {
         return None;
+    }
+
+    // 2. The descriptor's EFFECTIVE URL after redirects must also be on the
+    //    provenance origin. Without this, A's descriptor can 302 to B (followed
+    //    normally, since no credential was attached) and B can return a template
+    //    on A — checks 1 and 3 would both pass against the original URL, and a
+    //    later search would send A's credential to a URL B chose.
+    let effective_origin = origin_from_url(response.url().as_str());
+    if let Some(origin) = provenance_origin {
+        if effective_origin.as_deref() != Some(origin) {
+            return None;
+        }
     }
     let xml = response.text().ok()?;
 
@@ -534,6 +800,14 @@ pub fn resolve_search_url_with_trusted(url: &str, trusted: &[String]) -> Option<
                     if !template.is_empty()
                         && (url_type.contains("atom") || url_type.contains("opds"))
                     {
+                        // 3. The template must be on the effective descriptor
+                        //    origin, so a descriptor cannot point the eventual
+                        //    authenticated search somewhere else.
+                        if provenance_origin.is_some()
+                            && origin_from_url(&template) != effective_origin
+                        {
+                            return None;
+                        }
                         return Some(template);
                     }
                 }
@@ -559,25 +833,30 @@ pub fn url_encode(s: &str) -> String {
 
 /// Download a file from a URL to a local path.
 pub fn download_file(url: &str, dest: &str) -> CarrelResult<()> {
-    download_file_with_trusted(url, dest, &[])
+    download_file_with_context(url, dest, &OpdsContext::default())
 }
 
-/// Like [`download_file`], but allows URLs whose `host:port` matches a
-/// trusted entry — required for downloading from user-added LAN catalogs.
-pub fn download_file_with_trusted(url: &str, dest: &str, trusted: &[String]) -> CarrelResult<()> {
-    if !is_safe_url_with_trusted(url, trusted) {
+/// Like [`download_file`], but carries an [`OpdsContext`]: trusted `host:port`
+/// entries are allowed (required for user-added LAN catalogs) and the context's
+/// credential is attached when the request stays on its catalog's origin.
+pub fn download_file_with_context(url: &str, dest: &str, ctx: &OpdsContext) -> CarrelResult<()> {
+    if !is_safe_url_with_trusted(url, &ctx.trusted) {
         return Err(CarrelError::invalid(
             "URL blocked: only public HTTP/HTTPS URLs are allowed.",
         ));
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120)) // longer timeout for file downloads
-        .build()
-        .map_err(|e| CarrelError::network(format!("HTTP client error: {e}")))?;
-    let response = client
-        .get(url)
+    // Downloads keep their longer timeout and reqwest's default redirect policy
+    // when unauthenticated; an authenticated download gets the same timeout with
+    // the strict same-origin policy.
+    let client = client_for(url, ctx, DOWNLOAD_TIMEOUT, || {
+        build_client(DOWNLOAD_TIMEOUT, reqwest::redirect::Policy::default())
+    })?;
+    let response = apply_auth(client.get(url), url, ctx)
         .send()
         .map_err(|e| CarrelError::network(format!("Download failed: {e}")))?;
+    if let Some(err) = auth_error_for(response.status()) {
+        return Err(err);
+    }
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
@@ -623,6 +902,10 @@ pub fn download_file_ssrf_guarded(url: &str, dest: &str) -> CarrelResult<()> {
         .get(url)
         .send()
         .map_err(|e| CarrelError::network(format!("Download failed: {e}")))?;
+    // Deliberately no `auth_error_for` here: this is the plugin / dictionary
+    // download path, which never carries a catalog credential, so a 401 from it
+    // is not something a sign-in prompt could fix. Its error mapping is
+    // unchanged.
     if !response.status().is_success() {
         return Err(CarrelError::network(format!("HTTP {}", response.status())));
     }
@@ -1038,9 +1321,11 @@ mod tests {
             <link href="/api/books/123/cover" type="image/jpeg" rel="http://opds-spec.org/image"/>
           </entry>
         </feed>"#;
-        let trusted = vec!["192.168.0.12:7788".to_string()];
-        let feed =
-            parse_feed_with_trusted(xml, "http://192.168.0.12:7788/opds/all", &trusted).unwrap();
+        let ctx = OpdsContext {
+            trusted: vec!["192.168.0.12:7788".to_string()],
+            ..Default::default()
+        };
+        let feed = parse_feed_with_context(xml, "http://192.168.0.12:7788/opds/all", &ctx).unwrap();
         // Trusted LAN host — http preserved.
         assert_eq!(
             feed.entries[0].cover_url.as_deref(),
@@ -1076,5 +1361,665 @@ mod tests {
             "https://example.com/jenny.epub"
         );
         assert_eq!(feed.entries[0].links[0].mime_type, "application/epub+zip");
+    }
+
+    #[test]
+    fn origin_from_url_omits_default_ports_and_lowercases() {
+        assert_eq!(
+            origin_from_url("https://Books.Example.org:443/opds").as_deref(),
+            Some("https://books.example.org")
+        );
+        assert_eq!(
+            origin_from_url("http://Example.com:80/x").as_deref(),
+            Some("http://example.com")
+        );
+        assert_eq!(
+            origin_from_url("http://localhost:8080/opds").as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn origin_from_url_distinguishes_scheme() {
+        assert_ne!(
+            origin_from_url("http://h:443/x"),
+            origin_from_url("https://h:443/x")
+        );
+    }
+
+    #[test]
+    fn origin_from_url_rejects_hostless_and_non_http() {
+        assert!(origin_from_url("file:///etc/passwd").is_none());
+        assert!(origin_from_url("javascript:alert(1)").is_none());
+        assert!(origin_from_url("not a url").is_none());
+    }
+
+    #[test]
+    fn is_loopback_host_matches_localhost_and_loopback_ips() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("app.localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("192.168.0.50"));
+        assert!(!is_loopback_host("books.example.org"));
+    }
+
+    fn basic_ctx(origin: &str) -> OpdsContext {
+        OpdsContext {
+            trusted: vec![],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{origin}/opds"),
+                origin: origin.to_string(),
+            }),
+            cred: Some(OpdsCredential::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn credential_applies_only_to_the_provenance_origin() {
+        let ctx = basic_ctx("https://books.example.org");
+        assert!(credential_for_url("https://books.example.org/opds/all", &ctx).is_some());
+        assert!(
+            credential_for_url("http://books.example.org/opds", &ctx).is_none(),
+            "scheme downgrade"
+        );
+        assert!(
+            credential_for_url("https://books.example.org:8443/opds", &ctx).is_none(),
+            "port change"
+        );
+        assert!(
+            credential_for_url("https://evil.example.net/opds", &ctx).is_none(),
+            "host change"
+        );
+    }
+
+    #[test]
+    fn cached_entry_json_without_catalog_url_still_deserializes() {
+        // Discover caches entries as JSON; rows written before this field
+        // existed must keep loading.
+        let json = r#"{"id":"1","title":"T","author":"A","summary":"","coverUrl":null,"links":[],"navUrl":null}"#;
+        let e: OpdsEntry = serde_json::from_str(json).unwrap();
+        assert!(e.catalog_url.is_none());
+    }
+
+    #[test]
+    fn opensearch_rejects_a_cross_origin_descriptor_or_direct_template() {
+        let ctx = OpdsContext {
+            provenance: Some(OpdsProvenance {
+                catalog_url: "https://a/opds".into(),
+                origin: "https://a".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(resolve_search_url_with_context("https://b/os.xml", &ctx).is_none());
+        assert!(
+            resolve_search_url_with_context("https://b/search?q={searchTerms}", &ctx).is_none(),
+            "a direct template must be origin-checked too"
+        );
+        assert_eq!(
+            resolve_search_url_with_context("https://a/search?q={searchTerms}", &ctx).as_deref(),
+            Some("https://a/search?q={searchTerms}")
+        );
+    }
+
+    #[test]
+    fn auth_status_maps_to_permission_error_with_the_frontend_substring() {
+        let err = auth_error_for(reqwest::StatusCode::UNAUTHORIZED).expect("401 must map");
+        assert!(err.to_string().contains("OPDS auth required"));
+        assert!(auth_error_for(reqwest::StatusCode::FORBIDDEN).is_some());
+        assert!(auth_error_for(reqwest::StatusCode::NOT_FOUND).is_none());
+        assert!(auth_error_for(reqwest::StatusCode::OK).is_none());
+    }
+
+    #[test]
+    fn credential_requires_both_provenance_and_secret() {
+        let mut ctx = basic_ctx("https://h");
+        ctx.cred = None;
+        assert!(credential_for_url("https://h/x", &ctx).is_none());
+        let mut ctx = basic_ctx("https://h");
+        ctx.provenance = None;
+        assert!(credential_for_url("https://h/x", &ctx).is_none());
+    }
+}
+
+/// Tests that need a real HTTP server.
+///
+/// Credential handling is only observable on the wire: which `Authorization`
+/// header actually goes out, and which redirects are followed. Neither can be
+/// asserted by inspecting a `RequestBuilder`, so these use `wiremock`.
+///
+/// Two constraints apply to every test here. wiremock binds `127.0.0.1`, which
+/// `is_safe_url_with_trusted` blocks by design — so the server's `host:port`
+/// must go in `ctx.trusted`. And `OpdsContext` is deliberately not `Clone`, so
+/// each call gets a freshly built context.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    pub(super) const MINIMAL_FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <title>T</title>
+          <entry><id>1</id><title>Book</title></entry>
+        </feed>"#;
+
+    /// Run a blocking core call from an async test without stalling the runtime.
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    /// Context that trusts `url`'s host and carries nothing else.
+    fn trusting_ctx(url: &str) -> OpdsContext {
+        OpdsContext {
+            trusted: vec![host_port_from_url(url).unwrap()],
+            ..Default::default()
+        }
+    }
+
+    /// Context that trusts `url`'s host and carries `cred` for `url`'s origin.
+    fn authed_ctx(url: &str, cred: OpdsCredential) -> OpdsContext {
+        OpdsContext {
+            trusted: vec![host_port_from_url(url).unwrap()],
+            provenance: Some(OpdsProvenance {
+                catalog_url: url.to_string(),
+                origin: origin_from_url(url).unwrap(),
+            }),
+            cred: Some(cred),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn basic_credentials_reach_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            // base64("u:p") == "dTpw" — an unmatched header 404s, so a parsed
+            // feed proves this exact header was sent.
+            .and(wiremock::matchers::header("authorization", "Basic dTpw"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = authed_ctx(
+            &url,
+            OpdsCredential::Basic {
+                username: "u".into(),
+                password: "p".into(),
+            },
+        );
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bearer_token_reaches_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer ck_live_abc",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = authed_ctx(&url, OpdsCredential::Bearer("ck_live_abc".into()));
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_credential_is_sent_to_another_origin_on_the_same_host() {
+        // The scheme-downgrade guard, end to end: a credential registered for
+        // the https origin must not go out over http, even to the same host and
+        // port. Here provenance names an https origin while the request is
+        // http, so the header must be absent.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .and(wiremock::matchers::header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let mut ctx = authed_ctx(&url, OpdsCredential::Bearer("t".into()));
+        // Same host:port, https instead of http.
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.replace("http://", "https://"),
+            origin: origin_from_url(&url)
+                .unwrap()
+                .replace("http://", "https://"),
+        });
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.title, "T",
+            "an https credential must not go out over http"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_request_refuses_a_cross_origin_redirect() {
+        // A 302s to B. With a credential for A the fetch must ERROR rather than
+        // follow, and B must never be hit.
+        //
+        // Deliberately NOT using `.expect(0)` on B: during the red phase the
+        // assertion panics, MockServer verifies expectations in Drop, and a
+        // second panic while unwinding aborts the process instead of producing
+        // a clean red test. `received_requests()` avoids that.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/feed", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let url = format!("{}/opds", a.uri());
+        let mut ctx = authed_ctx(&url, OpdsCredential::Bearer("t".into()));
+        ctx.trusted.push(host_port_from_url(&b.uri()).unwrap());
+        let res = blocking(move || fetch_feed_with_context(&url, &ctx)).await;
+        let b_hits = b.received_requests().await.unwrap_or_default().len();
+        assert!(
+            res.is_err() && b_hits == 0,
+            "authenticated cross-origin redirect must not be followed (is_err={}, B hits={b_hits})",
+            res.is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unauthenticated_request_still_follows_a_cross_origin_redirect() {
+        // Public catalogs (Gutenberg mirrors) redirect across hosts and must
+        // keep working unchanged when no credential is involved.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/feed", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let url = format!("{}/opds", a.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.trusted.push(host_port_from_url(&b.uri()).unwrap());
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+        assert_eq!(
+            b.received_requests().await.unwrap_or_default().len(),
+            1,
+            "B must have served the feed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_same_origin_response_is_stamped_with_its_catalog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.clone(),
+            origin: origin_from_url(&url).unwrap(),
+        });
+        // No credential: a PUBLIC catalog must still be stamped, or the user
+        // could never sign in to it later.
+        let expected = url.clone();
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.catalog_url.as_deref(), Some(expected.as_str()));
+        assert!(feed
+            .entries
+            .iter()
+            .all(|e| e.catalog_url.as_deref() == Some(expected.as_str())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unauthenticated_cross_origin_redirect_clears_provenance() {
+        // Stamping rule 5. A has no readable secret, so the hop to B is followed
+        // normally — but the response must NOT be stamped A, or B's links
+        // inherit A's provenance and a later credential would authenticate a
+        // URL B chose.
+        //
+        // This is the paired negative of the test above: "never stamp anything"
+        // satisfies this one alone, so judge the two together.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/feed", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let url = format!("{}/opds", a.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.trusted.push(host_port_from_url(&b.uri()).unwrap());
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.clone(),
+            origin: origin_from_url(&url).unwrap(),
+        });
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert!(
+            feed.catalog_url.is_none(),
+            "provenance must not survive a cross-origin hop"
+        );
+        assert!(feed.entries.iter().all(|e| e.catalog_url.is_none()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parse_feed_forwards_the_context_to_opensearch_resolution() {
+        // Regression test for the missed opds.rs:471 call site: the root feed's
+        // search link is an OpenSearch descriptor on the same 127.0.0.1 server.
+        // Before the fix, parse_feed resolved it through the no-trusted wrapper,
+        // so the SSRF guard blocked the descriptor and search_url was always
+        // None for LAN and loopback catalogs.
+        let server = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", server.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&server)
+            .await;
+        let root = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+               <feed xmlns="http://www.w3.org/2005/Atom"><title>T</title>
+                 <link rel="search" type="application/opensearchdescription+xml" href="{}/os.xml"/>
+               </feed>"#,
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(root))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/opds", server.uri());
+        let mut ctx = trusting_ctx(&url);
+        ctx.provenance = Some(OpdsProvenance {
+            catalog_url: url.clone(),
+            origin: origin_from_url(&url).unwrap(),
+        });
+        let expected = template.clone();
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.search_url.as_deref(),
+            Some(expected.as_str()),
+            "the OpenSearch template must resolve when the context allows the descriptor host"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opensearch_descriptor_redirected_off_origin_yields_no_template() {
+        // A's descriptor 302s to B; B returns a template pointing back at A.
+        // Both the requested descriptor URL and the template are on A, so only
+        // the EFFECTIVE descriptor origin check catches this.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", a.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/os.xml", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let descriptor = format!("{}/os.xml", a.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(
+            got.is_none(),
+            "a descriptor redirected off-origin must not yield a template, got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opensearch_descriptor_redirected_off_origin_yields_no_off_origin_template_either() {
+        // Discriminates check 2 from check 3. Here A's descriptor 302s to B and
+        // B returns a template on B itself: the template *does* match the
+        // effective descriptor origin, so check 3 is satisfied and only the
+        // effective-origin check refuses it. Without this case, removing check 2
+        // leaves every test green.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", b.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", format!("{}/os.xml", b.uri())),
+            )
+            .mount(&a)
+            .await;
+        let descriptor = format!("{}/os.xml", a.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(
+            got.is_none(),
+            "a template from an off-origin descriptor must be refused whatever its own origin, got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_401_feed_surfaces_the_auth_error_not_a_network_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = trusting_ctx(&url);
+        let err = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("OPDS auth required"), "got: {err}");
+        // The kind matters as much as the message: the frontend's KIND_TO_KEY
+        // falls back on it, and `Network` is what produced the misleading
+        // "could not connect" copy.
+        assert_eq!(err.kind(), "PermissionDenied", "got kind {}", err.kind());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opensearch_refuses_a_template_pointing_at_another_origin() {
+        // Isolates check 3: the descriptor is served directly by A (no redirect,
+        // so check 2 passes) but hands back a template on B. Only the
+        // template-versus-effective-origin check refuses this.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let template = format!("{}/search?q={{searchTerms}}", b.uri());
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{template}"/>
+                   </OpenSearchDescription>"#
+            )))
+            .mount(&a)
+            .await;
+        let descriptor = format!("{}/os.xml", a.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(
+            got.is_none(),
+            "a same-origin descriptor must not hand the search off to another origin, got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cross_origin_descriptor_is_never_fetched() {
+        // Check 1, made independent of network failure. The descriptor exists
+        // and would answer; provenance names another origin, so no request may
+        // go out at all. Asserting zero received requests is the discriminating
+        // observation — an unreachable host would return None either way.
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/os.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+                     <Url type="application/atom+xml" template="{}/search?q={{searchTerms}}"/>
+                   </OpenSearchDescription>"#,
+                b.uri()
+            )))
+            .mount(&b)
+            .await;
+        let descriptor = format!("{}/os.xml", b.uri());
+        let ctx = OpdsContext {
+            trusted: vec![
+                host_port_from_url(&a.uri()).unwrap(),
+                host_port_from_url(&b.uri()).unwrap(),
+            ],
+            provenance: Some(OpdsProvenance {
+                catalog_url: format!("{}/opds", a.uri()),
+                origin: origin_from_url(&a.uri()).unwrap(),
+            }),
+            cred: None,
+        };
+        let got = blocking(move || resolve_search_url_with_context(&descriptor, &ctx)).await;
+        assert!(got.is_none());
+        assert_eq!(
+            b.received_requests().await.unwrap_or_default().len(),
+            0,
+            "a cross-origin descriptor must not be requested at all"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_authenticated_same_origin_redirect_is_followed_with_the_credential() {
+        // The positive half of the redirect matrix: a same-origin hop must still
+        // work while authenticated — a feed at /opds redirecting to /opds/ is
+        // ordinary — and the credential must survive it.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds/"))
+            .and(wiremock::matchers::header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/opds/"))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = authed_ctx(&url, OpdsCredential::Bearer("t".into()));
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.title, "T",
+            "same-origin redirects must still carry the credential"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_feed_reads_a_served_feed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/opds"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(MINIMAL_FEED))
+            .mount(&server)
+            .await;
+        let url = format!("{}/opds", server.uri());
+        let ctx = trusting_ctx(&url);
+        let feed = blocking(move || fetch_feed_with_context(&url, &ctx))
+            .await
+            .unwrap();
+        assert_eq!(feed.title, "T");
+        assert_eq!(feed.entries.len(), 1);
     }
 }

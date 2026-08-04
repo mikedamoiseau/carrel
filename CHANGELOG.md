@@ -5,6 +5,42 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Catalogs that require signing in.** Adding an OPDS catalog now has an
+  optional sign-in section for servers that don't allow anonymous access —
+  either a username and password, or a single API key sent as a Bearer token.
+  Carrel Server's own `/opds` feed offers both: your account email and
+  sign-in password, or a `ck_live_…` key you can generate for it. The
+  credential itself is stored in your OS keychain, never in Carrel's own
+  database, and is only ever sent to the catalog it was configured for — a
+  feed that links elsewhere doesn't get it. Sending a credential over an
+  unencrypted `http://` connection (other than to your own machine) now asks
+  you to confirm first, since that traffic isn't encrypted.
+
+### Fixed
+- **Saved passwords, PINs and keys are now actually stored in your system
+  keychain.** They never were. The library Carrel uses to talk to the keychain
+  stopped enabling any platform support by default in its version 3, and Carrel
+  had not asked for it — so it quietly fell back to a stand-in that accepts a
+  password, reports success, and keeps nothing. Because storing appeared to
+  work, nothing ever reported an error; the value simply wasn't there the next
+  time it was needed. This affected every password Carrel keeps: catalog
+  sign-ins, the web-interface PIN, profile locks, and backup credentials.
+  If you had set any of these, you will be asked for them once more, and macOS
+  will ask your permission the first time Carrel reaches the keychain.
+- **A catalog that needs a password no longer looks unreachable.** Adding or
+  browsing a catalog that answered with "please sign in" (HTTP 401/403) used
+  to be reported the same way as a catalog that couldn't be reached at all —
+  "Couldn't reach this feed — Could not connect to the server." Carrel now
+  recognizes this case for what it is and offers a sign-in panel on the spot,
+  instead of leaving you to guess why a perfectly reachable server "couldn't
+  connect."
+- **Search on local-network and same-machine catalogs.** Some catalogs publish
+  their search feature as a separate "OpenSearch" description rather than a
+  direct link. For any catalog on your LAN or on the same machine, Carrel was
+  discarding that description outright, so the search box would simply do
+  nothing. It's now resolved the same way as any other catalog.
+
 ## [3.0.2] - 2026-08-01
 
 ### Security

@@ -35,7 +35,18 @@ log = "0.4.29"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 tracing-appender = "0.2"
-keyring = "3"
+# keyring 3 ships NO default backend — every platform store is feature-gated,
+# and with none enabled the crate silently resolves to its in-memory *mock*
+# store (`pub use mock as default`), so writes return Ok and reads return
+# Ok(None) and nothing ever reaches the OS keychain. See
+# docs/backlog/2026-08-04-keyring-mock-backend.md. Each optional backend dep is
+# target-gated inside keyring, so naming all three here is safe on every
+# platform: a Linux build simply has no security-framework to pull.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+] }
 image = "0.25"
 
 # profile_lock.rs (A-M1): Argon2id KDF + zeroizing password wrapper for the

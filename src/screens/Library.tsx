@@ -165,7 +165,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   const [recentlyRead, setRecentlyRead] = useState<Book[]>([]);
 
   // Discover — popular/new books from catalogs (loaded lazily, cached 24h)
-  interface DiscoverEntry { id: string; title: string; author: string; summary: string; coverUrl: string | null; links: { href: string; mimeType: string; rel: string }[]; navUrl: string | null }
+  interface DiscoverEntry { id: string; title: string; author: string; summary: string; coverUrl: string | null; links: { href: string; mimeType: string; rel: string }[]; navUrl: string | null; catalogUrl?: string | null }
   const [showDiscover, setShowDiscover] = useState(() => localStorage.getItem("carrel-show-discover") === "true");
   const [showWantToRead, setShowWantToRead] = useState(() => localStorage.getItem("carrel-show-want-to-read") === "true");
   const [discoverBooks, setDiscoverBooks] = useState<DiscoverEntry[]>([]);
@@ -1351,6 +1351,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
                                 const result = await invoke<{ id: string; newly_imported: boolean }>("download_opds_book", {
                                   downloadUrl: picked.link.href,
                                   mimeType: picked.link.mimeType,
+                                  catalogUrl: entry.catalogUrl,
                                 });
                                 if (result.newly_imported) {
                                   recentlyImportedRef.current = new Set([result.id]);

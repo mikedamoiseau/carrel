@@ -447,6 +447,20 @@ export function isValidHttpUrl(value: string): boolean {
   return url.protocol === "http:" || url.protocol === "https:";
 }
 
+/**
+ * Frontend mirror of carrel-core's `is_loopback_host` (`opds.rs`) — true for
+ * `localhost`, `*.localhost`, and loopback IPs. Used only to decide whether
+ * the add-catalog form should warn before sending a credential over
+ * cleartext HTTP; the backend is the actual enforcement point.
+ */
+export function isLoopbackHost(hostname: string): boolean {
+  const bare = hostname.replace(/^\[/, "").replace(/\]$/, "");
+  const lower = bare.toLowerCase();
+  if (lower === "localhost" || lower.endsWith(".localhost")) return true;
+  if (bare === "::1") return true;
+  return /^127(?:\.\d{1,3}){3}$/.test(bare);
+}
+
 /** Number of days shown by the reading heatmap (F-5-4): a rolling year. */
 export const HEATMAP_DAYS = 365;
 

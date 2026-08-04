@@ -84,3 +84,7 @@ tempfile = { workspace = true }
 # Fixed IANA zones for deterministic DST-boundary tests (no reliance on the
 # host's local timezone). Test-only.
 chrono-tz = "0.10"
+# OPDS credential handling is only observable on the wire — which header goes
+# out, and which redirects are followed. Both need a real server. Test-only.
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
