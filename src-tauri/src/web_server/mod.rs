@@ -1284,6 +1284,59 @@ mod tests {
         let _ = tx.send(());
     }
 
+    /// The OpenSearch descriptor must be reachable through the real router.
+    /// The handler's own tests call it directly, so they would still pass if
+    /// the route were never mounted under `/opds` — and every feed advertises
+    /// it, so an unmounted route would be a 404 that only third-party clients
+    /// ever hit. This also pins that the served template is absolute on the
+    /// authority the client actually dialed.
+    #[tokio::test]
+    async fn opds_opensearch_descriptor_is_mounted_and_absolute() {
+        let state = test_state();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let router = build_router(
+            state,
+            ServerModes {
+                web_ui: false,
+                opds: true,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/opds/opensearch.xml"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "descriptor route must be mounted");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/opensearchdescription+xml"
+        );
+        let xml = resp.text().await.unwrap();
+        assert!(
+            xml.contains(&format!(
+                r#"template="http://127.0.0.1:{port}/opds/search?q={{searchTerms}}""#
+            )),
+            "template must be absolute on the dialed authority, got: {xml}"
+        );
+
+        let _ = tx.send(());
+    }
+
     #[tokio::test]
     async fn test_no_pin_allows_all_access() {
         let state = test_state();

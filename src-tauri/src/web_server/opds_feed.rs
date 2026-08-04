@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 const ATOM_CONTENT_TYPE: &str = "application/atom+xml;profile=opds-catalog;kind=navigation";
 const ATOM_ACQ_TYPE: &str = "application/atom+xml;profile=opds-catalog;kind=acquisition";
+const OPENSEARCH_DESC_TYPE: &str = "application/opensearchdescription+xml";
 
 /// Build all `/opds/` routes.
 pub fn routes(state: WebState) -> Router<WebState> {
@@ -23,6 +24,7 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .route("/new", get(new_books))
         .route("/collections/{id}", get(collection_feed))
         .route("/search", get(search_books))
+        .route("/opensearch.xml", get(opensearch_descriptor))
         .with_state(state)
 }
 
@@ -201,11 +203,78 @@ fn wrap_feed(
   <updated>{updated}</updated>
   <link rel="self" href="{self_href}" type="{kind}"/>
   <link rel="start" href="/opds" type="{ATOM_CONTENT_TYPE}"/>
+  <link rel="search" href="/opds/opensearch.xml" type="{OPENSEARCH_DESC_TYPE}"/>
   <link rel="search" href="/opds/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}"/>
 {next_link}
 {entries}
 </feed>"#
     )
+}
+
+/// The authority (`host[:port]`) this request was addressed to, if it is safe
+/// to interpolate into a URL inside an XML attribute.
+///
+/// Only characters that can legally appear in an authority are accepted —
+/// letters, digits, `.`, `-`, `_`, `:`, and `[`/`]` for IPv6 literals. That
+/// rules out quotes, `<`, `>`, whitespace, and `/`, so the value cannot break
+/// out of the attribute or graft a different path onto the template.
+///
+/// HTTP/1.1 always carries `Host`; the `:authority` fallback is there for
+/// completeness rather than because this server negotiates HTTP/2.
+fn request_authority(headers: &HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+    let raw = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| uri.authority().map(|a| a.to_string()))?;
+    let safe = !raw.is_empty()
+        && raw.len() <= 255
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']'));
+    safe.then_some(raw)
+}
+
+/// OpenSearch Description Document for the catalog's search facility.
+///
+/// OPDS 1.2 advertises search as a `rel="search"` link of type
+/// `application/opensearchdescription+xml` pointing at a document like this
+/// one. Carrel's feeds also carry the equivalent inline `{searchTerms}`
+/// template, which Carrel's own client uses directly (one fewer round trip);
+/// this document exists for third-party readers that only recognise the
+/// spec's form and would otherwise show no search at all.
+///
+/// The `template` is ABSOLUTE, built from the authority the client dialed.
+/// It has to be: `carrel_core::opds::resolve_search_url_with_context` returns
+/// the template verbatim without resolving it against the descriptor's URL,
+/// and — for a catalog with stored credentials — requires it to be on the
+/// descriptor's own origin. A relative template would therefore be discarded
+/// and search would silently disappear for authenticated catalogs.
+async fn opensearch_descriptor(headers: HeaderMap, uri: axum::http::Uri) -> Response {
+    let Some(authority) = request_authority(&headers, &uri) else {
+        return (StatusCode::BAD_REQUEST, "missing or invalid Host").into_response();
+    };
+    // Plain HTTP unless something in front terminated TLS and said so.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| *s == "https")
+        .unwrap_or("http");
+    let template = xml_escape(&format!(
+        "{scheme}://{authority}/opds/search?q={{searchTerms}}"
+    ));
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>Carrel</ShortName>
+  <Description>Search the Carrel library</Description>
+  <InputEncoding>UTF-8</InputEncoding>
+  <Url type="{ATOM_ACQ_TYPE}" template="{template}"/>
+</OpenSearchDescription>"#
+    );
+
+    ([(header::CONTENT_TYPE, OPENSEARCH_DESC_TYPE)], xml).into_response()
 }
 
 async fn root_catalog() -> Response {
@@ -907,6 +976,125 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_ne!(response_etag(&resp).unwrap(), etag);
+    }
+
+    async fn descriptor_body(host: Option<&str>, forwarded_proto: Option<&str>) -> Response {
+        let mut headers = HeaderMap::new();
+        if let Some(h) = host {
+            headers.insert(header::HOST, h.parse().unwrap());
+        }
+        if let Some(p) = forwarded_proto {
+            headers.insert("x-forwarded-proto", p.parse().unwrap());
+        }
+        opensearch_descriptor(
+            headers,
+            axum::http::Uri::from_static("/opds/opensearch.xml"),
+        )
+        .await
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// Every feed must advertise search BOTH ways: the spec's descriptor link,
+    /// for third-party readers that only recognise that form, and the inline
+    /// template Carrel's own client uses directly.
+    ///
+    /// Order is deliberate. `carrel_core::opds::parse_feed` assigns
+    /// `search_url` on every matching link without checking whether one is
+    /// already set, so the LAST `rel="search"` link wins — keeping the inline
+    /// template last leaves Carrel's own client on the cheaper direct-template
+    /// path. The descriptor is written to be correct either way, so a future
+    /// parser that took the first link instead would also work.
+    #[test]
+    fn feed_advertises_search_as_descriptor_and_inline_template() {
+        let xml = wrap_feed(
+            "T",
+            "urn:carrel:test",
+            "",
+            "/opds/all",
+            ATOM_ACQ_TYPE,
+            None,
+            None,
+        );
+        let descriptor = format!(
+            r#"<link rel="search" href="/opds/opensearch.xml" type="{OPENSEARCH_DESC_TYPE}"/>"#
+        );
+        let inline = format!(
+            r#"<link rel="search" href="/opds/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}"/>"#
+        );
+        let d = xml.find(&descriptor).expect("descriptor search link");
+        let i = xml.find(&inline).expect("inline template search link");
+        assert!(d < i, "inline template must come last so it wins");
+    }
+
+    /// The descriptor's `template` must be ABSOLUTE.
+    /// `resolve_search_url_with_context` returns it verbatim — it never
+    /// resolves it against the descriptor's own URL — and for a catalog with
+    /// stored credentials it requires the template to be on the descriptor's
+    /// origin. A relative template would be discarded and search would
+    /// silently vanish for exactly the authenticated catalogs this is for.
+    #[tokio::test]
+    async fn opensearch_descriptor_template_is_absolute_and_same_origin() {
+        let resp = descriptor_body(Some("192.168.0.50:7788"), None).await;
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            OPENSEARCH_DESC_TYPE
+        );
+        let xml = body_string(resp).await;
+        assert!(
+            xml.contains(r#"template="http://192.168.0.50:7788/opds/search?q={searchTerms}""#),
+            "template must be absolute on the dialed authority, got: {xml}"
+        );
+        assert!(xml.contains(&format!(r#"type="{ATOM_ACQ_TYPE}""#)));
+    }
+
+    /// A TLS-terminating proxy in front (Tailscale) makes the catalog https;
+    /// the template has to match, or it lands on the wrong origin.
+    #[tokio::test]
+    async fn opensearch_descriptor_honors_forwarded_proto() {
+        let xml =
+            body_string(descriptor_body(Some("carrel.example.ts.net"), Some("https")).await).await;
+        assert!(
+            xml.contains(r#"template="https://carrel.example.ts.net/opds/search?q={searchTerms}""#),
+            "got: {xml}"
+        );
+    }
+
+    /// A Host that could break out of the XML attribute — or graft a different
+    /// path onto the template a client will later call with the catalog's
+    /// credential — is refused rather than escaped and echoed.
+    #[tokio::test]
+    async fn opensearch_descriptor_rejects_unsafe_authority() {
+        let hosts = ["evil\" foo=\"bar", "host/other", "host with space"];
+        let mut checked = 0;
+        for host in hosts {
+            let mut headers = HeaderMap::new();
+            // A header value that cannot even be constructed is already
+            // rejected by hyper; only test ones that can.
+            let Ok(value) = host.parse() else { continue };
+            checked += 1;
+            headers.insert(header::HOST, value);
+            let resp = opensearch_descriptor(
+                headers,
+                axum::http::Uri::from_static("/opds/opensearch.xml"),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "host {host:?} must be refused"
+            );
+        }
+        assert_eq!(
+            checked,
+            hosts.len(),
+            "every unsafe host must actually reach the handler, not be skipped"
+        );
     }
 
     #[tokio::test]

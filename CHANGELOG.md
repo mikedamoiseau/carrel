@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Search now works when you browse Carrel's own catalog from another
+  e-reader app.** Carrel's OPDS catalog did advertise a search facility, but in
+  a shorthand form that only Carrel itself understood. Other reader apps either
+  saw no search at all, or tried to search for the literal text
+  `{searchTerms}`. The catalog now also publishes its search the standard way
+  (an OpenSearch description at `/opds/opensearch.xml`), alongside the existing
+  form — so third-party readers get a working search box, and nothing that
+  worked before changes.
+
 ## [3.0.3] - 2026-08-04
 
 ### Added
