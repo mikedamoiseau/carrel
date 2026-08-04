@@ -5937,16 +5937,41 @@ pub async fn reset_profile_lock<R: tauri::Runtime>(
     profile: String,
     state: State<'_, AppState>,
 ) -> CarrelResult<()> {
+    reset_profile_lock_with(
+        app,
+        profile,
+        state.inner(),
+        carrel_core::profile_lock::clear_lock,
+    )
+    .await
+}
+
+/// [`reset_profile_lock`] with the keychain clear injected, mirroring
+/// [`switch_active_profile_with`]. The only production caller passes
+/// `profile_lock::clear_lock`; tests pass a stub, because a real keychain call
+/// behaves differently per host — on a headless Linux CI runner there is no
+/// `org.freedesktop.secrets` service at all, so the real call fails there.
+///
+/// The clear is deliberately **not** fire-and-forget here, unlike
+/// `delete_profile`'s hygiene call: if the keychain entry survives, the profile
+/// is still locked, and marking it unlocked would report a recovery that did
+/// not happen.
+async fn reset_profile_lock_with<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    profile: String,
+    state: &AppState,
+    clear_lock: impl Fn(&str) -> CarrelResult<()>,
+) -> CarrelResult<()> {
     // Leaf serialization lock (see `AppState::profile_lifecycle`): held for
     // the whole body so this can't interleave with the other
     // profile-lifecycle commands across their `.await` points.
     let _lifecycle = state.profile_lifecycle.lock().await;
     state.ensure_profile_exists(&profile)?;
-    carrel_core::profile_lock::clear_lock(&profile)?;
+    clear_lock(&profile)?;
     state.mark_unlocked(&profile)?;
     // Recovery is an alternate unlock path: if the active profile was locked
     // at boot, run the same deferred plugin startup `unlock_profile` does.
-    run_deferred_plugin_start(&app, &profile, &state)?;
+    run_deferred_plugin_start(&app, &profile, state)?;
     Ok(())
 }
 
@@ -12454,7 +12479,9 @@ mod tests {
         }
 
         let state = handle.state::<AppState>();
-        reset_profile_lock(handle.clone(), "carol".to_string(), state)
+        // Stubbed keychain clear: see `reset_profile_lock_with`. A real
+        // `clear_lock` has no secret service to talk to on a headless runner.
+        reset_profile_lock_with(handle.clone(), "carol".to_string(), &state, |_| Ok(()))
             .await
             .expect("resetting an existing profile's lock should succeed");
 
@@ -12462,6 +12489,45 @@ mod tests {
         assert!(
             state.is_unlocked("carol"),
             "reset_profile_lock must mark the profile unlocked (Decision 9)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_profile_lock_fails_loudly_when_the_keychain_clear_fails() {
+        // Not fire-and-forget, unlike `delete_profile`'s hygiene call: if the
+        // keychain entry survives, the profile is still locked, so marking it
+        // unlocked would report a recovery that did not happen. This went
+        // unnoticed while `keyring` resolved to its mock store, which never
+        // failed — see the keyring backend fix.
+        let (app, _dir) = mock_app_with_state();
+        let handle = app.handle().clone();
+        {
+            // A non-default profile, so it starts out NOT unlocked — "default"
+            // is already unlocked in a fresh state, which would make the
+            // second assertion below vacuous.
+            let state = handle.state::<AppState>();
+            let mut ps = state.profile_state.lock().unwrap();
+            let pool = db::create_pool(&std::path::PathBuf::from(":memory:")).unwrap();
+            ps.pools.insert("carol".to_string(), pool);
+            drop(ps);
+            assert!(!state.is_unlocked("carol"), "precondition");
+        }
+
+        let state = handle.state::<AppState>();
+        let err = reset_profile_lock_with(handle.clone(), "carol".to_string(), &state, |_| {
+            Err(CarrelError::internal("keychain unavailable"))
+        })
+        .await
+        .expect_err("a failed keychain clear must not report success");
+        assert!(
+            err.to_string().contains("keychain unavailable"),
+            "got: {err}"
+        );
+
+        let state = handle.state::<AppState>();
+        assert!(
+            !state.is_unlocked("carol"),
+            "a failed clear must not leave the profile marked unlocked"
         );
     }
 
@@ -12486,7 +12552,7 @@ mod tests {
         }
 
         let state = handle.state::<AppState>();
-        reset_profile_lock(handle.clone(), "default".to_string(), state)
+        reset_profile_lock_with(handle.clone(), "default".to_string(), &state, |_| Ok(()))
             .await
             .expect("resetting the active profile's lock should succeed");
 
