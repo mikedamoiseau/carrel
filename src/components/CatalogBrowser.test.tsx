@@ -115,7 +115,7 @@ describe("CatalogBrowser add-catalog validation", () => {
     await fillForm("Carrel Server", "https://srv.example/opds");
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "common.add" })));
 
-    await waitFor(() => expect(screen.getByText("catalog.addAuthRejected")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("catalog.addAuthRejectedBasic")).toBeInTheDocument());
     expect(screen.queryByText(/catalog\.connectionTestFailed/)).not.toBeInTheDocument();
   });
 });

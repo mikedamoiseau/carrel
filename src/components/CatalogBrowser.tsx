@@ -458,7 +458,11 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       // the same misdirection this feature set out to fix.
       setAddCatalogError(
         isOpdsAuthError(err)
-          ? t("catalog.addAuthRejected")
+          ? t(
+              authKind === "bearer"
+                ? "catalog.addAuthRejectedBearer"
+                : "catalog.addAuthRejectedBasic",
+            )
           : t("catalog.connectionTestFailed", { error: friendlyError(err, t) }),
       );
     } finally {
