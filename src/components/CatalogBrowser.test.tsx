@@ -97,6 +97,27 @@ describe("CatalogBrowser add-catalog validation", () => {
     expect(invoke).toHaveBeenCalledWith("add_opds_catalog", { name: "Broken", url: "https://bad.example/opds" });
     expect(invoke).toHaveBeenCalledWith("remove_opds_catalog", { url: "https://bad.example/opds" });
   });
+
+  it("reports a rejected credential as an auth failure, not as unreachable", async () => {
+    // The server answered — it just refused the credential. Wrapping that in
+    // "Couldn't reach this feed" contradicts itself and sends the user hunting
+    // for a network problem.
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_opds_catalogs") return Promise.resolve([]);
+      if (cmd === "browse_opds")
+        return Promise.reject({
+          kind: "PermissionDenied",
+          message: "OPDS auth required: HTTP 401 Unauthorized",
+        });
+      return Promise.resolve(undefined);
+    });
+    await openAddForm();
+    await fillForm("Carrel Server", "https://srv.example/opds");
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "common.add" })));
+
+    await waitFor(() => expect(screen.getByText("catalog.addAuthRejected")).toBeInTheDocument());
+    expect(screen.queryByText(/catalog\.connectionTestFailed/)).not.toBeInTheDocument();
+  });
 });
 
 async function openSignIn() {

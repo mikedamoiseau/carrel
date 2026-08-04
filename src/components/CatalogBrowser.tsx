@@ -452,7 +452,15 @@ export default function CatalogBrowser({ onClose, onBookImported }: CatalogBrows
       resetAddForm();
       await loadCatalogs();
     } catch (err) {
-      setAddCatalogError(t("catalog.connectionTestFailed", { error: friendlyError(err, t) }));
+      // A rejected credential is not a connectivity failure: the server
+      // answered. Wrapping it in "Couldn't reach this feed" contradicts
+      // itself and sends the user looking for a network problem, which is
+      // the same misdirection this feature set out to fix.
+      setAddCatalogError(
+        isOpdsAuthError(err)
+          ? t("catalog.addAuthRejected")
+          : t("catalog.connectionTestFailed", { error: friendlyError(err, t) }),
+      );
     } finally {
       setAddingCatalog(false);
     }

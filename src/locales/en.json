@@ -714,6 +714,7 @@
     "invalidUrl": "Enter a valid http(s) URL.",
     "testingConnection": "Testing…",
     "connectionTestFailed": "Couldn’t reach this feed — {{error}}",
+    "addAuthRejected": "The catalog rejected these credentials. Check the username and password, or switch to a bearer token if the server expects an API key.",
     "removeCatalog": "Remove {{name}}",
     "removeCatalogTitle": "Remove catalog",
     "removeCatalogConfirmTitle": "Remove “{{name}}”?",
