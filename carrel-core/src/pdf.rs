@@ -188,10 +188,106 @@ pub fn get_page_count(path: &str) -> CarrelResult<u32> {
     Ok(document.pages().len() as u32)
 }
 
+// ---- Render-size bound ----
+
+/// Upper bound on the total pixel count of any bitmap this module asks pdfium
+/// to render.
+///
+/// A page's `MediaBox` is attacker-controlled and pdfium does **not** clamp it
+/// to the format's nominal 14400-unit maximum — a `[0 0 1 1000000]` box really
+/// does produce a 1x1000000 pt page. Since a target-width-only render config
+/// aspect-locks the height, output height is `width * page_h / page_w`, so a
+/// crafted page drives the pixel count (and the allocation, made before
+/// anything inspects the result, with [`PDFIUM_RENDER_LOCK`] held throughout)
+/// arbitrarily high. A 421-byte PDF measurably renders a 1.15 GB bitmap at
+/// this app's own default width.
+///
+/// The number is derived from the largest render any current caller
+/// legitimately asks for: the desktop reader clamps zoom to 9600 px wide
+/// (`get_pdf_page_bytes`), which on an ordinary page shape (ISO/US aspect
+/// ratios, all ≤ 1.5) is ≈ 1.4e8 px. 2e8 leaves headroom above that without
+/// admitting anything larger. Pages taller than ≈ 2.2:1 therefore render
+/// slightly smaller than requested at maximum zoom — a resolution change, not
+/// a failure.
+pub const MAX_RENDER_PIXELS: u64 = 200_000_000;
+
+/// Upper bound on either output dimension, independent of
+/// [`MAX_RENDER_PIXELS`].
+///
+/// This is JPEG's own limit, and every render path in this module JPEG-encodes:
+/// `image`'s encoder rejects any dimension above 65535. A pixel budget alone
+/// does not imply an encodable image — at a 1e6:1 aspect ratio even a 1 px-wide
+/// render is 1e6 px tall — so without this cap the extreme cases would still
+/// pay for a full render and then fail at the encoder, which is exactly what
+/// they did before this bound existed.
+pub const MAX_RENDER_DIMENSION: u32 = 65_535;
+
+/// Largest target width that keeps a page's aspect-locked render inside both
+/// [`MAX_RENDER_PIXELS`] and [`MAX_RENDER_DIMENSION`], never above
+/// `requested_width` (this scales down, never up).
+///
+/// Returns `None` when no width works, which happens for a page that is
+/// unrenderable rather than merely large: an aspect ratio above
+/// `MAX_RENDER_DIMENSION`:1 (no scale factor keeps the height encodable), a
+/// page so wide the scaled height rounds to zero, or degenerate dimensions.
+/// Callers turn that into an error *before* pdfium allocates anything.
+///
+/// Pure — no pdfium calls — so it's directly unit-testable without a real PDF
+/// or a bound library, the same reason [`render_output_dims`] is pure.
+fn clamp_render_width(page_w: f32, page_h: f32, requested_width: u32) -> Option<u32> {
+    if !page_w.is_finite() || !page_h.is_finite() || page_w <= 0.0 || page_h <= 0.0 {
+        return None;
+    }
+    if requested_width == 0 {
+        return None;
+    }
+    let ratio = page_h as f64 / page_w as f64;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+
+    // Output height is `w * ratio`, so:
+    //   w * (w * ratio) <= MAX_RENDER_PIXELS     =>  w <= sqrt(budget / ratio)
+    //   w * ratio       <= MAX_RENDER_DIMENSION  =>  w <= cap / ratio
+    let from_budget = (MAX_RENDER_PIXELS as f64 / ratio).sqrt().floor();
+    let from_height = (MAX_RENDER_DIMENSION as f64 / ratio).floor();
+    let width = (requested_width as f64)
+        .min(MAX_RENDER_DIMENSION as f64)
+        .min(from_budget)
+        .min(from_height);
+    if width < 1.0 {
+        return None;
+    }
+
+    let width = width as u32;
+    // pdfium rounds the aspect-locked height to whole pixels (see
+    // `render_output_dims`); a page wide enough that the height rounds away
+    // has no renderable output at this width.
+    if (width as f64 * ratio).round() < 1.0 {
+        return None;
+    }
+    Some(width)
+}
+
+/// Resolve the render width for `page`, bounded by [`clamp_render_width`].
+fn bounded_render_width(page: &PdfPage, page_index: u32, requested: u32) -> CarrelResult<u32> {
+    let (page_w, page_h) = (page.width().value, page.height().value);
+    clamp_render_width(page_w, page_h, requested).ok_or_else(|| {
+        CarrelError::invalid(format!(
+            "page {page_index} has dimensions {page_w} x {page_h} pt, an aspect ratio that \
+             cannot be rendered"
+        ))
+    })
+}
+
 /// Render one PDF page to a base64-encoded JPEG data URI.
 ///
 /// `width` is the target pixel width; height is calculated to preserve aspect ratio.
 /// Uses JPEG encoding for fast encode times and small transfer sizes.
+///
+/// The effective width is bounded by [`clamp_render_width`], so a page with a
+/// pathological aspect ratio renders smaller than requested rather than
+/// allocating an unbounded bitmap.
 pub fn get_page_image(path: &str, page_index: u32, width: u32) -> CarrelResult<String> {
     let pdfium = bind_pdfium()?;
     let document = pdfium
@@ -209,6 +305,7 @@ pub fn get_page_image(path: &str, page_index: u32, width: u32) -> CarrelResult<S
         .get(page_index as u16)
         .map_err(|e| CarrelError::not_found(format!("page {page_index} not found: {e}")))?;
 
+    let width = bounded_render_width(&page, page_index, width)?;
     let config = PdfRenderConfig::new().set_target_width(width as i32);
 
     let bitmap = page
@@ -230,8 +327,11 @@ pub fn get_page_image(path: &str, page_index: u32, width: u32) -> CarrelResult<S
 ///
 /// `target_width` controls the render resolution. When `None`, falls
 /// back to [`DEFAULT_RENDER_WIDTH`] (preserves the legacy 1200 px web
-/// default). The caller is responsible for clamping to a sensible
-/// upper bound (a 10 000 px request will be honored).
+/// default). The request is bounded by [`clamp_render_width`] against
+/// [`MAX_RENDER_PIXELS`] and [`MAX_RENDER_DIMENSION`], so callers need no
+/// upper bound of their own — a wide request is still honored on an ordinary
+/// page, but a pathological page renders smaller rather than allocating an
+/// unbounded bitmap.
 pub fn get_page_image_bytes(
     path: &str,
     page_index: u32,
@@ -257,6 +357,7 @@ pub fn get_page_image_bytes(
         Some(0) | None => DEFAULT_RENDER_WIDTH,
         Some(w) => w,
     };
+    let width = bounded_render_width(&page, page_index, width)?;
     let config = PdfRenderConfig::new().set_target_width(width as i32);
 
     let bitmap = page
@@ -1176,6 +1277,277 @@ mod tests {
         assert!(render_output_dims(100.0, 0.0, 1000).is_none());
         assert!(render_output_dims(f32::NAN, 100.0, 1000).is_none());
         assert!(render_output_dims(100.0, f32::INFINITY, 1000).is_none());
+    }
+
+    // ---- Render-size bound (see `clamp_render_width`) ----
+
+    /// An ordinary page at every width this app actually asks for must pass
+    /// through untouched — the bound is only allowed to bite pathological
+    /// geometry. 612x792 (US Letter) at the cover width, the page-cache
+    /// canonical width, and the desktop reader's zoom ceiling (9600, see
+    /// `get_pdf_page_bytes`) are all far inside both limits.
+    #[test]
+    fn test_clamp_render_width_leaves_ordinary_pages_alone() {
+        for requested in [400, CACHE_CANONICAL_WIDTH, DEFAULT_RENDER_WIDTH, 9600] {
+            assert_eq!(
+                clamp_render_width(612.0, 792.0, requested),
+                Some(requested),
+                "US Letter clamped at requested width {requested}"
+            );
+        }
+        // A2 poster (1191x1684), the tallest ordinary ISO shape, at max zoom.
+        assert_eq!(clamp_render_width(1191.0, 1684.0, 9600), Some(9600));
+    }
+
+    /// The pixel budget must bind before the per-dimension cap on a merely
+    /// tall page. 100x1000 (10:1) at the zoom ceiling would be
+    /// 9600 x 96000 = 9.2e8 px; the budget allows
+    /// floor(sqrt(MAX_RENDER_PIXELS / 10)).
+    #[test]
+    fn test_clamp_render_width_binds_on_pixel_budget() {
+        let w = clamp_render_width(100.0, 1000.0, 9600).expect("renderable");
+        let expected = (MAX_RENDER_PIXELS as f64 / 10.0).sqrt().floor() as u32;
+        assert_eq!(w, expected);
+        let h = (w as f64 * 10.0).round() as u64;
+        assert!(
+            w as u64 * h <= MAX_RENDER_PIXELS,
+            "clamped output {w}x{h} exceeds budget"
+        );
+        assert!(w < 9600, "budget did not reduce the requested width");
+    }
+
+    /// The per-dimension cap must bind before the budget once the aspect
+    /// ratio is extreme enough that a budget-sized render would still exceed
+    /// what a JPEG can encode. 7.2x14400 (2000:1) at the page-cache canonical
+    /// width is 2400 x 4_800_000 unclamped — 1.15e10 px, ~46 GB of BGRA.
+    #[test]
+    fn test_clamp_render_width_binds_on_dimension_cap() {
+        let w = clamp_render_width(7.2, 14400.0, CACHE_CANONICAL_WIDTH).expect("renderable");
+        let h = (w as f64 * 2000.0).round() as u64;
+        assert!(h <= MAX_RENDER_DIMENSION as u64, "height {h} exceeds cap");
+        assert!(w as u64 * h <= MAX_RENDER_PIXELS, "{w}x{h} exceeds budget");
+        // The budget alone would have allowed floor(sqrt(budget/2000)) — far
+        // more than the dimension cap's floor(65535/2000) = 32.
+        assert!(
+            w < (MAX_RENDER_PIXELS as f64 / 2000.0).sqrt().floor() as u32,
+            "dimension cap did not bind (w={w})"
+        );
+    }
+
+    /// Above ratio `MAX_RENDER_DIMENSION`:1 no scale factor exists that keeps
+    /// the height encodable — even a 1 px-wide render is too tall — so the
+    /// page must be refused, cheaply, rather than rendered. pdfium does NOT
+    /// clamp `MediaBox` to the 14400-unit format maximum: a `[0 0 1 1000000]`
+    /// box really does yield a 1x1000000 pt page.
+    #[test]
+    fn test_clamp_render_width_refuses_unrenderable_aspect_ratios() {
+        assert_eq!(
+            clamp_render_width(1.0, 1_000_000.0, CACHE_CANONICAL_WIDTH),
+            None
+        );
+        // Just past the boundary in each direction.
+        let ratio_ok = MAX_RENDER_DIMENSION as f32;
+        assert!(clamp_render_width(1.0, ratio_ok, CACHE_CANONICAL_WIDTH).is_some());
+        assert_eq!(
+            clamp_render_width(1.0, ratio_ok + 2.0, CACHE_CANONICAL_WIDTH),
+            None
+        );
+    }
+
+    /// Mirrors `render_output_dims`: a page whose scaled height rounds to
+    /// zero (an extremely wide page) is unrenderable, as is a degenerate one.
+    /// Today pdfium answers such a page with an opaque
+    /// `PdfiumLibraryInternalError(Unknown)`; the clamp turns it into a
+    /// specific error before pdfium is asked.
+    #[test]
+    fn test_clamp_render_width_rejects_degenerate_and_vanishing() {
+        assert_eq!(
+            clamp_render_width(14400.0, 1.0, CACHE_CANONICAL_WIDTH),
+            None
+        );
+        assert_eq!(clamp_render_width(0.0, 100.0, 1000), None);
+        assert_eq!(clamp_render_width(100.0, 0.0, 1000), None);
+        assert_eq!(clamp_render_width(f32::NAN, 100.0, 1000), None);
+        assert_eq!(clamp_render_width(100.0, f32::INFINITY, 1000), None);
+        assert_eq!(clamp_render_width(-10.0, 100.0, 1000), None);
+        // A zero requested width is the caller's "use the default" signal and
+        // is resolved before the clamp; the clamp itself must not invent one.
+        assert_eq!(clamp_render_width(612.0, 792.0, 0), None);
+    }
+
+    // ---- Crafted-PDF tests for the render-size bound ----
+
+    /// Build a single-page PDF with the given `MediaBox` and a valid xref
+    /// table. Generated rather than checked in: `src-tauri/test-fixtures/` is
+    /// gitignored, so a committed fixture would never reach CI.
+    fn crafted_pdf(media_box: &str) -> Vec<u8> {
+        let content = b"0 0 1 rg 0 0 10 10 re f\n";
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<</Type/Catalog/Pages 2 0 R>>".to_vec(),
+            b"<</Type/Pages/Kids[3 0 R]/Count 1>>".to_vec(),
+            format!("<</Type/Page/Parent 2 0 R/MediaBox[0 0 {media_box}]/Contents 4 0 R/Resources<<>>>>")
+                .into_bytes(),
+            format!(
+                "<</Length {}>>stream\n{}\nendstream",
+                content.len(),
+                std::str::from_utf8(content).unwrap()
+            )
+            .into_bytes(),
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"endobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// Point pdfium at the bundled library and return whether it is usable.
+    ///
+    /// The binary is downloaded by `scripts/download-pdfium.sh` (and by CI on
+    /// Linux/macOS) into `src-tauri/resources/`, which is gitignored — the
+    /// Windows CI job and a fresh clone that skipped the script have no
+    /// library at all, so tests that need one skip rather than fail. The path
+    /// is a process-global `OnceLock`, so setting it here is idempotent and
+    /// harmless: no other carrel-core test binds pdfium.
+    fn pdfium_available() -> bool {
+        let lib_name = if cfg!(target_os = "windows") {
+            "pdfium.dll"
+        } else if cfg!(target_os = "macos") {
+            "libpdfium.dylib"
+        } else {
+            "libpdfium.so"
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("src-tauri")
+            .join("resources")
+            .join(lib_name);
+        if !path.exists() {
+            return false;
+        }
+        set_pdfium_library_path(Some(path));
+        true
+    }
+
+    fn write_crafted_pdf(dir: &TempDir, name: &str, media_box: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, crafted_pdf(media_box)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// The load-bearing test: a real crafted PDF, rendered through the real
+    /// entry point at the real page-cache width.
+    ///
+    /// `[0 0 7.2 14400]` is a legal `MediaBox` (both sides within the format's
+    /// 14400-unit maximum) describing a 2000:1 page. Unclamped, pdfium
+    /// renders it at `CACHE_CANONICAL_WIDTH` as 2400 x 4_800_000 — 1.15e10 px,
+    /// ~46 GB of BGRA, allocated before anything inspects it and with
+    /// `PDFIUM_RENDER_LOCK` held throughout. Measured pre-fix at a
+    /// deliberately reduced width (250 px), the same page allocated 0.5 GB and
+    /// spent 2 s encoding before failing anyway, because `image`'s JPEG
+    /// encoder rejects any dimension above 65535.
+    ///
+    /// So this asserts two things at once: the output is inside the budget,
+    /// and it is a *usable* JPEG — the clamp turns a page that could not be
+    /// rendered at all into one that can.
+    #[test]
+    fn test_get_page_image_bytes_clamps_extreme_aspect_ratio() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let path = write_crafted_pdf(&dir, "ratio2000.pdf", "7.2 14400");
+
+        let (bytes, mime) =
+            get_page_image_bytes(&path, 0, Some(CACHE_CANONICAL_WIDTH)).expect("render");
+        assert_eq!(mime, "image/jpeg");
+
+        let (w, h) = image::load_from_memory(&bytes)
+            .map(|img| (img.width(), img.height()))
+            .expect("decodable JPEG");
+        assert!(
+            w <= MAX_RENDER_DIMENSION && h <= MAX_RENDER_DIMENSION,
+            "output {w}x{h} exceeds the per-dimension cap"
+        );
+        assert!(
+            w as u64 * h as u64 <= MAX_RENDER_PIXELS,
+            "output {w}x{h} = {} px exceeds MAX_RENDER_PIXELS",
+            w as u64 * h as u64
+        );
+        assert!(
+            w < CACHE_CANONICAL_WIDTH,
+            "the clamp did not reduce the requested width (w={w})"
+        );
+    }
+
+    /// The refusal path, end to end: a page too extreme for any scale factor
+    /// must error before pdfium allocates anything. `[0 0 1 1000000]` is
+    /// out-of-spec (the format caps a side at 14400) but pdfium honours it
+    /// verbatim, so the bound cannot lean on that limit.
+    #[test]
+    fn test_get_page_image_bytes_refuses_unrenderable_page() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let path = write_crafted_pdf(&dir, "absurd.pdf", "1 1000000");
+
+        let err = get_page_image_bytes(&path, 0, Some(CACHE_CANONICAL_WIDTH))
+            .expect_err("must refuse a 1000000:1 page");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("aspect ratio") || msg.contains("dimensions"),
+            "error should name the page geometry, got: {msg}"
+        );
+    }
+
+    /// The cover-extraction path (`get_page_image`, used at import with width
+    /// 400) shares the bound — it renders page 0 of a file that has just been
+    /// imported and never validated.
+    #[test]
+    fn test_get_page_image_clamps_extreme_aspect_ratio() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let path = write_crafted_pdf(&dir, "ratio2000-cover.pdf", "7.2 14400");
+
+        let uri = get_page_image(&path, 0, 400).expect("render");
+        let b64 = uri
+            .strip_prefix("data:image/jpeg;base64,")
+            .expect("data URI");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("base64");
+        let img = image::load_from_memory(&bytes).expect("decodable JPEG");
+        assert!(
+            img.height() <= MAX_RENDER_DIMENSION,
+            "cover height {} exceeds the per-dimension cap",
+            img.height()
+        );
     }
 
     /// Race guard: if an eviction (book removal) lands between a
