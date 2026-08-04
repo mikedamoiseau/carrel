@@ -47,7 +47,9 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 opendal = { version = "0.55", features = ["services-s3", "services-fs", "services-ftp", "services-webdav", "blocking"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
-keyring = "3"
+# Inherit the workspace declaration so the backend features stay in one place —
+# a bare `keyring = "3"` here would be a second, featureless declaration.
+keyring = { workspace = true }
 secrecy = { workspace = true }
 regex = "1"
 semver = "1"

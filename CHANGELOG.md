@@ -18,6 +18,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   you to confirm first, since that traffic isn't encrypted.
 
 ### Fixed
+- **Saved passwords, PINs and keys are now actually stored in your system
+  keychain.** They never were. The library Carrel uses to talk to the keychain
+  stopped enabling any platform support by default in its version 3, and Carrel
+  had not asked for it — so it quietly fell back to a stand-in that accepts a
+  password, reports success, and keeps nothing. Because storing appeared to
+  work, nothing ever reported an error; the value simply wasn't there the next
+  time it was needed. This affected every password Carrel keeps: catalog
+  sign-ins, the web-interface PIN, profile locks, and backup credentials.
+  If you had set any of these, you will be asked for them once more, and macOS
+  will ask your permission the first time Carrel reaches the keychain.
 - **A catalog that needs a password no longer looks unreachable.** Adding or
   browsing a catalog that answered with "please sign in" (HTTP 401/403) used
   to be reported the same way as a catalog that couldn't be reached at all —
