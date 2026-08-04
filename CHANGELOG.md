@@ -41,6 +41,22 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   discarding that description outright, so the search box would simply do
   nothing. It's now resolved the same way as any other catalog.
 
+### Security
+- **A PDF can no longer make Carrel allocate unbounded memory when rendering a
+  page.** A PDF page declares its own size, and Carrel rendered every page at a
+  fixed target *width*, leaving the height to follow the page's proportions. A
+  page declared absurdly tall and narrow therefore turned into an absurdly tall
+  image: a 421-byte file was enough to make a single page render as a
+  1.15 GB bitmap — and because Carrel renders one page at a time behind a
+  single lock, that stalled every other page in the app while it happened. Such
+  a page then failed to save anyway, since images that tall cannot be written as
+  JPEG, so the memory was spent for nothing. Page renders are now capped at a
+  total pixel count and a maximum height and width: an unusually long page is
+  rendered smaller instead of refused, so it still opens, and a page whose
+  proportions no size could ever accommodate is now rejected immediately rather
+  than after the work. Ordinary pages, at every zoom level Carrel offers, are
+  unaffected.
+
 ## [3.0.2] - 2026-08-01
 
 ### Security
