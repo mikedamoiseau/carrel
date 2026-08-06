@@ -6,6 +6,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **A broken table-of-contents entry can no longer mislabel the first
+  chapter.** When an e-book's table of contents pointed at a file that
+  isn't part of the book's reading order (a malformed or hand-edited EPUB),
+  that entry was silently attached to the first chapter, overwriting its
+  title. Such entries are now skipped, so the first chapter keeps its real
+  name and only genuine contents entries are shown.
 - **Search now works when you browse Carrel's own catalog from another
   e-reader app.** Carrel's OPDS catalog did advertise a search facility, but in
   a shorthand form that only Carrel itself understood. Other reader apps either
@@ -14,6 +20,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   (an OpenSearch description at `/opds/opensearch.xml`), alongside the existing
   form — so third-party readers get a working search box, and nothing that
   worked before changes.
+
+## [3.0.4] - 2026-08-06
 
 ## [3.0.3] - 2026-08-04
 

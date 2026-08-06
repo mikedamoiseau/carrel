@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "carrel"
-version = "3.0.3"
+version = "3.0.4"
 dependencies = [
  "ammonia",
  "axum",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "carrel-core"
-version = "3.0.3"
+version = "3.0.4"
 dependencies = [
  "ammonia",
  "argon2",
