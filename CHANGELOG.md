@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.5] - 2026-08-06
+
 ### Fixed
 - **Pinch-to-zoom in the web reader no longer zooms the whole page.** A
   two-finger pinch is meant to zoom the book page (in image/page mode), but
