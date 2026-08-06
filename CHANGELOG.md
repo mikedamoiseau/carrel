@@ -6,6 +6,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Pinch-to-zoom in the web reader no longer zooms the whole page.** A
+  two-finger pinch is meant to zoom the book page (in image/page mode), but
+  the browser's own full-page magnification sometimes fired alongside it,
+  leaving the interface zoomed and off-centre. The web UI now suppresses the
+  browser's native page zoom, so a pinch only ever zooms the book.
+
+## [3.0.4] - 2026-08-06
+
+### Fixed
 - **A broken table-of-contents entry can no longer mislabel the first
   chapter.** When an e-book's table of contents pointed at a file that
   isn't part of the book's reading order (a malformed or hand-edited EPUB),
@@ -20,8 +29,6 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   (an OpenSearch description at `/opds/opensearch.xml`), alongside the existing
   form — so third-party readers get a working search box, and nothing that
   worked before changes.
-
-## [3.0.4] - 2026-08-06
 
 ## [3.0.3] - 2026-08-04
 

@@ -1415,6 +1415,19 @@
 
   window.addEventListener("hashchange", route);
 
+  // ── Suppress native page pinch-zoom ───────────────────────────────────
+  // The reader implements its own pinch-zoom (page mode); the browser's
+  // whole-page magnification must never fire alongside it. `maximum-scale=1,
+  // user-scalable=no` in the viewport meta covers Android, desktop, and
+  // iOS-standalone (PWA), but mobile Safari in a tab ignores user-scalable —
+  // there the only lever is preventing its proprietary GestureEvents. The
+  // reader stage already does this for gestures over itself; this document-
+  // level backstop also catches a pinch whose fingers land off the stage (on
+  // the chrome or margins) and covers non-reader screens. No-op on browsers
+  // without GestureEvent (everything but Safari).
+  document.addEventListener("gesturestart", (e) => e.preventDefault(), { passive: false });
+  document.addEventListener("gesturechange", (e) => e.preventDefault(), { passive: false });
+
   // ── Keyboard Shortcuts ────────────────────────
   // Single listener, dispatches on `currentView`. See docs/web-ui-improvements.md
   // Item 2 for the key map.
