@@ -1483,19 +1483,21 @@ fn parse_nav_toc(nav: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
                     if anchor_depth == 0 {
                         if let Some(href) = current_href.take() {
                             let clean_href = href.split('#').next().unwrap_or(&href).to_string();
-                            let chapter_index =
-                                href_to_index.get(&clean_href).copied().unwrap_or(0);
-                            let label = if current_label.is_empty() {
-                                format!("Chapter {}", chapter_index + 1)
-                            } else {
-                                current_label.clone()
-                            };
-                            entries.push(TocEntry {
-                                label,
-                                chapter_index: chapter_index as u32,
-                                play_order: format!("{}", chapter_index + 1), // Default simple play order
-                                children: vec![],
-                            });
+                            // Skip entries whose href resolves to no spine item —
+                            // coercing to index 0 relabels the real chapter 0.
+                            if let Some(&chapter_index) = href_to_index.get(&clean_href) {
+                                let label = if current_label.is_empty() {
+                                    format!("Chapter {}", chapter_index + 1)
+                                } else {
+                                    current_label.clone()
+                                };
+                                entries.push(TocEntry {
+                                    label,
+                                    chapter_index: chapter_index as u32,
+                                    play_order: format!("{}", chapter_index + 1), // Default simple play order
+                                    children: vec![],
+                                });
+                            }
                         }
                         in_anchor = false;
                     }
@@ -1599,13 +1601,16 @@ fn parse_ncx_toc(ncx: &str, href_to_index: &HashMap<String, usize>) -> Vec<TocEn
                                 .next()
                                 .unwrap_or(&state.src)
                                 .to_string();
-                            let chapter_index = href_to_index.get(&clean_src).copied().unwrap_or(0);
-                            entries.push(TocEntry {
-                                label: state.label,
-                                chapter_index: chapter_index as u32,
-                                play_order: format!("{}", chapter_index + 1), // Default simple play order
-                                children: vec![],
-                            });
+                            // Skip entries whose src resolves to no spine item —
+                            // coercing to index 0 relabels the real chapter 0.
+                            if let Some(&chapter_index) = href_to_index.get(&clean_src) {
+                                entries.push(TocEntry {
+                                    label: state.label,
+                                    chapter_index: chapter_index as u32,
+                                    play_order: format!("{}", chapter_index + 1), // Default simple play order
+                                    children: vec![],
+                                });
+                            }
                         }
                     }
                 }
@@ -2569,6 +2574,120 @@ pub(crate) mod tests {
         let entries = parse_ncx_toc(ncx, &toc_href_index());
         let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, vec!["Tom & Jerry", "Résumé <draft>"]);
+    }
+
+    // ---- Unresolvable TOC hrefs must be skipped, not coerced to chapter 0 ----
+    //
+    // A TOC entry whose href matches no spine item (a broken/hostile EPUB, or a
+    // mid-document anchor into a non-spine file) must not be emitted at all.
+    // The old `unwrap_or(0)` turned it into a phantom entry pointing at chapter
+    // 0, which a label-overlay consumer then used to relabel the real chapter 0.
+
+    #[test]
+    fn test_parse_nav_toc_skips_unresolvable_href() {
+        let nav = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="toc">
+      <ol>
+        <li><a href="ch0.xhtml">Real Chapter</a></li>
+        <li><a href="ghost.xhtml">Ghost Chapter</a></li>
+      </ol>
+    </nav>
+  </body>
+</html>"#;
+
+        let entries = parse_nav_toc(nav, &toc_href_index());
+        assert_eq!(
+            entries.len(),
+            1,
+            "unresolvable href must be skipped, not emitted"
+        );
+        assert_eq!(entries[0].label, "Real Chapter");
+        assert_eq!(entries[0].chapter_index, 0);
+        assert!(
+            !entries.iter().any(|e| e.label == "Ghost Chapter"),
+            "stray label must not land on any entry"
+        );
+    }
+
+    #[test]
+    fn test_parse_ncx_toc_skips_unresolvable_src() {
+        let ncx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+    <navPoint id="n0" playOrder="1">
+      <navLabel><text>Real Chapter</text></navLabel>
+      <content src="ch0.xhtml"/>
+    </navPoint>
+    <navPoint id="nX" playOrder="2">
+      <navLabel><text>Ghost Chapter</text></navLabel>
+      <content src="ghost.xhtml"/>
+    </navPoint>
+  </navMap>
+</ncx>"#;
+
+        let entries = parse_ncx_toc(ncx, &toc_href_index());
+        assert_eq!(
+            entries.len(),
+            1,
+            "unresolvable src must be skipped, not emitted"
+        );
+        assert_eq!(entries[0].label, "Real Chapter");
+        assert_eq!(entries[0].chapter_index, 0);
+        assert!(
+            !entries.iter().any(|e| e.label == "Ghost Chapter"),
+            "stray label must not land on any entry"
+        );
+    }
+
+    // ---- Guard against over-skipping: every resolvable entry survives, mapped
+    //      to its real spine index. ----
+
+    #[test]
+    fn test_parse_nav_toc_keeps_all_resolvable_entries() {
+        let nav = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="toc">
+      <ol>
+        <li><a href="ch0.xhtml">First</a></li>
+        <li><a href="ch1.xhtml">Second</a></li>
+      </ol>
+    </nav>
+  </body>
+</html>"#;
+
+        let entries = parse_nav_toc(nav, &toc_href_index());
+        let mapped: Vec<(&str, u32)> = entries
+            .iter()
+            .map(|e| (e.label.as_str(), e.chapter_index))
+            .collect();
+        assert_eq!(mapped, vec![("First", 0), ("Second", 1)]);
+    }
+
+    #[test]
+    fn test_parse_ncx_toc_keeps_all_resolvable_entries() {
+        let ncx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <navMap>
+    <navPoint id="n0" playOrder="1">
+      <navLabel><text>First</text></navLabel>
+      <content src="ch0.xhtml"/>
+    </navPoint>
+    <navPoint id="n1" playOrder="2">
+      <navLabel><text>Second</text></navLabel>
+      <content src="ch1.xhtml"/>
+    </navPoint>
+  </navMap>
+</ncx>"#;
+
+        let entries = parse_ncx_toc(ncx, &toc_href_index());
+        let mapped: Vec<(&str, u32)> = entries
+            .iter()
+            .map(|e| (e.label.as_str(), e.chapter_index))
+            .collect();
+        assert_eq!(mapped, vec![("First", 0), ("Second", 1)]);
     }
 
     // ---- Attribute-flood bounds (RUSTSEC-2026-0194) ----
