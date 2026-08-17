@@ -31,6 +31,8 @@
 mod tests {
     const RELEASE_YML: &str = include_str!("../../.github/workflows/release.yml");
     const CI_YML: &str = include_str!("../../.github/workflows/ci.yml");
+    const MACOS_OPEN_HELPER: &str = include_str!("../../packaging/macos/Open Carrel.command");
+    const MACOS_README: &str = include_str!("../../packaging/macos/Read Me First.txt");
 
     /// Pull the value of `LIBMOBI_VERSION:` out of a workflow file.
     /// We deliberately *don't* depend on a YAML crate — the only
@@ -308,6 +310,46 @@ mod tests {
             "release.yml must export `LIBMOBI_STATIC` so carrel-core/build.rs \
              links the from-source `libmobi.a` statically on macOS instead of \
              a dylib."
+        );
+    }
+
+    #[test]
+    fn macos_dmg_includes_first_run_help() {
+        let needle = "Add first-run help to macOS DMG";
+        let after = RELEASE_YML
+            .split_once(needle)
+            .unwrap_or_else(|| panic!("release.yml must include a `{needle}` step"))
+            .1;
+        // Char-wise, not `&after[..900]`: the workflow contains non-ASCII
+        // (em dashes in the release body), and a byte slice that lands
+        // mid-codepoint panics instead of failing the assertion.
+        let window: String = after.chars().take(1200).collect();
+
+        assert!(
+            window.contains("matrix.platform == 'macos-latest'"),
+            "the first-run helper must only be added to macOS artifacts"
+        );
+        assert!(
+            window.contains("./scripts/add-macos-dmg-help.sh"),
+            "the macOS release step must inject the version-controlled help files"
+        );
+        assert!(
+            window.contains("find target") && !window.contains("find src-tauri/target"),
+            "the Cargo workspace writes Tauri bundles under the root target directory"
+        );
+        assert!(
+            window.contains("gh release upload") && window.contains("--clobber"),
+            "the enhanced DMG must replace tauri-action's original release asset"
+        );
+        assert!(
+            MACOS_OPEN_HELPER.contains("xattr -cr \"$APP\"")
+                && MACOS_OPEN_HELPER.contains("APP=\"/Applications/Carrel.app\""),
+            "the included helper must run the documented xattr command against Carrel only"
+        );
+        assert!(
+            MACOS_README.contains("xattr -cr /Applications/Carrel.app")
+                && MACOS_README.contains("Open Carrel.command"),
+            "the DMG read-me must document both the helper and manual Terminal fallback"
         );
     }
 }

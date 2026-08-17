@@ -5,6 +5,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **The macOS disk image now includes a first-run helper.** Due to macOS
+  security policy, the first launch could be blocked with a "damaged" or
+  "unidentified developer" message even though the download was intact. The
+  DMG now ships **Read Me First.txt** and **Open Carrel.command** alongside
+  Carrel.app: drag Carrel into Applications, double-click the helper, and it
+  performs the required setup and opens the app. The read-me also documents
+  the equivalent Terminal command for anyone who prefers to run it manually.
+
 ## [3.0.5] - 2026-08-06
 
 ### Fixed

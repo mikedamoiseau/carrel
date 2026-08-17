@@ -193,19 +193,18 @@ Pre-built binaries are available on the [GitHub Releases page](https://github.co
 
 ### macOS
 
-Open the `.dmg`, drag **Carrel.app** to **Applications**, then launch it.
+Open the `.dmg`, drag **Carrel.app** to **Applications**, then read **Read Me First.txt** in the DMG.
 
 #### macOS Gatekeeper: "damaged" / "unidentified developer" warning
 
-Because Carrel is not currently notarized with an Apple Developer certificate, macOS may block it on first launch.
+Due to macOS security policy, macOS may block Carrel on first launch even though the download is intact. The helper included in the DMG takes care of the required setup.
 
-**Recommended — right-click to open (no Terminal):**
+**Recommended — included helper:**
 
-1. In **Applications**, right-click (or Control-click) **Carrel.app**.
-2. Choose **Open** from the menu.
-3. In the dialog, click **Open** again.
+1. Drag **Carrel.app** from the DMG into **Applications**.
+2. Double-click **Open Carrel.command** in the DMG.
 
-This is only needed the first time. macOS remembers the choice, and afterwards you can launch Carrel normally. On macOS 15 (Sequoia) and later, if there is no **Open** option in the right-click menu, double-click the app once, then go to **System Settings → Privacy & Security** and click **Open Anyway**.
+The helper runs the command below and then launches Carrel. Only run it from a DMG downloaded from Carrel's official GitHub Releases page. This is normally needed once after each installation or update.
 
 **Alternative — clear the quarantine flag from Terminal:**
 
