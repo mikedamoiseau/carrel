@@ -57,8 +57,16 @@ mkdir -p "${FIXTURES_DIR}"
 # functionally by `cargo test -p carrel-core --features mobi`, whose
 # fixture-gated KF8 tests all pass against it. `pg11.mobi` (legacy v6) was
 # unchanged and keeps its original hash.
+#
+# 2026-08-17: reissued again (now 256060 bytes). Same verification as above,
+# same result — PalmDB name `Alice's_Adventures_in_Wonderlan`, BOOK/MOBI,
+# MOBI header file-version **8**, Carroll/Alice/Wonderland in the body, and
+# the fixture-gated KF8 tests green against it. `pg11.mobi` is still byte-
+# identical to its original pin, which is the useful signal here: only the
+# KF8 rendition is being regenerated upstream, so expect this hash to keep
+# moving and re-run the verification each time rather than repinning blind.
 declare -a FILES=(
-  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|816d542bb9396c53b0c8fb6215aee7145ebc935af9a7c68533103ea8e0f0a4c0"
+  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|fffee390f393ecf004f65c7fcd2cbefb3ee2652ff6f3fa8daa09c8a9a5644df0"
   "alice-legacy.mobi|https://www.gutenberg.org/cache/epub/11/pg11.mobi|c6de8f83459904177eac2623aa653ef57483ed6968078c8fc3d3171f20e06408"
 )
 
