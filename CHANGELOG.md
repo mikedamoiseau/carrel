@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.6] - 2026-08-17
+
 ### Added
 - **The macOS disk image now includes a first-run helper.** Due to macOS
   security policy, the first launch could be blocked with a "damaged" or
