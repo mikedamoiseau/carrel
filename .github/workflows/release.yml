@@ -192,8 +192,13 @@ jobs:
           # without any runtime DLL dependency. This avoids the
           # Tauri-bundler complications of placing a DLL where the
           # OS loader will find it next to the installed binary.
+          # No `-G` — see the matching step in ci.yml. The generator is
+          # left to CMake (newest installed Visual Studio) because the
+          # runner image, not this workflow, owns the VS version: the
+          # `windows-2025-vs2026` image rollout on 2026-08-17 dropped
+          # VS 2022 and broke the pinned `-G "Visual Studio 17 2022"`.
           cmake -B $build -S $src `
-            -G "Visual Studio 17 2022" -A x64 `
+            -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=OFF `
             -DUSE_LIBXML2=OFF `

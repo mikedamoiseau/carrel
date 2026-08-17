@@ -273,8 +273,18 @@ jobs:
           # MSVC regressions in the static-link path are caught here
           # before tag-push. See `windows_libmobi_build_is_static`
           # in src-tauri/src/release_workflow_test.rs for rationale.
+          # No `-G`: the generator is deliberately left to CMake, which
+          # selects the newest Visual Studio it finds. Pinning it broke
+          # the build on 2026-08-17, when `windows-latest` moved to the
+          # `windows-2025-vs2026` image — VS 2022 is gone from it, so
+          # `-G "Visual Studio 17 2022"` failed configure with "could not
+          # find any instance of Visual Studio". The runner image owns the
+          # VS version; hard-coding it here just re-arms that trap on the
+          # next image bump. `-A x64` stays because it is valid for every
+          # VS generator, and the `$build\src\Release\mobi.lib` assertion
+          # below fails loudly if a non-MSBuild generator is ever picked.
           cmake -B $build -S $src `
-            -G "Visual Studio 17 2022" -A x64 `
+            -A x64 `
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=OFF `
             -DUSE_LIBXML2=OFF `
