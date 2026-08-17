@@ -385,9 +385,36 @@ jobs:
           releaseBody: |
             See the assets below to download and install this version.
 
-            > **macOS note:** Because this app is not notarized, macOS Gatekeeper may show a "damaged" or "unidentified developer" warning. See the [installation guide](https://github.com/mikedamoiseau/carrel/blob/main/docs/USER_GUIDE.md#installing) for the one-line fix.
+            > **macOS note:** Due to macOS security policy, the first launch may show a "damaged" or "unidentified developer" warning even though the download is intact. The DMG includes **Read Me First.txt** and **Open Carrel.command** to take care of the required setup, or see the [installation guide](https://github.com/mikedamoiseau/carrel/blob/main/docs/USER_GUIDE.md#installing) for the Terminal command.
             >
             > **MOBI / AZW / AZW3 support:** MOBI import is included on Linux, arm64 macOS, and Windows. The arm64 macOS and Windows builds statically link libmobi, so no extra install is needed. Linux dynamically links against libmobi — install it before first MOBI open with `sudo apt install libmobi0` (Debian / Ubuntu). EPUB / PDF / CBZ / CBR do not need libmobi. The x86_64 (Intel) macOS build does not include MOBI support — use a different format on that platform.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      # Tauri's DMG configuration has no option for arbitrary top-level
+      # files. Rebuild each macOS DMG with the version-controlled first-run
+      # helper and read-me, then replace the asset tauri-action just uploaded.
+      # This stays out of Carrel.app itself (which cannot run until Gatekeeper
+      # lets it launch) and out of the Windows/Linux packages entirely.
+      - name: Add first-run help to macOS DMG
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Passed as environment values, never interpolated into the script
+          # body: a tag name is attacker-chosen text as far as the shell is
+          # concerned, and `${{ }}` inside `run:` is textual substitution.
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          dmg_count="$(find target -type f -path '*/release/bundle/dmg/*.dmg' | wc -l | tr -d ' ')"
+          if [[ "$dmg_count" != "1" ]]; then
+            echo "Expected exactly one macOS DMG, found $dmg_count" >&2
+            exit 1
+          fi
+          dmg_path="$(find target -type f -path '*/release/bundle/dmg/*.dmg' -print -quit)"
+          ./scripts/add-macos-dmg-help.sh "$dmg_path"
+          gh release upload "$RELEASE_TAG" "$dmg_path" \
+            --repo "$RELEASE_REPO" --clobber

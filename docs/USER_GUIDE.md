@@ -56,15 +56,15 @@ Go to the [GitHub Releases page](https://github.com/mikedamoiseau/carrel/release
 
 ### Installing
 
-**macOS:** Open the `.dmg`, drag Carrel into your Applications folder, then double-click to launch it.
+**macOS:** Open the `.dmg` and drag Carrel into your Applications folder. Read **Read Me First.txt** in the DMG before launching.
 
 > **macOS Gatekeeper — "damaged" or "unidentified developer" warning**
 >
-> Because this app is not notarized, macOS 14 (Sonoma) and later may block it with a _"Carrel.app is damaged and can't be opened"_ message.
+> Due to macOS security policy, macOS may block Carrel with a _"Carrel.app is damaged and can't be opened"_ message even though the download is intact. The helper included in the DMG takes care of the required setup.
 >
-> **Fix (recommended, no Terminal):** in Applications, right-click (Control-click) **Carrel.app**, choose **Open**, then click **Open** again in the dialog. On macOS 15 (Sequoia) and later, if there is no **Open** option, double-click once, then open **System Settings → Privacy & Security** and click **Open Anyway**. Only needed the first time — macOS remembers the choice.
+> **Fix (recommended):** after copying Carrel to Applications, double-click **Open Carrel.command** in the DMG. A Terminal window opens briefly, clears the attributes that block the app, and launches Carrel. Only run the helper from Carrel's official GitHub release.
 >
-> **Alternative (Terminal):** run `xattr -cr /Applications/Carrel.app`, then launch normally. This removes the quarantine flag and only needs to be done once after each install or update.
+> **Manual alternative:** open Terminal and run `xattr -cr /Applications/Carrel.app`, then launch normally. This is the exact command used by the helper and only needs to be done once after each install or update.
 
 **Windows:** Run the `.msi` installer and follow the prompts.
 
@@ -1135,7 +1135,7 @@ If you do not need MOBI support, use the Intel (x86_64) macOS release build — 
 
 Check that your OS meets the minimum version listed in [Getting Started](#1-getting-started).
 
-**macOS — "damaged and can't be opened" or "unidentified developer":** This is a Gatekeeper quarantine flag on unsigned apps. Easiest fix: right-click (Control-click) **Carrel.app** in Applications, choose **Open**, then click **Open** again. Or, after a blocked launch, go to **System Settings > Privacy & Security** and click **Open Anyway**. If neither works, clear the flag from Terminal and try launching again:
+**macOS — "damaged and can't be opened" or "unidentified developer":** Due to macOS security policy, the first launch may be blocked even though the download is intact. After copying Carrel to Applications, double-click **Open Carrel.command** in the DMG. The helper takes care of the required setup and launches Carrel. If the helper does not run, use Terminal:
 
 ```bash
 xattr -cr /Applications/Carrel.app
