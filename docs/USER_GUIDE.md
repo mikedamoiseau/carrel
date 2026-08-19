@@ -60,11 +60,9 @@ Go to the [GitHub Releases page](https://github.com/mikedamoiseau/carrel/release
 
 > **macOS Gatekeeper — "damaged" or "unidentified developer" warning**
 >
-> Due to macOS security policy, macOS may block Carrel with a _"Carrel.app is damaged and can't be opened"_ message even though the download is intact. The helper included in the DMG takes care of the required setup.
+> Due to macOS security policy, macOS may block Carrel with a _"Carrel.app is damaged and can't be opened"_ message even though the download is intact.
 >
-> **Fix (recommended):** after copying Carrel to Applications, double-click **Open Carrel.command** in the DMG. A Terminal window opens briefly, clears the attributes that block the app, and launches Carrel. Only run the helper from Carrel's official GitHub release.
->
-> **Manual alternative:** open Terminal and run `xattr -cr /Applications/Carrel.app`, then launch normally. This is the exact command used by the helper and only needs to be done once after each install or update.
+> **Fix:** open Terminal and run `xattr -cr /Applications/Carrel.app`, then launch normally. The command clears the quarantine flag, needs no sudo, and only needs to be run once after each install or update. It is also documented in **Read Me First.txt** inside the DMG. Only do this for a DMG downloaded from Carrel's official GitHub release.
 
 **Windows:** Run the `.msi` installer and follow the prompts.
 
@@ -1135,7 +1133,7 @@ If you do not need MOBI support, use the Intel (x86_64) macOS release build — 
 
 Check that your OS meets the minimum version listed in [Getting Started](#1-getting-started).
 
-**macOS — "damaged and can't be opened" or "unidentified developer":** Due to macOS security policy, the first launch may be blocked even though the download is intact. After copying Carrel to Applications, double-click **Open Carrel.command** in the DMG. The helper takes care of the required setup and launches Carrel. If the helper does not run, use Terminal:
+**macOS — "damaged and can't be opened" or "unidentified developer":** Due to macOS security policy, the first launch may be blocked even though the download is intact. After copying Carrel to Applications, clear the quarantine flag from Terminal and launch again:
 
 ```bash
 xattr -cr /Applications/Carrel.app

@@ -197,22 +197,16 @@ Open the `.dmg`, drag **Carrel.app** to **Applications**, then read **Read Me Fi
 
 #### macOS Gatekeeper: "damaged" / "unidentified developer" warning
 
-Due to macOS security policy, macOS may block Carrel on first launch even though the download is intact. The helper included in the DMG takes care of the required setup.
-
-**Recommended — included helper:**
+Due to macOS security policy, macOS may block Carrel on first launch even though the download is intact. One Terminal command fixes it:
 
 1. Drag **Carrel.app** from the DMG into **Applications**.
-2. Double-click **Open Carrel.command** in the DMG.
-
-The helper runs the command below and then launches Carrel. Only run it from a DMG downloaded from Carrel's official GitHub Releases page. This is normally needed once after each installation or update.
-
-**Alternative — clear the quarantine flag from Terminal:**
+2. Open **Terminal** and run:
 
 ```bash
 xattr -cr /Applications/Carrel.app
 ```
 
-Then launch the app normally.
+Then launch the app normally. The command clears the quarantine flag; it needs no sudo and touches nothing else. This is normally needed once after each installation or update, and is also documented in **Read Me First.txt** inside the DMG. Only do this for a DMG downloaded from Carrel's official GitHub Releases page.
 
 #### macOS SMB shares: import fails for accented filenames
 

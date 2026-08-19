@@ -385,7 +385,7 @@ jobs:
           releaseBody: |
             See the assets below to download and install this version.
 
-            > **macOS note:** Due to macOS security policy, the first launch may show a "damaged" or "unidentified developer" warning even though the download is intact. The DMG includes **Read Me First.txt** and **Open Carrel.command** to take care of the required setup, or see the [installation guide](https://github.com/mikedamoiseau/carrel/blob/main/docs/USER_GUIDE.md#installing) for the Terminal command.
+            > **macOS note:** Due to macOS security policy, the first launch may show a "damaged" or "unidentified developer" warning even though the download is intact. The DMG includes **Read Me First.txt** with the one-line Terminal fix, also covered in the [installation guide](https://github.com/mikedamoiseau/carrel/blob/main/docs/USER_GUIDE.md#installing).
             >
             > **MOBI / AZW / AZW3 support:** MOBI import is included on Linux, arm64 macOS, and Windows. The arm64 macOS and Windows builds statically link libmobi, so no extra install is needed. Linux dynamically links against libmobi — install it before first MOBI open with `sudo apt install libmobi0` (Debian / Ubuntu). EPUB / PDF / CBZ / CBR do not need libmobi. The x86_64 (Intel) macOS build does not include MOBI support — use a different format on that platform.
           releaseDraft: false
@@ -394,9 +394,11 @@ jobs:
 
       # Tauri's DMG configuration has no option for arbitrary top-level
       # files. Rebuild each macOS DMG with the version-controlled first-run
-      # helper and read-me, then replace the asset tauri-action just uploaded.
-      # This stays out of Carrel.app itself (which cannot run until Gatekeeper
-      # lets it launch) and out of the Windows/Linux packages entirely.
+      # read-me, then replace the asset tauri-action just uploaded. A plain
+      # text file only: an executable helper shipped in 3.0.6 was itself
+      # blocked by Gatekeeper (quarantine is inherited from the downloaded
+      # DMG, and unsigned items have no right-click Open override on
+      # macOS 15+), so without notarization nothing we ship can run.
       - name: Add first-run help to macOS DMG
         if: matrix.platform == 'macos-latest'
         shell: bash

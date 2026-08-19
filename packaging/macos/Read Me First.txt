@@ -2,36 +2,30 @@ CARREL FOR macOS — READ ME FIRST
 ================================
 
 Due to macOS security policy, macOS may say that Carrel is "damaged" or
-cannot be opened even though the download is intact. The included helper
-takes care of the required setup for you.
+cannot be opened even though the download is intact. One Terminal command
+fixes it.
 
 INSTALL CARREL
 --------------
 
 1. Drag Carrel.app into the Applications folder.
-2. Double-click "Open Carrel.command" in this disk image.
-
-A Terminal window will open briefly. The helper removes the macOS extended
-attributes that block Carrel, then launches the app. You normally need to do
-this only once after each installation or update.
-
-MANUAL METHOD
--------------
-
-If the helper does not run, open the Terminal app, paste this command, and
-press Return:
+2. Open the Terminal app (Applications > Utilities > Terminal, or search
+   for "Terminal" with Spotlight).
+3. Paste this command and press Return:
 
     xattr -cr /Applications/Carrel.app
 
-Then open Carrel normally from Applications.
+4. Open Carrel normally from Applications.
 
-The helper runs that exact command. It does not require sudo, change system
-security settings, connect to the internet, or modify any other application.
+The command removes the macOS extended attributes that block Carrel. It
+does not require sudo, change system security settings, connect to the
+internet, or modify any other application. You normally need to do this
+only once after each installation or update.
 
 SECURITY NOTE
 -------------
 
-Only use the helper with a Carrel DMG downloaded from the project's official
+Only do this for a Carrel DMG downloaded from the project's official
 GitHub Releases page:
 
     https://github.com/mikedamoiseau/carrel/releases

@@ -31,7 +31,6 @@
 mod tests {
     const RELEASE_YML: &str = include_str!("../../.github/workflows/release.yml");
     const CI_YML: &str = include_str!("../../.github/workflows/ci.yml");
-    const MACOS_OPEN_HELPER: &str = include_str!("../../packaging/macos/Open Carrel.command");
     const MACOS_README: &str = include_str!("../../packaging/macos/Read Me First.txt");
 
     /// Pull the value of `LIBMOBI_VERSION:` out of a workflow file.
@@ -327,7 +326,7 @@ mod tests {
 
         assert!(
             window.contains("matrix.platform == 'macos-latest'"),
-            "the first-run helper must only be added to macOS artifacts"
+            "the first-run read-me must only be added to macOS artifacts"
         );
         assert!(
             window.contains("./scripts/add-macos-dmg-help.sh"),
@@ -342,14 +341,18 @@ mod tests {
             "the enhanced DMG must replace tauri-action's original release asset"
         );
         assert!(
-            MACOS_OPEN_HELPER.contains("xattr -cr \"$APP\"")
-                && MACOS_OPEN_HELPER.contains("APP=\"/Applications/Carrel.app\""),
-            "the included helper must run the documented xattr command against Carrel only"
+            MACOS_README.contains("xattr -cr /Applications/Carrel.app"),
+            "the DMG read-me must document the exact Terminal command"
         );
+        // Gatekeeper blocks any unsigned executable shipped in a downloaded
+        // DMG (quarantine is inherited; macOS 15+ has no right-click Open
+        // override), so the DMG must stay executable-free: 3.0.6's
+        // "Open Carrel.command" helper was blocked by the very dialog it
+        // existed to avoid.
         assert!(
-            MACOS_README.contains("xattr -cr /Applications/Carrel.app")
-                && MACOS_README.contains("Open Carrel.command"),
-            "the DMG read-me must document both the helper and manual Terminal fallback"
+            !MACOS_README.contains(".command") && !RELEASE_YML.contains("Open Carrel.command"),
+            "no executable helper may be shipped in (or promised by) the DMG — \
+             Gatekeeper blocks unsigned executables inherited from a quarantined DMG"
         );
     }
 }

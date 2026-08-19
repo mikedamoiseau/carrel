@@ -1,9 +1,13 @@
 #!/bin/bash
 
-# Rebuild a Tauri-generated Carrel DMG with the first-run helper and read-me
-# at its top level. This runs only on the macOS release jobs, after Tauri has
-# created its normal DMG and before the enhanced copy replaces the release
-# asset on GitHub.
+# Rebuild a Tauri-generated Carrel DMG with the first-run read-me at its top
+# level. (An executable "Open Carrel.command" helper shipped in 3.0.6 and was
+# removed again: files inside a downloaded DMG inherit its quarantine flag, and
+# macOS 15+ offers no right-click -> Open override for unsigned items, so
+# Gatekeeper blocked the helper with only "Move to Trash" -- the exact dialog
+# it existed to avoid. Without notarization, no executable we ship can run.)
+# This runs only on the macOS release jobs, after Tauri has created its normal
+# DMG and before the enhanced copy replaces the release asset on GitHub.
 
 set -euo pipefail
 
@@ -34,15 +38,12 @@ dmg_dir="$(cd "$(dirname "$input_dmg")" && pwd)"
 dmg_path="$dmg_dir/$(basename "$input_dmg")"
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 assets_dir="$repo_root/packaging/macos"
-helper="$assets_dir/Open Carrel.command"
 readme="$assets_dir/Read Me First.txt"
 
-for asset in "$helper" "$readme"; do
-  if [[ ! -f "$asset" ]]; then
-    echo "Required DMG asset not found: $asset" >&2
-    exit 1
-  fi
-done
+if [[ ! -f "$readme" ]]; then
+  echo "Required DMG asset not found: $readme" >&2
+  exit 1
+fi
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/carrel-dmg.XXXXXX")"
 source_mount="$work_dir/source-volume"
@@ -70,7 +71,7 @@ ditto "$source_mount" "$staging"
 hdiutil detach "$source_mount" -quiet
 source_attached=false
 
-# Drop the Finder aesthetics rather than trying to extend them to four items.
+# Drop the Finder aesthetics rather than trying to extend them to the read-me.
 # Tauri bundles create-dmg's bundle_dmg.sh, where icon positions and the
 # window background are applied *only* by an `osascript` step — and Tauri
 # passes create-dmg's `--skip-jenkins` whenever it detects CI (unless
@@ -78,15 +79,13 @@ source_attached=false
 # DMG arrives with an unarranged window and a .background image that was
 # never wired up; there is no designed layout here to preserve. A local
 # `tauri build` on a GUI session *does* arrange it, and this discards that —
-# deliberately, since positioning four items would mean either driving Finder
-# ourselves (the flakiness upstream added the flag for) or writing .DS_Store
-# by hand. Let Finder auto-arrange all four top-level items instead.
+# deliberately, since positioning the extra item would mean either driving
+# Finder ourselves (the flakiness upstream added the flag for) or writing
+# .DS_Store by hand. Let Finder auto-arrange the top-level items instead.
 rm -f "$staging/.DS_Store"
 rm -rf "$staging/.background"
 
-ditto "$helper" "$staging/Open Carrel.command"
 ditto "$readme" "$staging/Read Me First.txt"
-chmod 755 "$staging/Open Carrel.command"
 
 echo "Creating enhanced DMG..."
 hdiutil create -srcfolder "$staging" -volname "Carrel" -fs HFS+ \
