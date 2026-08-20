@@ -428,6 +428,16 @@ is disabled until a word's next review date comes around.
 > dictionary or the source book. Turning the setting back off stops saving new
 > words but keeps everything you've already collected.
 
+**Web reader:** tap the 📚 button in the reader toolbar (next to Highlights) to
+open a drawer of the words you've saved from the book you're currently
+reading — each row shows the word, its part of speech, definition, chapter,
+and save date. Tap a row to jump back to where you looked it up, or ✕ to
+delete it. Like highlights, the drawer reads from your Carrel server, so it
+needs a connection — an offline-saved book still lists its words whenever
+you're back on the same network. The drawer is book-scoped for now; a
+cross-book Vocabulary screen and flashcard review for the web reader, matching
+the desktop features described above, are planned for a future update.
+
 ### Returning to the library
 
 Click the back arrow in the top-left corner or press `Escape`. Your progress is saved when you exit, unless "Don't track this session" is on.

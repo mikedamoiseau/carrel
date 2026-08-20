@@ -123,6 +123,10 @@
   let bookmarkPanelOpen = false;
   // Whether the highlights drawer is open. Same lifecycle as above.
   let hlPanelOpen = false;
+  // Whether the saved-words (vocabulary) drawer is open. Same lifecycle as
+  // above, but this one ALSO closes on ordinary navigation (route change),
+  // not just chrome rebuild — see the route() backstop.
+  let vocabPanelOpen = false;
   // True while an inline note editor is open in the highlights drawer —
   // opportunistic re-renders must skip while set (see bookmarkRenaming).
   let hlNoteEditing = false;
@@ -133,6 +137,13 @@
   // Bookmarks for the current book: { bookId, loaded, items }. Fetched lazily
   // on first panel open; cleared on every chrome (re)build.
   let bookmarksState = null;
+  // Saved words (vocabulary) for the current book: { bookId, items, loaded,
+  // failed }. Fetched lazily on first panel open (bookmark precedent), and
+  // re-fetched on every open (unlike bookmarks/highlights, a word can be
+  // saved from the Define popover elsewhere while the drawer sits unopened,
+  // so there is no "already loaded" short-circuit). Reset on every chrome
+  // (re)build.
+  let vocabState = { bookId: null, items: [], loaded: false, failed: false };
 
   const TYPO_FAMILY_ORDER = ["lora", "literata", "dm-sans", "opendyslexic"];
   const TYPO_FAMILY_LABELS = {
@@ -1380,6 +1391,10 @@
     // over the next view (Backspace-goBack reaches here without the Esc
     // branch's popover check, and browser back skips keydown entirely).
     closeDefinePopover();
+    // Unlike the highlights/bookmarks/TOC drawers (which persist across a
+    // same-book chapter turn), the saved-words drawer closes on ANY
+    // navigation — same transience as the Define popover above.
+    if (vocabPanelOpen) closeVocabPanel(false);
     const gen = ++routeGen;
     const hash = rawHash();
     // Highlight-jump backstop (spec §4): ANY navigation that isn't the jump's
@@ -1389,6 +1404,8 @@
     // bookmarks, close) clear it themselves; this catches history/back, nav
     // icons, login round-trips, and direct hash edits.
     if (pendingHlJump && hlJumpNavId !== pendingHlJump.navId) clearHlJump();
+    // Same backstop for a pending vocabulary jump.
+    if (pendingVocabJump && vocabJumpNavId !== pendingVocabJump.navId) clearVocabJump();
     // Offline: only a SAVED book's detail/reader work (their content is
     // served from the M2 cache). Everything else — a top-level destination
     // (library/stats/collections, none of which have offline data) OR a
@@ -3460,11 +3477,11 @@
     // Every ordinary navigation cancels a pending highlight jump (spec §4) —
     // startHlJump's own navigation calls gotoReaderIndex directly, not these.
     return {
-      next: () => { clearHlJump(); gotoReaderIndex(readerState.index + 1); },
-      prev: () => { clearHlJump(); gotoReaderIndex(readerState.index - 1); },
-      first: () => { clearHlJump(); gotoReaderIndex(0); },
-      last: () => { clearHlJump(); gotoReaderIndex(readerState.count - 1); },
-      goBack: () => { clearHlJump(); navigate("#/book/" + id); },
+      next: () => { clearHlJump(); clearVocabJump(); gotoReaderIndex(readerState.index + 1); },
+      prev: () => { clearHlJump(); clearVocabJump(); gotoReaderIndex(readerState.index - 1); },
+      first: () => { clearHlJump(); clearVocabJump(); gotoReaderIndex(0); },
+      last: () => { clearHlJump(); clearVocabJump(); gotoReaderIndex(readerState.count - 1); },
+      goBack: () => { clearHlJump(); clearVocabJump(); navigate("#/book/" + id); },
       toggleChrome: () => {
         readerState.chromeHidden = !readerState.chromeHidden;
         applyChromeVisibility();
@@ -3496,6 +3513,7 @@
     if (readerState.chromeHidden && tocPanelOpen) closeTocPanel(false);
     if (readerState.chromeHidden && bookmarkPanelOpen) closeBookmarkPanel(false);
     if (readerState.chromeHidden && hlPanelOpen) closeHlPanel(false);
+    if (readerState.chromeHidden && vocabPanelOpen) closeVocabPanel(false);
     // Showing/hiding the chrome rows resizes the stage without a window
     // resize event — re-clamp a zoomed pan against the new bounds so no
     // gap opens at an edge.
@@ -4182,6 +4200,7 @@
     if (tocPanelOpen) closeTocPanel(false); // only one bottom-chrome panel open
     if (bookmarkPanelOpen) closeBookmarkPanel(false);
     if (hlPanelOpen) closeHlPanel(false);
+    if (vocabPanelOpen) closeVocabPanel(false);
     renderTypoPanelState();
     panel.hidden = false;
     btn.setAttribute("aria-expanded", "true");
@@ -4412,6 +4431,7 @@
     if (typoPanelOpen) closeTypoPanel(false); // only one bottom-chrome panel open
     if (bookmarkPanelOpen) closeBookmarkPanel(false);
     if (hlPanelOpen) closeHlPanel(false);
+    if (vocabPanelOpen) closeVocabPanel(false);
     renderTocList();
     panel.classList.add("open");
     btn.setAttribute("aria-expanded", "true");
@@ -4438,6 +4458,7 @@
         idx = Math.min(Math.max(idx, 0), readerState.count - 1);
         closeTocPanel(false);
         clearHlJump(); // a TOC jump supersedes any pending highlight jump
+        clearVocabJump(); // and any pending vocabulary jump
         gotoReaderIndex(idx, { instant: true });
       });
     // Arrow/Home/End/Space/f inside the open panel must not reach the global
@@ -4577,6 +4598,7 @@
     if (typoPanelOpen) closeTypoPanel(false);
     if (tocPanelOpen) closeTocPanel(false);
     if (hlPanelOpen) closeHlPanel(false);
+    if (vocabPanelOpen) closeVocabPanel(false);
     renderBookmarkList();
     panel.classList.add("open");
     btn.setAttribute("aria-expanded", "true");
@@ -4593,6 +4615,7 @@
     const idx = Math.min(Math.max(chapterIndex, 0), readerState.count - 1);
     closeBookmarkPanel(false);
     clearHlJump(); // a bookmark jump supersedes any pending highlight jump
+    clearVocabJump(); // and any pending vocabulary jump
     if (readerState.mode === "chapter" && idx === readerState.index) {
       restoreChapterScroll(scrollPosition);
     } else {
@@ -4798,6 +4821,7 @@
     tocPanelOpen = false;
     bookmarkPanelOpen = false;
     hlPanelOpen = false;
+    vocabPanelOpen = false;
     pendingReanchor = null;
     // A chapter turn rebuilds the chrome without a scroll event when the
     // stage was already at the top, so the scroll-dismiss path can't be
@@ -4829,6 +4853,15 @@
       ? ""
       : `<button id="hl-btn" aria-label="Highlights" aria-haspopup="dialog" aria-expanded="false">&#128397;</button>`;
     const hlPanel = mode === "page" ? "" : hlPanelHtml();
+    // Saved-words (vocabulary) control — chapter mode only, same format
+    // gating as highlights (words can only be captured from selectable
+    // text). Starts hidden: visibility additionally depends on the
+    // session-cached vocabularyAvailable() status, applied once it resolves
+    // (applyVocabButtonVisibility, called below and off ensureDictionaryStatus).
+    const vocabBtn = mode === "page"
+      ? ""
+      : `<button id="vocab-btn" aria-label="Saved words" aria-haspopup="dialog" aria-expanded="false" hidden>&#128218;</button>`;
+    const vocabPanel = mode === "page" ? "" : vocabPanelHtml();
 
     app().innerHTML = `
       <div class="${rootClass}" id="reader-root">
@@ -4851,11 +4884,13 @@
             ${fitToggleBtn}
             ${bookmarkBtn}
             ${hlBtn}
+            ${vocabBtn}
           </div>
           ${typoPanel}
           ${tocPanel}
           ${bookmarkPanel}
           ${hlPanel}
+          ${vocabPanel}
         </div>
         <button class="chrome-toggle-fab" id="chrome-toggle-btn" title="Toggle toolbar" aria-label="Toggle toolbar">&#8942;</button>
       </div>`;
@@ -4908,8 +4943,11 @@
       bindHighlightMarkTaps();
       // Define (M2): kick the session-cached status fetch on first entry into
       // a chapter-mode reader. Memoized — later book entries and chapter
-      // turns are no-ops once it resolves.
-      ensureDictionaryStatus();
+      // turns are no-ops once it resolves. The vocab-btn's visibility depends
+      // on this same status (vocabularyAvailable()), so re-apply it once the
+      // fetch lands — it may still be null on the very first book opened in a
+      // fresh session.
+      ensureDictionaryStatus().then(applyVocabButtonVisibility);
       // Web typography: apply saved font/spacing/family/width to the chapter
       // column once here (inline styles persist across chapter-turn innerHTML
       // swaps). EPUB + MOBI both reach this branch (mode !== "page").
@@ -4945,6 +4983,16 @@
       loadHighlightsForBook(readerState.id).then(() => {
         rerenderChapterHighlights();
       });
+    }
+
+    // Saved words: reset per book entry (mirrors highlightsState above).
+    // Fetched lazily on first panel open (bookmark precedent), not here.
+    vocabState = { bookId: null, items: [], loaded: false, failed: false };
+    clearVocabJump(); // book entry/switch: a stale pending jump must not survive
+    if (readerState.mode !== "page") {
+      wireVocabControls();
+      buildVocabTrigger();
+      applyVocabButtonVisibility();
     }
 
     applyChromeVisibility();
@@ -5144,6 +5192,7 @@
   function startHlJump(hl) {
     pendingHlJump = { bookId: highlightsState.bookId, hlId: hl.id, navId: ++hlNavCounter, arrived: false };
     syncHlJumpTestHook();
+    clearVocabJump(); // a highlight jump supersedes any pending vocabulary jump
     closeHlPanel(false);
     if (hl.chapterIndex === currentChapterIndex && readerState && currentChapterIndex === readerState.index) {
       // Same chapter: marks already injected — consume immediately (this
@@ -5213,6 +5262,331 @@
     // rerender in the fast-render-before-GET path) — keep that scroll; only
     // restore the pre-rebuild position when no jump moved us.
     if (stage && !jumped) stage.scrollTop = scrollTop;
+  }
+
+  // ── Saved words (vocabulary drawer, M4) ──────────────────────────────────
+  // Book-scoped view of `GET /api/vocabulary?bookId=`. Unlike highlights,
+  // words carry no on-screen `<mark>` — a row tap jumps by resolving the
+  // word's stored offsets against a fresh TreeWalker snapshot of the target
+  // chapter (see maybeConsumeVocabJump below), reusing the same pending-jump
+  // token pattern as highlights (startHlJump/maybeConsumeHlJump) rather than
+  // a timer.
+
+  function vocabPanelHtml() {
+    return `
+      <div class="vocab-panel" id="vocab-panel" role="dialog" aria-label="Saved words">
+        <div class="vocab-head">
+          <span class="vocab-title">Saved words</span>
+          <button id="vocab-close" class="vocab-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="vocab-list" id="vocab-list"></div>
+      </div>`;
+  }
+
+  function buildVocabTrigger() {
+    const btn = $("#vocab-btn");
+    if (!btn) return;
+    btn.addEventListener("keydown", containReaderKeys);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (vocabPanelOpen) closeVocabPanel(true);
+      else openVocabPanel();
+    });
+  }
+
+  // Shows/hides the toolbar button per the session-cached dictionary status
+  // (vocabularyAvailable()). Called synchronously at chrome build (status may
+  // already be cached from an earlier book this session) and again once
+  // ensureDictionaryStatus()'s fetch resolves (it may not be yet, for the
+  // first chapter-mode book opened in a fresh session).
+  function applyVocabButtonVisibility() {
+    const btn = $("#vocab-btn");
+    if (btn) btn.hidden = !vocabularyAvailable();
+  }
+
+  // Chapter label for a drawer row: TOC title when known, else "Chapter N"
+  // (same resolution as hlChapterLabel/bookmarkLabel) — null when the word
+  // carries no chapter at all (chapterIndex is nullable).
+  function vocabChapterLabel(word) {
+    if (word.chapterIndex === null || word.chapterIndex === undefined) return null;
+    if (readerState && Array.isArray(readerState.toc)) {
+      const entry = readerState.toc.find((e) => e.chapter_index === word.chapterIndex);
+      if (entry && entry.label) return entry.label;
+    }
+    return `Chapter ${word.chapterIndex + 1}`;
+  }
+
+  function renderVocabList() {
+    const list = $("#vocab-list");
+    if (!list) return;
+    // Online-only, like highlights (spec §5 precedent): a terminal GET
+    // failure gets its own message, never an empty list that reads as "none
+    // saved".
+    if (vocabState.failed && !vocabState.loaded) {
+      list.innerHTML = `<p class="vocab-empty">Saved words need a connection.</p>`;
+      return;
+    }
+    const items = vocabState.items;
+    if (!items.length) {
+      list.innerHTML = `<p class="vocab-empty">No saved words in this book yet.</p>`;
+      return;
+    }
+    list.innerHTML = items
+      .map((w) => {
+        const meta = [vocabChapterLabel(w), formatAddedDate(w.createdAt)].filter(Boolean).join(" · ");
+        return `
+      <div class="vocab-entry" data-id="${esc(w.id)}" tabindex="0" role="button">
+        <span class="vocab-entry-body">
+          <span class="vocab-entry-word"><strong>${esc(w.word)}</strong>${w.pos ? ` <span class="vocab-entry-pos">${esc(w.pos)}</span>` : ""}</span>
+          <span class="vocab-entry-def">${esc(w.definition)}</span>
+          ${meta ? `<span class="vocab-entry-meta">${esc(meta)}</span>` : ""}
+        </span>
+        <button class="vocab-entry-delete" data-id="${esc(w.id)}" aria-label="Delete saved word">&times;</button>
+      </div>`;
+      })
+      .join("");
+  }
+
+  function renderVocabListIfOpen() {
+    if (vocabPanelOpen) renderVocabList();
+  }
+
+  function closeVocabPanel(restoreFocus) {
+    const panel = $("#vocab-panel");
+    const btn = $("#vocab-btn");
+    if (panel) panel.classList.remove("open");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    vocabPanelOpen = false;
+    if (restoreFocus && btn) btn.focus();
+  }
+
+  function openVocabPanel() {
+    const panel = $("#vocab-panel");
+    const btn = $("#vocab-btn");
+    if (!panel || !btn || !readerState) return;
+    // Mutual exclusion with the other bottom-chrome panels.
+    if (typoPanelOpen) closeTypoPanel(false);
+    if (tocPanelOpen) closeTocPanel(false);
+    if (bookmarkPanelOpen) closeBookmarkPanel(false);
+    if (hlPanelOpen) closeHlPanel(false);
+    renderVocabList();
+    panel.classList.add("open");
+    btn.setAttribute("aria-expanded", "true");
+    vocabPanelOpen = true;
+    refreshVocabPanelData();
+  }
+
+  // Monotonic fetch token (highlights precedent): a bookId check alone can't
+  // discriminate a stale fetch from a same-book reopen.
+  let vocabFetchSeq = 0;
+
+  async function loadVocabForBook(bookId) {
+    const seq = ++vocabFetchSeq;
+    const stale = () => !readerState || readerState.id !== bookId || seq !== vocabFetchSeq;
+    try {
+      const resp = await api(`/api/vocabulary?bookId=${encodeURIComponent(bookId)}`);
+      if (stale()) return;
+      if (!resp || !resp.ok) { vocabState = { bookId, items: [], loaded: false, failed: true }; return; }
+      const items = await resp.json();
+      if (stale()) return;
+      vocabState = { bookId, items: Array.isArray(items) ? items : [], loaded: true, failed: false };
+    } catch {
+      if (!stale()) vocabState = { bookId, items: [], loaded: false, failed: true };
+    }
+  }
+
+  // Always re-fetches on open (no "already loaded" short-circuit, unlike
+  // loadBookmarks): a word saved from the Define popover elsewhere while the
+  // drawer sat unopened must show up the next time it opens.
+  async function refreshVocabPanelData() {
+    if (!readerState || readerState.mode === "page") return;
+    const bookId = readerState.id;
+    await loadVocabForBook(bookId);
+    if (!readerState || readerState.id !== bookId) return;
+    renderVocabListIfOpen();
+  }
+
+  async function deleteVocabWord(id) {
+    const stateAtCall = vocabState;
+    const i = vocabState.items.findIndex((w) => w.id === id);
+    const removed = i !== -1 ? vocabState.items.splice(i, 1)[0] : null;
+    try {
+      const resp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      if (resp.status === 401) {
+        if (removed && vocabState === stateAtCall) {
+          vocabState.items.splice(i, 0, removed);
+          renderVocabListIfOpen();
+        }
+        showLogin();
+        return;
+      }
+      // Idempotent DELETE: 204 is success whether or not the row still existed.
+      if (!resp.ok && resp.status !== 204) throw new Error(`HTTP ${resp.status}`);
+    } catch {
+      if (removed && vocabState === stateAtCall) {
+        vocabState.items.splice(i, 0, removed);
+        renderVocabListIfOpen();
+      }
+      showToast("Couldn't delete saved word");
+    }
+  }
+
+  function wireVocabControls() {
+    const closeBtn = $("#vocab-close");
+    if (closeBtn) closeBtn.addEventListener("click", () => closeVocabPanel(true));
+    const list = $("#vocab-list");
+    if (list)
+      list.addEventListener("click", (e) => {
+        const del = e.target.closest(".vocab-entry-delete");
+        if (del) {
+          e.stopPropagation();
+          deleteVocabWord(del.getAttribute("data-id"));
+          renderVocabList(); // optimistic removal is synchronous
+          return;
+        }
+        const entry = e.target.closest(".vocab-entry");
+        if (!entry) return;
+        const word = vocabState.items.find((w) => w.id === entry.getAttribute("data-id"));
+        if (!word) return;
+        startVocabJump(word);
+      });
+    const panel = $("#vocab-panel");
+    if (panel) panel.addEventListener("keydown", containReaderKeys);
+    wirePanelRootDismissal({
+      isOpen: () => vocabPanelOpen,
+      close: closeVocabPanel,
+      panelSel: "#vocab-panel",
+      btnSel: "#vocab-btn",
+    });
+  }
+
+  // ── Vocabulary jump (offset-based — no navId machinery on a `<mark>`;
+  // pending-jump token pattern only, spec/plan M4) ──
+  let pendingVocabJump = null; // {bookId, word, targetChapterIndex, navId, arrived}
+  let vocabNavCounter = 0;
+  // navId of a jump navigation just dispatched; captured (and cleared) by
+  // renderReaderContent synchronously at its start — same lifecycle as
+  // hlJumpNavId above.
+  let vocabJumpNavId = null;
+
+  function startVocabJump(word) {
+    if (!readerState || readerState.mode === "page") return;
+    const raw = Number.isFinite(word.chapterIndex) ? word.chapterIndex : 0;
+    const targetChapterIndex = Math.min(Math.max(raw, 0), readerState.count - 1);
+    pendingVocabJump = {
+      bookId: vocabState.bookId,
+      word,
+      targetChapterIndex,
+      navId: ++vocabNavCounter,
+      arrived: false,
+    };
+    clearHlJump(); // a vocabulary jump supersedes any pending highlight jump
+    closeVocabPanel(false);
+    if (targetChapterIndex === currentChapterIndex && currentChapterIndex === readerState.index) {
+      // Same chapter: this call IS the token's navigation, so it carries the navId.
+      maybeConsumeVocabJump(document.getElementById("reader-content"), currentChapterIndex, pendingVocabJump.navId);
+    } else {
+      vocabJumpNavId = pendingVocabJump.navId;
+      gotoReaderIndex(targetChapterIndex, { instant: true });
+    }
+  }
+
+  function clearVocabJump() {
+    pendingVocabJump = null;
+    vocabJumpNavId = null;
+  }
+
+  // Snapshot #reader-content's plain text via a fresh TreeWalker (same
+  // UTF-16 code-unit basis as applyChapterHighlights) and locate the word's
+  // range: exact offsets first, else the nearest occurrence of the word text
+  // (resolveHighlightRange's drift-fallback logic, generalized to a single
+  // word/startOffset rather than a highlight's [start,end)).
+  function resolveVocabWordRange(word, chapterText) {
+    const w = word.word || "";
+    if (!w) return null;
+    const s = typeof word.startOffset === "number" ? word.startOffset : null;
+    if (s !== null) {
+      const e = typeof word.endOffset === "number" && word.endOffset > s ? word.endOffset : s + w.length;
+      if (chapterText.slice(s, e) === w) return { s, e };
+    }
+    const anchor = s !== null ? s : 0;
+    let best = -1, bestDist = Infinity;
+    let idx = chapterText.indexOf(w);
+    while (idx !== -1) {
+      const dist = Math.abs(idx - anchor);
+      if (dist < bestDist) { best = idx; bestDist = dist; }
+      idx = chapterText.indexOf(w, idx + 1);
+    }
+    return best === -1 ? null : { s: best, e: best + w.length };
+  }
+
+  // Map a [s,e) plain-text offset pair back onto live text nodes and build a
+  // Range over them — no DOM mutation (unlike applyChapterHighlights's
+  // wrap pass), since a vocabulary jump leaves no visible mark.
+  function rangeFromChapterOffsets(contentEl, s, e) {
+    const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT);
+    let node, pos = 0;
+    let startNode = null, startOffset = 0, endNode = null, endOffset = 0;
+    while ((node = walker.nextNode())) {
+      const len = node.nodeValue.length;
+      if (startNode === null && s >= pos && s <= pos + len) { startNode = node; startOffset = s - pos; }
+      if (endNode === null && e >= pos && e <= pos + len) { endNode = node; endOffset = e - pos; }
+      pos += len;
+      if (startNode && endNode) break;
+    }
+    if (!startNode || !endNode) return null;
+    const range = document.createRange();
+    range.setStart(startNode, startOffset);
+    range.setEnd(endNode, endOffset);
+    return range;
+  }
+
+  // Centers a Range in #reader-stage. Range has no reliably cross-browser
+  // scrollIntoView, unlike Element — so this computes the same "block:
+  // center" position directly against the actual scroll container via
+  // getBoundingClientRect() math (Range.getBoundingClientRect() IS standard).
+  // Returns true if it actually moved the stage — renderReaderContent needs
+  // that answer to suppress its own post-render scroll restore (see there).
+  function scrollRangeIntoView(range) {
+    const stage = document.getElementById("reader-stage");
+    if (!stage) return false;
+    const rect = range.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+    const stageRect = stage.getBoundingClientRect();
+    const target = stage.scrollTop + (rect.top - stageRect.top) - stage.clientHeight / 2 + rect.height / 2;
+    stage.scrollTop = Math.max(0, target);
+    return true;
+  }
+
+  // Called from renderReaderContent (with the render's navId, or null for an
+  // unrelated render) and directly from startVocabJump for the same-chapter
+  // case. Consumes only when: token exists, book matches, the token's own
+  // navigation has arrived, and we are on the target chapter — same
+  // supersession rules as maybeConsumeHlJump, minus the "wait for the GET"
+  // gate (the word is already in hand from the drawer row, no fetch needed).
+  // Returns true when it scrolled (same contract as applyChapterHighlights).
+  function maybeConsumeVocabJump(contentEl, chapterIndex, renderNavId) {
+    if (!pendingVocabJump) return false;
+    if (pendingVocabJump.bookId !== vocabState.bookId) { clearVocabJump(); return false; }
+    if (renderNavId === pendingVocabJump.navId) pendingVocabJump.arrived = true;
+    if (pendingVocabJump.targetChapterIndex !== chapterIndex) {
+      if (renderNavId !== pendingVocabJump.navId) clearVocabJump();
+      return false;
+    }
+    if (!pendingVocabJump.arrived) { clearVocabJump(); return false; }
+    const { word } = pendingVocabJump;
+    clearVocabJump();
+    const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT);
+    let chapterText = "";
+    let n;
+    while ((n = walker.nextNode())) chapterText += n.nodeValue;
+    const resolved = resolveVocabWordRange(word, chapterText);
+    if (!resolved) return false; // drift fallback failed: chapter navigation only, no error
+    const range = rangeFromChapterOffsets(contentEl, resolved.s, resolved.e);
+    return range ? scrollRangeIntoView(range) : false;
   }
 
   // ── Selection capture → create popover (spec §2) ──
@@ -5952,6 +6326,7 @@
     if (typoPanelOpen) closeTypoPanel(false);
     if (tocPanelOpen) closeTocPanel(false);
     if (bookmarkPanelOpen) closeBookmarkPanel(false);
+    if (vocabPanelOpen) closeVocabPanel(false);
     renderHlList();
     panel.classList.add("open");
     btn.setAttribute("aria-expanded", "true");
@@ -6062,6 +6437,9 @@
     // navId dies with it instead of leaking to the next unrelated render.
     const renderHlNavId = hlJumpNavId;
     hlJumpNavId = null;
+    // Same capture for a pending vocabulary jump.
+    const renderVocabNavId = vocabJumpNavId;
+    vocabJumpNavId = null;
     // F8: record the navigated-to index immediately, synchronously, before
     // any await below. Previously this only happened at the tail of this
     // function (after the chapter-content fetch resolved) or on a confirmed
@@ -6150,7 +6528,19 @@
       // DOM. We are inside the chapter-mode branch — page mode never gets here.
       currentChapterCleanHtml = html;
       currentChapterIndex = index;
-      if (contentEl) applyChapterHighlights(contentEl, index, renderHlNavId);
+      // Both consumers scroll SYNCHRONOUSLY when they consume a jump, so the
+      // restore below has to know it happened — otherwise its rAF resets the
+      // stage to 0 and the jump silently degrades to plain chapter
+      // navigation. This bit was missing for highlights too (the drawer's
+      // cross-chapter jump has never actually landed on the mark); the
+      // shipped e2e only highlighted a chapter's FIRST text, which is in view
+      // at scrollTop 0 either way, so it never caught it.
+      // Evaluated into separate consts, never `a() || b()`: both consumers
+      // must run on every render (each is also what CLEARS its own stale
+      // token), so short-circuiting one would leak a pending jump.
+      const hlScrolled = contentEl ? applyChapterHighlights(contentEl, index, renderHlNavId) === true : false;
+      const vocabScrolled = contentEl ? maybeConsumeVocabJump(contentEl, index, renderVocabNavId) === true : false;
+      const jumpScrolled = hlScrolled || vocabScrolled;
       renderChapterTurnAnimation(contentEl, index, isInitialRender);
       // K5: native Space/PageDown scrolling needs the scroll container focused.
       const stage = $("#reader-stage");
@@ -6165,6 +6555,12 @@
         requestAnimationFrame(() => {
           if (!readerState || readerState.renderGen !== gen) return;
           const max = stage.scrollHeight - stage.clientHeight;
+          // A consumed jump already positioned the stage on its target
+          // (synchronously, above) — leave it exactly where it landed.
+          if (jumpScrolled) {
+            establishedTop = Math.round(stage.scrollTop);
+            return;
+          }
           if (restoreRatio > 0 && max > 0) {
             setScrollTop(stage, restoreRatio * max);
           } else {
@@ -6180,7 +6576,7 @@
         // alone (this is robust even if a coalesced scroll slipped past
         // suppressScrollSave). Also guarded by the same render generation and a
         // unique token a user scroll cancels.
-        if (restoreRatio > 0) {
+        if (restoreRatio > 0 && !jumpScrolled) {
           const token = (pendingReanchor = {});
           document.fonts.ready.then(() => {
             if (pendingReanchor !== token) return;

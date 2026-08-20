@@ -269,6 +269,35 @@ test.describe("highlight jump (navId token)", () => {
     expect(pending).toBeNull();
   });
 
+  // The test above seeds its highlight on "chapter one" — the chapter's FIRST
+  // text, which is on screen at scrollTop 0 whether or not the jump scrolled,
+  // so toBeInViewport there cannot fail. This one seeds deep in the chapter
+  // (after 60 lorem paragraphs), where only a jump that survives the
+  // post-render scroll restore can bring the mark into view.
+  test("jump to a mark deep in the chapter survives the post-render scroll restore", async ({ page }) => {
+    await openEpubReader(page);
+    await page.locator("#next-btn").click();
+    await expect(page.locator("#reader-content")).toContainText("chapter one");
+    const needle = "Paragraph 59";
+    const { s, e } = await chapterOffsetsOf(page, needle);
+    expect(s).toBeGreaterThan(-1);
+    const resp = await page.request.post(`/api/books/${EPUB_ID}/highlights`, {
+      data: { chapterIndex: 1, text: needle, color: "#f6c445", startOffset: s, endOffset: e },
+    });
+    expect(resp.status()).toBe(201);
+    await page.reload();
+    await openEpubReader(page);
+
+    await page.locator("#hl-btn").click();
+    await page.locator(".hl-entry").first().click();
+    await expect(page.locator("#reader-content")).toContainText("chapter one");
+    const mark = page.locator(`mark.hl-mark`).filter({ hasText: needle }).first();
+    await expect(mark).toBeInViewport();
+    await expect
+      .poll(() => page.evaluate(() => document.getElementById("reader-stage")!.scrollTop))
+      .toBeGreaterThan(0);
+  });
+
   test("immediate Prev/Next after a jump cancels the pending jump", async ({ page }) => {
     await openEpubReader(page);
     await seedChapterOneHighlight(page);

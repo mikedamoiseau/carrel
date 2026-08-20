@@ -21,6 +21,21 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   vocabulary builder is turned on for the profile; a new
   `POST /api/vocabulary` endpoint backs it, and `GET /api/dictionary/status`
   gained a `vocabulary` field so the button knows when to appear.
+- **Saved words drawer in the web reader.** A new 📚 toolbar button (chapter
+  mode only, alongside Highlights) opens a drawer listing every word saved
+  from this book — its part of speech, definition, chapter, and save date —
+  with a tap-to-jump back to where it was looked up and a delete button per
+  row. Backed by `GET /api/vocabulary` (optionally filtered by `?bookId=`)
+  and a new `DELETE /api/vocabulary/{id}`, both gated on the vocabulary
+  builder setting like the existing save route.
+
+### Fixed
+- **Jumping to a highlight in the web reader now lands on the highlight.**
+  Tapping a row in the Highlights drawer navigated to the right chapter but
+  then scrolled back to the top of it, so any highlight below the first
+  screenful was left off-screen — the reader's post-render scroll restore ran
+  after the jump and overwrote it. Both the highlight jump and the new
+  saved-words jump now suppress that restore.
 
 ## [3.0.6] - 2026-08-17
 

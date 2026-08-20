@@ -189,7 +189,14 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .route("/stats", get(get_stats))
         .route("/dictionary/status", get(get_dictionary_status))
         .route("/dictionary/lookup", get(lookup_dictionary_word))
-        .route("/vocabulary", axum::routing::post(create_vocabulary_word))
+        .route(
+            "/vocabulary",
+            get(list_vocabulary_words).post(create_vocabulary_word),
+        )
+        .route(
+            "/vocabulary/{id}",
+            axum::routing::delete(delete_vocabulary_word_route),
+        )
         .route("/series", get(list_series))
         .route("/collections", get(list_collections))
         .route("/collections/{id}/books", get(get_collection_books))
@@ -2039,6 +2046,54 @@ async fn create_vocabulary_word(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/vocabulary` query params (M4). `bookId` filters to one book's
+/// words for the reader-drawer view; omitted, every row is returned (M5's
+/// full-list screen).
+#[derive(serde::Deserialize)]
+struct VocabularyListQuery {
+    #[serde(rename = "bookId")]
+    book_id: Option<String>,
+}
+
+/// List saved vocabulary words, optionally scoped to one book. Filtered in
+/// the handler rather than in `carrel-core` (see the epic plan) — that crate
+/// is a git dependency for Carrel Server and gets no new query variants for a
+/// web-only view. A `bookId` matching no real book returns an empty list, not
+/// 404: `vocabulary.book_id` is nullable, so a word survives its source
+/// book's deletion, and "no rows" is the honest answer either way.
+async fn list_vocabulary_words(
+    State(state): State<WebState>,
+    Query(params): Query<VocabularyListQuery>,
+) -> Result<Json<Vec<crate::models::VocabularyWord>>, (StatusCode, String)> {
+    let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
+    let words = db::list_vocabulary(&conn).map_err(carrel_status)?;
+    let words = match params.book_id {
+        Some(book_id) => words
+            .into_iter()
+            .filter(|w| w.book_id.as_deref() == Some(book_id.as_str()))
+            .collect(),
+        None => words,
+    };
+    Ok(Json(words))
+}
+
+/// Delete a saved vocabulary word. Idempotent (same as `delete_highlight_route`):
+/// an unknown id affects 0 rows and still returns 204.
+async fn delete_vocabulary_word_route(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
+    db::delete_vocabulary_word(&conn, &id).map_err(carrel_status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2282,7 +2337,7 @@ mod tests {
             id: id.to_string(),
             title: "Vocabulary Test Book".to_string(),
             author: "Author".to_string(),
-            file_path: "/nonexistent/vocab-test.epub".to_string(),
+            file_path: format!("/nonexistent/vocab-test-{id}.epub"),
             cover_path: None,
             total_chapters: 1,
             added_at: 0,
@@ -2551,6 +2606,175 @@ mod tests {
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].book_id.as_deref(), Some("book-1"));
         assert_eq!(words[0].chapter_index, Some(2));
+    }
+
+    // ── GET/DELETE /api/vocabulary (M4) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_vocabulary_words_returns_all_rows_without_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-1")).unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-2")).unwrap();
+        }
+        create_vocabulary_word(
+            State(state.clone()),
+            vocabulary_body(r#","bookId":"book-1""#),
+        )
+        .await
+        .unwrap();
+        create_vocabulary_word(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"word":"dog","lemma":"dog","definition":"canine mammal","bookId":"book-2"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let Json(words) =
+            list_vocabulary_words(State(state), Query(VocabularyListQuery { book_id: None }))
+                .await
+                .unwrap();
+
+        assert_eq!(words.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_vocabulary_words_filters_by_book_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-1")).unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-2")).unwrap();
+        }
+        create_vocabulary_word(
+            State(state.clone()),
+            vocabulary_body(r#","bookId":"book-1""#),
+        )
+        .await
+        .unwrap();
+        create_vocabulary_word(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"word":"dog","lemma":"dog","definition":"canine mammal","bookId":"book-2"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let Json(words) = list_vocabulary_words(
+            State(state),
+            Query(VocabularyListQuery {
+                book_id: Some("book-1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].lemma, "cat");
+    }
+
+    /// A word's source book can be deleted while the word survives
+    /// (`vocabulary.book_id` is nullable) — a `bookId` naming no real book is
+    /// therefore an honest "no rows", not a 404.
+    #[tokio::test]
+    async fn list_vocabulary_words_unknown_book_id_returns_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+
+        let Json(words) = list_vocabulary_words(
+            State(state),
+            Query(VocabularyListQuery {
+                book_id: Some("does-not-exist".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_vocabulary_words_disabled_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = list_vocabulary_words(State(state), Query(VocabularyListQuery { book_id: None }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn delete_vocabulary_word_route_removes_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        let id = {
+            let conn = state.conn().unwrap();
+            db::list_vocabulary(&conn).unwrap()[0].id.clone()
+        };
+
+        let status = delete_vocabulary_word_route(State(state.clone()), Path(id))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        assert!(db::list_vocabulary(&conn).unwrap().is_empty());
+    }
+
+    /// Idempotent, same as `delete_highlight_route`: deleting an id that was
+    /// never there (or already deleted) is still a success.
+    #[tokio::test]
+    async fn delete_vocabulary_word_route_unknown_id_is_still_no_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let status = delete_vocabulary_word_route(State(state), Path("does-not-exist".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_vocabulary_word_route_disabled_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = delete_vocabulary_word_route(State(state), Path("some-id".to_string()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
     #[test]
