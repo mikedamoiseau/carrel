@@ -432,9 +432,15 @@ is disabled until a word's next review date comes around.
 open a drawer of the words you've saved from the book you're currently
 reading — each row shows the word, its part of speech, definition, chapter,
 and save date. Tap a row to jump back to where you looked it up, or ✕ to
-delete it. Like highlights, the drawer reads from your Carrel server, so it
-needs a connection — an offline-saved book still lists its words whenever
-you're back on the same network. The drawer is book-scoped for now; a
+delete it. Deleting removes the word from your vocabulary everywhere, along
+with its review progress — not just from this book's list. Like highlights,
+the drawer reads from your Carrel server, so it needs a connection — an
+offline-saved book still lists its words whenever you're back on the same
+network. Note that a word is stored once per dictionary entry: if you already
+saved "cat" while reading another book, saving it again here confirms the
+save but leaves the word filed under the book you first looked it up in, so
+it appears in that book's drawer rather than this one. The drawer is
+book-scoped for now; a
 cross-book Vocabulary screen and flashcard review for the web reader, matching
 the desktop features described above, are planned for a future update.
 

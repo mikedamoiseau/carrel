@@ -5334,8 +5334,13 @@
     list.innerHTML = items
       .map((w) => {
         const meta = [vocabChapterLabel(w), formatAddedDate(w.createdAt)].filter(Boolean).join(" · ");
+        // A chapter-less row cannot jump (see startVocabJump), so it must not
+        // present itself as a button — no role, no tab stop, no pointer.
+        const jumpable = Number.isFinite(w.chapterIndex);
+        const rowClass = jumpable ? "vocab-entry" : "vocab-entry vocab-entry-static";
+        const rowAttrs = jumpable ? ` tabindex="0" role="button"` : "";
         return `
-      <div class="vocab-entry" data-id="${esc(w.id)}" tabindex="0" role="button">
+      <div class="${rowClass}" data-id="${esc(w.id)}"${rowAttrs}>
         <span class="vocab-entry-body">
           <span class="vocab-entry-word"><strong>${esc(w.word)}</strong>${w.pos ? ` <span class="vocab-entry-pos">${esc(w.pos)}</span>` : ""}</span>
           <span class="vocab-entry-def">${esc(w.definition)}</span>
@@ -5386,6 +5391,18 @@
     try {
       const resp = await api(`/api/vocabulary?bookId=${encodeURIComponent(bookId)}`);
       if (stale()) return;
+      // The setting was turned off since this tab cached its status: drop the
+      // cache, retire the trigger, and say what actually happened instead of
+      // blaming the network. Mirrors the Define popover's Save button.
+      if (resp && resp.status === 403) {
+        dictStatus = null;
+        dictStatusPromise = null;
+        vocabState = { bookId, items: [], loaded: false, failed: true, disabled: true };
+        closeVocabPanel(false);
+        applyVocabButtonVisibility();
+        showToast("Vocabulary is turned off");
+        return;
+      }
       if (!resp || !resp.ok) { vocabState = { bookId, items: [], loaded: false, failed: true }; return; }
       const items = await resp.json();
       if (stale()) return;
@@ -5407,6 +5424,11 @@
   }
 
   async function deleteVocabWord(id) {
+    // Retire any in-flight drawer GET. Every open starts one, so a row
+    // deleted while it is outstanding would otherwise be resurrected: that
+    // response replaces vocabState wholesale, and it may have read the table
+    // before this DELETE committed.
+    vocabFetchSeq++;
     const stateAtCall = vocabState;
     const i = vocabState.items.findIndex((w) => w.id === id);
     const removed = i !== -1 ? vocabState.items.splice(i, 1)[0] : null;
@@ -5474,8 +5496,12 @@
 
   function startVocabJump(word) {
     if (!readerState || readerState.mode === "page") return;
-    const raw = Number.isFinite(word.chapterIndex) ? word.chapterIndex : 0;
-    const targetChapterIndex = Math.min(Math.max(raw, 0), readerState.count - 1);
+    // `chapter_index` is nullable, and such a row renders with no chapter
+    // label (vocabChapterLabel returns null). There is nowhere to jump to —
+    // treating a missing chapter as 0 would navigate away from what the
+    // reader is on to a position the word was never looked up at.
+    if (!Number.isFinite(word.chapterIndex)) return;
+    const targetChapterIndex = Math.min(Math.max(word.chapterIndex, 0), readerState.count - 1);
     pendingVocabJump = {
       bookId: vocabState.bookId,
       word,
@@ -5504,6 +5530,8 @@
   // range: exact offsets first, else the nearest occurrence of the word text
   // (resolveHighlightRange's drift-fallback logic, generalized to a single
   // word/startOffset rather than a highlight's [start,end)).
+  const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
   function resolveVocabWordRange(word, chapterText) {
     const w = word.word || "";
     if (!w) return null;
@@ -5513,14 +5541,28 @@
       if (chapterText.slice(s, e) === w) return { s, e };
     }
     const anchor = s !== null ? s : 0;
-    let best = -1, bestDist = Infinity;
+    let best = -1, bestDist = Infinity, bestLen = w.length;
     let idx = chapterText.indexOf(w);
     while (idx !== -1) {
       const dist = Math.abs(idx - anchor);
       if (dist < bestDist) { best = idx; bestDist = dist; }
       idx = chapterText.indexOf(w, idx + 1);
     }
-    return best === -1 ? null : { s: best, e: best + w.length };
+    // A saved multi-word term stores its selection whitespace-collapsed
+    // (defineSelection), while chapterText carries the markup's real runs of
+    // whitespace — so a term spanning a line break never matches literally.
+    // Retry allowing any whitespace run between its words.
+    if (best === -1 && /\s/.test(w)) {
+      const pattern = w.split(/\s+/).map(escapeRegExp).join("\\s+");
+      const re = new RegExp(pattern, "g");
+      let m;
+      while ((m = re.exec(chapterText)) !== null) {
+        const dist = Math.abs(m.index - anchor);
+        if (dist < bestDist) { best = m.index; bestDist = dist; bestLen = m[0].length; }
+        re.lastIndex = m.index + 1; // overlapping candidates stay reachable
+      }
+    }
+    return best === -1 ? null : { s: best, e: best + bestLen };
   }
 
   // Map a [s,e) plain-text offset pair back onto live text nodes and build a

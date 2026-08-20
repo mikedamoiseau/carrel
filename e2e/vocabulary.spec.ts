@@ -147,6 +147,34 @@ test.describe("saved words drawer", () => {
     expect(visible?.inside).toBe(true);
   });
 
+  // `chapter_index` is nullable, so a word can exist with no chapter to jump
+  // to. Such a row must not advertise a jump it cannot perform.
+  test("a word saved without a chapter renders as an inert row", async ({ page }) => {
+    await openEpubReader(page);
+    const resp = await page.request.post("/api/vocabulary", {
+      data: {
+        word: "dog",
+        lemma: "dog",
+        definition: "canine mammal",
+        bookId: EPUB_ID,
+        bookTitle: "Book 050",
+      },
+    });
+    expect(resp.status()).toBe(204);
+
+    await page.locator("#vocab-btn").click();
+    const entry = page.locator(".vocab-entry");
+    await expect(entry).toHaveCount(1);
+    await expect(entry).toHaveClass(/vocab-entry-static/);
+    expect(await entry.getAttribute("role")).toBeNull();
+    expect(await entry.getAttribute("tabindex")).toBeNull();
+    // Clicking it is a no-op: the reader stays on the chapter it was on and
+    // the drawer stays open (a jump would close it).
+    await entry.click();
+    await expect(page.locator("#vocab-panel")).toBeVisible();
+    await expect(page.locator("#reader-content")).toContainText("chapter zero");
+  });
+
   test("delete removes the row and shows the empty state again", async ({ page }) => {
     await openEpubReader(page);
     const { s, e } = await chapterOffsetsOf(page, "cat");

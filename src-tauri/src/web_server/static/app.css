@@ -1084,3 +1084,7 @@ body:not(:has(.header))::before {
 }
 .vocab-entry-delete:hover, .vocab-entry-delete:focus-visible { color: var(--accent); }
 .vocab-empty { padding: 16px; color: var(--ink-muted); }
+/* A saved word with no chapter cannot jump (chapter_index is nullable), so its
+   row is inert — no hover affordance, no pointer. Its ✕ still works. */
+.vocab-entry-static { cursor: default; }
+.vocab-entry-static:hover { background: none; }
