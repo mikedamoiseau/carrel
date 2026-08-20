@@ -384,3 +384,83 @@ test.describe("vocabulary screen (#/vocabulary)", () => {
     await expect(page.locator(".vocab-screen-entry")).toHaveCount(1);
   });
 });
+
+// Both review passes flagged these two paths as reachable-but-untested: a
+// render fired after the user left (or re-entered) the screen reached through
+// document-global selectors, which either threw — swallowing the delete path's
+// showLogin() — or rebound a NEWER screen's controls to a dead closure.
+//
+// The debounce is driven with page.clock, not real time: racing a 200ms timer
+// against two navigations is exactly the kind of test that passes for timing
+// reasons rather than behavioural ones (an earlier real-time version of these
+// two passed against the unfixed code). With the clock installed, the timer
+// fires precisely when fastForward says, so a regression cannot hide in a
+// lucky interleaving.
+test.describe("vocabulary screen lifecycle", () => {
+  test.beforeEach(async ({ request }) => {
+    const resp = await request.get("/api/vocabulary");
+    if (!resp.ok()) return;
+    for (const w of await resp.json()) {
+      await request.delete(`/api/vocabulary/${w.id}`);
+    }
+  });
+
+  // NOTE on what this one is worth: it does NOT fail against the unfixed code
+  // (an exception thrown inside a faked-clock timer callback does not surface
+  // as a pageerror), so it is a guard against a future render() writing into
+  // the live view — not evidence for the fix. The test below IS the one that
+  // fails without it.
+  test("a debounce that fires after navigating away leaves the new view alone", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(String(e)));
+    await seedWord(page, { word: "cat", lemma: "cat-life-a", definition: "feline mammal", bookId: EPUB_ID, bookTitle: "Book 050" });
+
+    await page.clock.install();
+    await page.goto("/#/vocabulary");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(1);
+
+    // Queue the 200ms debounce, then leave in-page (a full goto would reload
+    // the document and take the pending timer with it — nothing under test).
+    await page.locator("#vocab-filter").fill("ca");
+    await page.evaluate(() => { location.hash = "#/"; });
+    await expect(page.locator("#library-content")).toBeVisible();
+
+    // Now let the orphaned timer fire into the dead view.
+    await page.clock.fastForward(1000);
+    expect(errors).toEqual([]);
+    await expect(page.locator(".vocab-screen")).toHaveCount(0);
+    await expect(page.locator("#library-content")).toBeVisible();
+  });
+
+  test("a stale visit's debounce cannot hijack a re-entered screen", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(String(e)));
+    await seedWord(page, { word: "apple", lemma: "apple-life", definition: "a fruit", bookId: EPUB_ID, bookTitle: "Book 050" });
+    await seedWord(page, { word: "zebra", lemma: "zebra-life", definition: "an animal", bookId: EPUB_ID, bookTitle: "Book 050" });
+
+    await page.clock.install();
+    await page.goto("/#/vocabulary");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(2);
+
+    // Queue visit A's debounce, then leave and re-enter so visit B is live.
+    await page.locator("#vocab-filter").fill("apple");
+    await page.evaluate(() => { location.hash = "#/"; });
+    await expect(page.locator("#library-content")).toBeVisible();
+    await page.evaluate(() => { location.hash = "#/vocabulary"; });
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(2);
+    await expect(page.locator("#vocab-filter")).toHaveValue("");
+
+    // A's timer lands now, against B's DOM. It must not filter B's list, and
+    // must not rebind B's controls to A's dead closure.
+    await page.clock.fastForward(1000);
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(2);
+    await expect(page.locator("#vocab-filter")).toHaveValue("");
+
+    // B's own controls still drive B's list — proof its handlers survived.
+    await page.locator("#vocab-filter").fill("zebra");
+    await page.clock.fastForward(1000);
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(1);
+    await expect(page.locator(".vocab-screen-entry")).toContainText("zebra");
+    expect(errors).toEqual([]);
+  });
+});

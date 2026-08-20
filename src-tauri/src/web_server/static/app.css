@@ -869,6 +869,10 @@ body:not(:has(.header))::before {
   .detail-more-btn { min-width: 44px; min-height: 44px; }
   .detail-menu-item { min-height: 44px; }
   .collections-toolbar .sort-btn { min-height: 44px; }
+  /* Same control, same floor — the Vocabulary screen's toolbar is cloned from
+     the collections one, so it needs its own rule here or it stays ~28px. */
+  .vocab-screen-toolbar .sort-btn { min-height: 44px; }
+  .vocab-entry-delete { min-width: 44px; min-height: 44px; }
   .reader-toolbar button { min-height: 44px; }
   /* The chrome-toggle FAB sits outside the toolbar and is explicitly 40x40. */
   .chrome-toggle-fab { width: 44px; height: 44px; }

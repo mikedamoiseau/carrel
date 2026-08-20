@@ -7423,6 +7423,11 @@
     render();
   }
 
+  // Monotonic visit token for the vocabulary screen — see the `gen`/`stale()`
+  // pair in showVocabularyScreen. Module-scoped so a second visit invalidates
+  // the first visit's in-flight work (its GET, its debounce, its deletes).
+  let vocabScreenGen = 0;
+
   // ── Vocabulary screen (M5, "See all") ───────────
   // Cross-book list of every saved word, reachable from the header nav
   // cluster / bottom tab bar and from the book-scoped drawer's "See all"
@@ -7450,20 +7455,25 @@
     bindTabBar();
     ensureDictionaryStatus().then(applyVocabNavVisibility);
 
-    // `currentView !== "vocabulary"` guards every branch below against
-    // rendering over a view the user has since navigated away from — same
-    // precedent as showStats/showCollections' Finding 1.
+    // Per-visit token, not just `currentView`: leaving and re-entering this
+    // screen leaves BOTH invocations seeing currentView === "vocabulary", so
+    // the older one's slow GET would otherwise select the new visit's
+    // container and overwrite fresh rows (and rebind its handlers) with an
+    // older snapshot. Every await below re-checks this.
+    const gen = ++vocabScreenGen;
+    const stale = () => currentView !== "vocabulary" || gen !== vocabScreenGen;
+
     let resp;
     try {
       resp = await api("/api/vocabulary");
     } catch (e) {
-      if (currentView !== "vocabulary") return;
+      if (stale()) return;
       const container = $(".vocab-screen");
       if (container) container.innerHTML = `<div class="empty">${esc(apiFailureToastMessage(e))}</div>`;
       showToast(apiFailureToastMessage(e));
       return;
     }
-    if (!resp || currentView !== "vocabulary") return; // 401 already redirected to login
+    if (!resp || stale()) return; // 401 already redirected to login
     // The vocabulary builder was switched off since this tab last cached its
     // status (or was never on) — same defense-in-depth 403 as the book-scoped
     // drawer's loadVocabForBook. Not a connection problem, so it must not go
@@ -7488,18 +7498,25 @@
     try {
       words = await resp.json();
     } catch (e) {
+      if (stale()) return;
       const container = $(".vocab-screen");
       if (container) container.innerHTML = `<div class="empty">${esc("Unexpected response")}</div>`;
       showToast("Unexpected response");
       return;
     }
-    if (currentView !== "vocabulary") return;
+    if (stale()) return;
     const container = $(".vocab-screen");
     if (!container) return;
     words = Array.isArray(words) ? words : [];
 
     let filterText = "";
     let sortMode = "newest"; // "newest" | "alphabetical"
+    // Hoisted out of render() deliberately (showLibrary's module-scoped
+    // searchDebounceTimer has the same rationale): a per-render local cannot
+    // be cleared by a render the sort toggle or a delete fired, so a pending
+    // search debounce would land after it, re-render with the PREVIOUS query,
+    // and drop whatever was typed in between.
+    let filterTimer = null;
 
     // Client-side search predicate — mirrors the desktop app's
     // matchesVocabularyQuery (src/lib/vocabulary.ts): case-insensitive
@@ -7533,7 +7550,14 @@
       // swap and restore them after. showCollections' unconditional
       // .focus() would also pull focus — and the mobile keyboard — on plain
       // screen entry, so this restores only what was already there.
-      const priorInput = $("#vocab-filter");
+      // A render can be fired from a debounce or a delete that resolves after
+      // the user navigated away (or re-entered, making a NEWER screen the live
+      // one). Bail: `container` is detached by then, so the writes below would
+      // be invisible while the document-scoped lookups either return null and
+      // throw — which on the delete path pre-empts showLogin() — or, worse,
+      // find the NEW visit's controls and rebind them to this dead closure.
+      if (stale()) return;
+      const priorInput = container.querySelector("#vocab-filter");
       const refocus = !!priorInput && document.activeElement === priorInput;
       const caret = refocus ? priorInput.selectionStart : null;
       const filtered = words.filter((w) => matchesQuery(w, filterText));
@@ -7576,8 +7600,8 @@
 
       container.innerHTML = html;
 
-      const filterInput = $("#vocab-filter");
-      let filterTimer;
+      const filterInput = container.querySelector("#vocab-filter");
+      clearTimeout(filterTimer); // this render supersedes any pending debounce
       filterInput.oninput = (e) => {
         clearTimeout(filterTimer);
         filterTimer = setTimeout(() => { filterText = e.target.value; render(); }, 200);
@@ -7587,7 +7611,7 @@
         if (caret !== null) filterInput.setSelectionRange(caret, caret);
       }
 
-      $("#vocab-sort").onclick = () => {
+      container.querySelector("#vocab-sort").onclick = () => {
         sortMode = sortMode === "alphabetical" ? "newest" : "alphabetical";
         render();
       };
@@ -7614,9 +7638,13 @@
           credentials: "same-origin",
         });
         if (delResp.status === 401) {
+          // showLogin() FIRST: the session is gone, and routing to the PIN
+          // screen must not be contingent on the local rollback below
+          // succeeding — that ordering is what made an expired session during
+          // a delete fail silently.
+          showLogin();
           words.splice(i, 0, removed);
           render();
-          showLogin();
           return;
         }
         // Idempotent DELETE: 204 is success whether or not the row still existed.
