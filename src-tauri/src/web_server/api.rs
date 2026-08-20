@@ -1744,25 +1744,33 @@ struct DictionaryLookupQuery {
     word: Option<String>,
 }
 
-/// Whether the per-profile `dictionary_enabled` setting is on. Re-checked
-/// server-side on every request (defense in depth — the frontend already
-/// gates the lookup UI), mirroring `log_vocabulary_word_entry`'s handling of
-/// `vocabulary_enabled`.
-fn dictionary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (StatusCode, String)> {
-    Ok(db::get_setting(conn, "dictionary_enabled")
+/// Whether the per-profile boolean setting named `key` is on. Shared by
+/// `dictionary_setting_enabled` and `vocabulary_setting_enabled` below, which
+/// were byte-identical apart from the key.
+fn bool_setting_enabled(
+    conn: &rusqlite::Connection,
+    key: &str,
+) -> Result<bool, (StatusCode, String)> {
+    Ok(db::get_setting(conn, key)
         .map_err(carrel_status)?
         .as_deref()
         == Some("true"))
 }
 
+/// Whether the per-profile `dictionary_enabled` setting is on. Re-checked
+/// server-side on every request (defense in depth — the frontend already
+/// gates the lookup UI), mirroring `log_vocabulary_word_entry`'s handling of
+/// `vocabulary_enabled`.
+fn dictionary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (StatusCode, String)> {
+    bool_setting_enabled(conn, "dictionary_enabled")
+}
+
 /// Whether the per-profile `vocabulary_enabled` setting is on. Same
 /// defense-in-depth re-check as `dictionary_setting_enabled` above; used to
-/// populate `GET /api/dictionary/status`'s `vocabulary` field (M3).
+/// populate `GET /api/dictionary/status`'s `vocabulary` field (M3) and to
+/// gate `POST /api/vocabulary` itself.
 fn vocabulary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (StatusCode, String)> {
-    Ok(db::get_setting(conn, "vocabulary_enabled")
-        .map_err(carrel_status)?
-        .as_deref()
-        == Some("true"))
+    bool_setting_enabled(conn, "vocabulary_enabled")
 }
 
 /// Get (opening and caching on first use) the readonly pool over the
@@ -1851,6 +1859,14 @@ async fn lookup_dictionary_word(
 /// for a real headword/gloss snapshot, tight enough to reject junk bodies.
 const VOCABULARY_WORD_MAX_LEN: usize = 200;
 const VOCABULARY_DEFINITION_MAX_LEN: usize = 2000;
+/// `lemma` is the dedup key (see `log_vocabulary_word_entry`'s `UNIQUE`
+/// constraint), so it gets the same cap as `word`.
+const VOCABULARY_LEMMA_MAX_LEN: usize = 200;
+const VOCABULARY_POS_MAX_LEN: usize = 50;
+const VOCABULARY_BOOK_TITLE_MAX_LEN: usize = 500;
+/// Matches desktop's `MAX_CONTEXT_CHARS` (`src/lib/vocabulary.ts`) — the web
+/// client truncates to this before sending, this is the server-side backstop.
+const VOCABULARY_CONTEXT_SENTENCE_MAX_LEN: usize = 300;
 
 /// POST body. camelCase, like `HighlightCreate` above (the web client sends
 /// camelCase for both). Mirrors the fields of `commands::log_vocabulary_word`
@@ -1884,14 +1900,13 @@ struct VocabularyCreate {
 /// surfaces can never drift apart on dedup-by-lemma, seen-count bumping, or
 /// the `vocabulary_enabled` re-check.
 ///
-/// That re-check means this route returns success (204) even when
-/// `vocabulary_enabled` is off: `log_vocabulary_word_entry` silently no-ops
-/// rather than erroring, matching desktop parity. This is defense in depth —
-/// the web UI itself only shows the Save button when
-/// `GET /api/dictionary/status`'s `vocabulary` field is true — so a real
-/// client should never hit the no-op path, but a stale client/tab (fetched
-/// status before the setting flipped off) must not see a false failure for a
-/// save that was legitimately requested when it was on.
+/// `vocabulary_enabled` off is a 403 here, checked before the delegation.
+/// The entry fn's own silent no-op stays as the backstop, but a silent
+/// success is the wrong answer over HTTP: the web UI flips its Save button to
+/// "Saved ✓" on 2xx, so a no-op would claim a save that never happened and
+/// lose the word. An honest failure is something a stale tab (one that
+/// fetched `GET /api/dictionary/status` before the setting flipped off) can
+/// react to — it drops its cached status and stops offering Save.
 async fn create_vocabulary_word(
     State(state): State<WebState>,
     body: Bytes,
@@ -1925,11 +1940,81 @@ async fn create_vocabulary_word(
             format!("definition exceeds {VOCABULARY_DEFINITION_MAX_LEN} characters"),
         ));
     }
+    // `lemma` is the dedup key, so it is validated as strictly as `word` —
+    // and trimmed before it reaches the UNIQUE column, since " cat" and
+    // "cat" would otherwise be two rows for one word.
+    let lemma = body.lemma.trim();
+    if lemma.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "lemma is empty".to_string()));
+    }
+    if lemma.chars().count() > VOCABULARY_LEMMA_MAX_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("lemma exceeds {VOCABULARY_LEMMA_MAX_LEN} characters"),
+        ));
+    }
+    // The remaining free-text fields are capped rather than required: they
+    // are display context, but they are still LAN-reachable writes into a
+    // table the desktop UI renders, so none of them may be unbounded.
+    let pos = match body.pos.as_deref().map(str::trim) {
+        Some(p) if p.chars().count() > VOCABULARY_POS_MAX_LEN => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("pos exceeds {VOCABULARY_POS_MAX_LEN} characters"),
+            ));
+        }
+        Some("") | None => None,
+        Some(p) => Some(p.to_string()),
+    };
+    if let Some(title) = &body.book_title {
+        if title.chars().count() > VOCABULARY_BOOK_TITLE_MAX_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("bookTitle exceeds {VOCABULARY_BOOK_TITLE_MAX_LEN} characters"),
+            ));
+        }
+    }
+    if let Some(sentence) = &body.context_sentence {
+        if sentence.chars().count() > VOCABULARY_CONTEXT_SENTENCE_MAX_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("contextSentence exceeds {VOCABULARY_CONTEXT_SENTENCE_MAX_LEN} characters"),
+            ));
+        }
+    }
+    // Offsets and chapter index feed desktop's jump-to-context navigation
+    // (`VocabularyPanel`), so nonsense here lands the reader on the wrong
+    // chapter later with no visible cause. Same rigor as `create_highlight`.
+    for (name, value) in [
+        ("chapterIndex", body.chapter_index),
+        ("startOffset", body.start_offset),
+        ("endOffset", body.end_offset),
+    ] {
+        if value.is_some_and(|v| v < 0) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{name} must not be negative"),
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (body.start_offset, body.end_offset) {
+        if end <= start {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "endOffset must be greater than startOffset".to_string(),
+            ));
+        }
+    }
 
     let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
     // Same rigor as `create_highlight`'s book check: a bookId that doesn't
-    // name a real book 404s explicitly here, rather than surfacing as a raw
-    // FK-constraint error from the `vocabulary.book_id` foreign key.
+    // name a real book 404s explicitly here. It normally avoids a raw
+    // FK-constraint error from the `vocabulary.book_id` foreign key, though
+    // no transaction spans this check and the insert below — a book deleted
+    // in between still surfaces as a 500.
     if let Some(book_id) = &body.book_id {
         db::get_book(&conn, book_id)
             .map_err(carrel_status)?
@@ -1939,8 +2024,8 @@ async fn create_vocabulary_word(
     crate::commands::log_vocabulary_word_entry(
         &conn,
         word.to_string(),
-        body.lemma,
-        body.pos,
+        lemma.to_string(),
+        pos,
         definition.to_string(),
         body.book_id,
         body.book_title,
@@ -2247,21 +2332,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_vocabulary_word_no_op_when_disabled() {
+    async fn create_vocabulary_word_disabled_is_forbidden() {
         let dir = tempfile::tempdir().unwrap();
         // vocabulary_enabled is left unset (defaults to off).
         let state = dictionary_test_state(dir.path().to_path_buf());
 
-        let status = create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+        let err = create_vocabulary_word(State(state.clone()), vocabulary_body(""))
             .await
-            .unwrap();
-        // Route still reports success — see create_vocabulary_word's doc
-        // comment on defense-in-depth vs. the web UI's own gating.
-        assert_eq!(status, StatusCode::NO_CONTENT);
+            .unwrap_err();
+        // An honest failure, not a silent no-op: the web UI turns 2xx into
+        // "Saved ✓", so success here would claim a save that never landed.
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
 
         let conn = state.conn().unwrap();
         let words = db::list_vocabulary(&conn).unwrap();
         assert!(words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_empty_lemma_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let body = Bytes::from(r#"{"word":"cat","lemma":"  ","definition":"feline mammal"}"#);
+        let err = create_vocabulary_word(State(state), body)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The lemma is the UNIQUE dedup key, so a padded one must not become a
+    /// second row for a word already saved.
+    #[tokio::test]
+    async fn create_vocabulary_word_trims_lemma_before_storing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let body = Bytes::from(r#"{"word":"cat","lemma":"  cat  ","definition":"feline mammal"}"#);
+        let status = create_vocabulary_word(State(state.clone()), body)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        let words = db::list_vocabulary(&conn).unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].lemma, "cat");
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_overlong_context_sentence_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let long = "a".repeat(VOCABULARY_CONTEXT_SENTENCE_MAX_LEN + 1);
+        let err = create_vocabulary_word(
+            State(state),
+            vocabulary_body(&format!(r#","contextSentence":"{long}""#)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_negative_offset_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let err = create_vocabulary_word(State(state), vocabulary_body(r#","startOffset":-5"#))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_inverted_offsets_are_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let err = create_vocabulary_word(
+            State(state),
+            vocabulary_body(r#","startOffset":40,"endOffset":10"#),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -5521,9 +5521,17 @@
   // using the entry's first sense per spec (simplest predictable rule,
   // mirroring defineSelection's own first-word-of-a-long-selection choice)
   // rather than desktop's part-of-speech grouping.
+  // Desktop expands the selection to its surrounding sentence and caps it at
+  // MAX_CONTEXT_CHARS (src/lib/vocabulary.ts); the web sends the raw
+  // selection, so it must respect the same cap — the route rejects longer.
+  const VOCAB_CONTEXT_MAX_CHARS = 300;
+
   function buildVocabularySaveButton(term, entry, captured) {
     if (!vocabularyAvailable() || !entry || !entry.senses || entry.senses.length === 0) return null;
     const primary = entry.senses[0];
+    // An empty gloss would make every save 400 ("definition is empty") with
+    // no path to success — don't offer the button at all.
+    if (!primary || !primary.gloss) return null;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.id = "dict-save-btn";
@@ -5546,12 +5554,28 @@
             bookId: readerState ? readerState.id : null,
             bookTitle: readerState && readerState.book ? readerState.book.title : null,
             chapterIndex: currentChapterIndex,
-            contextSentence: captured ? captured.text : null,
+            contextSentence: captured ? captured.text.slice(0, VOCAB_CONTEXT_MAX_CHARS) : null,
             startOffset: captured ? captured.startOffset : null,
             endOffset: captured ? captured.endOffset : null,
           }),
         });
-        if (resp.status === 401) { showLogin(); return; }
+        if (resp.status === 401) {
+          // #dict-popover is body-attached, so it would float over the PIN
+          // screen (with this button stuck disabled) unless closed here.
+          closeDefinePopover();
+          showLogin();
+          return;
+        }
+        if (resp.status === 403) {
+          // The setting was turned off since this tab cached its status.
+          // Drop the cache so later popovers stop offering Save, and say so
+          // instead of claiming a save that did not happen.
+          dictStatus = null;
+          dictStatusPromise = null;
+          btn.textContent = "Unavailable";
+          showToast("Vocabulary is turned off");
+          return;
+        }
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         btn.textContent = "Saved ✓";
       } catch {
