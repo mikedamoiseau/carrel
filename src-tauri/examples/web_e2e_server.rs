@@ -208,6 +208,11 @@ fn build_test_epub(path: &Path) -> Result<(), Box<dyn Error>> {
     // carrel-core/src/dictionary.rs — "cat" -> noun, "feline mammal").
     // Additive — nothing above moves.
     ch0_body.push_str("<p>A cat rested quietly on the windowsill.</p>");
+    // Dictionary e2e (dictionary.spec.ts): a multi-word selection with
+    // leading punctuation on its first word ("cat,") — exercises the
+    // first-word fallback (>3 words) together with punctuation stripping
+    // before lookup. Additive — nothing above moves.
+    ch0_body.push_str("<p>Indeed, cat, dog and fox met.</p>");
     zip.write_all(chapter("Ch0", &ch0_body).as_bytes())?;
     zip.start_file("OEBPS/ch1.xhtml", deflated)?;
     // Long enough that `#reader-stage` actually scrolls at the test viewport,

@@ -43,9 +43,12 @@ async function selectText(page: Page, needle: string) {
       off = node.nodeValue!.indexOf(needle);
       if (off !== -1) break;
     }
+    if (!node || off < 0) {
+      throw new Error(`selectText: needle "${needle}" not found in #reader-content`);
+    }
     const range = document.createRange();
-    range.setStart(node!, off);
-    range.setEnd(node!, off + needle.length);
+    range.setStart(node, off);
+    range.setEnd(node, off + needle.length);
     const sel = window.getSelection()!;
     sel.removeAllRanges();
     sel.addRange(range);
@@ -105,6 +108,19 @@ test.describe("Define (dictionary lookup)", () => {
     await expect(page.locator("#dict-popover")).toBeVisible();
     await page.locator("#reader-content").click({ position: { x: 5, y: 5 } });
     await expect(page.locator("#dict-popover")).toBeHidden();
+  });
+
+  test("a longer selection with leading punctuation on its first word normalizes and resolves", async ({ page }) => {
+    await openEpubReader(page);
+    // "cat, dog and fox" is 4 words (>3) — triggers the existing first-word
+    // fallback, so the raw term sent for normalization is "cat,". Proves
+    // punctuation stripping (fix #2) runs on the fallback word too.
+    await selectText(page, "cat, dog and fox");
+    await page.locator("#hl-popover #hl-define-btn").click();
+    const result = page.locator("#dict-popover");
+    await expect(result).toBeVisible();
+    await expect(result).toHaveAttribute("aria-label", 'Definition of "cat"');
+    await expect(result).toContainText("feline mammal");
   });
 
   // Toggling `dictionary_enabled` per test would need a settings-mutation
