@@ -85,7 +85,7 @@ Carrel is for the opposite case: you already have the files, and you want a bett
 - Read your library from any device on the same WiFi — phone, tablet, or another computer, no install required
 - Built-in web reader with QR-code pairing and PIN login, matching the desktop app's design with light/dark/system themes — installable as a PWA, with per-book **Save for offline** reading over a secure (HTTPS/localhost) connection
 - Adjustable reading typography (font size, line spacing, font family incl. OpenDyslexic, column width) for EPUB/MOBI via an **Aa** control — embedded fonts, remembered across books
-- Table of contents panel (EPUB/MOBI), bookmarks in every format, and text highlighting with notes in 5 colors (EPUB/MOBI) — all shared with the desktop app
+- Table of contents panel (EPUB/MOBI), bookmarks in every format, text highlighting with notes in 5 colors (EPUB/MOBI), and dictionary lookups ("Define") on a text selection (EPUB/MOBI) — all shared with the desktop app
 - Keyboard shortcuts (`/` to search, arrow-key reader navigation, a shortcuts overlay) and a fast, paginated library with search, filters, and sort
 - Reading progress syncs back to your library, with progress badges on book covers and animated swipe page-turns on touch devices
 - Installable as a home-screen web app (PWA, including iOS Add to Home Screen) for an app-like feel

@@ -1509,12 +1509,13 @@
       return;
     }
 
-    // Esc closes an open highlight popover (selection or mark-edit) first —
-    // before the reader's Esc-goes-Back branch below.
-    if (e.key === "Escape" && (hlPopoverEl || hlEditPopoverEl)) {
+    // Esc closes an open highlight or Define popover first — before the
+    // reader's Esc-goes-Back branch below.
+    if (e.key === "Escape" && (hlPopoverEl || hlEditPopoverEl || dictPopoverEl)) {
       e.preventDefault();
       closeHlPopover();
       closeHlEditPopover();
+      closeDefinePopover();
       return;
     }
 
@@ -4897,6 +4898,10 @@
       // innerHTML rebuild); the stage node itself is rebuilt per book entry,
       // so re-binding here is safe — no duplicate listeners.
       bindHighlightMarkTaps();
+      // Define (M2): kick the session-cached status fetch on first entry into
+      // a chapter-mode reader. Memoized — later book entries and chapter
+      // turns are no-ops once it resolves.
+      ensureDictionaryStatus();
       // Web typography: apply saved font/spacing/family/width to the chapter
       // column once here (inline styles persist across chapter-turn innerHTML
       // swaps). EPUB + MOBI both reach this branch (mode !== "page").
@@ -5206,9 +5211,45 @@
   let hlPopoverEl = null;
   let hlEditPopoverEl = null;
   let hlCaptured = null; // {text, startOffset, endOffset} frozen at open
+  let hlCapturedRect = null; // selection rect frozen alongside hlCaptured, for Define's result popover
   let hlPopoverPointerDown = false;
   let hlSelDebounce = 0;
   let hlPopoverScrollTop = null; // stage.scrollTop at popover open
+
+  // ── Define (dictionary lookup, M2) ──────────────────────────────────────
+  // Session-cached status: null until the first fetch resolves, then
+  // {installed, enabled}. Fetched once per page load (not per book) — see
+  // the ensureDictionaryStatus() call in renderReaderChrome's chapter-mode
+  // branch. A 503 from the lookup route (disabled/uninstalled mid-session)
+  // downgrades this cache so the popover stops offering Define.
+  let dictStatus = null;
+  let dictStatusPromise = null;
+  let dictUnavailableShown = false; // "Dictionary unavailable" toast: once per session
+  let dictPopoverEl = null;
+
+  async function ensureDictionaryStatus() {
+    if (dictStatus) return dictStatus;
+    if (!dictStatusPromise) {
+      dictStatusPromise = (async () => {
+        try {
+          const resp = await api("/api/dictionary/status");
+          if (!resp || !resp.ok) return { installed: false, enabled: false };
+          return await resp.json();
+        } catch {
+          return { installed: false, enabled: false };
+        }
+      })();
+    }
+    dictStatus = await dictStatusPromise;
+    // Test hook: lets e2e wait for the async status fetch to land before
+    // exercising selection, mirroring __hlJumpPendingForTest below.
+    window.__dictStatusForTest = dictStatus;
+    return dictStatus;
+  }
+
+  function dictionaryAvailable() {
+    return !!(dictStatus && dictStatus.installed && dictStatus.enabled);
+  }
 
   // Scroll events are dispatched asynchronously: a programmatic
   // scroll-into-view that lands JUST BEFORE the tap that opens a popover
@@ -5268,11 +5309,12 @@
         else closeHlPopover();
       }, 250);
     });
-    // Dismiss on outside tap — both popovers. Pointer interactions that
+    // Dismiss on outside tap — all three popovers. Pointer interactions that
     // START inside a popover must never dismiss it (contains() check).
     document.addEventListener("pointerdown", (e) => {
       if (hlPopoverEl && !hlPopoverEl.contains(e.target)) closeHlPopover();
       if (hlEditPopoverEl && !hlEditPopoverEl.contains(e.target)) closeHlEditPopover();
+      if (dictPopoverEl && !dictPopoverEl.contains(e.target)) closeDefinePopover();
     });
   }
   bindHighlightSelection();
@@ -5281,6 +5323,7 @@
     closeHlPopover();
     closeHlEditPopover();
     hlCaptured = { text: captured.text, startOffset: captured.startOffset, endOffset: captured.endOffset };
+    hlCapturedRect = captured.rect;
     const pop = document.createElement("div");
     pop.id = "hl-popover";
     pop.setAttribute("role", "toolbar");
@@ -5341,6 +5384,22 @@
       });
       pop.appendChild(clearBtn);
     }
+    // Define (M2): only offered once the session status fetch confirms the
+    // dictionary is installed + enabled — zero UI trace otherwise.
+    if (dictionaryAvailable()) {
+      const defineBtn = document.createElement("button");
+      defineBtn.type = "button";
+      defineBtn.id = "hl-define-btn";
+      defineBtn.setAttribute("aria-label", "Define");
+      defineBtn.textContent = "\u{1F4D6}"; // 📖
+      defineBtn.addEventListener("click", () => {
+        const captured = hlCaptured; // frozen before closeHlPopover clears it
+        const rect = hlCapturedRect;
+        closeHlPopover();
+        defineSelection(captured, rect);
+      });
+      pop.appendChild(defineBtn);
+    }
     // Captured-range guard: pointer interactions inside the popover must not
     // dismiss it before the click handler runs (spec §2). The clearing
     // listeners are registered INSIDE pointerdown (paired per press) — an
@@ -5373,6 +5432,73 @@
   function closeHlPopover() {
     if (hlPopoverEl) { hlPopoverEl.remove(); hlPopoverEl = null; }
     hlCaptured = null;
+    hlCapturedRect = null;
+  }
+
+  // ── Define result popover (M2) ──
+  const DICT_MAX_SENSES = 6;
+
+  function closeDefinePopover() {
+    if (dictPopoverEl) { dictPopoverEl.remove(); dictPopoverEl = null; }
+  }
+
+  function renderDefineBody(opts) {
+    if (opts.notFound) {
+      return `<div class="dict-empty">No definition found for '${esc(opts.word)}'</div>`;
+    }
+    const entry = opts.entry;
+    const senses = entry.senses.slice(0, DICT_MAX_SENSES);
+    const more = entry.senses.length - senses.length;
+    const items = senses
+      .map((s) => `<li><span class="dict-pos">${esc(s.pos)}</span> — ${esc(s.gloss)}</li>`)
+      .join("");
+    const moreLine = more > 0 ? `<div class="dict-more">+${more} more</div>` : "";
+    return `<div class="dict-word">${esc(entry.matchedWord)}</div><ul class="dict-senses">${items}</ul>${moreLine}`;
+  }
+
+  function openDefinePopover(rect, opts) {
+    closeDefinePopover();
+    const pop = document.createElement("div");
+    pop.id = "dict-popover";
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-label", `Definition of "${opts.entry ? opts.entry.matchedWord : opts.word}"`);
+    pop.innerHTML = renderDefineBody(opts);
+    document.body.appendChild(pop);
+    dictPopoverEl = pop;
+    if (rect) {
+      const top = Math.min(rect.bottom + 8, window.innerHeight - pop.offsetHeight - 8);
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8));
+      pop.style.top = `${top}px`;
+      pop.style.left = `${left}px`;
+    }
+  }
+
+  // Longer selections still show the Define button but define only the
+  // first word — simplest predictable rule (spec M2 §2) rather than
+  // guessing which word in a long selection the user meant.
+  async function defineSelection(captured, rect) {
+    if (!captured) return;
+    const collapsed = captured.text.trim().replace(/\s+/g, " ");
+    const words = collapsed.split(" ").filter(Boolean);
+    const term = words.length <= 3 && collapsed.length <= 100 ? collapsed : words[0];
+    if (!term) return;
+    try {
+      const resp = await api(`/api/dictionary/lookup?word=${encodeURIComponent(term)}`);
+      if (!resp) return; // 401 — api() already showed the login screen
+      if (resp.status === 404) { openDefinePopover(rect, { notFound: true, word: term }); return; }
+      if (resp.status === 503) {
+        // Dictionary went away (disabled/uninstalled) mid-session — refresh
+        // the cached status so the button stops appearing, and say so once.
+        dictStatus = { installed: false, enabled: false };
+        if (!dictUnavailableShown) { dictUnavailableShown = true; showToast("Dictionary unavailable"); }
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const entry = await resp.json();
+      openDefinePopover(rect, { entry });
+    } catch {
+      if (!dictUnavailableShown) { dictUnavailableShown = true; showToast("Dictionary unavailable"); }
+    }
   }
 
   async function createHighlightFromCapture(captured, color) {

@@ -5,6 +5,18 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Dictionary lookups ("Define") in the web reader.** Selecting text while
+  reading an EPUB or MOBI now offers a **Define** button alongside the
+  highlight actions, when the offline dictionary is installed and enabled. It
+  looks up the selection (or, for a longer selection, its first word) against
+  the same WordNet-derived dictionary the desktop app uses, and shows the
+  matched word's part-of-speech and definitions in a small popover — or a
+  "No definition found" message. Online-only, like highlighting; the button
+  simply doesn't appear when the dictionary isn't installed or reading
+  offline-saved books. Backed by the existing
+  `GET /api/dictionary/status`/`lookup` endpoints.
+
 ## [3.0.6] - 2026-08-17
 
 ### Added
