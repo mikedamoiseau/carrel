@@ -2109,13 +2109,15 @@ struct VocabularyDueQuery {
     limit: Option<i64>,
 }
 
-/// Default and hard-cap for `GET /api/vocabulary/due`'s `limit` — mirrors
-/// desktop's `VocabularyPanel.tsx` `REVIEW_LIMIT` intent (a generous safety
-/// bound on a personal vocabulary list, not real pagination), but the web
-/// route is LAN-reachable so the cap is enforced server-side rather than
-/// trusted from the client.
+/// Default and hard-cap for `GET /api/vocabulary/due`'s `limit`. The cap is
+/// the same 200 as desktop's `VocabularyPanel.tsx` `REVIEW_LIMIT` — a generous
+/// safety bound on a personal vocabulary list, not real pagination — but it is
+/// enforced here rather than trusted from the client, because this route is
+/// LAN-reachable. Keeping the two equal matters: the web UI labels the returned
+/// length as a due *count*, so a lower cap here would understate it and then
+/// let the UI claim the queue was finished with cards still due.
 const VOCABULARY_DUE_DEFAULT_LIMIT: i64 = 20;
-const VOCABULARY_DUE_MAX_LIMIT: i64 = 100;
+const VOCABULARY_DUE_MAX_LIMIT: i64 = 200;
 
 /// Clamp a caller-supplied `limit` into `1..=VOCABULARY_DUE_MAX_LIMIT`,
 /// defaulting to `VOCABULARY_DUE_DEFAULT_LIMIT` when absent. A non-positive

@@ -7455,12 +7455,14 @@
     return days === 1 ? "1 day" : `${days} days`;
   }
 
-  // Generous safety bound on one review session's queue — mirrors desktop's
-  // VocabularyPanel.tsx REVIEW_LIMIT intent (a personal vocabulary list is
-  // small; this isn't real pagination). The server clamps its own maximum
-  // independently (VOCABULARY_DUE_MAX_LIMIT, api.rs) — this is just what the
-  // web UI asks for.
-  const VOCAB_REVIEW_LIMIT = 100;
+  // Generous safety bound on one review session's queue — the same 200 as
+  // desktop's VocabularyPanel.tsx REVIEW_LIMIT (a personal vocabulary list is
+  // small; this isn't real pagination). It must not be LOWER than desktop's:
+  // the bar labels this number as a count, so a smaller web cap would quietly
+  // understate how many words are due and then claim "All caught up" with
+  // cards still pending. The server clamps its own maximum independently
+  // (VOCABULARY_DUE_MAX_LIMIT, api.rs) — this is just what the web UI asks for.
+  const VOCAB_REVIEW_LIMIT = 200;
 
   // ── Vocabulary screen (M5 "See all", M6 flashcard review) ───────────
   // Cross-book list of every saved word, reachable from the header nav
@@ -7570,6 +7572,10 @@
     let reviewTotal = 0;
     let flipped = false;
     let submitting = false;
+    // True while a fresh due count is in flight (see backToList /
+    // refreshDueCount): the bar renders inert rather than advertising a count
+    // that a just-finished session has invalidated.
+    let dueCountPending = false;
 
     // Client-side search predicate — mirrors the desktop app's
     // matchesVocabularyQuery (src/lib/vocabulary.ts): case-insensitive
@@ -7634,9 +7640,20 @@
       // none are due yet.
       let html = "";
       if (words.length > 0) {
+        // `dueCountPending` covers the window after a session ends while the
+        // fresh count is still in flight: the OLD count is not shown as if it
+        // were current, and the button stays inert so the just-reviewed queue
+        // cannot be replayed. A capped queue is labelled "N+" because the
+        // number is a cap, not a count — claiming an exact figure there was
+        // wrong in both directions (understated bar, false "All caught up").
+        const capped = dueWords.length >= VOCAB_REVIEW_LIMIT;
+        const dueLabel = dueCountPending
+          ? "Checking…"
+          : `Review ${dueWords.length}${capped ? "+" : ""} due`;
+        const dueDisabled = dueCountPending || dueWords.length === 0;
         html += `<div class="vocab-review-bar">
-          <button class="vocab-review-btn" id="vocab-review-btn" ${dueWords.length === 0 ? "disabled" : ""}>
-            Review ${dueWords.length} due
+          <button class="vocab-review-btn" id="vocab-review-btn" ${dueDisabled ? "disabled" : ""}>
+            ${dueLabel}
           </button>
         </div>`;
       }
@@ -7715,26 +7732,38 @@
     // not just go back to showing the STALE count it had on entry.
     function backToList() {
       view = "list";
+      // Mark the count unknown BEFORE rendering. Rendering the old count here
+      // let the bar advertise the queue that was just reviewed, and clicking
+      // it before the refresh landed restarted those same cards.
+      dueCountPending = true;
       render();
       refreshDueCount();
     }
 
+    // Re-reads the due queue. On any failure the count stays "unknown" rather
+    // than silently reverting to the pre-review number — an unknown count
+    // shows as an inert "Checking…" bar, which is honest and, unlike a stale
+    // count, cannot be clicked into a replay of an already-reviewed queue.
     async function refreshDueCount() {
       let r;
       try {
         r = await api(`/api/vocabulary/due?limit=${VOCAB_REVIEW_LIMIT}`);
       } catch (e) {
-        return; // best-effort — the bar just keeps its previous count
+        if (!stale()) { dueWords = []; dueCountPending = false; render(); }
+        return;
       }
-      if (!r || stale() || !r.ok) return; // a 401 already redirected to login
+      if (!r || stale()) return; // a 401 already redirected to login
+      if (!r.ok) { dueWords = []; dueCountPending = false; render(); return; }
       let d;
       try {
         d = await r.json();
       } catch (e) {
+        if (!stale()) { dueWords = []; dueCountPending = false; render(); }
         return;
       }
-      if (stale() || view !== "list") return;
+      if (stale()) return;
       dueWords = Array.isArray(d) ? d : [];
+      dueCountPending = false;
       render();
     }
 
@@ -7805,28 +7834,52 @@
         });
       } catch (e) {
         if (stale()) return;
+        // The outcome is genuinely UNKNOWN here: the request may have
+        // committed with only the response lost. Retaining the card for a
+        // blind retry would then record the same review twice, advancing the
+        // box two boxes for one answer. Re-read the queue from the server
+        // instead and say so — if the review did land, the card is simply
+        // gone from the refreshed queue.
         submitting = false;
-        showToast("Couldn't reach Carrel server");
+        flipped = false;
+        view = "list";
+        dueCountPending = true;
+        showToast("Couldn't confirm that review — checking");
         render();
+        refreshDueCount();
         return;
       }
+      // A profile switched on the desktop mid-session invalidates every queued
+      // row id; without this the answers just 404 one by one while the page
+      // keeps showing the old profile's words. (deleteScreenWord and the
+      // drawer's deleteVocabWord still omit it — that sweep is tracked
+      // separately, across every web write path at once.)
+      noteProfileTag(resp);
       if (stale()) return;
       if (resp.status === 401) { showLogin(); return; }
       if (resp.status === 403) {
         // Same defense-in-depth as the screen's own load: the setting was
         // switched off mid-session. Not a connection problem, so it must not
         // be reported as one — drop the cache and retire the affordance.
+        // Land on the SAME terminal state the screen's own 403 produces.
+        // Returning to the list instead rebuilt the full word list and an
+        // enabled Review button from data the server will now refuse, so
+        // every following action 403'd while the UI looked functional.
         dropVocabularyStatusCache();
         submitting = false;
-        view = "list";
         showToast("Vocabulary is turned off");
-        render();
+        container.innerHTML = `<div class="empty">Vocabulary is turned off.</div>`;
         return;
       }
       if (resp.status === 404) {
         // The word was deleted (from another tab/device) since the queue was
         // built — nothing to persist a review against. Drop it and move on
         // rather than getting the session stuck on a card that can't advance.
+        // Drop it from the list and the due set too, or the row lingers on the
+        // list behind this screen until a reload.
+        const goneId = card.id;
+        words = words.filter((w) => w.id !== goneId);
+        dueWords = dueWords.filter((w) => w.id !== goneId);
         reviewQueue = reviewQueue.slice(1);
         flipped = false;
         submitting = false;
@@ -7854,6 +7907,11 @@
       const i = words.findIndex((w) => w.id === id);
       if (i === -1) return;
       const removed = words.splice(i, 1)[0];
+      // The due set is a separate array, and leaving it alone meant the bar
+      // kept counting a deleted word and startReview() handed the user a
+      // flashcard for it — which then 404'd and blamed them for deleting it.
+      const dueIndex = dueWords.findIndex((w) => w.id === id);
+      const removedDue = dueIndex !== -1 ? dueWords.splice(dueIndex, 1)[0] : null;
       render();
       try {
         const delResp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
@@ -7867,6 +7925,7 @@
           // a delete fail silently.
           showLogin();
           words.splice(i, 0, removed);
+          if (removedDue) dueWords.splice(dueIndex, 0, removedDue);
           render();
           return;
         }
@@ -7874,6 +7933,7 @@
         if (!delResp.ok && delResp.status !== 204) throw new Error(`HTTP ${delResp.status}`);
       } catch {
         words.splice(i, 0, removed);
+        if (removedDue) dueWords.splice(dueIndex, 0, removedDue);
         render();
         showToast("Couldn't delete saved word");
       }

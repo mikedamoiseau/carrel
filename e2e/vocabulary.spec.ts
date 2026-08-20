@@ -578,3 +578,65 @@ test.describe("vocabulary screen lifecycle", () => {
     expect(errors).toEqual([]);
   });
 });
+
+// Review-bar bookkeeping: the due set is a second array beside `words`, and
+// review mode reads it directly, so anything that mutates one must mutate the
+// other. Both review passes caught this as a live defect.
+test.describe("vocabulary screen — review bar bookkeeping (M6)", () => {
+  test.beforeEach(async ({ request }) => {
+    const resp = await request.get("/api/vocabulary");
+    if (!resp.ok()) return;
+    for (const w of await resp.json()) {
+      await request.delete(`/api/vocabulary/${w.id}`);
+    }
+  });
+
+  test("deleting a word drops it from the due count and the review queue", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m6-f", definition: "feline mammal" });
+    await seedWord(page, { word: "dog", lemma: "dog-m6-f", definition: "canine mammal" });
+
+    await page.goto("/#/vocabulary");
+    await expect(page.locator("#vocab-review-btn")).toContainText("Review 2 due");
+
+    // Delete "cat" from the list, then start a review: the count must follow,
+    // and the queue must not hand back the deleted word (which would 404 on
+    // answering and blame the user for their own delete).
+    await page.locator(".vocab-screen-entry", { hasText: "cat" }).locator(".vocab-entry-delete").click();
+    await expect(page.locator("#vocab-review-btn")).toContainText("Review 1 due");
+
+    await page.locator("#vocab-review-btn").click();
+    await expect(page.locator(".vocab-review-progress")).toContainText("1 / 1");
+    await expect(page.locator(".vocab-review-card")).toContainText("dog");
+    await expect(page.locator(".vocab-review-card")).not.toContainText("cat");
+  });
+
+  // Pins the failure case both review passes named: if the post-session
+  // refresh never succeeds, the bar must not go on offering the count from
+  // before the session — clicking it replays cards already answered. The
+  // refresh is failed outright rather than delayed, because a delay only
+  // proves "eventually correct": Playwright retries the assertion until the
+  // fresh count lands, so the stale window goes unnoticed either way.
+  test("a failed post-session refresh does not leave a stale count clickable", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m6-g", definition: "feline mammal" });
+
+    // Call 1 is the screen's initial load; call 2 is the refresh after review.
+    let dueCalls = 0;
+    await page.route("**/api/vocabulary/due*", async (route) => {
+      dueCalls += 1;
+      if (dueCalls >= 2) await route.abort();
+      else await route.continue();
+    });
+
+    await page.goto("/#/vocabulary");
+    await expect(page.locator("#vocab-review-btn")).toContainText("Review 1 due");
+    await page.locator("#vocab-review-btn").click();
+    await page.locator("#vocab-review-reveal").click();
+    await page.locator("#vocab-review-gotit").click();
+    await expect(page.locator(".vocab-review")).toContainText("All caught up");
+    await page.locator("#vocab-review-back").click();
+
+    const bar = page.locator("#vocab-review-btn");
+    await expect(bar).not.toContainText("Review 1 due");
+    await expect(bar).toBeDisabled();
+  });
+});
