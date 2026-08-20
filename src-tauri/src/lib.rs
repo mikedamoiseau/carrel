@@ -214,7 +214,7 @@ pub fn run() {
                 ipc_metrics: crate::ipc_metrics::IpcMetrics::new(500, 500.0),
                 plugin_manager: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 _log_guard: log_guard,
-                dictionary_pool: std::sync::Mutex::new(None),
+                dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 dictionary_downloading: std::sync::atomic::AtomicBool::new(false),
                 pending_manual_update_check: std::sync::Mutex::new(false),
                 startup_update_check_taken: std::sync::atomic::AtomicBool::new(false),
@@ -347,6 +347,7 @@ pub fn run() {
                     unlocked_profiles: state.unlocked_profiles.clone(),
                     private_mode: state.private_mode.clone(),
                     profile_host: Some(crate::profile_host::for_app(&app_handle)),
+                    dictionary_pool: state.dictionary_pool.clone(),
                 };
                 if let Ok(handle) = web_server::start(web_state, port, modes).await {
                     {

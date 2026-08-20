@@ -26,7 +26,7 @@
 // The `carrel-` prefix on this and the two cache names below names caches held
 // in the user's browser: renaming it orphans every offline-saved book rather
 // than migrating it. Only the trailing content hash is meant to change.
-const CACHE_VERSION = "carrel-shell-6d947396e85a";
+const CACHE_VERSION = "carrel-shell-ed59c1a5b48c";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW

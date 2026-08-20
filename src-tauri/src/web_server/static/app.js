@@ -1376,6 +1376,10 @@
     // survive a navigation — it would block the next view and swallow
     // shortcuts on it.
     closeShortcutsOverlay();
+    // Same document.body-survival hazard: a Define result card would float
+    // over the next view (Backspace-goBack reaches here without the Esc
+    // branch's popover check, and browser back skips keydown entirely).
+    closeDefinePopover();
     const gen = ++routeGen;
     const hash = rawHash();
     // Highlight-jump backstop (spec §4): ANY navigation that isn't the jump's
@@ -1509,12 +1513,13 @@
       return;
     }
 
-    // Esc closes an open highlight popover (selection or mark-edit) first —
-    // before the reader's Esc-goes-Back branch below.
-    if (e.key === "Escape" && (hlPopoverEl || hlEditPopoverEl)) {
+    // Esc closes an open highlight or Define popover first — before the
+    // reader's Esc-goes-Back branch below.
+    if (e.key === "Escape" && (hlPopoverEl || hlEditPopoverEl || dictPopoverEl)) {
       e.preventDefault();
       closeHlPopover();
       closeHlEditPopover();
+      closeDefinePopover();
       return;
     }
 
@@ -4794,6 +4799,10 @@
     bookmarkPanelOpen = false;
     hlPanelOpen = false;
     pendingReanchor = null;
+    // A chapter turn rebuilds the chrome without a scroll event when the
+    // stage was already at the top, so the scroll-dismiss path can't be
+    // relied on — close a lingering Define card here explicitly.
+    closeDefinePopover();
     const { book, mode, count, index, fitMode } = readerState;
     const rootClass = mode === "page" ? `reader-page ${fitMode}` : "reader-chapter";
     // Item 12: `page-img-incoming` is the animated overlay for a committed
@@ -4897,6 +4906,10 @@
       // innerHTML rebuild); the stage node itself is rebuilt per book entry,
       // so re-binding here is safe — no duplicate listeners.
       bindHighlightMarkTaps();
+      // Define (M2): kick the session-cached status fetch on first entry into
+      // a chapter-mode reader. Memoized — later book entries and chapter
+      // turns are no-ops once it resolves.
+      ensureDictionaryStatus();
       // Web typography: apply saved font/spacing/family/width to the chapter
       // column once here (inline styles persist across chapter-turn innerHTML
       // swaps). EPUB + MOBI both reach this branch (mode !== "page").
@@ -5205,10 +5218,69 @@
   // ── Selection capture → create popover (spec §2) ──
   let hlPopoverEl = null;
   let hlEditPopoverEl = null;
-  let hlCaptured = null; // {text, startOffset, endOffset} frozen at open
+  let hlCaptured = null; // {text, startOffset, endOffset, rect} frozen at open
   let hlPopoverPointerDown = false;
   let hlSelDebounce = 0;
   let hlPopoverScrollTop = null; // stage.scrollTop at popover open
+
+  // ── Define (dictionary lookup, M2) ──────────────────────────────────────
+  // Session-cached status: null until the first fetch resolves, then
+  // {installed, enabled}. Fetched once per page load (not per book) — see
+  // the ensureDictionaryStatus() call in renderReaderChrome's chapter-mode
+  // branch. A 503 from the lookup route (disabled/uninstalled mid-session)
+  // downgrades this cache so the popover stops offering Define.
+  let dictStatus = null;
+  let dictStatusPromise = null;
+  let dictUnavailableShown = false; // "Dictionary unavailable" toast: once per session
+  let dictPopoverEl = null;
+
+  async function ensureDictionaryStatus() {
+    if (dictStatus) return dictStatus;
+    if (!dictStatusPromise) {
+      dictStatusPromise = (async () => {
+        try {
+          const resp = await api("/api/dictionary/status");
+          if (!resp || !resp.ok) return null; // failure — see recovery below
+          return await resp.json();
+        } catch {
+          return null;
+        }
+      })();
+    }
+    const result = await dictStatusPromise;
+    // Status-cache recovery: only a successful HTTP response gets cached. A
+    // failed/exception fetch (transient error, 401, mid-outage 503) must not
+    // freeze the Define button hidden for the rest of the session — clear
+    // both so the NEXT ensureDictionaryStatus() call (fired per book entry,
+    // see renderReaderChrome) retries instead of replaying the failure.
+    if (result === null) {
+      dictStatusPromise = null;
+      dictStatus = null;
+      window.__dictStatusForTest = null;
+      return null;
+    }
+    dictStatus = result;
+    // Recovery restores future toasts: a status that comes back healthy
+    // means a prior "Dictionary unavailable" is no longer the current state.
+    if (dictStatus.installed && dictStatus.enabled) dictUnavailableShown = false;
+    // Test hook: lets e2e wait for the async status fetch to land before
+    // exercising selection, mirroring __hlJumpPendingForTest below.
+    window.__dictStatusForTest = dictStatus;
+    return dictStatus;
+  }
+
+  function dictionaryAvailable() {
+    return !!(dictStatus && dictStatus.installed && dictStatus.enabled);
+  }
+
+  // M3: whether the per-profile `vocabulary_enabled` setting is on, per the
+  // same session-cached status fetch as dictionaryAvailable() above. Gates
+  // the Define popover's "Save" button — POST /api/vocabulary re-checks this
+  // server-side too (defense in depth), so this is purely to avoid offering
+  // a button that would silently no-op.
+  function vocabularyAvailable() {
+    return !!(dictStatus && dictStatus.vocabulary);
+  }
 
   // Scroll events are dispatched asynchronously: a programmatic
   // scroll-into-view that lands JUST BEFORE the tap that opens a popover
@@ -5220,6 +5292,10 @@
   }
 
   function dismissHlPopoversOnScroll(scrollTop) {
+    // Define opens from a tap, not a scroll, so it has no "just-opened"
+    // scroll position to anchor a guard against (unlike hlPopoverScrollTop
+    // below) — dismiss it on any scroll at all.
+    if (dictPopoverEl) closeDefinePopover();
     if (!hlPopoverEl && !hlEditPopoverEl) return;
     if (hlPopoverScrollTop !== null && scrollTop === hlPopoverScrollTop) return;
     closeHlPopover();
@@ -5262,25 +5338,44 @@
       hlSelDebounce = setTimeout(() => {
         // Chapter-mode gate: #reader-content only exists in chapter mode.
         const contentEl = document.getElementById("reader-content");
-        if (!contentEl || !navigator.onLine) { closeHlPopover(); return; } // online-only
+        if (!contentEl || !navigator.onLine) { closeHlPopover(); closeDefinePopover(); return; } // online-only
         const captured = computeSelectionOffsets(contentEl);
         if (captured) openHlPopover(captured);
-        else closeHlPopover();
+        else { closeHlPopover(); closeDefinePopover(); }
       }, 250);
     });
-    // Dismiss on outside tap — both popovers. Pointer interactions that
+    // Dismiss on outside tap — all three popovers. Pointer interactions that
     // START inside a popover must never dismiss it (contains() check).
     document.addEventListener("pointerdown", (e) => {
       if (hlPopoverEl && !hlPopoverEl.contains(e.target)) closeHlPopover();
       if (hlEditPopoverEl && !hlEditPopoverEl.contains(e.target)) closeHlEditPopover();
+      if (dictPopoverEl && !dictPopoverEl.contains(e.target)) closeDefinePopover();
     });
   }
   bindHighlightSelection();
 
+  // Shared clamp math for popovers anchored below a selection/tap rect: 8px
+  // margins from the viewport edges on both axes. `opts.center` reproduces
+  // openHlPopover's horizontally-centered variant; the default matches
+  // openHlEditPopover's and openDefinePopover's left-aligned variant.
+  function positionPopoverBelow(pop, rect, opts) {
+    const top = Math.min(rect.bottom + 8, window.innerHeight - pop.offsetHeight - 8);
+    const left = opts && opts.center
+      ? Math.max(8, Math.min(rect.left + rect.width / 2 - pop.offsetWidth / 2,
+          window.innerWidth - pop.offsetWidth - 8))
+      : Math.max(8, Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8));
+    pop.style.top = `${top}px`;
+    pop.style.left = `${left}px`;
+  }
+
   function openHlPopover(captured) {
     closeHlPopover();
     closeHlEditPopover();
-    hlCaptured = { text: captured.text, startOffset: captured.startOffset, endOffset: captured.endOffset };
+    // A new selection supersedes any Define result still on screen from a
+    // previous one — it would otherwise float, stale and misplaced.
+    closeDefinePopover();
+    hlCaptured = { text: captured.text, startOffset: captured.startOffset,
+      endOffset: captured.endOffset, rect: captured.rect };
     const pop = document.createElement("div");
     pop.id = "hl-popover";
     pop.setAttribute("role", "toolbar");
@@ -5341,6 +5436,22 @@
       });
       pop.appendChild(clearBtn);
     }
+    // Define (M2): only offered once the session status fetch confirms the
+    // dictionary is installed + enabled — zero UI trace otherwise.
+    if (dictionaryAvailable()) {
+      const defineBtn = document.createElement("button");
+      defineBtn.type = "button";
+      defineBtn.id = "hl-define-btn";
+      defineBtn.setAttribute("aria-label", "Define");
+      defineBtn.textContent = "\u{1F4D6}"; // 📖
+      defineBtn.addEventListener("click", () => {
+        const captured = hlCaptured; // frozen before closeHlPopover clears it
+        const rect = captured.rect;
+        closeHlPopover();
+        defineSelection(captured, rect);
+      });
+      pop.appendChild(defineBtn);
+    }
     // Captured-range guard: pointer interactions inside the popover must not
     // dismiss it before the click handler runs (spec §2). The clearing
     // listeners are registered INSIDE pointerdown (paired per press) — an
@@ -5361,18 +5472,188 @@
     document.body.appendChild(pop);
     hlPopoverEl = pop;
     recordHlPopoverScrollTop();
-    // Position: below the selection (clear of the iOS callout), edge-clamped.
-    const r = captured.rect;
-    const top = Math.min(r.bottom + 8, window.innerHeight - pop.offsetHeight - 8);
-    const left = Math.max(8, Math.min(r.left + r.width / 2 - pop.offsetWidth / 2,
-      window.innerWidth - pop.offsetWidth - 8));
-    pop.style.top = `${top}px`;
-    pop.style.left = `${left}px`;
+    // Position: below the selection (clear of the iOS callout), edge-clamped,
+    // centered under the selection rect.
+    positionPopoverBelow(pop, captured.rect, { center: true });
   }
 
   function closeHlPopover() {
     if (hlPopoverEl) { hlPopoverEl.remove(); hlPopoverEl = null; }
     hlCaptured = null;
+  }
+
+  // ── Define result popover (M2) ──
+  const DICT_MAX_SENSES = 6;
+  // In-flight race guard: bumped at the start of every defineSelection call
+  // (and here) so a response for a superseded lookup can recognize itself as
+  // stale and discard silently — no popover, no toast.
+  let defineSeq = 0;
+
+  function closeDefinePopover() {
+    if (dictPopoverEl) { dictPopoverEl.remove(); dictPopoverEl = null; }
+    defineSeq++; // invalidate any in-flight lookup
+  }
+
+  // A lookup started under `seq` is stale once either a newer defineSelection
+  // call has begun, or the user has moved on to a new selection (the hl
+  // popover reopened) — checked fresh at each point a response might render.
+  function defineIsStale(seq) {
+    return seq !== defineSeq || hlPopoverEl !== null;
+  }
+
+  function renderDefineBody(opts) {
+    if (opts.notFound) {
+      return `<div class="dict-empty">No definition found for '${esc(opts.word)}'</div>`;
+    }
+    const entry = opts.entry;
+    const senses = entry.senses.slice(0, DICT_MAX_SENSES);
+    const more = entry.senses.length - senses.length;
+    const items = senses
+      .map((s) => `<li><span class="dict-pos">${esc(s.pos)}</span> — ${esc(s.gloss)}</li>`)
+      .join("");
+    const moreLine = more > 0 ? `<div class="dict-more">+${more} more</div>` : "";
+    return `<div class="dict-word">${esc(entry.matchedWord)}</div><ul class="dict-senses">${items}</ul>${moreLine}`;
+  }
+
+  // M3: "Save to vocabulary" button for the Define result popover (success
+  // path only — never on the not-found card). Builds and POSTs the same
+  // shape desktop's auto-log sends (word/lemma/pos/definition/book context),
+  // using the entry's first sense per spec (simplest predictable rule,
+  // mirroring defineSelection's own first-word-of-a-long-selection choice)
+  // rather than desktop's part-of-speech grouping.
+  // Desktop expands the selection to its surrounding sentence and caps it at
+  // MAX_CONTEXT_CHARS (src/lib/vocabulary.ts); the web sends the raw
+  // selection, so it must respect the same cap — the route rejects longer.
+  const VOCAB_CONTEXT_MAX_CHARS = 300;
+
+  function buildVocabularySaveButton(term, entry, captured) {
+    if (!vocabularyAvailable() || !entry || !entry.senses || entry.senses.length === 0) return null;
+    const primary = entry.senses[0];
+    // An empty gloss would make every save 400 ("definition is empty") with
+    // no path to success — don't offer the button at all.
+    if (!primary || !primary.gloss) return null;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.id = "dict-save-btn";
+    btn.className = "dict-save-btn";
+    btn.setAttribute("aria-label", "Save to vocabulary");
+    btn.textContent = "Save";
+    btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
+      btn.disabled = true; // guard double-taps for the duration of the request
+      try {
+        const resp = await fetch("/api/vocabulary", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            word: term,
+            lemma: entry.matchedWord,
+            pos: primary.pos || null,
+            definition: primary.gloss || "",
+            bookId: readerState ? readerState.id : null,
+            bookTitle: readerState && readerState.book ? readerState.book.title : null,
+            chapterIndex: currentChapterIndex,
+            contextSentence: captured ? captured.text.slice(0, VOCAB_CONTEXT_MAX_CHARS) : null,
+            startOffset: captured ? captured.startOffset : null,
+            endOffset: captured ? captured.endOffset : null,
+          }),
+        });
+        if (resp.status === 401) {
+          // #dict-popover is body-attached, so it would float over the PIN
+          // screen (with this button stuck disabled) unless closed here.
+          closeDefinePopover();
+          showLogin();
+          return;
+        }
+        if (resp.status === 403) {
+          // The setting was turned off since this tab cached its status.
+          // Drop the cache so later popovers stop offering Save, and say so
+          // instead of claiming a save that did not happen.
+          dictStatus = null;
+          dictStatusPromise = null;
+          btn.textContent = "Unavailable";
+          showToast("Vocabulary is turned off");
+          return;
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        btn.textContent = "Saved ✓";
+      } catch {
+        btn.disabled = false;
+        showToast("Could not save");
+      }
+    });
+    return btn;
+  }
+
+  function openDefinePopover(rect, opts) {
+    closeDefinePopover();
+    const pop = document.createElement("div");
+    pop.id = "dict-popover";
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-label", `Definition of "${opts.entry ? opts.entry.matchedWord : opts.word}"`);
+    pop.innerHTML = renderDefineBody(opts);
+    if (!opts.notFound) {
+      const saveBtn = buildVocabularySaveButton(opts.term, opts.entry, opts.captured);
+      if (saveBtn) pop.appendChild(saveBtn);
+    }
+    document.body.appendChild(pop);
+    dictPopoverEl = pop;
+    if (rect) positionPopoverBelow(pop, rect);
+  }
+
+  // Longer selections still show the Define button but define only the
+  // first word — simplest predictable rule (spec M2 §2) rather than
+  // guessing which word in a long selection the user meant.
+  async function defineSelection(captured, rect) {
+    if (!captured) return;
+    const mySeq = ++defineSeq;
+    const collapsed = captured.text.trim().replace(/\s+/g, " ");
+    const words = collapsed.split(" ").filter(Boolean);
+    let term = words.length <= 3 && collapsed.length <= 100 ? collapsed : words[0];
+    // Punctuation/possessive normalization — mirrors desktop's
+    // extractLookupWord (src/lib/dictionary.ts): strip surrounding
+    // non-letter characters, then a trailing 's/'s possessive.
+    term = (term || "").replace(/^[^\p{L}]+/u, "").replace(/[^\p{L}]+$/u, "");
+    term = term.replace(/['’]s$/iu, "").replace(/['’]$/u, "");
+    if (!term) return;
+    // Overlong single word: the server always 400s past 100 chars (see
+    // DICTIONARY_WORD_MAX_LEN in web_server/api.rs) — render the not-found
+    // card locally rather than spend the once-per-session toast on a
+    // guaranteed failure.
+    if (term.length > 100) {
+      openDefinePopover(rect, { notFound: true, word: `${term.slice(0, 40)}…` });
+      return;
+    }
+    try {
+      const resp = await api(`/api/dictionary/lookup?word=${encodeURIComponent(term)}`);
+      if (!resp) return; // 401 — api() already showed the login screen
+      if (resp.status === 404) {
+        if (!defineIsStale(mySeq)) openDefinePopover(rect, { notFound: true, word: term });
+        return;
+      }
+      if (resp.status === 503) {
+        // Dictionary went away (disabled/uninstalled) mid-session — clear the
+        // cached status so the button stops appearing AND a future
+        // ensureDictionaryStatus() call re-fetches instead of replaying this
+        // failure forever (see the recovery comment there).
+        dictStatus = null;
+        dictStatusPromise = null;
+        if (!defineIsStale(mySeq) && !dictUnavailableShown) {
+          dictUnavailableShown = true;
+          showToast("Dictionary unavailable");
+        }
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const entry = await resp.json();
+      if (!defineIsStale(mySeq)) openDefinePopover(rect, { entry, term, captured });
+    } catch {
+      if (!defineIsStale(mySeq) && !dictUnavailableShown) {
+        dictUnavailableShown = true;
+        showToast("Dictionary unavailable");
+      }
+    }
   }
 
   async function createHighlightFromCapture(captured, color) {
@@ -5426,6 +5707,9 @@
   function openHlEditPopover(hlId, rect) {
     closeHlPopover();
     closeHlEditPopover();
+    // Tapping an existing highlight mark supersedes any stray Define result
+    // still on screen from an earlier selection.
+    closeDefinePopover();
     const hl = highlightsState.items.find((h) => h.id === hlId);
     // tmp- = optimistic create not yet reconciled with its server id: a PUT
     // 404s and a DELETE resurrects as a ghost on next load. Untouchable until
@@ -5468,10 +5752,7 @@
     document.body.appendChild(pop);
     hlEditPopoverEl = pop;
     recordHlPopoverScrollTop();
-    const top = Math.min(rect.bottom + 8, window.innerHeight - pop.offsetHeight - 8);
-    const left = Math.max(8, Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8));
-    pop.style.top = `${top}px`;
-    pop.style.left = `${left}px`;
+    positionPopoverBelow(pop, rect);
   }
 
   function closeHlEditPopover() {

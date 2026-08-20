@@ -203,6 +203,16 @@ fn build_test_epub(path: &Path) -> Result<(), Box<dyn Error>> {
     // code units of the rendered textContent. Additive — nothing above moves.
     ch0_body
         .push_str("<p>Fish &amp; chips 🦀 the quick brown fox jumps over the lazy dog again.</p>");
+    // Dictionary e2e (dictionary.spec.ts): a selectable word that's actually
+    // in the seeded dictionary test artifact (see write_test_artifact in
+    // carrel-core/src/dictionary.rs — "cat" -> noun, "feline mammal").
+    // Additive — nothing above moves.
+    ch0_body.push_str("<p>A cat rested quietly on the windowsill.</p>");
+    // Dictionary e2e (dictionary.spec.ts): a multi-word selection with
+    // leading punctuation on its first word ("cat,") — exercises the
+    // first-word fallback (>3 words) together with punctuation stripping
+    // before lookup. Additive — nothing above moves.
+    ch0_body.push_str("<p>Indeed, cat, dog and fox met.</p>");
     zip.write_all(chapter("Ch0", &ch0_body).as_bytes())?;
     zip.start_file("OEBPS/ch1.xhtml", deflated)?;
     // Long enough that `#reader-stage` actually scrolls at the test viewport,
@@ -454,7 +464,19 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     {
         let conn = pool.get()?;
         seed(&conn, &cbz_path, &epub_path)?;
+        // M2: enable the dictionary so /api/dictionary/status reports
+        // {installed: true, enabled: true} — see the artifact seed below.
+        db::set_setting(&conn, "dictionary_enabled", "true")?;
+        // M3: enable the vocabulary builder so /api/dictionary/status reports
+        // {vocabulary: true} and the Define popover's Save button is offered.
+        db::set_setting(&conn, "vocabulary_enabled", "true")?;
     }
+
+    // M2: seed the offline dictionary test artifact (a handful of words,
+    // including "cat" -> noun, "feline mammal") so the web Define e2e
+    // (e2e/dictionary.spec.ts) has a real installed dictionary to look up
+    // against. See carrel_core::dictionary::write_test_artifact.
+    carrel_core::dictionary::write_test_artifact(&data_dir.join("dictionary"))?;
 
     let active_profile_name = Arc::new(Mutex::new("default".to_string()));
     let unlocked_profiles = Arc::new(Mutex::new(std::collections::HashSet::from([
@@ -479,6 +501,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
             active_profile_name,
             unlocked_profiles,
         ))),
+        dictionary_pool: Arc::new(Mutex::new(None)),
     };
 
     let router = web_server::build_router(

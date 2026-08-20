@@ -83,12 +83,29 @@ pub struct WebState {
     /// `None` in harnesses with no Tauri app behind them — the endpoints then
     /// report 503 instead of pretending there are no profiles.
     pub profile_host: Option<Arc<dyn ProfileHost>>,
+    /// Lazily-opened readonly pool over the installed dictionary artifact
+    /// (`{data_dir}/dictionary/dictionary.db`), cached in place after first
+    /// open. This is the SAME cache `AppState` holds — cloned in at server
+    /// start — so desktop's `download_dictionary`/`delete_dictionary`
+    /// invalidation covers web lookups too; a re-download or deletion while
+    /// the server runs is visible on the next lookup instead of the pool
+    /// silently serving the old artifact's unlinked inode forever. The
+    /// dictionary artifact is profile-independent (one artifact serves every
+    /// profile), so — unlike `pool` above — this is never touched by a
+    /// profile switch.
+    pub dictionary_pool: Arc<Mutex<Option<DbPool>>>,
 }
 
 impl WebState {
     /// Reads the private-mode flag (B-M1). Mirrors `AppState::is_private`.
     pub fn is_private(&self) -> bool {
         self.private_mode.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Directory holding the offline dictionary artifact. Mirrors
+    /// `AppState::dictionary_dir`.
+    pub fn dictionary_dir(&self) -> std::path::PathBuf {
+        self.data_dir.join("dictionary")
     }
 
     /// Get a database connection from the active pool.
@@ -474,6 +491,7 @@ mod tests {
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
+            dictionary_pool: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1894,6 +1912,7 @@ mod tests {
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
+            dictionary_pool: Arc::new(Mutex::new(None)),
         };
 
         let mut book = cache_test_book(std::path::Path::new("/Volumes/remote/comic.pdf"));
@@ -1948,6 +1967,7 @@ mod tests {
             unlocked_profiles: Arc::new(Mutex::new(HashSet::from(["default".to_string()]))),
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
+            dictionary_pool: Arc::new(Mutex::new(None)),
         };
 
         let dir = tempfile::tempdir().unwrap();

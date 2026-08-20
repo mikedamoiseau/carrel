@@ -950,10 +950,31 @@ body:not(:has(.header))::before {
   border: 2px solid var(--warm-border); border-radius: 50%; cursor: pointer;
   background-clip: content-box; /* padding stays transparent — dot reads as a circle */
 }
-#hl-note-btn, #hl-delete-btn, #hl-clear-btn, #hl-create-note-btn {
+#hl-note-btn, #hl-delete-btn, #hl-clear-btn, #hl-create-note-btn, #hl-define-btn {
   min-width: 44px; min-height: 44px; background: none; border: none;
   color: var(--ink); font-size: 1.1rem; line-height: 1; cursor: pointer;
 }
+
+/* Define result popover (M2) — same visual family as #hl-popover above. */
+#dict-popover {
+  position: fixed; z-index: 60; max-width: min(320px, 85vw);
+  padding: 10px 12px; border-radius: 10px;
+  background: var(--surface); border: 1px solid var(--warm-border);
+  box-shadow: 0 4px 16px var(--shadow);
+  color: var(--ink); font-size: 0.9rem;
+}
+.dict-word { font-weight: 600; margin-bottom: 4px; }
+.dict-senses { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.dict-pos { color: var(--ink-muted); font-style: italic; }
+.dict-more, .dict-empty { color: var(--ink-muted); margin-top: 4px; }
+/* "Save to vocabulary" button (M3) — appended after renderDefineBody's HTML,
+   so it lives outside that innerHTML string with its own click handler. */
+.dict-save-btn {
+  display: block; margin-top: 8px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--accent); background: var(--accent-light);
+  color: var(--accent); font-size: 0.85rem; cursor: pointer;
+}
+.dict-save-btn:disabled { opacity: 0.6; cursor: default; }
 
 /* Highlights drawer (cloned from the bookmark drawer). */
 .reader-toolbar #hl-btn { font-size: 1rem; line-height: 1; }
