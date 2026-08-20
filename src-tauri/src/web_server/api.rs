@@ -189,6 +189,7 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .route("/stats", get(get_stats))
         .route("/dictionary/status", get(get_dictionary_status))
         .route("/dictionary/lookup", get(lookup_dictionary_word))
+        .route("/vocabulary", axum::routing::post(create_vocabulary_word))
         .route("/series", get(list_series))
         .route("/collections", get(list_collections))
         .route("/collections/{id}/books", get(get_collection_books))
@@ -1730,6 +1731,12 @@ const DICTIONARY_WORD_MAX_LEN: usize = 100;
 struct DictionaryStatusResponse {
     installed: bool,
     enabled: bool,
+    /// Whether `vocabulary_enabled` is on for the active profile (M3). Lets
+    /// the web UI decide whether the Define popover offers "Save to
+    /// vocabulary" — `POST /api/vocabulary` still succeeds either way (see
+    /// its doc comment), this is purely so the button isn't shown for no
+    /// reason.
+    vocabulary: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -1743,6 +1750,16 @@ struct DictionaryLookupQuery {
 /// `vocabulary_enabled`.
 fn dictionary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (StatusCode, String)> {
     Ok(db::get_setting(conn, "dictionary_enabled")
+        .map_err(carrel_status)?
+        .as_deref()
+        == Some("true"))
+}
+
+/// Whether the per-profile `vocabulary_enabled` setting is on. Same
+/// defense-in-depth re-check as `dictionary_setting_enabled` above; used to
+/// populate `GET /api/dictionary/status`'s `vocabulary` field (M3).
+fn vocabulary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (StatusCode, String)> {
+    Ok(db::get_setting(conn, "vocabulary_enabled")
         .map_err(carrel_status)?
         .as_deref()
         == Some("true"))
@@ -1773,10 +1790,15 @@ async fn get_dictionary_status(
 ) -> Result<Json<DictionaryStatusResponse>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let enabled = dictionary_setting_enabled(&conn)?;
+    let vocabulary = vocabulary_setting_enabled(&conn)?;
     drop(conn);
     let status = carrel_core::dictionary::inspect(&state.dictionary_dir());
     let installed = status.state == carrel_core::dictionary::DictionaryState::Ready;
-    Ok(Json(DictionaryStatusResponse { installed, enabled }))
+    Ok(Json(DictionaryStatusResponse {
+        installed,
+        enabled,
+        vocabulary,
+    }))
 }
 
 async fn lookup_dictionary_word(
@@ -1823,6 +1845,115 @@ async fn lookup_dictionary_word(
     }
 }
 
+// ── Vocabulary builder (F-1-5 web, M3) ──────────────────────────────────────
+
+/// Longest `word`/`definition` accepted by `POST /api/vocabulary` — generous
+/// for a real headword/gloss snapshot, tight enough to reject junk bodies.
+const VOCABULARY_WORD_MAX_LEN: usize = 200;
+const VOCABULARY_DEFINITION_MAX_LEN: usize = 2000;
+
+/// POST body. camelCase, like `HighlightCreate` above (the web client sends
+/// camelCase for both). Mirrors the fields of `commands::log_vocabulary_word`
+/// one-for-one; this route shares that command's logic (see
+/// `commands::log_vocabulary_word_entry`) rather than reimplementing it.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VocabularyCreate {
+    word: String,
+    lemma: String,
+    #[serde(default)]
+    pos: Option<String>,
+    definition: String,
+    #[serde(default)]
+    book_id: Option<String>,
+    #[serde(default)]
+    book_title: Option<String>,
+    #[serde(default)]
+    chapter_index: Option<i64>,
+    #[serde(default)]
+    context_sentence: Option<String>,
+    #[serde(default)]
+    start_offset: Option<i64>,
+    #[serde(default)]
+    end_offset: Option<i64>,
+}
+
+/// Save a looked-up word to the vocabulary builder from the web Define
+/// popover. Delegates to `commands::log_vocabulary_word_entry` — the exact
+/// logic desktop's `log_vocabulary_word` IPC command runs — so the two
+/// surfaces can never drift apart on dedup-by-lemma, seen-count bumping, or
+/// the `vocabulary_enabled` re-check.
+///
+/// That re-check means this route returns success (204) even when
+/// `vocabulary_enabled` is off: `log_vocabulary_word_entry` silently no-ops
+/// rather than erroring, matching desktop parity. This is defense in depth —
+/// the web UI itself only shows the Save button when
+/// `GET /api/dictionary/status`'s `vocabulary` field is true — so a real
+/// client should never hit the no-op path, but a stale client/tab (fetched
+/// status before the setting flipped off) must not see a false failure for a
+/// save that was legitimately requested when it was on.
+async fn create_vocabulary_word(
+    State(state): State<WebState>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Manual parse (like `create_highlight`/`put_progress`) so malformed
+    // bodies map to 400 rather than axum's built-in 422.
+    let body: VocabularyCreate = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid request body: {e}"),
+        )
+    })?;
+
+    let word = body.word.trim();
+    if word.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "word is empty".to_string()));
+    }
+    if word.chars().count() > VOCABULARY_WORD_MAX_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("word exceeds {VOCABULARY_WORD_MAX_LEN} characters"),
+        ));
+    }
+    let definition = body.definition.trim();
+    if definition.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "definition is empty".to_string()));
+    }
+    if definition.chars().count() > VOCABULARY_DEFINITION_MAX_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("definition exceeds {VOCABULARY_DEFINITION_MAX_LEN} characters"),
+        ));
+    }
+
+    let conn = state.conn().map_err(carrel_status)?;
+    // Same rigor as `create_highlight`'s book check: a bookId that doesn't
+    // name a real book 404s explicitly here, rather than surfacing as a raw
+    // FK-constraint error from the `vocabulary.book_id` foreign key.
+    if let Some(book_id) = &body.book_id {
+        db::get_book(&conn, book_id)
+            .map_err(carrel_status)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
+    }
+
+    crate::commands::log_vocabulary_word_entry(
+        &conn,
+        word.to_string(),
+        body.lemma,
+        body.pos,
+        definition.to_string(),
+        body.book_id,
+        body.book_title,
+        body.chapter_index,
+        body.context_sentence,
+        body.start_offset,
+        body.end_offset,
+    )
+    .map_err(carrel_status)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1859,6 +1990,7 @@ mod tests {
 
         assert!(!status.installed);
         assert!(!status.enabled);
+        assert!(!status.vocabulary);
     }
 
     #[tokio::test]
@@ -1875,6 +2007,22 @@ mod tests {
 
         assert!(status.installed);
         assert!(status.enabled);
+        // vocabulary_enabled was never set — false by default (M3).
+        assert!(!status.vocabulary);
+    }
+
+    #[tokio::test]
+    async fn dictionary_status_reports_vocabulary_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let Json(status) = get_dictionary_status(State(state)).await.unwrap();
+
+        assert!(status.vocabulary);
     }
 
     #[tokio::test]
@@ -2040,6 +2188,189 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    // ── POST /api/vocabulary (M3) ───────────────────────────────────────────
+
+    fn vocabulary_test_book(id: &str) -> crate::models::Book {
+        crate::models::Book {
+            id: id.to_string(),
+            title: "Vocabulary Test Book".to_string(),
+            author: "Author".to_string(),
+            file_path: "/nonexistent/vocab-test.epub".to_string(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: crate::models::BookFormat::Epub,
+            file_hash: None,
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        }
+    }
+
+    fn vocabulary_body(extra: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"word":"cat","lemma":"cat","pos":"noun","definition":"feline mammal"{extra}}}"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_saves_row_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let status = create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        let words = db::list_vocabulary(&conn).unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].lemma, "cat");
+        assert_eq!(words[0].definition, "feline mammal");
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_no_op_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let status = create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        // Route still reports success — see create_vocabulary_word's doc
+        // comment on defense-in-depth vs. the web UI's own gating.
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        let words = db::list_vocabulary(&conn).unwrap();
+        assert!(words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_empty_word_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let body = Bytes::from(r#"{"word":"   ","lemma":"cat","definition":"feline mammal"}"#);
+        let err = create_vocabulary_word(State(state), body)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_overlong_word_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let overlong = "a".repeat(VOCABULARY_WORD_MAX_LEN + 1);
+        let body = Bytes::from(
+            serde_json::json!({
+                "word": overlong,
+                "lemma": "cat",
+                "definition": "feline mammal",
+            })
+            .to_string(),
+        );
+        let err = create_vocabulary_word(State(state), body)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_overlong_definition_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let overlong = "a".repeat(VOCABULARY_DEFINITION_MAX_LEN + 1);
+        let body = Bytes::from(
+            serde_json::json!({
+                "word": "cat",
+                "lemma": "cat",
+                "definition": overlong,
+            })
+            .to_string(),
+        );
+        let err = create_vocabulary_word(State(state), body)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_unknown_book_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let body = vocabulary_body(r#","bookId":"does-not-exist""#);
+        let err = create_vocabulary_word(State(state), body)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn create_vocabulary_word_with_real_book_id_saves_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-1")).unwrap();
+        }
+
+        let body = vocabulary_body(
+            r#","bookId":"book-1","bookTitle":"Vocabulary Test Book","chapterIndex":2"#,
+        );
+        let status = create_vocabulary_word(State(state.clone()), body)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        let words = db::list_vocabulary(&conn).unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].book_id.as_deref(), Some("book-1"));
+        assert_eq!(words[0].chapter_index, Some(2));
     }
 
     #[test]

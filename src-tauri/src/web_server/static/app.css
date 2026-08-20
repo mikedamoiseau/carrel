@@ -967,6 +967,14 @@ body:not(:has(.header))::before {
 .dict-senses { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .dict-pos { color: var(--ink-muted); font-style: italic; }
 .dict-more, .dict-empty { color: var(--ink-muted); margin-top: 4px; }
+/* "Save to vocabulary" button (M3) — appended after renderDefineBody's HTML,
+   so it lives outside that innerHTML string with its own click handler. */
+.dict-save-btn {
+  display: block; margin-top: 8px; padding: 6px 10px; border-radius: 8px;
+  border: 1px solid var(--accent); background: var(--accent-light);
+  color: var(--accent); font-size: 0.85rem; cursor: pointer;
+}
+.dict-save-btn:disabled { opacity: 0.6; cursor: default; }
 
 /* Highlights drawer (cloned from the bookmark drawer). */
 .reader-toolbar #hl-btn { font-size: 1rem; line-height: 1; }

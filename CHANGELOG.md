@@ -15,7 +15,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   "No definition found" message. Online-only, like highlighting; the button
   simply doesn't appear when the dictionary isn't installed or reading
   offline-saved books. Backed by the existing
-  `GET /api/dictionary/status`/`lookup` endpoints.
+  `GET /api/dictionary/status`/`lookup` endpoints. The Define popover now
+  also offers a **Save** button that logs the word to the vocabulary builder
+  (same dedup-by-lemma logic the desktop app uses), shown only when the
+  vocabulary builder is turned on for the profile; a new
+  `POST /api/vocabulary` endpoint backs it, and `GET /api/dictionary/status`
+  gained a `vocabulary` field so the button knows when to appear.
 
 ## [3.0.6] - 2026-08-17
 

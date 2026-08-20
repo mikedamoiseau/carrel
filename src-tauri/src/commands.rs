@@ -7869,9 +7869,11 @@ pub async fn lookup_word(
 /// server-side (defense in depth — the frontend already gates the call) and
 /// no-ops without writing when it's off. Free function taking `&Connection`
 /// directly (mirrors `apply_reading_progress` above) so it's unit-testable
-/// without a full `AppState`.
+/// without a full `AppState`. `pub(crate)` so `web_server::api`'s
+/// `POST /api/vocabulary` (M3) can share this logic rather than reimplement
+/// it — same crate, no `AppState` needed on that side either.
 #[allow(clippy::too_many_arguments)]
-fn log_vocabulary_word_entry(
+pub(crate) fn log_vocabulary_word_entry(
     conn: &rusqlite::Connection,
     word: String,
     lemma: String,

@@ -5273,6 +5273,15 @@
     return !!(dictStatus && dictStatus.installed && dictStatus.enabled);
   }
 
+  // M3: whether the per-profile `vocabulary_enabled` setting is on, per the
+  // same session-cached status fetch as dictionaryAvailable() above. Gates
+  // the Define popover's "Save" button — POST /api/vocabulary re-checks this
+  // server-side too (defense in depth), so this is purely to avoid offering
+  // a button that would silently no-op.
+  function vocabularyAvailable() {
+    return !!(dictStatus && dictStatus.vocabulary);
+  }
+
   // Scroll events are dispatched asynchronously: a programmatic
   // scroll-into-view that lands JUST BEFORE the tap that opens a popover
   // delivers its scroll event AFTER the popover opens — dismissing it
@@ -5506,6 +5515,53 @@
     return `<div class="dict-word">${esc(entry.matchedWord)}</div><ul class="dict-senses">${items}</ul>${moreLine}`;
   }
 
+  // M3: "Save to vocabulary" button for the Define result popover (success
+  // path only — never on the not-found card). Builds and POSTs the same
+  // shape desktop's auto-log sends (word/lemma/pos/definition/book context),
+  // using the entry's first sense per spec (simplest predictable rule,
+  // mirroring defineSelection's own first-word-of-a-long-selection choice)
+  // rather than desktop's part-of-speech grouping.
+  function buildVocabularySaveButton(term, entry, captured) {
+    if (!vocabularyAvailable() || !entry || !entry.senses || entry.senses.length === 0) return null;
+    const primary = entry.senses[0];
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.id = "dict-save-btn";
+    btn.className = "dict-save-btn";
+    btn.setAttribute("aria-label", "Save to vocabulary");
+    btn.textContent = "Save";
+    btn.addEventListener("click", async () => {
+      if (btn.disabled) return;
+      btn.disabled = true; // guard double-taps for the duration of the request
+      try {
+        const resp = await fetch("/api/vocabulary", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            word: term,
+            lemma: entry.matchedWord,
+            pos: primary.pos || null,
+            definition: primary.gloss || "",
+            bookId: readerState ? readerState.id : null,
+            bookTitle: readerState && readerState.book ? readerState.book.title : null,
+            chapterIndex: currentChapterIndex,
+            contextSentence: captured ? captured.text : null,
+            startOffset: captured ? captured.startOffset : null,
+            endOffset: captured ? captured.endOffset : null,
+          }),
+        });
+        if (resp.status === 401) { showLogin(); return; }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        btn.textContent = "Saved ✓";
+      } catch {
+        btn.disabled = false;
+        showToast("Could not save");
+      }
+    });
+    return btn;
+  }
+
   function openDefinePopover(rect, opts) {
     closeDefinePopover();
     const pop = document.createElement("div");
@@ -5513,6 +5569,10 @@
     pop.setAttribute("role", "dialog");
     pop.setAttribute("aria-label", `Definition of "${opts.entry ? opts.entry.matchedWord : opts.word}"`);
     pop.innerHTML = renderDefineBody(opts);
+    if (!opts.notFound) {
+      const saveBtn = buildVocabularySaveButton(opts.term, opts.entry, opts.captured);
+      if (saveBtn) pop.appendChild(saveBtn);
+    }
     document.body.appendChild(pop);
     dictPopoverEl = pop;
     if (rect) positionPopoverBelow(pop, rect);
@@ -5563,7 +5623,7 @@
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const entry = await resp.json();
-      if (!defineIsStale(mySeq)) openDefinePopover(rect, { entry });
+      if (!defineIsStale(mySeq)) openDefinePopover(rect, { entry, term, captured });
     } catch {
       if (!defineIsStale(mySeq) && !dictUnavailableShown) {
         dictUnavailableShown = true;

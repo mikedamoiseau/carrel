@@ -467,6 +467,9 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         // M2: enable the dictionary so /api/dictionary/status reports
         // {installed: true, enabled: true} — see the artifact seed below.
         db::set_setting(&conn, "dictionary_enabled", "true")?;
+        // M3: enable the vocabulary builder so /api/dictionary/status reports
+        // {vocabulary: true} and the Define popover's Save button is offered.
+        db::set_setting(&conn, "vocabulary_enabled", "true")?;
     }
 
     // M2: seed the offline dictionary test artifact (a handful of words,

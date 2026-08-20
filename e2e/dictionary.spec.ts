@@ -10,8 +10,8 @@ test.use({ serviceWorkers: "block" });
 declare global {
   interface Window {
     // Test hook set by app.js once the session dictionary-status fetch
-    // resolves: {installed, enabled} or null before it lands.
-    __dictStatusForTest?: { installed: boolean; enabled: boolean } | null;
+    // resolves: {installed, enabled, vocabulary} or null before it lands.
+    __dictStatusForTest?: { installed: boolean; enabled: boolean; vocabulary: boolean } | null;
   }
 }
 
@@ -121,6 +121,35 @@ test.describe("Define (dictionary lookup)", () => {
     await expect(result).toBeVisible();
     await expect(result).toHaveAttribute("aria-label", 'Definition of "cat"');
     await expect(result).toContainText("feline mammal");
+  });
+
+  test("Save button appears after a successful Define and flips to Saved on click", async ({ page }) => {
+    await openEpubReader(page);
+    await selectText(page, "cat");
+    await page.locator("#hl-popover #hl-define-btn").click();
+    const result = page.locator("#dict-popover");
+    await expect(result).toBeVisible();
+    const saveBtn = result.locator("#dict-save-btn");
+    await expect(saveBtn).toBeVisible();
+    await expect(saveBtn).toHaveAttribute("aria-label", "Save to vocabulary");
+    await expect(saveBtn).toBeEnabled();
+
+    await saveBtn.click();
+    await expect(saveBtn).toBeDisabled();
+    await expect(saveBtn).toHaveText("Saved ✓");
+    // The button stays disabled — re-clicking to save a duplicate isn't
+    // possible from the UI. (DB-level assertion that only one row was
+    // written isn't reachable from Playwright against this harness; that
+    // path is covered by the Rust unit tests in web_server/api.rs instead.)
+  });
+
+  test("no Save button on the not-found card", async ({ page }) => {
+    await openEpubReader(page);
+    await selectText(page, "lorem");
+    await page.locator("#hl-popover #hl-define-btn").click();
+    const result = page.locator("#dict-popover");
+    await expect(result).toBeVisible();
+    await expect(result.locator("#dict-save-btn")).toHaveCount(0);
   });
 
   // Toggling `dictionary_enabled` per test would need a settings-mutation
