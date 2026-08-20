@@ -347,6 +347,7 @@ pub fn run() {
                     unlocked_profiles: state.unlocked_profiles.clone(),
                     private_mode: state.private_mode.clone(),
                     profile_host: Some(crate::profile_host::for_app(&app_handle)),
+                    dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 };
                 if let Ok(handle) = web_server::start(web_state, port, modes).await {
                     {

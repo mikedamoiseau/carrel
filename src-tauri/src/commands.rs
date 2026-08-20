@@ -9039,6 +9039,7 @@ pub async fn web_server_set_modes(
             unlocked_profiles: state.unlocked_profiles.clone(),
             private_mode: state.private_mode.clone(),
             profile_host: Some(crate::profile_host::for_app(&app)),
+            dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         let handle = crate::web_server::start(web_state, port_used, modes).await?;

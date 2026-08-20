@@ -479,6 +479,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
             active_profile_name,
             unlocked_profiles,
         ))),
+        dictionary_pool: Arc::new(Mutex::new(None)),
     };
 
     let router = web_server::build_router(

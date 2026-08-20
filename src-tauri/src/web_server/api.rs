@@ -187,6 +187,8 @@ pub fn routes(state: WebState) -> Router<WebState> {
             get(download_book_with_filename),
         )
         .route("/stats", get(get_stats))
+        .route("/dictionary/status", get(get_dictionary_status))
+        .route("/dictionary/lookup", get(lookup_dictionary_word))
         .route("/series", get(list_series))
         .route("/collections", get(list_collections))
         .route("/collections/{id}/books", get(get_collection_books))
@@ -1718,9 +1720,256 @@ async fn get_stats(
     Ok(Json(stats))
 }
 
+// ── Dictionary (F-1-1 web) ───────────────────────────────────────────────────
+
+/// Longest word accepted by `GET /api/dictionary/lookup` — generous for any
+/// real dictionary headword, tight enough to reject junk queries early.
+const DICTIONARY_WORD_MAX_LEN: usize = 100;
+
+#[derive(serde::Serialize)]
+struct DictionaryStatusResponse {
+    installed: bool,
+    enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct DictionaryLookupQuery {
+    word: Option<String>,
+}
+
+/// Whether the per-profile `dictionary_enabled` setting is on. Re-checked
+/// server-side on every request (defense in depth — the frontend already
+/// gates the lookup UI), mirroring `log_vocabulary_word_entry`'s handling of
+/// `vocabulary_enabled`.
+fn dictionary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (StatusCode, String)> {
+    Ok(db::get_setting(conn, "dictionary_enabled")
+        .map_err(carrel_status)?
+        .as_deref()
+        == Some("true"))
+}
+
+/// Get (opening and caching on first use) the readonly pool over the
+/// installed dictionary artifact. Mirrors desktop's `lookup_word` command,
+/// except the cache lives on `WebState` — app-level like the artifact
+/// itself, so it is never invalidated by a profile switch.
+fn dictionary_readonly_pool(
+    state: &WebState,
+) -> crate::error::CarrelResult<carrel_core::db::DbPool> {
+    let mut guard = state.dictionary_pool.lock()?;
+    if guard.is_none() {
+        *guard = Some(carrel_core::dictionary::open_readonly_pool(
+            &state.data_dir.join("dictionary"),
+        )?);
+    }
+    Ok(guard.as_ref().expect("pool populated above").clone())
+}
+
+async fn get_dictionary_status(
+    State(state): State<WebState>,
+) -> Result<Json<DictionaryStatusResponse>, (StatusCode, String)> {
+    let conn = state.conn().map_err(carrel_status)?;
+    let enabled = dictionary_setting_enabled(&conn)?;
+    drop(conn);
+    let status = carrel_core::dictionary::inspect(&state.data_dir.join("dictionary"));
+    let installed = status.state == carrel_core::dictionary::DictionaryState::Ready;
+    Ok(Json(DictionaryStatusResponse { installed, enabled }))
+}
+
+async fn lookup_dictionary_word(
+    State(state): State<WebState>,
+    Query(params): Query<DictionaryLookupQuery>,
+) -> Result<Json<carrel_core::dictionary::DictionaryEntry>, (StatusCode, String)> {
+    let word = params.word.unwrap_or_default();
+    let word = word.trim();
+    if word.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "word must not be empty".to_string(),
+        ));
+    }
+    if word.chars().count() > DICTIONARY_WORD_MAX_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("word exceeds {DICTIONARY_WORD_MAX_LEN} characters"),
+        ));
+    }
+
+    let conn = state.conn().map_err(carrel_status)?;
+    let enabled = dictionary_setting_enabled(&conn)?;
+    drop(conn);
+    if !enabled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Dictionary is not enabled".to_string(),
+        ));
+    }
+    let status = carrel_core::dictionary::inspect(&state.data_dir.join("dictionary"));
+    if status.state != carrel_core::dictionary::DictionaryState::Ready {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Dictionary is not installed".to_string(),
+        ));
+    }
+
+    let pool = dictionary_readonly_pool(&state).map_err(carrel_status)?;
+    let dict_conn = pool.get().map_err(carrel_status)?;
+    match carrel_core::dictionary::lookup(&dict_conn, word).map_err(carrel_status)? {
+        Some(entry) => Ok(Json(entry)),
+        None => Err((StatusCode::NOT_FOUND, "Word not found".to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal `WebState` for dictionary handler tests, rooted at `data_dir`
+    /// (a fresh tempdir per test, so `write_test_artifact` and the settings
+    /// pool never leak between tests). Mirrors `mod::tests::test_state`.
+    fn dictionary_test_state(data_dir: std::path::PathBuf) -> WebState {
+        let pool =
+            crate::db::create_pool(&std::path::PathBuf::from(":memory:")).expect("in-memory DB");
+        WebState {
+            pool: std::sync::Arc::new(std::sync::Mutex::new(pool)),
+            data_dir,
+            cache_dir: std::env::temp_dir(),
+            pin_hash: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sessions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            login_limiter: std::sync::Arc::new(super::super::auth::RateLimiter::new(5, 300)),
+            active_profile_name: std::sync::Arc::new(std::sync::Mutex::new("default".to_string())),
+            unlocked_profiles: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::from(["default".to_string()]),
+            )),
+            private_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_host: None,
+            dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn dictionary_status_reports_not_installed_on_empty_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let Json(status) = get_dictionary_status(State(state)).await.unwrap();
+
+        assert!(!status.installed);
+        assert!(!status.enabled);
+    }
+
+    #[tokio::test]
+    async fn dictionary_status_reports_installed_and_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        carrel_core::dictionary::write_test_artifact(&dir.path().join("dictionary")).unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "dictionary_enabled", "true").unwrap();
+        }
+
+        let Json(status) = get_dictionary_status(State(state)).await.unwrap();
+
+        assert!(status.installed);
+        assert!(status.enabled);
+    }
+
+    #[tokio::test]
+    async fn dictionary_lookup_returns_seeded_word() {
+        let dir = tempfile::tempdir().unwrap();
+        carrel_core::dictionary::write_test_artifact(&dir.path().join("dictionary")).unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "dictionary_enabled", "true").unwrap();
+        }
+
+        let Json(entry) = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("cat".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entry.matched_word, "cat");
+        assert_eq!(entry.senses[0].gloss, "feline mammal");
+    }
+
+    #[tokio::test]
+    async fn dictionary_lookup_unknown_word_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        carrel_core::dictionary::write_test_artifact(&dir.path().join("dictionary")).unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "dictionary_enabled", "true").unwrap();
+        }
+
+        let err = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("zzznotaword".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dictionary_lookup_disabled_setting_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        // Artifact is installed, but `dictionary_enabled` is left unset.
+        carrel_core::dictionary::write_test_artifact(&dir.path().join("dictionary")).unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("cat".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dictionary_lookup_empty_word_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("   ".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dictionary_lookup_overlong_word_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("a".repeat(DICTIONARY_WORD_MAX_LEN + 1)),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn width_param_absent_and_invalid_resolve_to_none() {
