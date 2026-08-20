@@ -757,6 +757,11 @@ body:not(:has(.header))::before {
 .nav-icon { background: none; border: none; cursor: pointer; padding: 6px; border-radius: 6px; color: var(--ink-muted); display: flex; align-items: center; }
 .nav-icon:hover { color: var(--ink); background: var(--warm-subtle); }
 .nav-icon.active { color: var(--accent); }
+/* M5: `.nav-icon` sets `display` itself, so the plain `hidden` attribute
+   (author-normal `display:flex` beats the UA stylesheet's `[hidden]` rule
+   regardless of specificity) needs this explicit override to actually hide
+   the Vocabulary icon when unavailable. */
+.nav-icon[hidden] { display: none; }
 
 /* ── Profile Switcher (remote profile switching) ── */
 /* Sits in the header cluster next to the theme toggle, and deliberately has no
@@ -815,6 +820,9 @@ body:not(:has(.header))::before {
 }
 .tab-label { font-size: 0.7rem; font-weight: 600; letter-spacing: 0.01em; }
 .tab.active { color: var(--accent); }
+/* M5: same `hidden`-attribute-vs-author-`display` issue as `.nav-icon[hidden]`
+   above — `.tab` sets `display: flex` itself. */
+.tab[hidden] { display: none; }
 
 /* Narrow OR touch (comma = OR): phones, narrow windows, and coarse-pointer
    tablets in landscape. Desktop (wide + fine pointer) falls through to the
@@ -1057,9 +1065,13 @@ body:not(:has(.header))::before {
 .vocab-panel.open { transform: translateX(0); visibility: visible; }
 @media (prefers-reduced-motion: reduce) { .vocab-panel { transition: none; } }
 .vocab-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: 8px;
   padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--warm-border);
 }
+.vocab-title { flex: 1; }
+/* M5: link to the full-list screen (#/vocabulary). */
+.vocab-see-all { color: var(--accent); font-size: 0.8rem; font-weight: 400; text-decoration: none; }
+.vocab-see-all:hover, .vocab-see-all:focus-visible { text-decoration: underline; }
 .vocab-close {
   min-width: 44px; min-height: 44px; background: none; border: none;
   color: var(--ink); font-size: 1.4rem; line-height: 1; cursor: pointer;
@@ -1088,3 +1100,18 @@ body:not(:has(.header))::before {
    row is inert — no hover affordance, no pointer. Its ✕ still works. */
 .vocab-entry-static { cursor: default; }
 .vocab-entry-static:hover { background: none; }
+
+/* M5: cross-book "See all" vocabulary screen (#/vocabulary) — full-width
+   list, cloned from `.collections`/`.collections-toolbar` below. Row
+   sub-elements (`.vocab-entry-word`/`-pos`/`-def`/`-meta`/`-delete`,
+   `.vocab-entry-body`) reuse the drawer's classes above unchanged. */
+.vocab-screen { max-width: 640px; margin: 0 auto; padding: var(--gap); }
+.vocab-screen-toolbar { display: flex; gap: 10px; align-items: center; padding-bottom: var(--gap); }
+.vocab-screen-toolbar input { flex: 1; padding: 8px 12px; background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius); color: var(--ink); font-size: 0.85rem; }
+.vocab-screen-toolbar .sort-btn { background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius); padding: 6px 10px; color: var(--ink-muted); cursor: pointer; font-size: 0.8rem; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.vocab-screen-toolbar .sort-btn:hover { color: var(--ink); border-color: var(--accent); }
+.vocab-screen-list { display: flex; flex-direction: column; gap: 8px; }
+.vocab-screen-entry {
+  background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius);
+  padding: 12px 16px; display: flex; align-items: flex-start; gap: 8px;
+}

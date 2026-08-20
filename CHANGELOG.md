@@ -28,6 +28,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   row. Backed by `GET /api/vocabulary` (optionally filtered by `?bookId=`)
   and a new `DELETE /api/vocabulary/{id}`, both gated on the vocabulary
   builder setting like the existing save route.
+- **Vocabulary screen ("See all") in the web reader.** A new Vocabulary icon
+  in the header nav cluster (and bottom tab bar on narrow viewports) opens a
+  full cross-book list of every saved word — the book it came from, chapter,
+  and save date — with a search box, a newest/alphabetical sort toggle, and a
+  delete button per row. Also reachable via a "See all" link in the M4
+  drawer's header. No new backend route: it reuses `GET /api/vocabulary`
+  without `?bookId=`, which already returns every row.
 
 ### Fixed
 - **Jumping to a highlight in the web reader now lands on the highlight.**

@@ -1131,7 +1131,7 @@
 
   // R2-3/R3-1: current view + reader state, used by the global keyboard
   // shortcut dispatcher and by the reader's own nav handlers.
-  let currentView = null; // "login" | "library" | "detail" | "reader" | "stats" | "collections"
+  let currentView = null; // "login" | "library" | "detail" | "reader" | "stats" | "collections" | "vocabulary"
   let readerState = null; // set while currentView === "reader"; see showReader()
   let shortcutsOverlayOpen = false;
 
@@ -1426,6 +1426,7 @@
     }
     if (hash === "#/stats") return showStats();
     if (hash === "#/collections") return showCollections();
+    if (hash === "#/vocabulary") return showVocabularyScreen();
     if (hash.startsWith("#/book/") && hash.includes("/read")) {
       const parts = hash.replace("#/book/", "").replace("/read", "").split("/");
       return showReader(parts[0], parseInt(parts[1] || "0"));
@@ -1937,6 +1938,7 @@
 
       bindNavIcons();
       bindTabBar();
+      ensureDictionaryStatus().then(applyVocabNavVisibility);
       renderFilterBar();
     } else {
       // Item 7: DOM already exists — this is a hash change while still
@@ -3024,6 +3026,7 @@
       </div>`;
     $("#back-btn").addEventListener("click", goHome);
     bindNavIcons();
+    ensureDictionaryStatus().then(applyVocabNavVisibility);
     const coverImg = $(".detail .cover img");
     if (coverImg) bindCoverFallback(coverImg);
     // "More" overflow menu. Toggle open/closed; outside-click and Esc dismiss
@@ -4908,6 +4911,9 @@
       gotoReaderIndex(parseInt(e.target.value, 10), { instant: true });
     });
     bindNavIcons();
+    // M5: the nav cluster's Vocabulary icon is gated the same way in every
+    // mode (unlike the chapter-mode-only vocab-btn toolbar button below).
+    ensureDictionaryStatus().then(applyVocabNavVisibility);
 
     if (mode === "page") {
       const img = $("#page-img");
@@ -5273,10 +5279,17 @@
   // a timer.
 
   function vocabPanelHtml() {
+    // M5: "See all" is a plain hash link, not a navigate()-bound button — a
+    // hash-only href changes location.hash itself, which fires the same
+    // hashchange -> route() as every other navigation (route() already
+    // closes this panel on any navigation, so no extra JS is needed here).
+    // Reachable only through this drawer, which is itself gated on
+    // vocabularyAvailable() (the trigger button), so no separate gating.
     return `
       <div class="vocab-panel" id="vocab-panel" role="dialog" aria-label="Saved words">
         <div class="vocab-head">
           <span class="vocab-title">Saved words</span>
+          <a href="#/vocabulary" id="vocab-see-all" class="vocab-see-all">See all</a>
           <button id="vocab-close" class="vocab-close" aria-label="Close">&times;</button>
         </div>
         <div class="vocab-list" id="vocab-list"></div>
@@ -5302,6 +5315,23 @@
   function applyVocabButtonVisibility() {
     const btn = $("#vocab-btn");
     if (btn) btn.hidden = !vocabularyAvailable();
+  }
+
+  // Same idea as applyVocabButtonVisibility, for the M5 "Vocabulary" entry in
+  // the header nav cluster and bottom tab bar (rendered on every top-level
+  // screen, not just the reader). Toggles the `hidden` attribute set by
+  // navIconsHtml()/tabBarHtml() at render time, which reflects whatever
+  // vocabularyAvailable() already knew synchronously — this applies the
+  // result once the async status fetch resolves. `[hidden]` alone would not
+  // hide either element: both `.nav-icon` and `.tab` set `display` in CSS,
+  // which as an author rule beats the UA stylesheet's `[hidden]{display:none}`
+  // regardless of specificity — see the `.nav-icon[hidden]`/`.tab[hidden]`
+  // overrides in app.css.
+  function applyVocabNavVisibility() {
+    const nav = $('[data-nav="vocabulary"]');
+    if (nav) nav.hidden = !vocabularyAvailable();
+    const tab = $('[data-tab="vocabulary"]');
+    if (tab) tab.hidden = !vocabularyAvailable();
   }
 
   // Chapter label for a drawer row: TOC title when known, else "Chapter N"
@@ -5647,10 +5677,14 @@
 
   // ── Define (dictionary lookup, M2) ──────────────────────────────────────
   // Session-cached status: null until the first fetch resolves, then
-  // {installed, enabled}. Fetched once per page load (not per book) — see
-  // the ensureDictionaryStatus() call in renderReaderChrome's chapter-mode
-  // branch. A 503 from the lookup route (disabled/uninstalled mid-session)
-  // downgrades this cache so the popover stops offering Define.
+  // {installed, enabled, vocabulary}. Fetched once per page load (not per
+  // book), memoized via dictStatusPromise — every top-level screen that
+  // shows the Vocabulary nav icon (library/detail/reader/stats/collections/
+  // vocabulary, M5) kicks it on render, and renderReaderChrome's chapter-mode
+  // branch kicks it too for the vocab-btn toolbar button; whichever call
+  // lands first does the actual fetch. A 503 from the lookup route
+  // (disabled/uninstalled mid-session) downgrades this cache so the popover
+  // stops offering Define.
   let dictStatus = null;
   let dictStatusPromise = null;
   let dictUnavailableShown = false; // "Dictionary unavailable" toast: once per session
@@ -7158,6 +7192,7 @@
     $("#back-btn").addEventListener("click", goHome);
     bindNavIcons();
     bindTabBar();
+    ensureDictionaryStatus().then(applyVocabNavVisibility);
 
     // Finding 1: stats previously had no failure handling at all beyond a
     // 401 — a network error, non-2xx response, or bad JSON left "Loading..."
@@ -7247,6 +7282,7 @@
     $("#back-btn").addEventListener("click", goHome);
     bindNavIcons();
     bindTabBar();
+    ensureDictionaryStatus().then(applyVocabNavVisibility);
 
     // Finding 1: this previously had no failure handling at all — a network
     // error, non-2xx response, or bad JSON left "Loading..." on screen
@@ -7382,6 +7418,214 @@
           navigate(libraryHash({ q: "", series: row.dataset.seriesName, collection: null, sort: activeSort }));
         };
       });
+    }
+
+    render();
+  }
+
+  // ── Vocabulary screen (M5, "See all") ───────────
+  // Cross-book list of every saved word, reachable from the header nav
+  // cluster / bottom tab bar and from the book-scoped drawer's "See all"
+  // link (M4). Backed by the same `GET /api/vocabulary` the drawer uses,
+  // just without `?bookId=` — nothing new on the backend. Structured like
+  // showCollections() above: fetch once, then a closure-local render()
+  // re-renders the full list on every filter/sort/delete.
+  async function showVocabularyScreen() {
+    currentView = "vocabulary";
+    document.title = "Vocabulary — Carrel";
+    flushProgressSave();
+    readerState = null;
+    resumePromptActive = false;
+    app().innerHTML = `
+      <div class="header">
+        <button class="back-btn" id="back-btn" aria-label="Back">&larr;</button>
+        <h1>Vocabulary</h1>
+        <span style="flex:1"></span>
+        ${navIconsHtml("vocabulary")}
+      </div>
+      <div class="vocab-screen"><div class="loading">Loading...</div></div>
+      ${tabBarHtml("vocabulary")}`;
+    $("#back-btn").addEventListener("click", goHome);
+    bindNavIcons();
+    bindTabBar();
+    ensureDictionaryStatus().then(applyVocabNavVisibility);
+
+    // `currentView !== "vocabulary"` guards every branch below against
+    // rendering over a view the user has since navigated away from — same
+    // precedent as showStats/showCollections' Finding 1.
+    let resp;
+    try {
+      resp = await api("/api/vocabulary");
+    } catch (e) {
+      if (currentView !== "vocabulary") return;
+      const container = $(".vocab-screen");
+      if (container) container.innerHTML = `<div class="empty">${esc(apiFailureToastMessage(e))}</div>`;
+      showToast(apiFailureToastMessage(e));
+      return;
+    }
+    if (!resp || currentView !== "vocabulary") return; // 401 already redirected to login
+    // The vocabulary builder was switched off since this tab last cached its
+    // status (or was never on) — same defense-in-depth 403 as the book-scoped
+    // drawer's loadVocabForBook. Not a connection problem, so it must not go
+    // through httpErrorToastMessage's generic "Server error" phrasing.
+    if (resp.status === 403) {
+      dictStatus = null;
+      dictStatusPromise = null;
+      window.__dictStatusForTest = null;
+      applyVocabNavVisibility();
+      const container = $(".vocab-screen");
+      if (container) container.innerHTML = `<div class="empty">Vocabulary is turned off.</div>`;
+      showToast("Vocabulary is turned off");
+      return;
+    }
+    if (!resp.ok) {
+      const container = $(".vocab-screen");
+      if (container) container.innerHTML = `<div class="empty">${esc(`Couldn't load vocabulary (HTTP ${resp.status})`)}</div>`;
+      showToast(httpErrorToastMessage(resp.status));
+      return;
+    }
+    let words;
+    try {
+      words = await resp.json();
+    } catch (e) {
+      const container = $(".vocab-screen");
+      if (container) container.innerHTML = `<div class="empty">${esc("Unexpected response")}</div>`;
+      showToast("Unexpected response");
+      return;
+    }
+    if (currentView !== "vocabulary") return;
+    const container = $(".vocab-screen");
+    if (!container) return;
+    words = Array.isArray(words) ? words : [];
+
+    let filterText = "";
+    let sortMode = "newest"; // "newest" | "alphabetical"
+
+    // Client-side search predicate — mirrors the desktop app's
+    // matchesVocabularyQuery (src/lib/vocabulary.ts): case-insensitive
+    // substring match across word, lemma, definition, and bookTitle. An
+    // empty query matches everything.
+    function matchesQuery(w, query) {
+      const needle = query.trim().toLowerCase();
+      if (needle === "") return true;
+      return (
+        w.word.toLowerCase().includes(needle) ||
+        w.lemma.toLowerCase().includes(needle) ||
+        w.definition.toLowerCase().includes(needle) ||
+        (w.bookTitle ? w.bookTitle.toLowerCase().includes(needle) : false)
+      );
+    }
+
+    // "Chapter N" only, unlike the drawer's vocabChapterLabel — this screen
+    // has no live reader for the word's book (it may not even be open, or
+    // may span many different books at once), so there is no TOC to resolve
+    // a real title against. Still null when the word carries no chapter at
+    // all (chapterIndex is nullable).
+    function chapterLabel(w) {
+      return Number.isFinite(w.chapterIndex) ? `Chapter ${w.chapterIndex + 1}` : null;
+    }
+
+    function render() {
+      // Every render replaces the search box along with the list, so a
+      // re-render fired by the input's own debounce would drop focus and
+      // swallow whatever the user typed next (a pause longer than the
+      // debounce is enough). Capture focus and caret BEFORE the innerHTML
+      // swap and restore them after. showCollections' unconditional
+      // .focus() would also pull focus — and the mobile keyboard — on plain
+      // screen entry, so this restores only what was already there.
+      const priorInput = $("#vocab-filter");
+      const refocus = !!priorInput && document.activeElement === priorInput;
+      const caret = refocus ? priorInput.selectionStart : null;
+      const filtered = words.filter((w) => matchesQuery(w, filterText));
+      const sorted = filtered.slice().sort((a, b) =>
+        sortMode === "alphabetical"
+          ? a.word.toLowerCase().localeCompare(b.word.toLowerCase())
+          : b.createdAt - a.createdAt
+      );
+
+      let html = `<div class="vocab-screen-toolbar">
+        <input type="text" id="vocab-filter" placeholder="Search saved words..." value="${esc(filterText)}">
+        <button class="sort-btn" id="vocab-sort">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 5h10M11 9h7M11 13h4"/><path d="M3 17l3 3 3-3M6 18V4"/></svg>
+          ${sortMode === "alphabetical" ? "A→Z" : "Newest"}
+        </button>
+      </div>`;
+
+      if (words.length === 0) {
+        html += '<div class="empty">No saved words yet. Look up a word in the reader and tap Save to build your vocabulary.</div>';
+      } else if (sorted.length === 0) {
+        html += '<div class="empty">No matches</div>';
+      } else {
+        html += '<div class="vocab-screen-list">';
+        for (const w of sorted) {
+          // A word whose source book was deleted keeps its row (book_id is
+          // nullable) — bookTitle is simply absent from the meta line then.
+          const meta = [w.bookTitle, chapterLabel(w), formatAddedDate(w.createdAt)].filter(Boolean).join(" · ");
+          html += `
+          <div class="vocab-screen-entry" data-id="${esc(w.id)}">
+            <span class="vocab-entry-body">
+              <span class="vocab-entry-word"><strong>${esc(w.word)}</strong>${w.pos ? ` <span class="vocab-entry-pos">${esc(w.pos)}</span>` : ""}</span>
+              <span class="vocab-entry-def">${esc(w.definition)}</span>
+              ${meta ? `<span class="vocab-entry-meta">${esc(meta)}</span>` : ""}
+            </span>
+            <button class="vocab-entry-delete" data-id="${esc(w.id)}" aria-label="Delete saved word">&times;</button>
+          </div>`;
+        }
+        html += '</div>';
+      }
+
+      container.innerHTML = html;
+
+      const filterInput = $("#vocab-filter");
+      let filterTimer;
+      filterInput.oninput = (e) => {
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => { filterText = e.target.value; render(); }, 200);
+      };
+      if (refocus) {
+        filterInput.focus();
+        if (caret !== null) filterInput.setSelectionRange(caret, caret);
+      }
+
+      $("#vocab-sort").onclick = () => {
+        sortMode = sortMode === "alphabetical" ? "newest" : "alphabetical";
+        render();
+      };
+
+      container.querySelectorAll(".vocab-entry-delete").forEach((btn) => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          deleteScreenWord(btn.getAttribute("data-id"));
+        };
+      });
+    }
+
+    // Optimistic delete + rollback on failure — same idempotent-204 and 401
+    // handling as the drawer's deleteVocabWord, scoped to this screen's own
+    // `words` array instead of vocabState.
+    async function deleteScreenWord(id) {
+      const i = words.findIndex((w) => w.id === id);
+      if (i === -1) return;
+      const removed = words.splice(i, 1)[0];
+      render();
+      try {
+        const delResp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "same-origin",
+        });
+        if (delResp.status === 401) {
+          words.splice(i, 0, removed);
+          render();
+          showLogin();
+          return;
+        }
+        // Idempotent DELETE: 204 is success whether or not the row still existed.
+        if (!delResp.ok && delResp.status !== 204) throw new Error(`HTTP ${delResp.status}`);
+      } catch {
+        words.splice(i, 0, removed);
+        render();
+        showToast("Couldn't delete saved word");
+      }
     }
 
     render();
@@ -7561,6 +7805,8 @@
     collections: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
     stats: '<path d="M18 20V10M12 20V4M6 20v-6"/>',
     library: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+    // M5: Feather "book-open", distinct from the closed-book `library` glyph.
+    vocabulary: '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>',
   };
   const navIconSvg = (size, inner) =>
     `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
@@ -7568,6 +7814,7 @@
   function navIconsHtml(activePage) {
     const folderColor = activePage === "collections" ? "active" : "";
     const chartColor = activePage === "stats" ? "active" : "";
+    const vocabColor = activePage === "vocabulary" ? "active" : "";
     return `<div class="nav-icons">
       ${profileSwitcherHtml()}
       ${themeToggleHtml()}
@@ -7576,6 +7823,9 @@
       </button>
       <button class="nav-icon ${chartColor}" title="Reading Stats" aria-label="Reading Stats" data-nav="stats">
         ${navIconSvg(20, NAV_ICON_PATH.stats)}
+      </button>
+      <button class="nav-icon ${vocabColor}" title="Vocabulary" aria-label="Vocabulary" data-nav="vocabulary"${vocabularyAvailable() ? "" : " hidden"}>
+        ${navIconSvg(20, NAV_ICON_PATH.vocabulary)}
       </button>
     </div>`;
   }
@@ -7590,16 +7840,17 @@
   }
 
   // Item A (app-feel Tier 1): fixed bottom tab bar for primary navigation on
-  // narrow/touch viewports. Rendered by the three top-level views
-  // (library/collections/stats) — not the reader (immersive) or login. On
-  // desktop it is CSS-hidden and the header icon cluster is used instead
-  // (the two are mutually exclusive via a media query in app.css). SVGs mirror
-  // the header cluster's (folder = collections, bar-chart = stats); Library
-  // gets a book glyph the cluster never had.
+  // narrow/touch viewports. Rendered by the top-level views
+  // (library/collections/stats/vocabulary, M5) — not the reader (immersive)
+  // or login. On desktop it is CSS-hidden and the header icon cluster is used
+  // instead (the two are mutually exclusive via a media query in app.css).
+  // SVGs mirror the header cluster's (folder = collections, bar-chart =
+  // stats, open book = vocabulary); Library gets a closed-book glyph the
+  // cluster never had.
   function tabBarHtml(activePage) {
-    const tab = (page, label, svg) => {
+    const tab = (page, label, svg, hidden) => {
       const active = activePage === page;
-      return `<button class="tab ${active ? "active" : ""}" data-tab="${page}" aria-label="${label}"${active ? ' aria-current="page"' : ""}>
+      return `<button class="tab ${active ? "active" : ""}" data-tab="${page}" aria-label="${label}"${active ? ' aria-current="page"' : ""}${hidden ? " hidden" : ""}>
         ${svg}
         <span class="tab-label">${label}</span>
       </button>`;
@@ -7608,6 +7859,7 @@
       ${tab("library", "Library", navIconSvg(22, NAV_ICON_PATH.library))}
       ${tab("collections", "Collections", navIconSvg(22, NAV_ICON_PATH.collections))}
       ${tab("stats", "Stats", navIconSvg(22, NAV_ICON_PATH.stats))}
+      ${tab("vocabulary", "Words", navIconSvg(22, NAV_ICON_PATH.vocabulary), !vocabularyAvailable())}
     </nav>`;
   }
 

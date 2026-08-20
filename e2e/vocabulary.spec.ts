@@ -220,3 +220,167 @@ test.describe("saved words drawer", () => {
     await expect(entry).toContainText("feline mammal");
   });
 });
+
+// M5: cross-book "See all" vocabulary screen (#/vocabulary) — global search,
+// sort, and delete over every saved word, reachable from the header nav
+// cluster and from the M4 drawer's "See all" link. Backed by the same
+// `GET /api/vocabulary` (no `bookId`) as M4 — nothing new on the backend.
+const OTHER_BOOK_ID = "e2e-book-001";
+const OTHER_BOOK_TITLE = "Book 001";
+
+async function waitForDictStatus(page: Page) {
+  // The Vocabulary nav icon's visibility depends on the same session-cached
+  // `GET /api/dictionary/status` fetch as the reader's vocab-btn — see
+  // openEpubReader above.
+  await expect
+    .poll(() => page.evaluate(() => window.__dictStatusForTest ?? null))
+    .not.toBeNull();
+}
+
+async function seedWord(
+  page: Page,
+  opts: {
+    word: string;
+    lemma: string;
+    definition: string;
+    bookId?: string;
+    bookTitle?: string;
+  }
+) {
+  const resp = await page.request.post("/api/vocabulary", {
+    data: {
+      word: opts.word,
+      lemma: opts.lemma,
+      definition: opts.definition,
+      bookId: opts.bookId,
+      bookTitle: opts.bookTitle,
+    },
+  });
+  expect(resp.status()).toBe(204);
+}
+
+test.describe("vocabulary screen (#/vocabulary)", () => {
+  // This screen lists EVERY saved word, not just one book's — clear the
+  // whole table before each test, not just EPUB_ID's (the outer beforeEach
+  // above only clears that one book, but these tests also seed
+  // OTHER_BOOK_ID and bookId-less rows).
+  test.beforeEach(async ({ request }) => {
+    const resp = await request.get("/api/vocabulary");
+    if (!resp.ok()) return;
+    for (const w of await resp.json()) {
+      await request.delete(`/api/vocabulary/${w.id}`);
+    }
+  });
+
+  test("header nav cluster shows a Vocabulary icon that opens the screen", async ({ page }) => {
+    await page.goto("/#/");
+    await waitForDictStatus(page);
+    const navIcon = page.locator('[data-nav="vocabulary"]');
+    await expect(navIcon).toBeVisible();
+    await navIcon.click();
+    await expect(page).toHaveURL(/#\/vocabulary$/);
+    await expect(page.locator(".vocab-screen")).toBeVisible();
+  });
+
+  test("empty state before any word is saved", async ({ page }) => {
+    await page.goto("/#/vocabulary");
+    await expect(page.locator(".vocab-screen .empty")).toContainText("No saved words yet");
+  });
+
+  test("lists words saved from different books, each with its own book label", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m5-a", definition: "feline mammal", bookId: EPUB_ID, bookTitle: "Book 050" });
+    await seedWord(page, { word: "dog", lemma: "dog-m5-a", definition: "canine mammal", bookId: OTHER_BOOK_ID, bookTitle: OTHER_BOOK_TITLE });
+
+    await page.goto("/#/vocabulary");
+    const entries = page.locator(".vocab-screen-entry");
+    await expect(entries).toHaveCount(2);
+    await expect(entries.filter({ hasText: "cat" })).toContainText("Book 050");
+    await expect(entries.filter({ hasText: "dog" })).toContainText(OTHER_BOOK_TITLE);
+  });
+
+  // A word's source book can be deleted while the word survives
+  // (`vocabulary.book_id` is nullable) — it must still render, with no book
+  // label, and still be deletable.
+  test("a word with no book still renders and can be deleted", async ({ page }) => {
+    await seedWord(page, { word: "orphan", lemma: "orphan-m5", definition: "left behind" });
+
+    await page.goto("/#/vocabulary");
+    const entry = page.locator(".vocab-screen-entry");
+    await expect(entry).toHaveCount(1);
+    await expect(entry).toContainText("orphan");
+
+    await entry.locator(".vocab-entry-delete").click();
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(0);
+    const resp = await page.request.get("/api/vocabulary");
+    expect(await resp.json()).toHaveLength(0);
+  });
+
+  // A row that should be excluded must actually be ABSENT, not merely
+  // outnumbered by the matching row — an assertion that only checks the
+  // match's presence would still pass with filtering deleted entirely.
+  test("search filters the list", async ({ page }) => {
+    await seedWord(page, { word: "ephemeral", lemma: "ephemeral-m5", definition: "lasting a short time", bookId: EPUB_ID, bookTitle: "Book 050" });
+    await seedWord(page, { word: "gregarious", lemma: "gregarious-m5", definition: "fond of company", bookId: OTHER_BOOK_ID, bookTitle: OTHER_BOOK_TITLE });
+
+    await page.goto("/#/vocabulary");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(2);
+
+    await page.locator("#vocab-filter").fill("ephemeral");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(1);
+    await expect(page.locator(".vocab-screen-entry")).toContainText("ephemeral");
+    await expect(page.locator(".vocab-screen-entry", { hasText: "gregarious" })).toHaveCount(0);
+    // The debounced re-render replaces the search box itself, so keep typing
+    // after it: focus must survive, or the next keystrokes go nowhere.
+    expect(await page.evaluate(() => document.activeElement?.id)).toBe("vocab-filter");
+    await page.keyboard.type("XYZ");
+    await expect(page.locator("#vocab-filter")).toHaveValue("ephemeralXYZ");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(0);
+    await expect(page.locator(".vocab-screen .empty")).toContainText("No matches");
+  });
+
+  // The sort toggle must actually reorder the rows — comparing the first
+  // row's text before and after, not merely that both words are present.
+  test("sort toggle reorders the list", async ({ page }) => {
+    // "apple" seeded first (older), "zebra" second (newer): newest-first
+    // puts zebra on top, alphabetical puts apple on top — the two orders
+    // disagree, so whichever one the toggle produces is unambiguous. A full
+    // second apart so created_at (whole-second resolution) can't tie.
+    await seedWord(page, { word: "apple", lemma: "apple-m5", definition: "a fruit", bookId: EPUB_ID, bookTitle: "Book 050" });
+    await new Promise((r) => setTimeout(r, 1100));
+    await seedWord(page, { word: "zebra", lemma: "zebra-m5", definition: "an animal", bookId: OTHER_BOOK_ID, bookTitle: OTHER_BOOK_TITLE });
+
+    await page.goto("/#/vocabulary");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(2);
+    const firstWord = () => page.locator(".vocab-screen-entry .vocab-entry-word").first().innerText();
+    await expect.poll(firstWord).toContain("zebra"); // newest first, the default
+
+    await page.locator("#vocab-sort").click();
+    await expect.poll(firstWord).toContain("apple"); // alphabetical
+  });
+
+  // Verified against the server, not the DOM: a stale client-side removal
+  // would pass a DOM-only assertion but leave the row on reload.
+  test("delete removes the row from the server", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m5-b", definition: "feline mammal", bookId: EPUB_ID, bookTitle: "Book 050" });
+
+    await page.goto("/#/vocabulary");
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(1);
+    await page.locator(".vocab-entry-delete").click();
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(0);
+
+    await page.reload();
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(0);
+    const resp = await page.request.get("/api/vocabulary");
+    expect(await resp.json()).toHaveLength(0);
+  });
+
+  test("the drawer's See all link opens the same screen", async ({ page }) => {
+    await openEpubReader(page);
+    await seedWord(page, { word: "cat", lemma: "cat-m5-c", definition: "feline mammal", bookId: EPUB_ID, bookTitle: "Book 050" });
+    await page.locator("#vocab-btn").click();
+    await expect(page.locator("#vocab-panel")).toBeVisible();
+    await page.locator("#vocab-see-all").click();
+    await expect(page).toHaveURL(/#\/vocabulary$/);
+    await expect(page.locator(".vocab-screen-entry")).toHaveCount(1);
+  });
+});

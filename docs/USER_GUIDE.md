@@ -439,10 +439,14 @@ offline-saved book still lists its words whenever you're back on the same
 network. Note that a word is stored once per dictionary entry: if you already
 saved "cat" while reading another book, saving it again here confirms the
 save but leaves the word filed under the book you first looked it up in, so
-it appears in that book's drawer rather than this one. The drawer is
-book-scoped for now; a
-cross-book Vocabulary screen and flashcard review for the web reader, matching
-the desktop features described above, are planned for a future update.
+it appears in that book's drawer rather than this one. To find it anyway —
+or to browse every saved word at once — open the **Vocabulary** screen: the
+book-open icon in the header (or the **Words** tab on narrow screens), or
+**See all** at the top of the drawer. It lists every word with its book,
+chapter, and save date, a search box (word, definition, or book), a
+newest/alphabetical sort toggle, and its own delete button per row.
+Flashcard review for the web reader, matching the desktop feature described
+above, is planned for a future update.
 
 ### Returning to the library
 
