@@ -5453,6 +5453,12 @@
         renderVocabListIfOpen();
       }
       showToast("Couldn't delete saved word");
+      // The token bump above retired whatever refresh was in flight, and it
+      // may have been carrying words saved elsewhere since this list was
+      // built. Reinserting the row locally is not enough — re-read the
+      // server's list so a failed delete leaves the drawer complete, not
+      // merely un-deleted.
+      refreshVocabPanelData();
     }
   }
 
