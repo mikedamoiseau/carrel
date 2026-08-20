@@ -5334,6 +5334,19 @@
     if (tab) tab.hidden = !vocabularyAvailable();
   }
 
+  // Shared by the Vocabulary screen's two 403 paths (initial load, and M6's
+  // answerCard) — the setting was switched off since this tab cached its
+  // status. Drop the cache so nothing here or elsewhere in the tab keeps
+  // treating vocabulary as on, and retire the nav affordance. A single
+  // function so the two call sites can't quietly drift on which fields get
+  // cleared (they already had before this was extracted).
+  function dropVocabularyStatusCache() {
+    dictStatus = null;
+    dictStatusPromise = null;
+    window.__dictStatusForTest = null;
+    applyVocabNavVisibility();
+  }
+
   // Chapter label for a drawer row: TOC title when known, else "Chapter N"
   // (same resolution as hlChapterLabel/bookmarkLabel) — null when the word
   // carries no chapter at all (chapterIndex is nullable).
@@ -7428,13 +7441,36 @@
   // the first visit's in-flight work (its GET, its debounce, its deletes).
   let vocabScreenGen = 0;
 
-  // ── Vocabulary screen (M5, "See all") ───────────
+  // Leitner-box review intervals, in days — must match carrel-core's
+  // BOX_INTERVAL_DAYS (vocabulary.rs) exactly, since this is only used to
+  // PREDICT the outcome of a review for the feedback text (the request body
+  // carries no schedule back; desktop's ReviewView predicts the same way,
+  // from the pre-review box, rather than round-tripping the server's answer).
+  const VOCAB_BOX_INTERVAL_DAYS = [1, 3, 7, 14, 30];
+  function vocabBoxIntervalDays(box) {
+    const clamped = Math.min(Math.max(Math.round(box), 1), VOCAB_BOX_INTERVAL_DAYS.length);
+    return VOCAB_BOX_INTERVAL_DAYS[clamped - 1];
+  }
+  function vocabDaysLabel(days) {
+    return days === 1 ? "1 day" : `${days} days`;
+  }
+
+  // Generous safety bound on one review session's queue — mirrors desktop's
+  // VocabularyPanel.tsx REVIEW_LIMIT intent (a personal vocabulary list is
+  // small; this isn't real pagination). The server clamps its own maximum
+  // independently (VOCABULARY_DUE_MAX_LIMIT, api.rs) — this is just what the
+  // web UI asks for.
+  const VOCAB_REVIEW_LIMIT = 100;
+
+  // ── Vocabulary screen (M5 "See all", M6 flashcard review) ───────────
   // Cross-book list of every saved word, reachable from the header nav
   // cluster / bottom tab bar and from the book-scoped drawer's "See all"
   // link (M4). Backed by the same `GET /api/vocabulary` the drawer uses,
-  // just without `?bookId=` — nothing new on the backend. Structured like
-  // showCollections() above: fetch once, then a closure-local render()
-  // re-renders the full list on every filter/sort/delete.
+  // just without `?bookId=`. M6 adds a review mode to this same screen
+  // (rather than a new route) so it inherits the per-visit `stale()` guard
+  // below instead of needing its own copy. Structured like showCollections()
+  // above: fetch once, then a closure-local render() re-renders the current
+  // view (list or review) on every filter/sort/delete/answer.
   async function showVocabularyScreen() {
     currentView = "vocabulary";
     document.title = "Vocabulary — Carrel";
@@ -7463,9 +7499,15 @@
     const gen = ++vocabScreenGen;
     const stale = () => currentView !== "vocabulary" || gen !== vocabScreenGen;
 
-    let resp;
+    // Fetched together (Promise.all, same pattern as showCollections' pair of
+    // fetches): the due count feeds the "Review N due" bar shown alongside the
+    // list, so there is no reason to serialize the two requests.
+    let resp, dueResp;
     try {
-      resp = await api("/api/vocabulary");
+      [resp, dueResp] = await Promise.all([
+        api("/api/vocabulary"),
+        api(`/api/vocabulary/due?limit=${VOCAB_REVIEW_LIMIT}`),
+      ]);
     } catch (e) {
       if (stale()) return;
       const container = $(".vocab-screen");
@@ -7473,30 +7515,30 @@
       showToast(apiFailureToastMessage(e));
       return;
     }
-    if (!resp || stale()) return; // 401 already redirected to login
+    if (!resp || !dueResp || stale()) return; // 401 already redirected to login
     // The vocabulary builder was switched off since this tab last cached its
     // status (or was never on) — same defense-in-depth 403 as the book-scoped
     // drawer's loadVocabForBook. Not a connection problem, so it must not go
     // through httpErrorToastMessage's generic "Server error" phrasing.
-    if (resp.status === 403) {
-      dictStatus = null;
-      dictStatusPromise = null;
-      window.__dictStatusForTest = null;
-      applyVocabNavVisibility();
+    const forbiddenResp = resp.status === 403 ? resp : dueResp.status === 403 ? dueResp : null;
+    if (forbiddenResp) {
+      dropVocabularyStatusCache();
       const container = $(".vocab-screen");
       if (container) container.innerHTML = `<div class="empty">Vocabulary is turned off.</div>`;
       showToast("Vocabulary is turned off");
       return;
     }
-    if (!resp.ok) {
+    const badResp = !resp.ok ? resp : !dueResp.ok ? dueResp : null;
+    if (badResp) {
       const container = $(".vocab-screen");
-      if (container) container.innerHTML = `<div class="empty">${esc(`Couldn't load vocabulary (HTTP ${resp.status})`)}</div>`;
-      showToast(httpErrorToastMessage(resp.status));
+      if (container) container.innerHTML = `<div class="empty">${esc(`Couldn't load vocabulary (HTTP ${badResp.status})`)}</div>`;
+      showToast(httpErrorToastMessage(badResp.status));
       return;
     }
-    let words;
+    let words, dueWords;
     try {
       words = await resp.json();
+      dueWords = await dueResp.json();
     } catch (e) {
       if (stale()) return;
       const container = $(".vocab-screen");
@@ -7508,6 +7550,7 @@
     const container = $(".vocab-screen");
     if (!container) return;
     words = Array.isArray(words) ? words : [];
+    dueWords = Array.isArray(dueWords) ? dueWords : [];
 
     let filterText = "";
     let sortMode = "newest"; // "newest" | "alphabetical"
@@ -7517,6 +7560,16 @@
     // search debounce would land after it, re-render with the PREVIOUS query,
     // and drop whatever was typed in between.
     let filterTimer = null;
+
+    // Review mode state. `view` mirrors desktop's VocabularyPanel "list" |
+    // "review" — a separate route was deliberately avoided (see the epic
+    // plan) so this reuses the per-visit `stale()` guard above rather than
+    // needing its own copy of the M5 lifecycle fix.
+    let view = "list";
+    let reviewQueue = [];
+    let reviewTotal = 0;
+    let flipped = false;
+    let submitting = false;
 
     // Client-side search predicate — mirrors the desktop app's
     // matchesVocabularyQuery (src/lib/vocabulary.ts): case-insensitive
@@ -7542,7 +7595,16 @@
       return Number.isFinite(w.chapterIndex) ? `Chapter ${w.chapterIndex + 1}` : null;
     }
 
+    // Dispatches to the current view. Kept as the single entry point every
+    // caller below already used pre-M6 (filter debounce, sort click, delete)
+    // so none of them need to know which view they're re-rendering into.
     function render() {
+      if (stale()) return;
+      if (view === "review") { renderReview(); return; }
+      renderList();
+    }
+
+    function renderList() {
       // Every render replaces the search box along with the list, so a
       // re-render fired by the input's own debounce would drop focus and
       // swallow whatever the user typed next (a pause longer than the
@@ -7567,7 +7629,19 @@
           : b.createdAt - a.createdAt
       );
 
-      let html = `<div class="vocab-screen-toolbar">
+      // M6: "Review N due" — hidden entirely when there is nothing saved at
+      // all (there's nothing to review either way), disabled when saved but
+      // none are due yet.
+      let html = "";
+      if (words.length > 0) {
+        html += `<div class="vocab-review-bar">
+          <button class="vocab-review-btn" id="vocab-review-btn" ${dueWords.length === 0 ? "disabled" : ""}>
+            Review ${dueWords.length} due
+          </button>
+        </div>`;
+      }
+
+      html += `<div class="vocab-screen-toolbar">
         <input type="text" id="vocab-filter" placeholder="Search saved words..." value="${esc(filterText)}">
         <button class="sort-btn" id="vocab-sort">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 5h10M11 9h7M11 13h4"/><path d="M3 17l3 3 3-3M6 18V4"/></svg>
@@ -7622,6 +7696,155 @@
           deleteScreenWord(btn.getAttribute("data-id"));
         };
       });
+
+      const reviewBtn = container.querySelector("#vocab-review-btn");
+      if (reviewBtn) reviewBtn.onclick = startReview;
+    }
+
+    function startReview() {
+      if (dueWords.length === 0) return;
+      reviewQueue = dueWords.slice();
+      reviewTotal = reviewQueue.length;
+      flipped = false;
+      view = "review";
+      render();
+    }
+
+    // Leaving review is also the moment the due count can have changed (a
+    // reviewed word is rescheduled), so the bar's "Review N due" label must
+    // not just go back to showing the STALE count it had on entry.
+    function backToList() {
+      view = "list";
+      render();
+      refreshDueCount();
+    }
+
+    async function refreshDueCount() {
+      let r;
+      try {
+        r = await api(`/api/vocabulary/due?limit=${VOCAB_REVIEW_LIMIT}`);
+      } catch (e) {
+        return; // best-effort — the bar just keeps its previous count
+      }
+      if (!r || stale() || !r.ok) return; // a 401 already redirected to login
+      let d;
+      try {
+        d = await r.json();
+      } catch (e) {
+        return;
+      }
+      if (stale() || view !== "list") return;
+      dueWords = Array.isArray(d) ? d : [];
+      render();
+    }
+
+    function renderReview() {
+      if (stale()) return;
+      const card = reviewQueue[0] || null;
+      let html;
+      if (!card) {
+        html = `<div class="vocab-review">
+          <div class="empty">All caught up — no more cards due right now.</div>
+          <button class="vocab-review-back" id="vocab-review-back">Back to list</button>
+        </div>`;
+      } else {
+        const progress = reviewTotal - reviewQueue.length + 1;
+        const missedDays = vocabBoxIntervalDays(1);
+        const gotItDays = vocabBoxIntervalDays(card.box + 1);
+        const revealOrDefinition = flipped
+          ? `<div class="vocab-review-definition">${esc(card.definition)}</div>
+             ${card.contextSentence ? `<div class="vocab-review-context">“${esc(card.contextSentence)}”</div>` : ""}
+             ${card.bookTitle ? `<div class="vocab-review-book">${esc(card.bookTitle)}</div>` : ""}`
+          : `<button class="vocab-review-reveal" id="vocab-review-reveal">Reveal</button>`;
+        const answers = flipped
+          ? `<div class="vocab-review-answers">
+              <button class="vocab-review-missed" id="vocab-review-missed" ${submitting ? "disabled" : ""}>
+                Missed<span>due in ${vocabDaysLabel(missedDays)}</span>
+              </button>
+              <button class="vocab-review-gotit" id="vocab-review-gotit" ${submitting ? "disabled" : ""}>
+                Got it<span>due in ${vocabDaysLabel(gotItDays)}</span>
+              </button>
+            </div>`
+          : "";
+        html = `<div class="vocab-review">
+          <div class="vocab-review-progress">${progress} / ${reviewTotal}</div>
+          <div class="vocab-review-card">
+            <div class="vocab-review-word"><strong>${esc(card.word)}</strong>${card.pos ? ` <span class="vocab-entry-pos">${esc(card.pos)}</span>` : ""}</div>
+            ${revealOrDefinition}
+          </div>
+          ${answers}
+          <button class="vocab-review-back" id="vocab-review-back">Back to list</button>
+        </div>`;
+      }
+
+      container.innerHTML = html;
+      const backBtn = container.querySelector("#vocab-review-back");
+      if (backBtn) backBtn.onclick = backToList;
+      const revealBtn = container.querySelector("#vocab-review-reveal");
+      if (revealBtn) revealBtn.onclick = () => { flipped = true; render(); };
+      const missedBtn = container.querySelector("#vocab-review-missed");
+      if (missedBtn) missedBtn.onclick = () => answerCard(false);
+      const gotItBtn = container.querySelector("#vocab-review-gotit");
+      if (gotItBtn) gotItBtn.onclick = () => answerCard(true);
+    }
+
+    async function answerCard(correct) {
+      if (submitting) return;
+      const card = reviewQueue[0];
+      if (!card) return;
+      submitting = true;
+      render(); // disables the answer buttons while the request is in flight
+
+      let resp;
+      try {
+        resp = await fetch(`/api/vocabulary/${encodeURIComponent(card.id)}/review`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ correct }),
+        });
+      } catch (e) {
+        if (stale()) return;
+        submitting = false;
+        showToast("Couldn't reach Carrel server");
+        render();
+        return;
+      }
+      if (stale()) return;
+      if (resp.status === 401) { showLogin(); return; }
+      if (resp.status === 403) {
+        // Same defense-in-depth as the screen's own load: the setting was
+        // switched off mid-session. Not a connection problem, so it must not
+        // be reported as one — drop the cache and retire the affordance.
+        dropVocabularyStatusCache();
+        submitting = false;
+        view = "list";
+        showToast("Vocabulary is turned off");
+        render();
+        return;
+      }
+      if (resp.status === 404) {
+        // The word was deleted (from another tab/device) since the queue was
+        // built — nothing to persist a review against. Drop it and move on
+        // rather than getting the session stuck on a card that can't advance.
+        reviewQueue = reviewQueue.slice(1);
+        flipped = false;
+        submitting = false;
+        showToast("That word was deleted");
+        render();
+        return;
+      }
+      if (!resp.ok) {
+        submitting = false;
+        showToast(httpErrorToastMessage(resp.status));
+        render();
+        return;
+      }
+
+      reviewQueue = reviewQueue.slice(1);
+      flipped = false;
+      submitting = false;
+      render();
     }
 
     // Optimistic delete + rollback on failure — same idempotent-204 and 401

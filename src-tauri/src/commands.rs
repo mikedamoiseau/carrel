@@ -7981,7 +7981,12 @@ pub async fn get_due_vocabulary(
 /// Core logic behind `record_vocabulary_review`: stamps `now` and forwards to
 /// `db::record_vocabulary_review`. Free function so it's unit-testable
 /// without a full `AppState` (mirrors `log_vocabulary_word_entry` above).
-fn record_vocabulary_review_now(
+///
+/// `pub(crate)` so the web server's `POST /api/vocabulary/{id}/review` route
+/// (M6) can reuse it instead of re-deriving the `now`-stamping — the point is
+/// that desktop and web can never drift on scheduling (same precedent as
+/// `log_vocabulary_word_entry`).
+pub(crate) fn record_vocabulary_review_now(
     conn: &rusqlite::Connection,
     id: &str,
     correct: bool,

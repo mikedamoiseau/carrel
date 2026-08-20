@@ -445,8 +445,12 @@ book-open icon in the header (or the **Words** tab on narrow screens), or
 **See all** at the top of the drawer. It lists every word with its book,
 chapter, and save date, a search box (word, definition, or book), a
 newest/alphabetical sort toggle, and its own delete button per row.
-Flashcard review for the web reader, matching the desktop feature described
-above, is planned for a future update.
+
+A **Review N due** bar above the list quizzes you on the words that are due,
+the same flashcard flow as the desktop app: reveal the definition, then mark
+**Got it** or **Missed** to see the new box and when it comes due again, until
+the queue is empty. The due count updates as soon as you finish reviewing, and
+the bar is disabled when nothing is due.
 
 ### Returning to the library
 

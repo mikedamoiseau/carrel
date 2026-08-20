@@ -35,6 +35,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   delete button per row. Also reachable via a "See all" link in the M4
   drawer's header. No new backend route: it reuses `GET /api/vocabulary`
   without `?bookId=`, which already returns every row.
+- **Flashcard review in the web reader.** A "Review N due" bar on the
+  Vocabulary screen quizzes you on the words scheduled for review: reveal the
+  definition, then mark **Got it** or **Missed** to see the new box and when
+  it's next due, same five-box spaced-repetition schedule as the desktop app.
+  Backed by two new endpoints, both gated on the vocabulary builder setting —
+  `GET /api/vocabulary/due` (server-clamped `limit`, default 20, max 100) and
+  `POST /api/vocabulary/{id}/review`, which delegates to the same scheduling
+  logic the desktop app's review command uses so the two surfaces can't drift.
 
 ### Fixed
 - **Jumping to a highlight in the web reader now lands on the highlight.**

@@ -385,6 +385,120 @@ test.describe("vocabulary screen (#/vocabulary)", () => {
   });
 });
 
+// M6: flashcard review, added to the same #/vocabulary screen (no new route)
+// so it inherits the M5 lifecycle fix's per-visit token/container scoping.
+async function markReviewed(page: Page, id: string, correct: boolean) {
+  const resp = await page.request.post(`/api/vocabulary/${id}/review`, { data: { correct } });
+  expect(resp.status()).toBe(204);
+}
+
+test.describe("vocabulary screen — flashcard review (M6)", () => {
+  test.beforeEach(async ({ request }) => {
+    const resp = await request.get("/api/vocabulary");
+    if (!resp.ok()) return;
+    for (const w of await resp.json()) {
+      await request.delete(`/api/vocabulary/${w.id}`);
+    }
+  });
+
+  test("the review bar reflects the due count and is disabled at zero", async ({ page }) => {
+    await page.goto("/#/vocabulary");
+    // No saved words at all yet — nothing to review, bar isn't shown.
+    await expect(page.locator("#vocab-review-btn")).toHaveCount(0);
+
+    await seedWord(page, { word: "cat", lemma: "cat-m6-a", definition: "feline mammal" });
+    // reload(), not a second goto() to the identical URL: the screen only
+    // re-reads the due queue on a real load, and goto to a URL the page is
+    // already on is not a dependable reload. That made this test flaky —
+    // usually passing, occasionally rendering the pre-seed (empty) state.
+    await page.reload();
+    const reviewBtn = page.locator("#vocab-review-btn");
+    await expect(reviewBtn).toContainText("Review 1 due");
+    await expect(reviewBtn).toBeEnabled();
+  });
+
+  // The definition must be genuinely ABSENT from the DOM pre-reveal, not just
+  // hidden by CSS — a test that only checked visibility would still pass with
+  // the definition rendered behind a `display:none`.
+  test("the card's definition is hidden until revealed", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m6-b", definition: "a very particular feline gloss" });
+
+    await page.goto("/#/vocabulary");
+    await page.locator("#vocab-review-btn").click();
+    await expect(page.locator(".vocab-review-card")).toContainText("cat");
+    await expect(page.locator(".vocab-review-card")).not.toContainText("a very particular feline gloss");
+    await expect(page.locator("#vocab-review-reveal")).toBeVisible();
+
+    await page.locator("#vocab-review-reveal").click();
+    await expect(page.locator(".vocab-review-card")).toContainText("a very particular feline gloss");
+    await expect(page.locator("#vocab-review-reveal")).toHaveCount(0);
+  });
+
+  // A row already scheduled for the future must be excluded from the review
+  // QUEUE itself, not merely from the count — seeded here via a real prior
+  // review through the API (the same route the UI uses), so this proves the
+  // queue-building fetch honors `next_due_at`, not just that one word shows up.
+  test("a word that isn't due yet never appears in the review queue", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m6-c", definition: "feline mammal" });
+    await seedWord(page, { word: "dog", lemma: "dog-m6-c", definition: "canine mammal" });
+    const dogId = (await (await page.request.get("/api/vocabulary")).json())
+      .find((w: { lemma: string; id: string }) => w.lemma === "dog-m6-c").id;
+    await markReviewed(page, dogId, true); // pushes dog's next_due_at days out
+
+    await page.goto("/#/vocabulary");
+    await expect(page.locator("#vocab-review-btn")).toContainText("Review 1 due");
+    await page.locator("#vocab-review-btn").click();
+    await expect(page.locator(".vocab-review-card")).toContainText("cat");
+    await expect(page.locator(".vocab-review-progress")).toContainText("1 / 1");
+  });
+
+  // Persistence verified against the server (not just the UI's own optimism),
+  // and the due count is asserted to have actually CHANGED after the session
+  // — not merely that the review screen returned to the list.
+  test("marking a card correct persists the review and the due count drops", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m6-d", definition: "feline mammal" });
+    const id = (await (await page.request.get("/api/vocabulary")).json())[0].id;
+
+    await page.goto("/#/vocabulary");
+    await page.locator("#vocab-review-btn").click();
+    await page.locator("#vocab-review-reveal").click();
+    await page.locator("#vocab-review-gotit").click();
+    await expect(page.locator(".vocab-review")).toContainText("All caught up");
+
+    await page.locator("#vocab-review-back").click();
+    await expect(page.locator("#vocab-review-btn")).toContainText("Review 0 due");
+
+    const word = (await (await page.request.get("/api/vocabulary")).json())
+      .find((w: { id: string }) => w.id === id);
+    expect(word.box).toBe(2);
+    expect(word.nextDueAt).not.toBeNull();
+  });
+
+  // Missing a card must persist a real review (box stays at 1, its floor, and
+  // `nextDueAt` moves from null to a real timestamp) — distinguishes "the
+  // Missed button actually called the API" from "the UI just advanced the
+  // queue locally". (Box>1 -> reset-to-1 on a miss is covered at the Rust
+  // handler level, `review_vocabulary_word_route_wrong_resets_box_to_one`:
+  // advancing a box here first would reschedule the word days out and make it
+  // fall out of THIS due queue before the miss could be exercised through the
+  // UI against a real server clock.)
+  test("marking a card wrong persists the review", async ({ page }) => {
+    await seedWord(page, { word: "cat", lemma: "cat-m6-e", definition: "feline mammal" });
+    const id = (await (await page.request.get("/api/vocabulary")).json())[0].id;
+
+    await page.goto("/#/vocabulary");
+    await page.locator("#vocab-review-btn").click();
+    await page.locator("#vocab-review-reveal").click();
+    await page.locator("#vocab-review-missed").click();
+    await expect(page.locator(".vocab-review")).toContainText("All caught up");
+
+    const word = (await (await page.request.get("/api/vocabulary")).json())
+      .find((w: { id: string }) => w.id === id);
+    expect(word.box).toBe(1);
+    expect(word.nextDueAt).not.toBeNull();
+  });
+});
+
 // Both review passes flagged these two paths as reachable-but-untested: a
 // render fired after the user left (or re-entered) the screen reached through
 // document-global selectors, which either threw — swallowing the delete path's

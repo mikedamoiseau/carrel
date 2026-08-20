@@ -873,6 +873,11 @@ body:not(:has(.header))::before {
      the collections one, so it needs its own rule here or it stays ~28px. */
   .vocab-screen-toolbar .sort-btn { min-height: 44px; }
   .vocab-entry-delete { min-width: 44px; min-height: 44px; }
+  /* M6 review controls — same floor, same reason as the sort-btn/delete rules
+     above (cloned buttons, cloned gap). */
+  .vocab-review-btn { min-height: 44px; }
+  .vocab-review-answers button { min-height: 44px; }
+  .vocab-review-reveal, .vocab-review-back { min-height: 44px; }
   .reader-toolbar button { min-height: 44px; }
   /* The chrome-toggle FAB sits outside the toolbar and is explicitly 40x40. */
   .chrome-toggle-fab { width: 44px; height: 44px; }
@@ -1119,3 +1124,38 @@ body:not(:has(.header))::before {
   background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius);
   padding: 12px 16px; display: flex; align-items: flex-start; gap: 8px;
 }
+
+/* M6: flashcard review, entered from the "Review N due" bar above the
+   toolbar. `.vocab-review*` replaces the toolbar/list markup entirely while
+   `view === "review"` — see showVocabularyScreen's render()/renderReview(). */
+.vocab-review-bar { padding-bottom: var(--gap); }
+.vocab-review-btn {
+  width: 100%; background: var(--accent); color: var(--on-accent); border: none;
+  border-radius: var(--radius); padding: 10px 16px; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+}
+.vocab-review-btn:hover:not(:disabled) { background: var(--accent-hover); }
+.vocab-review-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.vocab-review-progress { text-align: center; color: var(--ink-muted); font-size: 0.8rem; margin-bottom: 10px; }
+.vocab-review-card {
+  background: var(--warm-subtle); border-radius: var(--radius); padding: 28px 20px; text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 12px; min-height: 9rem; justify-content: center;
+}
+.vocab-review-word { font-size: 1.2rem; }
+.vocab-review-reveal, .vocab-review-back {
+  background: none; border: none; color: var(--accent); font-size: 0.85rem; font-weight: 600; cursor: pointer;
+}
+.vocab-review-back { color: var(--ink-muted); font-weight: 400; display: block; margin: 14px auto 0; }
+.vocab-review-back:hover, .vocab-review-reveal:hover { text-decoration: underline; }
+.vocab-review-definition { font-size: 0.9rem; color: var(--ink); text-align: left; align-self: stretch; }
+.vocab-review-context { font-size: 0.8rem; font-style: italic; color: var(--ink-muted); text-align: left; align-self: stretch; }
+.vocab-review-book { font-size: 0.75rem; color: var(--ink-muted); text-align: left; align-self: stretch; }
+.vocab-review-answers { display: flex; gap: 10px; justify-content: center; margin-top: 12px; }
+.vocab-review-answers button {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  border-radius: var(--radius); padding: 10px 14px; font-size: 0.85rem; font-weight: 600;
+  cursor: pointer;
+}
+.vocab-review-answers button span { font-size: 0.7rem; font-weight: 400; opacity: 0.8; }
+.vocab-review-missed { background: var(--surface); border: 1px solid var(--warm-border); color: var(--ink); }
+.vocab-review-gotit { background: var(--accent); border: none; color: var(--on-accent); }
+.vocab-review-answers button:disabled { opacity: 0.5; cursor: not-allowed; }
