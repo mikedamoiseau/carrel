@@ -135,8 +135,11 @@ pub struct AppState {
     /// `None` by `delete_dictionary` so the file can be removed. The artifact
     /// lives at `{data_dir}/dictionary/` — profile-independent, one download
     /// serves every profile. Leaf lock — never held with another `AppState`
-    /// mutex.
-    pub dictionary_pool: std::sync::Mutex<Option<DbPool>>,
+    /// mutex. `Arc`-wrapped so `WebState` can hold a clone of the SAME cache:
+    /// desktop's `download_dictionary`/`delete_dictionary` invalidation then
+    /// covers web lookups too, instead of the web server serving a stale
+    /// artifact's unlinked inode forever after a re-download.
+    pub dictionary_pool: std::sync::Arc<std::sync::Mutex<Option<DbPool>>>,
     /// Guards against concurrent dictionary downloads: `download_dictionary`
     /// CAS-flips this to `true` for the duration of a download and clears it
     /// when done, so a second invocation returns early instead of racing on
@@ -9039,7 +9042,7 @@ pub async fn web_server_set_modes(
             unlocked_profiles: state.unlocked_profiles.clone(),
             private_mode: state.private_mode.clone(),
             profile_host: Some(crate::profile_host::for_app(&app)),
-            dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            dictionary_pool: state.dictionary_pool.clone(),
         };
 
         let handle = crate::web_server::start(web_state, port_used, modes).await?;
@@ -11712,7 +11715,7 @@ mod tests {
             ipc_metrics: IpcMetrics::new(500, 500.0),
             plugin_manager: std::sync::Arc::new(std::sync::Mutex::new(None)),
             _log_guard: None,
-            dictionary_pool: std::sync::Mutex::new(None),
+            dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dictionary_downloading: std::sync::atomic::AtomicBool::new(false),
             pending_manual_update_check: std::sync::Mutex::new(false),
             startup_update_check_taken: std::sync::atomic::AtomicBool::new(false),

@@ -85,9 +85,14 @@ pub struct WebState {
     pub profile_host: Option<Arc<dyn ProfileHost>>,
     /// Lazily-opened readonly pool over the installed dictionary artifact
     /// (`{data_dir}/dictionary/dictionary.db`), cached in place after first
-    /// open. The dictionary artifact is profile-independent (one artifact
-    /// serves every profile), so — unlike `pool` above — this is never
-    /// touched by a profile switch.
+    /// open. This is the SAME cache `AppState` holds — cloned in at server
+    /// start — so desktop's `download_dictionary`/`delete_dictionary`
+    /// invalidation covers web lookups too; a re-download or deletion while
+    /// the server runs is visible on the next lookup instead of the pool
+    /// silently serving the old artifact's unlinked inode forever. The
+    /// dictionary artifact is profile-independent (one artifact serves every
+    /// profile), so — unlike `pool` above — this is never touched by a
+    /// profile switch.
     pub dictionary_pool: Arc<Mutex<Option<DbPool>>>,
 }
 
@@ -95,6 +100,12 @@ impl WebState {
     /// Reads the private-mode flag (B-M1). Mirrors `AppState::is_private`.
     pub fn is_private(&self) -> bool {
         self.private_mode.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Directory holding the offline dictionary artifact. Mirrors
+    /// `AppState::dictionary_dir`.
+    pub fn dictionary_dir(&self) -> std::path::PathBuf {
+        self.data_dir.join("dictionary")
     }
 
     /// Get a database connection from the active pool.

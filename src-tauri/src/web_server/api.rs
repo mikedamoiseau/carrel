@@ -1749,16 +1749,20 @@ fn dictionary_setting_enabled(conn: &rusqlite::Connection) -> Result<bool, (Stat
 }
 
 /// Get (opening and caching on first use) the readonly pool over the
-/// installed dictionary artifact. Mirrors desktop's `lookup_word` command,
-/// except the cache lives on `WebState` — app-level like the artifact
-/// itself, so it is never invalidated by a profile switch.
+/// installed dictionary artifact. Mirrors desktop's `lookup_word` command;
+/// the cache is shared with `AppState` (cloned in at server start), so a
+/// desktop download/delete invalidates it for web lookups too. The
+/// per-request `inspect()` calls below are what make a deletion or a
+/// disabled setting visible between requests; the shared cache invalidation
+/// is what prevents this warmed pool from going on serving a replaced
+/// artifact's old inode after a re-download.
 fn dictionary_readonly_pool(
     state: &WebState,
 ) -> crate::error::CarrelResult<carrel_core::db::DbPool> {
     let mut guard = state.dictionary_pool.lock()?;
     if guard.is_none() {
         *guard = Some(carrel_core::dictionary::open_readonly_pool(
-            &state.data_dir.join("dictionary"),
+            &state.dictionary_dir(),
         )?);
     }
     Ok(guard.as_ref().expect("pool populated above").clone())
@@ -1770,7 +1774,7 @@ async fn get_dictionary_status(
     let conn = state.conn().map_err(carrel_status)?;
     let enabled = dictionary_setting_enabled(&conn)?;
     drop(conn);
-    let status = carrel_core::dictionary::inspect(&state.data_dir.join("dictionary"));
+    let status = carrel_core::dictionary::inspect(&state.dictionary_dir());
     let installed = status.state == carrel_core::dictionary::DictionaryState::Ready;
     Ok(Json(DictionaryStatusResponse { installed, enabled }))
 }
@@ -1799,14 +1803,14 @@ async fn lookup_dictionary_word(
     drop(conn);
     if !enabled {
         return Err((
-            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
             "Dictionary is not enabled".to_string(),
         ));
     }
-    let status = carrel_core::dictionary::inspect(&state.data_dir.join("dictionary"));
+    let status = carrel_core::dictionary::inspect(&state.dictionary_dir());
     if status.state != carrel_core::dictionary::DictionaryState::Ready {
         return Err((
-            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
             "Dictionary is not installed".to_string(),
         ));
     }
@@ -1896,6 +1900,51 @@ mod tests {
         assert_eq!(entry.senses[0].gloss, "feline mammal");
     }
 
+    /// Simulates desktop's `download_dictionary`/`delete_dictionary`
+    /// invalidating the shared cache mid-run: after a lookup has warmed the
+    /// pool, clearing `dictionary_pool` (as those commands do) and swapping
+    /// in a fresh artifact must be picked up by the next lookup, proving the
+    /// lazy re-open works through the shared handle rather than going stale.
+    #[tokio::test]
+    async fn dictionary_lookup_reopens_pool_after_shared_cache_invalidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dict_dir = dir.path().join("dictionary");
+        carrel_core::dictionary::write_test_artifact(&dict_dir).unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "dictionary_enabled", "true").unwrap();
+        }
+
+        // Warm the pool.
+        let Json(entry) = lookup_dictionary_word(
+            State(state.clone()),
+            Query(DictionaryLookupQuery {
+                word: Some("cat".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry.matched_word, "cat");
+
+        // Simulate desktop-side invalidation: clear the shared cache and
+        // replace the artifact with a fresh copy.
+        *state.dictionary_pool.lock().unwrap() = None;
+        std::fs::remove_dir_all(&dict_dir).unwrap();
+        carrel_core::dictionary::write_test_artifact(&dict_dir).unwrap();
+
+        let Json(entry) = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("cat".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entry.matched_word, "cat");
+    }
+
     #[tokio::test]
     async fn dictionary_lookup_unknown_word_is_not_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -1919,7 +1968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dictionary_lookup_disabled_setting_is_not_found() {
+    async fn dictionary_lookup_disabled_setting_is_service_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         // Artifact is installed, but `dictionary_enabled` is left unset.
         carrel_core::dictionary::write_test_artifact(&dir.path().join("dictionary")).unwrap();
@@ -1934,7 +1983,29 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn dictionary_lookup_artifact_absent_is_service_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        // `dictionary_enabled` is on, but no artifact was ever installed.
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "dictionary_enabled", "true").unwrap();
+        }
+
+        let err = lookup_dictionary_word(
+            State(state),
+            Query(DictionaryLookupQuery {
+                word: Some("cat".to_string()),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
