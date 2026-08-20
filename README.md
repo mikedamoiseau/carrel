@@ -85,12 +85,12 @@ Carrel is for the opposite case: you already have the files, and you want a bett
 - Read your library from any device on the same WiFi — phone, tablet, or another computer, no install required
 - Built-in web reader with QR-code pairing and PIN login, matching the desktop app's design with light/dark/system themes — installable as a PWA, with per-book **Save for offline** reading over a secure (HTTPS/localhost) connection
 - Adjustable reading typography (font size, line spacing, font family incl. OpenDyslexic, column width) for EPUB/MOBI via an **Aa** control — embedded fonts, remembered across books
-- Table of contents panel (EPUB/MOBI), bookmarks in every format, text highlighting with notes in 5 colors (EPUB/MOBI), and dictionary lookups ("Define") on a text selection, with one-tap saving to the vocabulary builder (EPUB/MOBI) — all shared with the desktop app
+- Table of contents panel (EPUB/MOBI), bookmarks in every format, text highlighting with notes in 5 colors (EPUB/MOBI), and dictionary lookups ("Define") on a text selection, with one-tap saving to the vocabulary builder, a book-scoped saved-words drawer, and a cross-book Vocabulary screen with search, sort, delete, and spaced-repetition flashcard review over every saved word (EPUB/MOBI) — all shared with the desktop app
 - Keyboard shortcuts (`/` to search, arrow-key reader navigation, a shortcuts overlay) and a fast, paginated library with search, filters, and sort
 - Reading progress syncs back to your library, with progress badges on book covers and animated swipe page-turns on touch devices
 - Installable as a home-screen web app (PWA, including iOS Add to Home Screen) for an app-like feel
 - OPDS server so ebook apps (KOReader, Thorium, Calibre, Moon+ Reader) can connect directly
-- Sanitized, and limited to reading-state writes (progress, want-to-read, bookmarks, highlights, saved vocabulary words) — no importing, metadata editing, or library changes from remote; PIN hashed in your OS keychain, with rate-limited logins and a login audit trail
+- Sanitized, and limited to reading and vocabulary-review writes (progress, want-to-read, bookmarks, highlights, saved vocabulary words and their flashcard review progress) — no importing, metadata editing, or library changes from remote; PIN hashed in your OS keychain, with rate-limited logins and a login audit trail
 - System tray toggles to flip the Web UI and OPDS server on or off
 
 ### Extensibility

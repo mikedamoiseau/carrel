@@ -428,6 +428,30 @@ is disabled until a word's next review date comes around.
 > dictionary or the source book. Turning the setting back off stops saving new
 > words but keeps everything you've already collected.
 
+**Web reader:** tap the 📚 button in the reader toolbar (next to Highlights) to
+open a drawer of the words you've saved from the book you're currently
+reading — each row shows the word, its part of speech, definition, chapter,
+and save date. Tap a row to jump back to where you looked it up, or ✕ to
+delete it. Deleting removes the word from your vocabulary everywhere, along
+with its review progress — not just from this book's list. Like highlights,
+the drawer reads from your Carrel server, so it needs a connection — an
+offline-saved book still lists its words whenever you're back on the same
+network. Note that a word is stored once per dictionary entry: if you already
+saved "cat" while reading another book, saving it again here confirms the
+save but leaves the word filed under the book you first looked it up in, so
+it appears in that book's drawer rather than this one. To find it anyway —
+or to browse every saved word at once — open the **Vocabulary** screen: the
+book-open icon in the header (or the **Words** tab on narrow screens), or
+**See all** at the top of the drawer. It lists every word with its book,
+chapter, and save date, a search box (word, definition, or book), a
+newest/alphabetical sort toggle, and its own delete button per row.
+
+A **Review N due** bar above the list quizzes you on the words that are due,
+the same flashcard flow as the desktop app: reveal the definition, then mark
+**Got it** or **Missed** to see the new box and when it comes due again, until
+the queue is empty. The due count updates as soon as you finish reviewing, and
+the bar is disabled when nothing is due.
+
 ### Returning to the library
 
 Click the back arrow in the top-left corner or press `Escape`. Your progress is saved when you exit, unless "Don't track this session" is on.

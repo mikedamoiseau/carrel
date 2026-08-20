@@ -757,6 +757,11 @@ body:not(:has(.header))::before {
 .nav-icon { background: none; border: none; cursor: pointer; padding: 6px; border-radius: 6px; color: var(--ink-muted); display: flex; align-items: center; }
 .nav-icon:hover { color: var(--ink); background: var(--warm-subtle); }
 .nav-icon.active { color: var(--accent); }
+/* M5: `.nav-icon` sets `display` itself, so the plain `hidden` attribute
+   (author-normal `display:flex` beats the UA stylesheet's `[hidden]` rule
+   regardless of specificity) needs this explicit override to actually hide
+   the Vocabulary icon when unavailable. */
+.nav-icon[hidden] { display: none; }
 
 /* ── Profile Switcher (remote profile switching) ── */
 /* Sits in the header cluster next to the theme toggle, and deliberately has no
@@ -815,6 +820,9 @@ body:not(:has(.header))::before {
 }
 .tab-label { font-size: 0.7rem; font-weight: 600; letter-spacing: 0.01em; }
 .tab.active { color: var(--accent); }
+/* M5: same `hidden`-attribute-vs-author-`display` issue as `.nav-icon[hidden]`
+   above — `.tab` sets `display: flex` itself. */
+.tab[hidden] { display: none; }
 
 /* Narrow OR touch (comma = OR): phones, narrow windows, and coarse-pointer
    tablets in landscape. Desktop (wide + fine pointer) falls through to the
@@ -861,6 +869,15 @@ body:not(:has(.header))::before {
   .detail-more-btn { min-width: 44px; min-height: 44px; }
   .detail-menu-item { min-height: 44px; }
   .collections-toolbar .sort-btn { min-height: 44px; }
+  /* Same control, same floor — the Vocabulary screen's toolbar is cloned from
+     the collections one, so it needs its own rule here or it stays ~28px. */
+  .vocab-screen-toolbar .sort-btn { min-height: 44px; }
+  .vocab-entry-delete { min-width: 44px; min-height: 44px; }
+  /* M6 review controls — same floor, same reason as the sort-btn/delete rules
+     above (cloned buttons, cloned gap). */
+  .vocab-review-btn { min-height: 44px; }
+  .vocab-review-answers button { min-height: 44px; }
+  .vocab-review-reveal, .vocab-review-back { min-height: 44px; }
   .reader-toolbar button { min-height: 44px; }
   /* The chrome-toggle FAB sits outside the toolbar and is explicitly 40x40. */
   .chrome-toggle-fab { width: 44px; height: 44px; }
@@ -1041,3 +1058,104 @@ body:not(:has(.header))::before {
   background: var(--accent-hover); color: var(--on-accent);
   border: none; border-radius: var(--radius); cursor: pointer; font-weight: 600;
 }
+
+/* Saved-words (vocabulary) drawer (M4, cloned from the highlights drawer). */
+.reader-toolbar #vocab-btn { font-size: 1rem; line-height: 1; }
+.vocab-panel {
+  position: fixed; top: 0; left: 0; height: 100%;
+  width: min(320px, 85vw);
+  display: flex; flex-direction: column;
+  background: var(--surface); border-right: 1px solid var(--warm-border);
+  box-shadow: 2px 0 16px var(--shadow);
+  transform: translateX(-100%); visibility: hidden;
+  transition: transform 0.2s ease, visibility 0.2s;
+  z-index: 40;
+}
+.vocab-panel.open { transform: translateX(0); visibility: visible; }
+@media (prefers-reduced-motion: reduce) { .vocab-panel { transition: none; } }
+.vocab-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--warm-border);
+}
+.vocab-title { flex: 1; }
+/* M5: link to the full-list screen (#/vocabulary). */
+.vocab-see-all { color: var(--accent); font-size: 0.8rem; font-weight: 400; text-decoration: none; }
+.vocab-see-all:hover, .vocab-see-all:focus-visible { text-decoration: underline; }
+.vocab-close {
+  min-width: 44px; min-height: 44px; background: none; border: none;
+  color: var(--ink); font-size: 1.4rem; line-height: 1; cursor: pointer;
+}
+.vocab-list { list-style: none; margin: 0; padding: 8px 0; overflow-y: auto; flex: 1; }
+.vocab-entry {
+  display: flex; align-items: flex-start; gap: 8px;
+  min-height: 44px; padding: 8px 16px;
+  color: var(--ink); cursor: pointer;
+}
+.vocab-entry:hover, .vocab-entry:focus-visible { background: var(--accent-light); }
+.vocab-entry-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.vocab-entry-pos { color: var(--ink-muted); font-size: 0.85rem; font-weight: 400; font-style: italic; }
+.vocab-entry-def {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.vocab-entry-meta { color: var(--ink-muted); font-size: 0.85rem; }
+.vocab-entry-delete {
+  flex: none; min-width: 32px; min-height: 32px; background: none; border: none;
+  color: var(--ink-muted); font-size: 1.2rem; line-height: 1; cursor: pointer;
+}
+.vocab-entry-delete:hover, .vocab-entry-delete:focus-visible { color: var(--accent); }
+.vocab-empty { padding: 16px; color: var(--ink-muted); }
+/* A saved word with no chapter cannot jump (chapter_index is nullable), so its
+   row is inert — no hover affordance, no pointer. Its ✕ still works. */
+.vocab-entry-static { cursor: default; }
+.vocab-entry-static:hover { background: none; }
+
+/* M5: cross-book "See all" vocabulary screen (#/vocabulary) — full-width
+   list, cloned from `.collections`/`.collections-toolbar` below. Row
+   sub-elements (`.vocab-entry-word`/`-pos`/`-def`/`-meta`/`-delete`,
+   `.vocab-entry-body`) reuse the drawer's classes above unchanged. */
+.vocab-screen { max-width: 640px; margin: 0 auto; padding: var(--gap); }
+.vocab-screen-toolbar { display: flex; gap: 10px; align-items: center; padding-bottom: var(--gap); }
+.vocab-screen-toolbar input { flex: 1; padding: 8px 12px; background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius); color: var(--ink); font-size: 0.85rem; }
+.vocab-screen-toolbar .sort-btn { background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius); padding: 6px 10px; color: var(--ink-muted); cursor: pointer; font-size: 0.8rem; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.vocab-screen-toolbar .sort-btn:hover { color: var(--ink); border-color: var(--accent); }
+.vocab-screen-list { display: flex; flex-direction: column; gap: 8px; }
+.vocab-screen-entry {
+  background: var(--surface); border: 1px solid var(--warm-border); border-radius: var(--radius);
+  padding: 12px 16px; display: flex; align-items: flex-start; gap: 8px;
+}
+
+/* M6: flashcard review, entered from the "Review N due" bar above the
+   toolbar. `.vocab-review*` replaces the toolbar/list markup entirely while
+   `view === "review"` — see showVocabularyScreen's render()/renderReview(). */
+.vocab-review-bar { padding-bottom: var(--gap); }
+.vocab-review-btn {
+  width: 100%; background: var(--accent); color: var(--on-accent); border: none;
+  border-radius: var(--radius); padding: 10px 16px; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+}
+.vocab-review-btn:hover:not(:disabled) { background: var(--accent-hover); }
+.vocab-review-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.vocab-review-progress { text-align: center; color: var(--ink-muted); font-size: 0.8rem; margin-bottom: 10px; }
+.vocab-review-card {
+  background: var(--warm-subtle); border-radius: var(--radius); padding: 28px 20px; text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 12px; min-height: 9rem; justify-content: center;
+}
+.vocab-review-word { font-size: 1.2rem; }
+.vocab-review-reveal, .vocab-review-back {
+  background: none; border: none; color: var(--accent); font-size: 0.85rem; font-weight: 600; cursor: pointer;
+}
+.vocab-review-back { color: var(--ink-muted); font-weight: 400; display: block; margin: 14px auto 0; }
+.vocab-review-back:hover, .vocab-review-reveal:hover { text-decoration: underline; }
+.vocab-review-definition { font-size: 0.9rem; color: var(--ink); text-align: left; align-self: stretch; }
+.vocab-review-context { font-size: 0.8rem; font-style: italic; color: var(--ink-muted); text-align: left; align-self: stretch; }
+.vocab-review-book { font-size: 0.75rem; color: var(--ink-muted); text-align: left; align-self: stretch; }
+.vocab-review-answers { display: flex; gap: 10px; justify-content: center; margin-top: 12px; }
+.vocab-review-answers button {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  border-radius: var(--radius); padding: 10px 14px; font-size: 0.85rem; font-weight: 600;
+  cursor: pointer;
+}
+.vocab-review-answers button span { font-size: 0.7rem; font-weight: 400; opacity: 0.8; }
+.vocab-review-missed { background: var(--surface); border: 1px solid var(--warm-border); color: var(--ink); }
+.vocab-review-gotit { background: var(--accent); border: none; color: var(--on-accent); }
+.vocab-review-answers button:disabled { opacity: 0.5; cursor: not-allowed; }

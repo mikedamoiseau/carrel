@@ -7,6 +7,8 @@ use axum::{
     Json, Router,
 };
 
+use rusqlite::OptionalExtension;
+
 use super::auth::{log_login_attempt, LoginOutcome, WebAuthMethod};
 use super::{carrel_status, WebState};
 use crate::db;
@@ -189,7 +191,19 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .route("/stats", get(get_stats))
         .route("/dictionary/status", get(get_dictionary_status))
         .route("/dictionary/lookup", get(lookup_dictionary_word))
-        .route("/vocabulary", axum::routing::post(create_vocabulary_word))
+        .route(
+            "/vocabulary",
+            get(list_vocabulary_words).post(create_vocabulary_word),
+        )
+        .route("/vocabulary/due", get(get_due_vocabulary_words))
+        .route(
+            "/vocabulary/{id}",
+            axum::routing::delete(delete_vocabulary_word_route),
+        )
+        .route(
+            "/vocabulary/{id}/review",
+            axum::routing::post(review_vocabulary_word_route),
+        )
         .route("/series", get(list_series))
         .route("/collections", get(list_collections))
         .route("/collections/{id}/books", get(get_collection_books))
@@ -2039,6 +2053,158 @@ async fn create_vocabulary_word(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/vocabulary` query params (M4). `bookId` filters to one book's
+/// words for the reader-drawer view; omitted, every row is returned (M5's
+/// full-list screen).
+#[derive(serde::Deserialize)]
+struct VocabularyListQuery {
+    #[serde(rename = "bookId")]
+    book_id: Option<String>,
+}
+
+/// List saved vocabulary words, optionally scoped to one book. Filtered in
+/// the handler rather than in `carrel-core` (see the epic plan) — that crate
+/// is a git dependency for Carrel Server and gets no new query variants for a
+/// web-only view. A `bookId` matching no real book returns an empty list, not
+/// 404: `vocabulary.book_id` is nullable, so a word survives its source
+/// book's deletion, and "no rows" is the honest answer either way.
+async fn list_vocabulary_words(
+    State(state): State<WebState>,
+    Query(params): Query<VocabularyListQuery>,
+) -> Result<Json<Vec<crate::models::VocabularyWord>>, (StatusCode, String)> {
+    let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
+    let words = db::list_vocabulary(&conn).map_err(carrel_status)?;
+    let words = match params.book_id {
+        Some(book_id) => words
+            .into_iter()
+            .filter(|w| w.book_id.as_deref() == Some(book_id.as_str()))
+            .collect(),
+        None => words,
+    };
+    Ok(Json(words))
+}
+
+/// Delete a saved vocabulary word. Idempotent (same as `delete_highlight_route`):
+/// an unknown id affects 0 rows and still returns 204.
+async fn delete_vocabulary_word_route(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
+    db::delete_vocabulary_word(&conn, &id).map_err(carrel_status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/vocabulary/due` query params (M6). `limit` is caller-suggested
+/// only — never trusted verbatim, see [`clamp_due_limit`].
+#[derive(serde::Deserialize)]
+struct VocabularyDueQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Default and hard-cap for `GET /api/vocabulary/due`'s `limit`. The cap is
+/// the same 200 as desktop's `VocabularyPanel.tsx` `REVIEW_LIMIT` — a generous
+/// safety bound on a personal vocabulary list, not real pagination — but it is
+/// enforced here rather than trusted from the client, because this route is
+/// LAN-reachable. Keeping the two equal matters: the web UI labels the returned
+/// length as a due *count*, so a lower cap here would understate it and then
+/// let the UI claim the queue was finished with cards still due.
+const VOCABULARY_DUE_DEFAULT_LIMIT: i64 = 20;
+const VOCABULARY_DUE_MAX_LIMIT: i64 = 200;
+
+/// Clamp a caller-supplied `limit` into `1..=VOCABULARY_DUE_MAX_LIMIT`,
+/// defaulting to `VOCABULARY_DUE_DEFAULT_LIMIT` when absent. A non-positive
+/// value is treated the same as "too high" (clamped up to 1) rather than
+/// rejected — this is a read endpoint, so there is no invalid input to 400
+/// on, only a nonsensical request to make harmless.
+fn clamp_due_limit(limit: Option<i64>) -> i64 {
+    limit
+        .unwrap_or(VOCABULARY_DUE_DEFAULT_LIMIT)
+        .clamp(1, VOCABULARY_DUE_MAX_LIMIT)
+}
+
+/// List vocabulary rows due for review (M6 flashcard queue). `now` is always
+/// the server clock — a client-supplied time would let a review session be
+/// replayed or postponed by lying about it.
+async fn get_due_vocabulary_words(
+    State(state): State<WebState>,
+    Query(params): Query<VocabularyDueQuery>,
+) -> Result<Json<Vec<crate::models::VocabularyWord>>, (StatusCode, String)> {
+    let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let limit = clamp_due_limit(params.limit);
+    let words = db::due_vocabulary(&conn, now, limit).map_err(carrel_status)?;
+    Ok(Json(words))
+}
+
+/// `POST /api/vocabulary/{id}/review` body.
+#[derive(serde::Deserialize)]
+struct VocabularyReviewBody {
+    correct: bool,
+}
+
+/// Score a flashcard review and persist the result. Delegates to
+/// `commands::record_vocabulary_review_now` — the exact logic desktop's
+/// `record_vocabulary_review` IPC command runs — so the two surfaces cannot
+/// drift on Leitner-box scheduling.
+///
+/// An unknown id is a 404: `db::record_vocabulary_review` reads the row's
+/// current box before scoring it, which would otherwise surface as an opaque
+/// 500 (a bare SQLite "no rows returned" maps to `CarrelError::Database`, not
+/// `NotFound`). Checked explicitly here rather than teaching that mapping to
+/// carrel-core, which is a git dependency for Carrel Server. No transaction
+/// spans the check and the update below, so a delete landing in that window
+/// (another tab/device) still surfaces as a 500 — same accepted race as
+/// `create_vocabulary_word`'s book-id check above.
+async fn review_vocabulary_word_route(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Manual parse (like `create_vocabulary_word`) so a malformed body maps to
+    // 400 rather than axum's built-in 422.
+    let body: VocabularyReviewBody = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid request body: {e}"),
+        )
+    })?;
+
+    let conn = state.conn().map_err(carrel_status)?;
+    if !vocabulary_setting_enabled(&conn)? {
+        return Err((StatusCode::FORBIDDEN, "Vocabulary is disabled".to_string()));
+    }
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM vocabulary WHERE id = ?1",
+            rusqlite::params![id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(carrel_status)?
+        .is_some();
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "Word not found".to_string()));
+    }
+
+    crate::commands::record_vocabulary_review_now(&conn, &id, body.correct)
+        .map_err(carrel_status)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2282,7 +2448,7 @@ mod tests {
             id: id.to_string(),
             title: "Vocabulary Test Book".to_string(),
             author: "Author".to_string(),
-            file_path: "/nonexistent/vocab-test.epub".to_string(),
+            file_path: format!("/nonexistent/vocab-test-{id}.epub"),
             cover_path: None,
             total_chapters: 1,
             added_at: 0,
@@ -2551,6 +2717,408 @@ mod tests {
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].book_id.as_deref(), Some("book-1"));
         assert_eq!(words[0].chapter_index, Some(2));
+    }
+
+    // ── GET/DELETE /api/vocabulary (M4) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_vocabulary_words_returns_all_rows_without_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-1")).unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-2")).unwrap();
+        }
+        create_vocabulary_word(
+            State(state.clone()),
+            vocabulary_body(r#","bookId":"book-1""#),
+        )
+        .await
+        .unwrap();
+        create_vocabulary_word(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"word":"dog","lemma":"dog","definition":"canine mammal","bookId":"book-2"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let Json(words) =
+            list_vocabulary_words(State(state), Query(VocabularyListQuery { book_id: None }))
+                .await
+                .unwrap();
+
+        assert_eq!(words.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_vocabulary_words_filters_by_book_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-1")).unwrap();
+            db::insert_book(&conn, &vocabulary_test_book("book-2")).unwrap();
+        }
+        create_vocabulary_word(
+            State(state.clone()),
+            vocabulary_body(r#","bookId":"book-1""#),
+        )
+        .await
+        .unwrap();
+        create_vocabulary_word(
+            State(state.clone()),
+            Bytes::from(
+                r#"{"word":"dog","lemma":"dog","definition":"canine mammal","bookId":"book-2"}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let Json(words) = list_vocabulary_words(
+            State(state),
+            Query(VocabularyListQuery {
+                book_id: Some("book-1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].lemma, "cat");
+    }
+
+    /// A word's source book can be deleted while the word survives
+    /// (`vocabulary.book_id` is nullable) — a `bookId` naming no real book is
+    /// therefore an honest "no rows", not a 404.
+    #[tokio::test]
+    async fn list_vocabulary_words_unknown_book_id_returns_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+
+        let Json(words) = list_vocabulary_words(
+            State(state),
+            Query(VocabularyListQuery {
+                book_id: Some("does-not-exist".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(words.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_vocabulary_words_disabled_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = list_vocabulary_words(State(state), Query(VocabularyListQuery { book_id: None }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn delete_vocabulary_word_route_removes_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        let id = {
+            let conn = state.conn().unwrap();
+            db::list_vocabulary(&conn).unwrap()[0].id.clone()
+        };
+
+        let status = delete_vocabulary_word_route(State(state.clone()), Path(id))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        assert!(db::list_vocabulary(&conn).unwrap().is_empty());
+    }
+
+    /// Idempotent, same as `delete_highlight_route`: deleting an id that was
+    /// never there (or already deleted) is still a success.
+    #[tokio::test]
+    async fn delete_vocabulary_word_route_unknown_id_is_still_no_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let status = delete_vocabulary_word_route(State(state), Path("does-not-exist".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn delete_vocabulary_word_route_disabled_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = delete_vocabulary_word_route(State(state), Path("some-id".to_string()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    // ── GET /api/vocabulary/due, POST /api/vocabulary/{id}/review (M6) ──────
+
+    /// The discriminating half of "due" — a row already scheduled for the
+    /// future must NOT come back, not merely that a due row does. A handler
+    /// that ignored `next_due_at` entirely (returned every row) would still
+    /// pass a test that only checked inclusion.
+    #[tokio::test]
+    async fn due_vocabulary_words_excludes_a_row_not_yet_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        // Never-reviewed row: due immediately (next_due_at IS NULL).
+        create_vocabulary_word(
+            State(state.clone()),
+            Bytes::from(r#"{"word":"cat","lemma":"cat-due","definition":"feline mammal"}"#),
+        )
+        .await
+        .unwrap();
+        // A row already scheduled far in the future must not be due yet.
+        create_vocabulary_word(
+            State(state.clone()),
+            Bytes::from(r#"{"word":"dog","lemma":"dog-not-due","definition":"canine mammal"}"#),
+        )
+        .await
+        .unwrap();
+        {
+            let conn = state.conn().unwrap();
+            conn.execute(
+                "UPDATE vocabulary SET next_due_at = ?1 WHERE lemma = 'dog-not-due'",
+                rusqlite::params![i64::MAX],
+            )
+            .unwrap();
+        }
+
+        let Json(due) =
+            get_due_vocabulary_words(State(state), Query(VocabularyDueQuery { limit: None }))
+                .await
+                .unwrap();
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].lemma, "cat-due");
+    }
+
+    /// A caller-supplied limit above the server cap is silently clamped, not
+    /// trusted or rejected — this asserts the clamp actually bites by
+    /// counting what comes back, not just that the request succeeds.
+    #[tokio::test]
+    async fn due_vocabulary_words_limit_clamps_to_server_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        for i in 0..(VOCABULARY_DUE_MAX_LIMIT + 5) {
+            create_vocabulary_word(
+                State(state.clone()),
+                Bytes::from(format!(
+                    r#"{{"word":"w{i}","lemma":"clamp-{i}","definition":"def"}}"#
+                )),
+            )
+            .await
+            .unwrap();
+        }
+
+        let Json(due) = get_due_vocabulary_words(
+            State(state),
+            Query(VocabularyDueQuery {
+                limit: Some(10_000),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(due.len(), VOCABULARY_DUE_MAX_LIMIT as usize);
+    }
+
+    #[tokio::test]
+    async fn due_vocabulary_words_disabled_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = get_due_vocabulary_words(State(state), Query(VocabularyDueQuery { limit: None }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    fn review_body(correct: bool) -> Bytes {
+        Bytes::from(format!(r#"{{"correct":{correct}}}"#))
+    }
+
+    /// Persistence, not just the status code: a 204 that left the row
+    /// untouched would pass a weaker test. Reads the row back and checks both
+    /// the box and the due timestamp actually moved.
+    #[tokio::test]
+    async fn review_vocabulary_word_route_correct_advances_box_and_sets_next_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        let id = {
+            let conn = state.conn().unwrap();
+            db::list_vocabulary(&conn).unwrap()[0].id.clone()
+        };
+
+        let status =
+            review_vocabulary_word_route(State(state.clone()), Path(id.clone()), review_body(true))
+                .await
+                .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        let word = db::list_vocabulary(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id)
+            .unwrap();
+        assert_eq!(word.box_num, 2, "a correct review should advance the box");
+        assert!(word.next_due_at.is_some(), "next_due_at must be set");
+        assert!(word.last_reviewed_at.is_some());
+    }
+
+    /// A wrong answer resets the box to 1 regardless of where it started —
+    /// verified by first advancing the box with a correct review, then
+    /// checking a wrong one resets it rather than merely leaving it alone.
+    #[tokio::test]
+    async fn review_vocabulary_word_route_wrong_resets_box_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        let id = {
+            let conn = state.conn().unwrap();
+            db::list_vocabulary(&conn).unwrap()[0].id.clone()
+        };
+        review_vocabulary_word_route(State(state.clone()), Path(id.clone()), review_body(true))
+            .await
+            .unwrap();
+
+        let status = review_vocabulary_word_route(
+            State(state.clone()),
+            Path(id.clone()),
+            review_body(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let conn = state.conn().unwrap();
+        let word = db::list_vocabulary(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id)
+            .unwrap();
+        assert_eq!(word.box_num, 1, "a wrong review must reset the box to 1");
+    }
+
+    #[tokio::test]
+    async fn review_vocabulary_word_route_unknown_id_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+
+        let err = review_vocabulary_word_route(
+            State(state),
+            Path("does-not-exist".to_string()),
+            review_body(true),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn review_vocabulary_word_route_disabled_is_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        // vocabulary_enabled is left unset (defaults to off).
+        let state = dictionary_test_state(dir.path().to_path_buf());
+
+        let err = review_vocabulary_word_route(
+            State(state),
+            Path("some-id".to_string()),
+            review_body(true),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn review_vocabulary_word_route_malformed_body_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "vocabulary_enabled", "true").unwrap();
+        }
+        create_vocabulary_word(State(state.clone()), vocabulary_body(""))
+            .await
+            .unwrap();
+        let id = {
+            let conn = state.conn().unwrap();
+            db::list_vocabulary(&conn).unwrap()[0].id.clone()
+        };
+
+        let err = review_vocabulary_word_route(State(state), Path(id), Bytes::from("not json"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[test]

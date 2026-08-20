@@ -21,6 +21,36 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   vocabulary builder is turned on for the profile; a new
   `POST /api/vocabulary` endpoint backs it, and `GET /api/dictionary/status`
   gained a `vocabulary` field so the button knows when to appear.
+- **Saved words drawer in the web reader.** A new 📚 toolbar button (chapter
+  mode only, alongside Highlights) opens a drawer listing every word saved
+  from this book — its part of speech, definition, chapter, and save date —
+  with a tap-to-jump back to where it was looked up and a delete button per
+  row. Backed by `GET /api/vocabulary` (optionally filtered by `?bookId=`)
+  and a new `DELETE /api/vocabulary/{id}`, both gated on the vocabulary
+  builder setting like the existing save route.
+- **Vocabulary screen ("See all") in the web reader.** A new Vocabulary icon
+  in the header nav cluster (and bottom tab bar on narrow viewports) opens a
+  full cross-book list of every saved word — the book it came from, chapter,
+  and save date — with a search box, a newest/alphabetical sort toggle, and a
+  delete button per row. Also reachable via a "See all" link in the M4
+  drawer's header. No new backend route: it reuses `GET /api/vocabulary`
+  without `?bookId=`, which already returns every row.
+- **Flashcard review in the web reader.** A "Review N due" bar on the
+  Vocabulary screen quizzes you on the words scheduled for review: reveal the
+  definition, then mark **Got it** or **Missed** to see the new box and when
+  it's next due, same five-box spaced-repetition schedule as the desktop app.
+  Backed by two new endpoints, both gated on the vocabulary builder setting —
+  `GET /api/vocabulary/due` (server-clamped `limit`, default 20, max 100) and
+  `POST /api/vocabulary/{id}/review`, which delegates to the same scheduling
+  logic the desktop app's review command uses so the two surfaces can't drift.
+
+### Fixed
+- **Jumping to a highlight in the web reader now lands on the highlight.**
+  Tapping a row in the Highlights drawer navigated to the right chapter but
+  then scrolled back to the top of it, so any highlight below the first
+  screenful was left off-screen — the reader's post-render scroll restore ran
+  after the jump and overwrote it. Both the highlight jump and the new
+  saved-words jump now suppress that restore.
 
 ## [3.0.6] - 2026-08-17
 
