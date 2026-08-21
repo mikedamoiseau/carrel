@@ -8352,10 +8352,20 @@
     // would let an interleaved render read the *old* profile's namespace,
     // which routeGen can't prevent because that render isn't this
     // continuation.
-    if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+    try {
+      if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+    } catch (e) {
+      // Fail closed, and say so: without a namespace known to match the
+      // server's active profile, leaving offline mode would let a save file
+      // one profile's book under another's. Staying offline keeps the banner
+      // (and its Retry, which re-runs this whole probe) on screen, which is
+      // the recoverable end of that trade.
+      return;
+    }
     // loadProfiles() inside the sync above is itself a request, so the move
-    // can be noticed *here* rather than on the probe. reloadPending then
-    // means the document is already going away and nothing below should run.
+    // can be noticed *there* rather than on the probe — in which case the
+    // scope has already been moved to the profile the imminent reload lands
+    // in, which is where boot would put it anyway. Nothing below should run.
     if (superseded() || reloadPending) return;
     offlineMode = false;
     route();
