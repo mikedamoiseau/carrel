@@ -1018,7 +1018,7 @@
         // Direct PUT (not sendProgress) — a queued row is the book's latest
         // offline intent, so it must bypass the live-session monotonic guard
         // (an offline Start Over to page 0 must replay, not be dropped).
-        const put = await fetch(`/api/books/${row.bookId}/progress`, {
+        const put = await apiWrite(`/api/books/${row.bookId}/progress`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chapter_index: row.chapterIndex, scroll_position: row.scrollPosition }),
@@ -1245,6 +1245,19 @@
     }
     noteProfileTag(resp);
     if (resp.status === 401) { authenticated = false; showLogin(); return null; }
+    return resp;
+  }
+
+  // Write-path counterpart to api(): every write must also see
+  // noteProfileTag, since a write issued after the active profile moved
+  // would otherwise commit under the new profile with ids that belonged to
+  // the old one. Unlike api(), this does not interpret the response — write
+  // call sites each handle 401/403/404/409/423/204-vs-body differently, so
+  // it just forwards fetch()'s own resolution/rejection and lets the caller's
+  // existing try/catch and status checks run unchanged.
+  async function apiWrite(path, options) {
+    const resp = await fetch(path, options);
+    noteProfileTag(resp);
     return resp;
   }
 
@@ -1650,7 +1663,7 @@
       if (!pin) return;
       btn.disabled = true;
       try {
-        const resp = await fetch("/api/auth", {
+        const resp = await apiWrite("/api/auth", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ pin }),
@@ -3154,7 +3167,7 @@
         wantBtn.setAttribute("aria-busy", "true");
         let resp;
         try {
-          resp = await fetch(`/api/books/${id}/want-to-read`, {
+          resp = await apiWrite(`/api/books/${id}/want-to-read`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ want_to_read: next }),
@@ -4662,13 +4675,12 @@
         ? clampScrollRatio(readerState.scrollPosition || 0)
         : (readerState.count > 1 ? readerState.index / readerState.count : 0);
     try {
-      const resp = await fetch(`/api/books/${bookId}/bookmarks`, {
+      const resp = await apiWrite(`/api/books/${bookId}/bookmarks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chapter_index: chapterIndex, scroll_position: scrollPosition }),
         credentials: "same-origin",
       });
-      noteProfileTag(resp);
       if (resp.status === 401) { authenticated = false; showLogin(); return; }
       if (!resp.ok) return;
       const created = await resp.json();
@@ -4688,7 +4700,7 @@
     if (!readerState) return;
     const bookId = readerState.id;
     try {
-      const resp = await fetch(`/api/books/${bookId}/bookmarks/${id}`, {
+      const resp = await apiWrite(`/api/books/${bookId}/bookmarks/${id}`, {
         method: "DELETE",
         credentials: "same-origin",
       });
@@ -4754,7 +4766,7 @@
     }
     const bookId = readerState.id;
     try {
-      const resp = await fetch(`/api/books/${bookId}/bookmarks/${id}`, {
+      const resp = await apiWrite(`/api/books/${bookId}/bookmarks/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: rawName }),
@@ -5476,7 +5488,7 @@
     const i = vocabState.items.findIndex((w) => w.id === id);
     const removed = i !== -1 ? vocabState.items.splice(i, 1)[0] : null;
     try {
-      const resp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
+      const resp = await apiWrite(`/api/vocabulary/${encodeURIComponent(id)}`, {
         method: "DELETE",
         credentials: "same-origin",
       });
@@ -6011,7 +6023,7 @@
       if (btn.disabled) return;
       btn.disabled = true; // guard double-taps for the duration of the request
       try {
-        const resp = await fetch("/api/vocabulary", {
+        const resp = await apiWrite("/api/vocabulary", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -6138,7 +6150,7 @@
     highlightsState.items.push(temp);
     rerenderChapterHighlights();
     try {
-      const resp = await fetch(`/api/books/${encodeURIComponent(bookId)}/highlights`, {
+      const resp = await apiWrite(`/api/books/${encodeURIComponent(bookId)}/highlights`, {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
@@ -6239,7 +6251,7 @@
     const removed = i !== -1 ? highlightsState.items.splice(i, 1)[0] : null;
     rerenderChapterHighlights();
     try {
-      const resp = await fetch(
+      const resp = await apiWrite(
         `/api/books/${encodeURIComponent(bookId)}/highlights/${encodeURIComponent(hlId)}`,
         { method: "DELETE", credentials: "same-origin" });
       if (resp.status === 401) {
@@ -6296,7 +6308,7 @@
     const seq = (hlUpdateSeq.get(hlId) || 0) + 1;
     hlUpdateSeq.set(hlId, seq);
     try {
-      const resp = await fetch(
+      const resp = await apiWrite(
         `/api/books/${encodeURIComponent(bookId)}/highlights/${encodeURIComponent(hlId)}`,
         { method: "PUT", credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -7018,17 +7030,16 @@
       return;
     }
     try {
-      const resp = await fetch(`/api/books/${id}/progress`, {
+      // Checked on the reader's own write path, not just on reads (via
+      // apiWrite): this is the request most likely to be the first thing a
+      // long-open reader tab does after the active profile moved under it.
+      const resp = await apiWrite(`/api/books/${id}/progress`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chapter_index: chapterIndex, scroll_position: scrollPosition }),
         credentials: "same-origin",
         keepalive: true,
       });
-      // Checked on the reader's own write path, not just on reads: this is the
-      // request most likely to be the first thing a long-open reader tab does
-      // after the active profile moved under it.
-      noteProfileTag(resp);
       // F3: a debounced/flushed save (unlike the pagehide teardown flush)
       // can and should react to an expired session — route to the same
       // login redirect the rest of the app uses.
@@ -7826,7 +7837,7 @@
 
       let resp;
       try {
-        resp = await fetch(`/api/vocabulary/${encodeURIComponent(card.id)}/review`, {
+        resp = await apiWrite(`/api/vocabulary/${encodeURIComponent(card.id)}/review`, {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -7851,10 +7862,8 @@
       }
       // A profile switched on the desktop mid-session invalidates every queued
       // row id; without this the answers just 404 one by one while the page
-      // keeps showing the old profile's words. (deleteScreenWord and the
-      // drawer's deleteVocabWord still omit it — that sweep is tracked
-      // separately, across every web write path at once.)
-      noteProfileTag(resp);
+      // keeps showing the old profile's words. Now covered by every write
+      // path via apiWrite, not just this one.
       if (stale()) return;
       if (resp.status === 401) { showLogin(); return; }
       if (resp.status === 403) {
@@ -7914,7 +7923,7 @@
       const removedDue = dueIndex !== -1 ? dueWords.splice(dueIndex, 1)[0] : null;
       render();
       try {
-        const delResp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
+        const delResp = await apiWrite(`/api/vocabulary/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "same-origin",
         });
@@ -8065,6 +8074,12 @@
     if (!name || name === activeProfileName()) return;
     let resp;
     try {
+      // Deliberately NOT apiWrite: this call's whole purpose is to move the
+      // active profile, so its response necessarily carries a different
+      // x-carrel-profile tag than the page's baseline. Routing it through
+      // noteProfileTag would fire location.reload() right here, racing the
+      // location.hash reset below and dropping the user back wherever they
+      // were instead of on the library.
       resp = await fetch("/api/profile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

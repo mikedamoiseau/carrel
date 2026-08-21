@@ -59,6 +59,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   message is still logged server-side, with its error kind — while the app's
   own validation and lookup messages (not-found, permission, invalid input,
   rate-limited) are unchanged.
+- **A web tab left open on a stale profile no longer writes into the wrong
+  library.** The active profile is shared by the desktop app and every web
+  client, so it can move while a browser tab sits open; every response
+  carries a header the web UI compares against a per-tab baseline, reloading
+  on a mismatch. That check only ran on reads — a save, delete, or edit sent
+  after the profile moved committed against the new profile using the old
+  one's book ids and the tab never noticed. Every write in the web UI (saving
+  progress, bookmarks, highlights, vocabulary words, want-to-read, flashcard
+  review, login) now runs the same check.
 
 ## [3.0.6] - 2026-08-17
 

@@ -126,6 +126,75 @@ test.describe("web UI profile switcher", () => {
     await other.close();
   });
 
+  test("a write with a stale profile tag triggers a reload, not just a status check", async ({
+    page,
+  }) => {
+    // Writes (unlike GETs) used to bypass noteProfileTag entirely — a write
+    // issued after the profile moved would commit under the new profile with
+    // the old profile's book id and the tab would never notice. Model the
+    // move on a single write's response, without touching the server's real
+    // (shared) active profile: rewrite just this request's x-carrel-profile
+    // header to something other than the page's baseline.
+    const bookId = "e2e-book-001";
+    await page.goto(`/#/book/${bookId}`);
+    await expect(page.locator("#want-btn")).toBeVisible();
+
+    await page.route(`**/api/books/${bookId}/want-to-read`, async (route) => {
+      const response = await route.fetch();
+      const headers = { ...response.headers(), "x-carrel-profile": "e2e-spoofed-profile" };
+      await route.fulfill({ response, headers });
+    });
+
+    // A window global only a fresh document load clears — proves an actual
+    // reload happened, not merely that the write "succeeded" or that some
+    // DOM element changed.
+    await page.evaluate(() => {
+      (window as unknown as { __stalenessProbe?: string }).__stalenessProbe = "present";
+    });
+
+    try {
+      await page.locator("#want-btn").click();
+
+      await expect
+        .poll(
+          async () => page.evaluate(() => (window as unknown as { __stalenessProbe?: string }).__stalenessProbe),
+          { timeout: 10_000 }
+        )
+        .toBeUndefined();
+    } finally {
+      // The click's PUT really did commit server-side (only its response
+      // header was rewritten). want-to-read.spec.ts's flagged-book count
+      // assumes this book stays unflagged, and the DB persists across the
+      // whole (workers=1) run — reset it via page.request, which is a direct
+      // API client and isn't caught by the page.route above.
+      await page.request
+        .put(`/api/books/${bookId}/want-to-read`, { data: { want_to_read: false } })
+        .catch(() => {});
+    }
+  });
+
+  test("switching profile from a non-library view still lands on the library", async ({
+    page,
+  }) => {
+    // switchProfile's own write deliberately does NOT go through the shared
+    // reload guard (its response necessarily carries a different tag than
+    // the page's baseline, by design). If it ever did, that reload would
+    // race switchProfile's own location.hash="#/" reset and could leave the
+    // tab stuck on the book-detail view instead of the library it just
+    // switched into.
+    const bookId = "e2e-book-001";
+    await page.goto(`/#/book/${bookId}`);
+    await expect(page.locator("#want-btn")).toBeVisible();
+
+    await openProfileMenu(page);
+    await page.locator('.profile-row[data-profile="magazines"]').click();
+
+    await expect(page).toHaveURL(/#\/$/, { timeout: 15_000 });
+    await expect(page.locator("#profile-switcher-btn")).toContainText("magazines", {
+      timeout: 15_000,
+    });
+  });
+
   test("the menu closes on an outside click", async ({ page }) => {
     await page.goto("/");
     await openProfileMenu(page);
