@@ -27,6 +27,34 @@ use carrel_core::events::{self, CarrelEvent};
 ///   surfacing in a PIN-gated export reachable over the network
 const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_providers", "opds_auth"];
 
+/// Refuse a route that bulk-dumps personal data unless a web PIN is actually
+/// configured.
+///
+/// `auth_middleware` lets every request through when there is no PIN — an
+/// acceptable posture for reading one's own library on a home LAN, and the
+/// documented default. It is not acceptable for the routes that hand over a
+/// pile of personal records in one response, so those ask for this gate by
+/// name. Poisoned mutex → fail closed (500), never open access, mirroring
+/// `auth_middleware` itself.
+fn require_configured_pin(state: &WebState, what: &str) -> Result<(), (StatusCode, String)> {
+    let has_pin = match state.pin_hash.lock() {
+        Ok(guard) => guard.is_some(),
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ))
+        }
+    };
+    if !has_pin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("{what} requires a configured web PIN."),
+        ));
+    }
+    Ok(())
+}
+
 /// Build the full GDPR export document: the shared core metadata plus the
 /// activity log and a redacted settings map.
 ///
@@ -99,21 +127,7 @@ async fn data_export(State(state): State<WebState>) -> Result<Response, (StatusC
     // settings). Refuse to serve it on an unauthenticated server — the GDPR
     // export requires that web auth actually be set up. Poisoned mutex → fail
     // closed (500), never open access (mirrors `auth_middleware`).
-    let has_pin = match state.pin_hash.lock() {
-        Ok(guard) => guard.is_some(),
-        Err(_) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-            ))
-        }
-    };
-    if !has_pin {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Data export requires a configured web PIN.".to_string(),
-        ));
-    }
+    require_configured_pin(&state, "Data export")?;
 
     let conn = state.conn().map_err(carrel_status)?;
     let value = build_gdpr_export(&conn)?;
@@ -424,10 +438,16 @@ struct HistoryQuery {
     limit: Option<u32>,
 }
 
+/// Every login attempt this server has seen: client IP, user agent, outcome.
+/// Gated like the data export — it is the same kind of payload, and the rows
+/// outlive the PIN that produced them, so an owner who configures a PIN, uses
+/// the web UI, then clears the PIN would otherwise leave that log readable by
+/// anything on the LAN.
 async fn login_history(
     State(state): State<WebState>,
     Query(params): Query<HistoryQuery>,
 ) -> Result<Json<Vec<crate::models::WebSessionEntry>>, (StatusCode, String)> {
+    require_configured_pin(&state, "The login history")?;
     let conn = state.conn().map_err(carrel_status)?;
     let rows = db::get_web_session_log(&conn, params.limit.unwrap_or(100).min(1000))
         .map_err(carrel_status)?;
@@ -469,7 +489,6 @@ struct PublicBook {
     total_chapters: u32,
     added_at: i64,
     format: BookFormat,
-    file_hash: Option<String>,
     description: Option<String>,
     genres: Option<String>,
     rating: Option<f64>,
@@ -496,7 +515,11 @@ impl From<crate::models::Book> for PublicBook {
             total_chapters,
             added_at,
             format,
-            file_hash,
+            // The file's SHA-256. Nothing on the web side reads it, and it is
+            // an exact-copy fingerprint of the owner's file — enough to match
+            // against a known-file database and identify the precise edition
+            // they hold. Dropped for the same reason as the two paths.
+            file_hash: _,
             description,
             genres,
             rating,
@@ -518,7 +541,6 @@ impl From<crate::models::Book> for PublicBook {
             total_chapters,
             added_at,
             format,
-            file_hash,
             description,
             genres,
             rating,

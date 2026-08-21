@@ -82,7 +82,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   their own routes; both are now stripped from these four responses. The
   GDPR data export (`/api/data-export`) is unaffected — it's the owner's own
   data dump, already refuses to serve without a web PIN configured, and the
-  stored path is a legitimate part of that record.
+  stored path is a legitimate part of that record. The book detail response
+  also no longer includes the file's content hash, which nothing on the web
+  side used and which fingerprints the exact copy the owner holds.
+- **The login history now requires a configured web PIN, like the data
+  export.** `/api/audit/login-history` returns up to 1000 login attempts with
+  the client IP and user agent of each. Web access is deliberately open when
+  no PIN is set, which is fine for reading your own library but not for that
+  log — and because the rows outlive the PIN that produced them, an owner who
+  set a PIN, used the web UI, then cleared it left the log readable by anything
+  on the LAN. It now refuses in that state, exactly as the data export does.
 - **A web tab left open on a stale profile now notices its own writes.** The
   active profile is shared by the desktop app and every web client, so it can
   move while a browser tab sits open; every response carries a header the web

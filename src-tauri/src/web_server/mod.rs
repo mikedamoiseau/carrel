@@ -1841,6 +1841,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_history_refuses_without_a_configured_pin() {
+        // Same payload class as the data export — client IPs and user agents —
+        // and the rows outlive the PIN that produced them, so an owner who
+        // sets a PIN, uses the web UI, then clears it must not leave this log
+        // readable by anything on the LAN. `auth_middleware` lets every route
+        // through when there is no PIN, so the gate has to be on the route.
+        let state = test_state();
+        assert!(state.pin_hash.lock().unwrap().is_none());
+
+        let router = build_router(
+            state,
+            ServerModes {
+                web_ui: true,
+                opds: true,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/audit/login-history"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("requires a configured web PIN"),
+            "unexpected refusal body: {body:?}"
+        );
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn login_history_serves_an_authed_request_on_a_pinned_server() {
+        // The gate must not cost the feature its actual use: with a PIN set and
+        // credentials presented, the log still comes back.
+        let state = test_state();
+        *state.pin_hash.lock().unwrap() = Some(auth::hash_pin("1234"));
+        // Seeded rather than relying on this test's own request being logged —
+        // a *successful* auth is not a logged attempt, so that assumption
+        // failed. Seeding also makes the assertion about the route's content
+        // rather than about its status code alone.
+        {
+            let conn = state.conn().unwrap();
+            carrel_core::db::insert_web_session_log(
+                &conn,
+                &crate::models::WebSessionEntry {
+                    id: "seeded-attempt-1".to_string(),
+                    timestamp: 1_700_000_000,
+                    ip: "192.0.2.7".to_string(),
+                    method: "pin".to_string(),
+                    outcome: "failure".to_string(),
+                    user_agent: Some("seeded-agent/1.0".to_string()),
+                },
+            )
+            .unwrap();
+        }
+
+        let router = build_router(
+            state,
+            ServerModes {
+                web_ui: true,
+                opds: true,
+            },
+        );
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .ok();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/audit/login-history"))
+            .basic_auth("carrel", Some("1234"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let rows: Vec<serde_json::Value> = resp.json().await.unwrap();
+        assert!(
+            rows.iter().any(|r| r["ip"] == "192.0.2.7"),
+            "the seeded attempt should come back: {rows:?}"
+        );
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
     async fn data_export_returns_zip_for_authed_request() {
         let state = test_state();
         *state.pin_hash.lock().unwrap() = Some(auth::hash_pin("1234"));
@@ -5315,7 +5428,6 @@ mod tests {
                 "total_chapters",
                 "added_at",
                 "format",
-                "file_hash",
                 "description",
                 "genres",
                 "rating",
@@ -5389,6 +5501,44 @@ mod tests {
         assert_eq!(items[0]["title"], "Corrupt Test");
         assert_eq!(items[0]["author"], "Author");
         assert_eq!(items[0]["format"], "epub");
+
+        // The paginated branch builds its page through a *separate* conversion
+        // (`books[offset..end]`), so the unpaginated assertion above does not
+        // cover it — a revert scoped to that branch alone would slip past.
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/books?limit=1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("x-total-count").unwrap(),
+            "1",
+            "pagination must still report the pre-slice total"
+        );
+        let body_text = resp.text().await.unwrap();
+        assert_no_secret(&body_text, "paginated book list response");
+        let items: Vec<serde_json::Value> = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            json_keys(&items[0]),
+            key_set(&[
+                "id",
+                "title",
+                "author",
+                "total_chapters",
+                "added_at",
+                "format",
+                "series",
+                "volume",
+                "rating",
+                "language",
+                "publish_year",
+                "is_imported",
+                "want_to_read",
+            ]),
+            "paginated book grid item key set changed"
+        );
 
         let _ = tx.send(());
     }
