@@ -1193,6 +1193,12 @@
   }
 
   function showToast(msg) {
+    // This document is being replaced (see `noteProfileTag`). Every write
+    // that was in flight when the profile move was noticed lands in its
+    // caller's failure branch and asks for a toast, so without this the last
+    // thing the user sees before the reload is a stack of "couldn't reach the
+    // server" messages describing a server that answered fine.
+    if (reloadPending) return;
     const container = ensureToastContainer();
     const toast = document.createElement("div");
     toast.className = "toast";
@@ -1227,6 +1233,11 @@
   // never decoded, and needs no crypto (so it works on a plain-HTTP LAN too).
   let seenProfileTag = null;
   let profileMoveHandled = false;
+  // Set only where a document replacement has actually been requested. Kept
+  // separate from profileMoveHandled on purpose: gating user feedback on
+  // "a move was handled" would silence the app permanently the first time
+  // some future path handles a move *without* replacing the document.
+  let reloadPending = false;
 
   // Returns true when this response came back from a *different* profile than
   // the page booted into — i.e. its data must not be acted on. The reload is
@@ -1244,6 +1255,7 @@
       // the offline namespace all belong to the profile this page booted into.
       // Guarded so a burst of in-flight requests can't reload repeatedly.
       profileMoveHandled = true;
+      reloadPending = true;
       location.reload();
     }
     return true;
@@ -5524,6 +5536,10 @@
       // Idempotent DELETE: 204 is success whether or not the row still existed.
       if (!resp.ok && resp.status !== 204) throw new Error(`HTTP ${resp.status}`);
     } catch {
+      // A moved profile is not a failed delete: the page is being replaced,
+      // and the re-read below would pull the *other* library's words into
+      // this list on the way out.
+      if (profileMoveHandled) return;
       if (removed && vocabState === stateAtCall) {
         vocabState.items.splice(i, 0, removed);
         renderVocabListIfOpen();
@@ -7870,6 +7886,10 @@
         });
       } catch (e) {
         if (stale()) return;
+        // Same as above: `stale()` only tracks this screen's own visit token,
+        // not a profile move, and refreshDueCount() below would re-read the
+        // other library's queue.
+        if (profileMoveHandled) return;
         // The outcome is genuinely UNKNOWN here: the request may have
         // committed with only the response lost. Retaining the card for a
         // blind retry would then record the same review twice, advancing the
@@ -8314,9 +8334,18 @@
       return;
     }
     if (superseded()) return;
+    // Leaving offline mode is a boot in miniature, and it was the only server
+    // probe that skipped these two: without the tag check this page adopts a
+    // profile move instead of noticing it, and without the re-scope it then
+    // renders the new profile's library while every offline read and write
+    // still points at the old profile's namespace — so a "Save offline" from
+    // that state files the new profile's book under the old one.
+    if (noteProfileTag(test)) return; // the reload will re-run this properly
     offlineMode = false;
     if (test.status === 401) return showLogin();
     authenticated = true;
+    if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+    if (superseded()) return;
     route();
   }
 

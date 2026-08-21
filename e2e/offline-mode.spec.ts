@@ -643,12 +643,19 @@ test.describe("offline mode — progress replay (M5)", () => {
       // compare GET there is no reload at all and this times out.
       const reloaded = page.waitForEvent("load", { timeout: 20_000 });
       await context.setOffline(false);
-      await page.evaluate(() => window.dispatchEvent(new Event("online")));
+      // setOffline(false) already fires `online` in the page, which is enough
+      // to start replay here. The synthetic dispatch the other replay tests
+      // use is kept only as a belt-and-braces trigger and must not be
+      // awaited on its own terms: unlike those tests, this one *does* reload,
+      // so the evaluate can land mid-navigation and reject with "Execution
+      // context was destroyed" — failing the test because the feature worked.
+      await page.evaluate(() => window.dispatchEvent(new Event("online"))).catch(() => {});
       await reloaded;
 
       // The row survived. Read it after the reload — IndexedDB outlives the
-      // navigation, and a profile's offline namespace is a key *prefix*, not
-      // a separate database, so this raw scan sees the row either way.
+      // navigation, and this opens the default profile's database by name
+      // (each non-default profile gets its own `carrel-offline-<scope>`
+      // database), which is the one the row was written into.
       // Without the guard this is 0: baseline 1 never matches the server's
       // timestamp, so replay discards the row and deletes it.
       const rows = await page.evaluate(async (id) => {
@@ -674,21 +681,108 @@ test.describe("offline mode — progress replay (M5)", () => {
         const restored = await request.post("/api/profile", { data: { name: "default" } });
         expect(restored.ok()).toBeTruthy();
       }
-      await page
-        .evaluate(async (id) => {
-          const db = await new Promise<IDBDatabase>((res, rej) => {
-            const req = indexedDB.open("carrel-offline");
-            req.onsuccess = () => res(req.result);
-            req.onerror = () => rej(req.error);
-          });
-          await new Promise<void>((res) => {
-            const tx = db.transaction("progressQueue", "readwrite");
-            tx.objectStore("progressQueue").delete(id);
-            tx.oncomplete = () => res();
-            tx.onerror = () => res();
-          });
-        }, CBZ_ID)
-        .catch(() => {});
+      // Retried rather than swallowed: if the assertion above failed while a
+      // reload was in flight, the first attempt hits a destroyed execution
+      // context — and a surviving queue row is exactly the cross-test
+      // contamination this cleanup exists to prevent.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const deleted = await page
+          .evaluate(async (id) => {
+            const db = await new Promise<IDBDatabase>((res, rej) => {
+              const req = indexedDB.open("carrel-offline");
+              req.onsuccess = () => res(req.result);
+              req.onerror = () => rej(req.error);
+            });
+            await new Promise<void>((res) => {
+              const tx = db.transaction("progressQueue", "readwrite");
+              tx.objectStore("progressQueue").delete(id);
+              tx.oncomplete = () => res();
+              tx.onerror = () => res();
+            });
+            return true;
+          }, CBZ_ID)
+          .catch(() => false);
+        if (deleted) break;
+        await page.waitForLoadState("load").catch(() => {});
+      }
+    }
+  });
+});
+
+test.describe("offline mode — stale-profile writes (LAN hardening M2)", () => {
+  test("a live progress save that comes back from another profile advances nothing", async ({
+    page,
+    request,
+  }) => {
+    // This is what `apiWrite`'s ProfileMovedError buys, and the only place
+    // it is observable after the reload: the offline sync baseline. On a
+    // successful PUT the reader advances that baseline to the timestamp the
+    // server returned. If the profile moved under the tab, that timestamp
+    // belongs to the *other* library, and a later replay would compare this
+    // book's queued position against it. `location.reload()` does not stop
+    // the caller, so without the throw the baseline write happens anyway.
+    const SENTINEL = 4242;
+    await saveBookOffline(page, CBZ_ID);
+    await openReaderAtZero(page, CBZ_ID);
+
+    // After the reader's own baseline refresh, plant a value no real server
+    // timestamp can equal.
+    await page.evaluate(
+      async ([id, sentinel]) => {
+        const db = await new Promise<IDBDatabase>((res, rej) => {
+          const req = indexedDB.open("carrel-offline");
+          req.onsuccess = () => res(req.result);
+          req.onerror = () => rej(req.error);
+        });
+        await new Promise<void>((res) => {
+          const tx = db.transaction("books", "readwrite");
+          const store = tx.objectStore("books");
+          const g = store.get(id as string);
+          g.onsuccess = () => {
+            const row = g.result;
+            row.baselineLastReadAt = sentinel;
+            store.put(row);
+          };
+          tx.oncomplete = () => res();
+          tx.onerror = () => res();
+        });
+      },
+      [CBZ_ID, SENTINEL] as const
+    );
+
+    let switched = false;
+    try {
+      const moved = await request.post("/api/profile", { data: { name: "magazines" } });
+      expect(moved.ok()).toBeTruthy();
+      switched = true;
+
+      // Turn a page and wait out the 2s progress debounce: the PUT is the
+      // next request this tab makes, and its response is the first one
+      // carrying the new profile's tag.
+      const reloaded = page.waitForEvent("load", { timeout: 20_000 });
+      await page.locator("#reader-stage").focus();
+      await page.keyboard.press("ArrowRight");
+      await reloaded;
+
+      const baseline = await page.evaluate(async (id) => {
+        const db = await new Promise<IDBDatabase>((res, rej) => {
+          const req = indexedDB.open("carrel-offline");
+          req.onsuccess = () => res(req.result);
+          req.onerror = () => rej(req.error);
+        });
+        return new Promise<unknown>((res) => {
+          const tx = db.transaction("books", "readonly");
+          const r = tx.objectStore("books").get(id);
+          r.onsuccess = () => res(r.result ? r.result.baselineLastReadAt : null);
+          r.onerror = () => res(null);
+        });
+      }, CBZ_ID);
+      expect(baseline).toBe(SENTINEL);
+    } finally {
+      if (switched) {
+        const restored = await request.post("/api/profile", { data: { name: "default" } });
+        expect(restored.ok()).toBeTruthy();
+      }
     }
   });
 });
