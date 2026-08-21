@@ -198,18 +198,35 @@ impl WebState {
 /// tuple for axum handlers.
 ///
 /// `NotFound` → 404, `PermissionDenied` → 403, `InvalidInput` → 400,
-/// `Network` → 502; everything else → 500. Accepts `CarrelError` directly or
-/// any source error with a `From<E> for CarrelError` impl (e.g. `std::io::Error`).
+/// `Network` → 502, `RateLimited` → 429 — these keep the error's own message
+/// text, since it's our own validation/lookup/rate-limit wording, not a
+/// leaked system detail, and clients rely on it.
+///
+/// Everything else (`Database`, `Io`, `Serialization`, `LockRequired`,
+/// `Internal`) means something broke internally. The web server is reachable
+/// by anything on the user's LAN behind a PIN session, so those bodies must
+/// not hand out SQL fragments, filesystem paths, or other internals: they map
+/// to 500 with a fixed, generic body, while the real message is logged
+/// server-side at error level for the operator.
+///
+/// Accepts `CarrelError` directly or any source error with a `From<E> for
+/// CarrelError` impl (e.g. `std::io::Error`).
 pub fn carrel_status<E: Into<CarrelError>>(e: E) -> (StatusCode, String) {
     let err: CarrelError = e.into();
-    let status = match err.kind() {
-        "NotFound" => StatusCode::NOT_FOUND,
-        "PermissionDenied" => StatusCode::FORBIDDEN,
-        "InvalidInput" => StatusCode::BAD_REQUEST,
-        "Network" => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, err.to_string())
+    match err.kind() {
+        "NotFound" => (StatusCode::NOT_FOUND, err.to_string()),
+        "PermissionDenied" => (StatusCode::FORBIDDEN, err.to_string()),
+        "InvalidInput" => (StatusCode::BAD_REQUEST, err.to_string()),
+        "Network" => (StatusCode::BAD_GATEWAY, err.to_string()),
+        "RateLimited" => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
+        _ => {
+            log::error!("internal error: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
+    }
 }
 
 /// Handle to a running web server instance.
@@ -4732,5 +4749,67 @@ mod tests {
         let sizes: Vec<&str> = icons.iter().filter_map(|i| i["sizes"].as_str()).collect();
         assert!(sizes.contains(&"192x192"));
         assert!(sizes.contains(&"512x512"));
+    }
+
+    // ── carrel_status body sanitization (LAN hardening M1) ──────────────
+    //
+    // The web server is reachable by anything on the user's LAN behind a
+    // PIN session. Kinds that mean "something broke internally" must not
+    // hand the client SQL fragments, filesystem paths, or other internals
+    // via the response body — but our own validation/lookup wording for
+    // NotFound/PermissionDenied/InvalidInput is safe and relied on by
+    // clients, so it must survive unchanged.
+
+    #[test]
+    fn carrel_status_sanitizes_internal_failure_bodies() {
+        let secret = "/Users/mike/Library/secret-path near column token='abc123xyz'";
+        let errors: Vec<CarrelError> = vec![
+            CarrelError::database(secret),
+            CarrelError::io(secret),
+            CarrelError::Serialization(secret.to_string()),
+            CarrelError::lock_required(secret),
+            CarrelError::internal(secret),
+        ];
+        for err in errors {
+            let kind = err.kind();
+            let (status, body) = carrel_status(err);
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{kind} must map to 500"
+            );
+            assert!(
+                !body.contains(secret),
+                "{kind}: response body leaked internal detail: {body:?}"
+            );
+            assert_eq!(
+                body, "Internal server error",
+                "{kind}: body must be generic"
+            );
+        }
+    }
+
+    #[test]
+    fn carrel_status_keeps_message_text_for_client_facing_kinds() {
+        let (status, body) = carrel_status(CarrelError::not_found("Book file not found"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "Book file not found");
+
+        let (status, body) = carrel_status(CarrelError::permission("Not allowed"));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Not allowed");
+
+        let (status, body) = carrel_status(CarrelError::invalid("Bad input"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Bad input");
+    }
+
+    #[test]
+    fn carrel_status_maps_rate_limited_to_429_and_keeps_its_message() {
+        let (status, body) = carrel_status(CarrelError::RateLimited(
+            "some-provider: rate limited after 3 attempts".to_string(),
+        ));
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, "some-provider: rate limited after 3 attempts");
     }
 }

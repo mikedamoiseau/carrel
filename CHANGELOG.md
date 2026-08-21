@@ -51,6 +51,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   screenful was left off-screen — the reader's post-render scroll restore ran
   after the jump and overwrote it. Both the highlight jump and the new
   saved-words jump now suppress that restore.
+- **Web server errors no longer leak internal details to LAN clients.**
+  Database, filesystem, serialization, and other internal failures used to
+  return the raw error text (which can include SQL fragments or filesystem
+  paths) as the response body. Those kinds now return a generic "Internal
+  server error" body — the real message is still logged server-side — while
+  the app's own validation and lookup error messages (not-found, permission,
+  invalid input) are unchanged. Rate-limited requests now correctly return
+  `429` instead of `500`.
 
 ## [3.0.6] - 2026-08-17
 
