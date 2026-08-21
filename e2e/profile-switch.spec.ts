@@ -153,35 +153,47 @@ test.describe("web UI profile switcher", () => {
     });
 
     try {
+      // Wait for the load event rather than polling the probe: `expect.poll`
+      // evaluates its callback OUTSIDE the try that converts failures into
+      // another attempt (playwright/lib/matchers/expect.js — `const value =
+      // await actual()`), and `page.evaluate` rejects with "Execution context
+      // was destroyed" if it lands mid-navigation. Polling across the very
+      // reload being asserted therefore fails the test *because* the feature
+      // worked. Arm the listener before the click so a fast reload can't be
+      // missed; without the feature no reload happens and this times out.
+      const reloaded = page.waitForEvent("load", { timeout: 10_000 });
       await page.locator("#want-btn").click();
+      await reloaded;
 
-      await expect
-        .poll(
-          async () => page.evaluate(() => (window as unknown as { __stalenessProbe?: string }).__stalenessProbe),
-          { timeout: 10_000 }
+      expect(
+        await page.evaluate(
+          () => (window as unknown as { __stalenessProbe?: string }).__stalenessProbe
         )
-        .toBeUndefined();
+      ).toBeUndefined();
     } finally {
       // The click's PUT really did commit server-side (only its response
       // header was rewritten). want-to-read.spec.ts's flagged-book count
       // assumes this book stays unflagged, and the DB persists across the
       // whole (workers=1) run — reset it via page.request, which is a direct
       // API client and isn't caught by the page.route above.
-      await page.request
-        .put(`/api/books/${bookId}/want-to-read`, { data: { want_to_read: false } })
-        .catch(() => {});
+      // Asserted, not swallowed: a silently failed reset surfaces as a
+      // baffling failure in want-to-read.spec.ts's empty-grid test instead.
+      const reset = await page.request.put(`/api/books/${bookId}/want-to-read`, {
+        data: { want_to_read: false },
+      });
+      expect(reset.ok()).toBeTruthy();
     }
   });
 
   test("switching profile from a non-library view still lands on the library", async ({
     page,
   }) => {
-    // switchProfile's own write deliberately does NOT go through the shared
-    // reload guard (its response necessarily carries a different tag than
-    // the page's baseline, by design). If it ever did, that reload would
-    // race switchProfile's own location.hash="#/" reset and could leave the
-    // tab stuck on the book-detail view instead of the library it just
-    // switched into.
+    // switchProfile's own write deliberately does NOT go through apiWrite:
+    // its response necessarily carries a different tag than the page's
+    // baseline, by design. Routing it through would now make apiWrite throw
+    // ProfileMovedError, so switchProfile's catch would report a connection
+    // failure and return — the hash reset and reload below it never run and
+    // the tab stays on the book-detail view of the profile it just left.
     const bookId = "e2e-book-001";
     await page.goto(`/#/book/${bookId}`);
     await expect(page.locator("#want-btn")).toBeVisible();

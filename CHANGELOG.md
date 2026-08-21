@@ -59,15 +59,24 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   message is still logged server-side, with its error kind — while the app's
   own validation and lookup messages (not-found, permission, invalid input,
   rate-limited) are unchanged.
-- **A web tab left open on a stale profile no longer writes into the wrong
-  library.** The active profile is shared by the desktop app and every web
-  client, so it can move while a browser tab sits open; every response
-  carries a header the web UI compares against a per-tab baseline, reloading
-  on a mismatch. That check only ran on reads — a save, delete, or edit sent
-  after the profile moved committed against the new profile using the old
-  one's book ids and the tab never noticed. Every write in the web UI (saving
-  progress, bookmarks, highlights, vocabulary words, want-to-read, flashcard
-  review, login) now runs the same check.
+- **A web tab left open on a stale profile now notices its own writes.** The
+  active profile is shared by the desktop app and every web client, so it can
+  move while a browser tab sits open; every response carries a header the web
+  UI compares against a per-tab baseline, reloading on a mismatch. That check
+  only ran on reads, so a save, delete, or edit sent afterwards went out under
+  the old profile's book ids and the tab carried on as if nothing had changed.
+  Every write in the web UI (progress, bookmarks, highlights, vocabulary
+  words, want-to-read, flashcard review, login) now runs the same check, and a
+  write that comes back from another profile stops there instead of committing
+  what follows it — the reload it triggers is queued by the browser, not
+  immediate, so the code after it used to keep running.
+- **Reading progress made offline is no longer discarded when the profile
+  moved.** Queued offline positions replay on reconnect by comparing against
+  the server first, then dropping the queued row once the decision is made.
+  If the active profile had moved meanwhile, that comparison ran against the
+  other library — where the book id means something else — and the row was
+  dropped on the strength of it, losing a reading position that was still
+  valid in the profile it was recorded in.
 
 ## [3.0.6] - 2026-08-17
 

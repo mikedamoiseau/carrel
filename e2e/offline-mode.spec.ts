@@ -581,6 +581,116 @@ test.describe("offline mode — progress replay (M5)", () => {
       .toBe(0);
     expect(putFired).toBe(false);
   });
+
+  test("replay keeps the queued row when the profile moved under the tab", async ({
+    page,
+    context,
+    request,
+  }) => {
+    // LAN-hardening M2. Replay's compare-then-push starts with a GET, and the
+    // row is deleted once the decision is made — pushed or discarded. If the
+    // active profile moved while this tab sat open, that decision is being
+    // made against the *other* library: the book id means something else
+    // there, so the comparison is meaningless and the delete throws away an
+    // offline reading position that is still valid where it was recorded.
+    //
+    // Same setup as the discard test above — a baseline older than any real
+    // server timestamp — so the unguarded code takes the discard-and-delete
+    // path. The only difference is the spoofed profile tag on the compare
+    // GET, which must make replay bail with the row intact.
+    await saveBookOffline(page, CBZ_ID);
+    await openReaderAtZero(page, CBZ_ID);
+    await page.evaluate(async (id) => {
+      const db = await new Promise<IDBDatabase>((res, rej) => {
+        const req = indexedDB.open("carrel-offline");
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+      });
+      await new Promise<void>((res) => {
+        const tx = db.transaction("books", "readwrite");
+        const store = tx.objectStore("books");
+        const g = store.get(id);
+        g.onsuccess = () => {
+          const row = g.result;
+          row.baselineLastReadAt = 1;
+          store.put(row);
+        };
+        tx.oncomplete = () => res();
+        tx.onerror = () => res();
+      });
+    }, CBZ_ID);
+
+    await context.setOffline(true);
+    await page.locator("#reader-stage").focus();
+    await page.keyboard.press("ArrowRight");
+    await page.waitForTimeout(2500);
+
+    // Move the profile for real, from OUTSIDE the browser context: the
+    // `request` fixture is a standalone API client, so it is unaffected by
+    // setOffline and its call never touches this page's baseline tag. (An
+    // earlier version of this test spoofed the header with page.route
+    // instead — that never fires here, because in offline mode the service
+    // worker is controlling and page.route does not intercept a request the
+    // worker forwards to the network.)
+    let switched = false;
+    try {
+      const moved = await request.post("/api/profile", { data: { name: "magazines" } });
+      expect(moved.ok()).toBeTruthy();
+      switched = true;
+
+      // The staleness guard reloads the document; arm the wait before the
+      // trigger so a fast reload can't be missed. Without the guard on the
+      // compare GET there is no reload at all and this times out.
+      const reloaded = page.waitForEvent("load", { timeout: 20_000 });
+      await context.setOffline(false);
+      await page.evaluate(() => window.dispatchEvent(new Event("online")));
+      await reloaded;
+
+      // The row survived. Read it after the reload — IndexedDB outlives the
+      // navigation, and a profile's offline namespace is a key *prefix*, not
+      // a separate database, so this raw scan sees the row either way.
+      // Without the guard this is 0: baseline 1 never matches the server's
+      // timestamp, so replay discards the row and deletes it.
+      const rows = await page.evaluate(async (id) => {
+        const db = await new Promise<IDBDatabase>((res, rej) => {
+          const req = indexedDB.open("carrel-offline");
+          req.onsuccess = () => res(req.result);
+          req.onerror = () => rej(req.error);
+        });
+        return new Promise<number>((res) => {
+          const tx = db.transaction("progressQueue", "readonly");
+          const r = tx.objectStore("progressQueue").getAll();
+          r.onsuccess = () =>
+            res(r.result.filter((x: { bookId: string }) => x.bookId === id).length);
+          r.onerror = () => res(-1);
+        });
+      }, CBZ_ID);
+      expect(rows).toBe(1);
+    } finally {
+      // The active profile is server-global state shared with every other
+      // spec, and a surviving queue row would replay later and move this
+      // book's server progress out from under whichever test is running.
+      if (switched) {
+        const restored = await request.post("/api/profile", { data: { name: "default" } });
+        expect(restored.ok()).toBeTruthy();
+      }
+      await page
+        .evaluate(async (id) => {
+          const db = await new Promise<IDBDatabase>((res, rej) => {
+            const req = indexedDB.open("carrel-offline");
+            req.onsuccess = () => res(req.result);
+            req.onerror = () => rej(req.error);
+          });
+          await new Promise<void>((res) => {
+            const tx = db.transaction("progressQueue", "readwrite");
+            tx.objectStore("progressQueue").delete(id);
+            tx.oncomplete = () => res();
+            tx.onerror = () => res();
+          });
+        }, CBZ_ID)
+        .catch(() => {});
+    }
+  });
 });
 
 test.describe("offline mode — eviction integrity & reconciliation (M6)", () => {

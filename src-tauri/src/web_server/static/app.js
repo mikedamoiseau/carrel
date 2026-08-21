@@ -990,6 +990,11 @@
     try {
       resp = await fetch(`/api/books/${row.bookId}/progress`, { credentials: "same-origin" });
     } catch (e) { return; }                 // still offline — keep the row
+    // Before any status handling: under a moved profile this book id belongs
+    // to the other library, so the GET 404s and the branch below would delete
+    // the queued row — discarding an offline reading position that is still
+    // valid in the profile it was recorded in.
+    if (noteProfileTag(resp)) return;      // keep the row; the page is reloading
     if (resp.status === 401) {
       // Session expired — surface login (same as a live save) and keep the
       // row so replay retries after re-auth, instead of failing silently.
@@ -1223,18 +1228,34 @@
   let seenProfileTag = null;
   let profileMoveHandled = false;
 
+  // Returns true when this response came back from a *different* profile than
+  // the page booted into — i.e. its data must not be acted on. The reload is
+  // fired once (later mismatches still report true: `location.reload()` does
+  // not stop the caller that is already running, so every stale caller has to
+  // be told, not just the first one).
   function noteProfileTag(resp) {
     let tag;
-    try { tag = resp && resp.headers ? resp.headers.get("x-carrel-profile") : null; } catch (e) { return; }
-    if (!tag) return; // pre-header server, or a response the SW synthesized
-    if (seenProfileTag === null) { seenProfileTag = tag; return; }
-    if (tag === seenProfileTag || profileMoveHandled) return;
-    // Reload rather than patch: books, ids, collections, series, progress and
-    // the offline namespace all belong to the profile this page booted into.
-    // Guarded so a burst of in-flight requests can't reload repeatedly.
-    profileMoveHandled = true;
-    location.reload();
+    try { tag = resp && resp.headers ? resp.headers.get("x-carrel-profile") : null; } catch (e) { return false; }
+    if (!tag) return false; // pre-header server, or a response the SW synthesized
+    if (seenProfileTag === null) { seenProfileTag = tag; return false; }
+    if (tag === seenProfileTag) return false;
+    if (!profileMoveHandled) {
+      // Reload rather than patch: books, ids, collections, series, progress and
+      // the offline namespace all belong to the profile this page booted into.
+      // Guarded so a burst of in-flight requests can't reload repeatedly.
+      profileMoveHandled = true;
+      location.reload();
+    }
+    return true;
   }
+
+  // A write whose response came from another profile. Thrown by apiWrite so a
+  // stale caller stops instead of committing side effects: location.reload()
+  // only *queues* a navigation, so without this the caller runs on — 200-OK
+  // branches, optimistic-state commits, and (worst) the offline queue's
+  // "the push succeeded, drop the row" delete all execute against the wrong
+  // profile before the browser gets around to unloading the document.
+  class ProfileMovedError extends Error {}
 
   async function api(path) {
     let resp;
@@ -1257,7 +1278,7 @@
   // existing try/catch and status checks run unchanged.
   async function apiWrite(path, options) {
     const resp = await fetch(path, options);
-    noteProfileTag(resp);
+    if (noteProfileTag(resp)) throw new ProfileMovedError("active profile moved");
     return resp;
   }
 
@@ -7072,6 +7093,10 @@
         if (saved && saved.last_read_at) await updateOfflineBaseline(id, saved.last_read_at);
       }
     } catch (e) {
+      // A moved profile is not a network failure: the PUT already committed
+      // under the *new* profile, and queueing would replay that position into
+      // whichever profile is active after the reload. Drop it.
+      if (e instanceof ProfileMovedError) return;
       // Network error: for a saved book, queue the position for
       // compare-then-push replay on reconnect instead of dropping it. Awaited
       // so two failed saves (both inside the saveChains link) can't race on
