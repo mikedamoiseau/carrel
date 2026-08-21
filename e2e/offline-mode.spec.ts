@@ -62,8 +62,21 @@ async function openReaderAtZero(page: Page, bookId: string) {
   const restart = page.locator("#resume-restart-btn");
   const stage = page.locator("#reader-stage");
   await expect(restart.or(stage)).toBeVisible({ timeout: 15_000 });
-  if (await restart.isVisible().catch(() => false)) await restart.click();
-  await expect(stage).toBeVisible({ timeout: 15_000 });
+  // Same race as highlights.spec.ts's openEpubReader: the prompt is gated on
+  // the progress fetch and can arrive after a first render, so dismissing it
+  // has to keep looking rather than checking once. (Its own comment above
+  // already notes this book carries progress from earlier tests.)
+  await expect
+    .poll(
+      async () => {
+        if (await restart.isVisible().catch(() => false)) {
+          await restart.click().catch(() => {});
+        }
+        return await stage.isVisible().catch(() => false);
+      },
+      { timeout: 20_000 }
+    )
+    .toBe(true);
 }
 
 // Read something out of the page after a reload the test triggered on purpose.
