@@ -86,10 +86,13 @@ async function evaluateSettled<Arg, Ret>(
       // throw from inside the callback, an IndexedDB failure, a wrong result —
       // is the signal this helper exists to preserve, so it is rethrown at
       // once rather than possibly passing on a later attempt.
+      // Exactly the navigation race, and nothing else. "Target closed" and
+      // "frame was detached" were here too, but neither is recoverable by
+      // retrying, and both are messages a callback could plausibly produce
+      // itself — which would make this helper swallow the very failure it is
+      // supposed to preserve.
       const message = e instanceof Error ? e.message : String(e);
-      if (!/Execution context was destroyed|frame was detached|Target closed/i.test(message)) {
-        throw e;
-      }
+      if (!message.includes("Execution context was destroyed")) throw e;
       lastError = e;
       await page.waitForLoadState("load").catch(() => {});
     }
@@ -421,10 +424,9 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     // /api/books/{id}… and the shell), so it reaches the network from the
     // page and page.route really does intercept it.
     //
-    // Aborted rather than 503'd: a 503 is this server saying it has no profile
-    // host at all, which means one library and therefore no namespace to get
-    // wrong — that case deliberately does NOT fail closed. What must fail
-    // closed is not being able to ask.
+    // Aborted, i.e. the request never lands. Any non-OK status fails closed the
+    // same way — including 503, which `profile_lock_gate` also uses for a
+    // locked profile, so it cannot be read as "this server has no profiles".
     await page.route("**/api/profiles", (route) => route.abort());
     await context.setOffline(false);
     // Any navigation while offline re-probes through showOfflineLibrary, which
@@ -461,6 +463,35 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     // and using it would file this book under the wrong profile's namespace.
     await expect(page.locator("#offline-save-btn")).toHaveCount(0);
     await expect(page.locator("#offline-remove-btn")).toHaveCount(0);
+  });
+
+  test("offline recovers once the profile list is reachable again", async ({ page }) => {
+    // The flag set above must not cost the document its offline mode for good:
+    // a dropped connection at boot is the ordinary way into it, and
+    // reconnecting is the natural moment to ask again. (This is why the
+    // profile-unknown state is its own flag rather than the permanent
+    // `offlineUnavailable` one, which means the page and the service worker
+    // could not be kept in agreement and really is reload-only.)
+    let failProfiles = true;
+    await page.route("**/api/profiles", (route) => {
+      if (failProfiles) return route.abort();
+      return route.continue();
+    });
+    await page.goto(`/#/book/${EPUB_ID}`);
+    await openDetailMenu(page);
+    await expect(page.locator("#offline-save-btn")).toHaveCount(0);
+
+    // Connectivity back: the reconnect handler re-asks, re-scopes, and lifts
+    // the flag. Without that recovery the affordance stays gone until reload.
+    failProfiles = false;
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    // Leave and come back so the detail view re-renders from scratch with its
+    // menu closed — the affordance is decided at render time.
+    await page.goto("/#/");
+    await expect(page.locator("#search")).toBeVisible({ timeout: 15_000 });
+    await page.goto(`/#/book/${EPUB_ID}`);
+    await openDetailMenu(page);
+    await expect(page.locator("#offline-save-btn")).toBeVisible({ timeout: 15_000 });
   });
 
   test("offline deep-link to a NON-saved book redirects to the offline library", async ({

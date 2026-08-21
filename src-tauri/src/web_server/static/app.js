@@ -284,9 +284,15 @@
   // worker is the one serving — so offline is switched off for the session
   // instead of risking one profile's content under another's book ids.
   let offlineUnavailable = false;
+  // Set when the active profile could not be established, so the namespace
+  // every offline read and write would use is unconfirmed. Unlike
+  // `offlineUnavailable` this is cleared the moment a profile request succeeds
+  // — a transient failure must not cost this document its offline mode.
+  let offlineProfileUnknown = false;
 
   function offlineSupported() {
     return !offlineUnavailable &&
+      !offlineProfileUnknown &&
       "serviceWorker" in navigator &&
       !!window.indexedDB &&
       !!window.caches &&
@@ -399,8 +405,13 @@
     const active = (await loadProfiles()).find((p) => p.active);
     // A stale cache can name an active profile that moved since it was built,
     // so the outcome — not the list — decides whether this is knowledge.
-    if (profilesOutcome === "unsupported") return "unchanged"; // one library only
     if (profilesOutcome !== "ok" || !active) return "unknown";
+    // The profile is known again: lift a previous "unknown" (a transient
+    // /api/profiles failure must not disable offline for the whole document's
+    // life). Deliberately does NOT touch `offlineUnavailable`, which means the
+    // page and the worker could not be kept in agreement about the namespace —
+    // that one is only recoverable by a reload.
+    offlineProfileUnknown = false;
     if (!offlineSupported()) return "unchanged"; // nothing to scope
     // applyOfflineScope reports a failed marker publish as false as well, but
     // it sets offlineUnavailable when it does, which disables offline entirely
@@ -1730,7 +1741,7 @@
         // offline saves could land in the wrong profile's namespace.
         const loginScope = await syncOfflineScopeWithServer();
         // Same reasoning as init() below.
-        if (loginScope === "unknown") offlineUnavailable = true;
+        if (loginScope === "unknown") offlineProfileUnknown = true;
         else if (loginScope === "changed") await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
@@ -8061,19 +8072,24 @@
   /// Fetches the profile list, caching it for the header. Also the single
   /// source for the active profile name (offline scoping reads it too), so a
   /// boot costs one request, not two.
-  // Why the last loadProfiles() returned what it did. The list alone cannot say:
-  // a failure returns the previous cache, so a caller that needs to know the
-  // *current* active profile — offline namespacing does — would otherwise act
-  // on stale data believing it fresh. 503 is its own outcome because it is a
-  // supported configuration, not a failure: a server with no profile host has
-  // exactly one library, so there is no namespace to get wrong.
-  let profilesOutcome = "failed"; // "ok" | "unsupported" | "failed"
+  // Whether the last loadProfiles() actually learned anything. The list alone
+  // cannot say: a failure returns the previous cache, so a caller that needs
+  // the *current* active profile — offline namespacing does — would otherwise
+  // act on stale data believing it fresh.
+  //
+  // Every non-OK status counts as a failure, 503 included. An earlier version
+  // treated 503 as "this server has no profile host, so there is one library
+  // and no namespace to get wrong" — but `profile_lock_gate` answers 503 with
+  // "Profile locked" too, so that read would mistake a locked multi-profile
+  // server for a single-library one. And every production caller builds
+  // `WebState` with `profile_host: Some(…)`, so the case it was protecting
+  // does not ship.
+  let profilesOutcome = "failed"; // "ok" | "failed"
 
   async function loadProfiles() {
     try {
       const resp = await fetch("/api/profiles", { credentials: "same-origin" });
       noteProfileTag(resp);
-      if (resp.status === 503) { profilesOutcome = "unsupported"; return cachedProfiles; }
       if (!resp.ok) { profilesOutcome = "failed"; return cachedProfiles; }
       const list = await resp.json();
       if (Array.isArray(list)) { cachedProfiles = list; profilesOutcome = "ok"; }
@@ -8481,8 +8497,8 @@
       // answers are self-consistent, not which name the stored namespace was
       // built from. `offlineUnavailable` gates all of that through
       // offlineSupported() (replayProgressQueue included), so online browsing
-      // carries on unaffected.
-      offlineUnavailable = true;
+      // carries on unaffected. Cleared as soon as a profile request succeeds.
+      offlineProfileUnknown = true;
     } else if (bootScope === "changed") {
       await verifyOfflineIntegrity();
     }
@@ -8503,7 +8519,18 @@
 
   // Reconnect signal: the browser fires `online` when connectivity returns —
   // replay the offline progress queue without waiting for a navigation.
-  window.addEventListener("online", () => { replayProgressQueue(); });
+  window.addEventListener("online", async () => {
+    // If boot could not establish the active profile, offline is switched off
+    // and the queue is not replayable — and a dropped connection at boot is
+    // exactly how that happens. Reconnecting is the natural moment to ask
+    // again; a successful answer re-scopes and lifts the flag, and until one
+    // arrives replayProgressQueue() is a no-op anyway.
+    if (offlineProfileUnknown) {
+      const scope = await syncOfflineScopeWithServer();
+      if (scope === "changed") await verifyOfflineIntegrity();
+    }
+    replayProgressQueue();
+  });
 
   init();
 })();
