@@ -82,6 +82,14 @@ async function evaluateSettled<Arg, Ret>(
     try {
       return await page.evaluate(fn, arg);
     } catch (e) {
+      // Only the navigation race is worth another attempt. Anything else — a
+      // throw from inside the callback, an IndexedDB failure, a wrong result —
+      // is the signal this helper exists to preserve, so it is rethrown at
+      // once rather than possibly passing on a later attempt.
+      const message = e instanceof Error ? e.message : String(e);
+      if (!/Execution context was destroyed|frame was detached|Target closed/i.test(message)) {
+        throw e;
+      }
       lastError = e;
       await page.waitForLoadState("load").catch(() => {});
     }
@@ -412,9 +420,12 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     // /api/profiles is not one of the paths sw.js answers (it only claims
     // /api/books/{id}… and the shell), so it reaches the network from the
     // page and page.route really does intercept it.
-    await page.route("**/api/profiles", (route) =>
-      route.fulfill({ status: 503, contentType: "text/plain", body: "no profile host" })
-    );
+    //
+    // Aborted rather than 503'd: a 503 is this server saying it has no profile
+    // host at all, which means one library and therefore no namespace to get
+    // wrong — that case deliberately does NOT fail closed. What must fail
+    // closed is not being able to ask.
+    await page.route("**/api/profiles", (route) => route.abort());
     await context.setOffline(false);
     // Any navigation while offline re-probes through showOfflineLibrary, which
     // is the path that permits offline writes again. (The banner's Retry runs
@@ -431,6 +442,25 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     // Without the fix, offline mode is left and the stats page paints.
     await expect(page.locator(".offline-banner")).toBeVisible();
     await expect(page.locator(".stat-card")).toHaveCount(0);
+  });
+
+  test("boot with an unreachable profile list disables offline entirely", async ({ page }) => {
+    // The other half of the same fail-closed decision. init() cannot leave the
+    // tab offline the way showOfflineLibrary can — the app has to render — so
+    // instead it disables offline for the session: without knowing which
+    // profile is active, every offline read, write and queued-progress replay
+    // would run against a namespace nothing has confirmed. The observable
+    // consequence is that a book offers no "Save offline" at all.
+    await page.route("**/api/profiles", (route) => route.abort());
+    await page.goto(`/#/book/${EPUB_ID}`);
+    await openDetailMenu(page);
+
+    // The menu itself renders (online browsing is unaffected)…
+    await expect(page.locator("#detail-menu")).toBeVisible();
+    // …but the offline affordance is withheld. Without the fix it is offered,
+    // and using it would file this book under the wrong profile's namespace.
+    await expect(page.locator("#offline-save-btn")).toHaveCount(0);
+    await expect(page.locator("#offline-remove-btn")).toHaveCount(0);
   });
 
   test("offline deep-link to a NON-saved book redirects to the offline library", async ({

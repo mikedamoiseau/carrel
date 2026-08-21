@@ -397,8 +397,15 @@
   /// apart.
   async function syncOfflineScopeWithServer() {
     const active = (await loadProfiles()).find((p) => p.active);
-    if (!active) return "unknown";
+    // A stale cache can name an active profile that moved since it was built,
+    // so the outcome — not the list — decides whether this is knowledge.
+    if (profilesOutcome === "unsupported") return "unchanged"; // one library only
+    if (profilesOutcome !== "ok" || !active) return "unknown";
     if (!offlineSupported()) return "unchanged"; // nothing to scope
+    // applyOfflineScope reports a failed marker publish as false as well, but
+    // it sets offlineUnavailable when it does, which disables offline entirely
+    // — so a false here is either "already correct" or "offline is now off",
+    // and both are safe to call unchanged.
     return (await applyOfflineScope(active.name)) ? "changed" : "unchanged";
   }
 
@@ -1721,7 +1728,10 @@
         // list and the offline scope are still unresolved here — resolve them
         // before the first render, or the header would have no switcher and
         // offline saves could land in the wrong profile's namespace.
-        if ((await syncOfflineScopeWithServer()) === "changed") await verifyOfflineIntegrity();
+        const loginScope = await syncOfflineScopeWithServer();
+        // Same reasoning as init() below.
+        if (loginScope === "unknown") offlineUnavailable = true;
+        else if (loginScope === "changed") await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
     }
@@ -8051,14 +8061,27 @@
   /// Fetches the profile list, caching it for the header. Also the single
   /// source for the active profile name (offline scoping reads it too), so a
   /// boot costs one request, not two.
+  // Why the last loadProfiles() returned what it did. The list alone cannot say:
+  // a failure returns the previous cache, so a caller that needs to know the
+  // *current* active profile — offline namespacing does — would otherwise act
+  // on stale data believing it fresh. 503 is its own outcome because it is a
+  // supported configuration, not a failure: a server with no profile host has
+  // exactly one library, so there is no namespace to get wrong.
+  let profilesOutcome = "failed"; // "ok" | "unsupported" | "failed"
+
   async function loadProfiles() {
     try {
       const resp = await fetch("/api/profiles", { credentials: "same-origin" });
       noteProfileTag(resp);
-      if (!resp.ok) return cachedProfiles;
+      if (resp.status === 503) { profilesOutcome = "unsupported"; return cachedProfiles; }
+      if (!resp.ok) { profilesOutcome = "failed"; return cachedProfiles; }
       const list = await resp.json();
-      if (Array.isArray(list)) cachedProfiles = list;
-    } catch (e) { /* keep whatever we had; the switcher just won't render */ }
+      if (Array.isArray(list)) { cachedProfiles = list; profilesOutcome = "ok"; }
+      else profilesOutcome = "failed";
+    } catch (e) {
+      // Keep whatever we had; the switcher just won't render.
+      profilesOutcome = "failed";
+    }
     return cachedProfiles;
   }
 
@@ -8450,7 +8473,19 @@
     // the desktop, or another web client — one active profile is shared by
     // all of them). Re-scope before anything reads offline storage, and
     // re-check integrity in the new namespace if it changed.
-    if ((await syncOfflineScopeWithServer()) === "changed") await verifyOfflineIntegrity();
+    const bootScope = await syncOfflineScopeWithServer();
+    if (bootScope === "unknown") {
+      // Fail closed for offline only. The namespace every offline read, write
+      // and queue replay uses belongs to a profile, and this page could not
+      // confirm which profile is active — the profile tag says the server's
+      // answers are self-consistent, not which name the stored namespace was
+      // built from. `offlineUnavailable` gates all of that through
+      // offlineSupported() (replayProgressQueue included), so online browsing
+      // carries on unaffected.
+      offlineUnavailable = true;
+    } else if (bootScope === "changed") {
+      await verifyOfflineIntegrity();
+    }
     // Reconnected (or a normal online launch): flush any progress queued
     // while offline. Fire-and-forget — it serializes per book via saveChains
     // and never blocks the first render.

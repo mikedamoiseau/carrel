@@ -274,8 +274,11 @@ pub fn carrel_status<E: Into<CarrelError>>(e: E) -> (StatusCode, String) {
 /// wording for an OS permission failure. Every other kind (`Database`, `Io`,
 /// `Serialization`, `LockRequired`, `Internal`, `Network`, `RateLimited`)
 /// reuses `carrel_status`'s existing mapping and body unchanged. The real
-/// error, with its kind, is always logged at error level first, so an
-/// operator can still triage a report from the log.
+/// error, with its kind, is always logged first, so an operator can still
+/// triage a report from the log — at warn for the three client-fault kinds
+/// above (a routine 404 on these routes is not a server fault, and an
+/// unauthenticated client can produce them at will), at error for the kinds
+/// `carrel_status` handles.
 pub fn book_file_status<E: Into<CarrelError>>(
     not_found_msg: &str,
     invalid_msg: &str,
