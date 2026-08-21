@@ -29,6 +29,14 @@ const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_provide
 
 /// Build the full GDPR export document: the shared core metadata plus the
 /// activity log and a redacted settings map.
+///
+/// Unlike `PublicBook`/`PublicBookGridItem`/`PublicContinueReadingItem`
+/// elsewhere in this file, the `books` array here (via
+/// `db::build_core_export`) keeps `file_path` and `cover_path` — this is the
+/// library owner's own data dump, so the stored path is a legitimate part of
+/// the record, not a leak. It's also not reachable without a web PIN
+/// configured (`data_export`, below), unlike the routes those wrappers
+/// guard.
 fn build_gdpr_export(
     conn: &rusqlite::Connection,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
@@ -428,6 +436,197 @@ async fn login_history(
 
 // ── Books ────────────────────────────────────────────────────────────────────
 
+// The three structs below are web-safe views of carrel-core's `Book`,
+// `BookGridItem` and `ContinueReadingItem`: every field except `file_path`
+// and/or `cover_path`. Both are absolute filesystem paths — `file_path` is
+// the book's own location (under `import_mode = link`, the owner's original
+// path outside the library folder entirely) and `cover_path` is under the
+// app-data covers directory, which embeds the OS username — and the web
+// server is reachable by anything on the LAN that gets past the (optional)
+// PIN, so neither may reach a response body. Clients that need the bytes
+// already use `GET /api/books/{id}/download` and `.../cover`, which serve
+// the file directly rather than its path.
+//
+// Deliberately field-listed rather than "serialize to `Value` and strip two
+// keys": the concise shape republishes any new field `carrel-core` adds to
+// these models by default, which is how this defect exists in the first
+// place. Each `From` impl below also destructures its source struct
+// exhaustively (no `..`), so a new field on `Book`/`BookGridItem`/
+// `ContinueReadingItem` fails this file to compile until someone decides
+// whether it belongs on the web-facing side too — the key-set tests in
+// `mod::tests` are the second, independent guard against the same field
+// reappearing.
+//
+// Not done in carrel-core itself: it's a git dependency Carrel Server pins
+// to a release tag, and the desktop frontend reads `cover_path` over IPC
+// from these same structs, so a `skip_serializing` there would break both.
+
+#[derive(serde::Serialize)]
+struct PublicBook {
+    id: String,
+    title: String,
+    author: String,
+    total_chapters: u32,
+    added_at: i64,
+    format: BookFormat,
+    file_hash: Option<String>,
+    description: Option<String>,
+    genres: Option<String>,
+    rating: Option<f64>,
+    isbn: Option<String>,
+    openlibrary_key: Option<String>,
+    enrichment_status: Option<String>,
+    series: Option<String>,
+    volume: Option<u32>,
+    language: Option<String>,
+    publisher: Option<String>,
+    publish_year: Option<u16>,
+    is_imported: bool,
+    want_to_read: bool,
+}
+
+impl From<crate::models::Book> for PublicBook {
+    fn from(book: crate::models::Book) -> Self {
+        let crate::models::Book {
+            id,
+            title,
+            author,
+            file_path: _,
+            cover_path: _,
+            total_chapters,
+            added_at,
+            format,
+            file_hash,
+            description,
+            genres,
+            rating,
+            isbn,
+            openlibrary_key,
+            enrichment_status,
+            series,
+            volume,
+            language,
+            publisher,
+            publish_year,
+            is_imported,
+            want_to_read,
+        } = book;
+        Self {
+            id,
+            title,
+            author,
+            total_chapters,
+            added_at,
+            format,
+            file_hash,
+            description,
+            genres,
+            rating,
+            isbn,
+            openlibrary_key,
+            enrichment_status,
+            series,
+            volume,
+            language,
+            publisher,
+            publish_year,
+            is_imported,
+            want_to_read,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PublicBookGridItem {
+    id: String,
+    title: String,
+    author: String,
+    total_chapters: u32,
+    added_at: i64,
+    format: BookFormat,
+    series: Option<String>,
+    volume: Option<u32>,
+    rating: Option<f64>,
+    language: Option<String>,
+    publish_year: Option<u16>,
+    is_imported: bool,
+    want_to_read: bool,
+}
+
+impl From<crate::models::BookGridItem> for PublicBookGridItem {
+    fn from(item: crate::models::BookGridItem) -> Self {
+        let crate::models::BookGridItem {
+            id,
+            title,
+            author,
+            cover_path: _,
+            total_chapters,
+            added_at,
+            format,
+            series,
+            volume,
+            rating,
+            language,
+            publish_year,
+            is_imported,
+            want_to_read,
+        } = item;
+        Self {
+            id,
+            title,
+            author,
+            total_chapters,
+            added_at,
+            format,
+            series,
+            volume,
+            rating,
+            language,
+            publish_year,
+            is_imported,
+            want_to_read,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PublicContinueReadingItem {
+    id: String,
+    title: String,
+    author: String,
+    format: BookFormat,
+    total_chapters: u32,
+    chapter_index: u32,
+    scroll_position: f64,
+    last_read_at: i64,
+}
+
+impl From<crate::models::ContinueReadingItem> for PublicContinueReadingItem {
+    fn from(item: crate::models::ContinueReadingItem) -> Self {
+        let crate::models::ContinueReadingItem {
+            id,
+            title,
+            author,
+            cover_path: _,
+            format,
+            total_chapters,
+            chapter_index,
+            scroll_position,
+            last_read_at,
+        } = item;
+        Self {
+            id,
+            title,
+            author,
+            format,
+            total_chapters,
+            chapter_index,
+            scroll_position,
+            last_read_at,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct BookQuery {
     q: Option<String>,
@@ -536,7 +735,8 @@ async fn list_books(
             let total = books.len();
             let offset = params.offset.unwrap_or(0).min(total);
             let end = offset.saturating_add(limit).min(total);
-            let page = books[offset..end].to_vec();
+            let page: Vec<PublicBookGridItem> =
+                books[offset..end].iter().cloned().map(Into::into).collect();
             Ok((
                 [(
                     axum::http::HeaderName::from_static("x-total-count"),
@@ -546,7 +746,10 @@ async fn list_books(
             )
                 .into_response())
         }
-        None => Ok(Json(books).into_response()),
+        None => {
+            let books: Vec<PublicBookGridItem> = books.into_iter().map(Into::into).collect();
+            Ok(Json(books).into_response())
+        }
     }
 }
 
@@ -560,21 +763,22 @@ struct ContinueReadingQuery {
 async fn continue_reading(
     State(state): State<WebState>,
     Query(params): Query<ContinueReadingQuery>,
-) -> Result<Json<Vec<crate::models::ContinueReadingItem>>, (StatusCode, String)> {
+) -> Result<Json<Vec<PublicContinueReadingItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let limit = params.limit.unwrap_or(12).min(50);
     let books = db::get_continue_reading_books(&conn, limit).map_err(carrel_status)?;
-    Ok(Json(books))
+    Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
-/// Item 8: the book-detail response is the shared `Book` model plus
-/// `file_size`, which isn't a DB column — it's stat'd from the resolved
-/// book file on disk (same path `download_book` reads) so no schema change
-/// is needed. `None` when the file can't be stat'd (e.g. missing/unlinked).
+/// Item 8: the book-detail response is the shared `Book` model (minus
+/// `file_path`/`cover_path` — see [`PublicBook`]) plus `file_size`, which
+/// isn't a DB column — it's stat'd from the resolved book file on disk
+/// (same path `download_book` reads) so no schema change is needed. `None`
+/// when the file can't be stat'd (e.g. missing/unlinked).
 #[derive(serde::Serialize)]
 struct BookDetail {
     #[serde(flatten)]
-    book: crate::models::Book,
+    book: PublicBook,
     file_size: Option<u64>,
 }
 
@@ -605,7 +809,10 @@ async fn get_book(
         }
         Err(_) => None,
     };
-    Ok(Json(BookDetail { book, file_size }))
+    Ok(Json(BookDetail {
+        book: book.into(),
+        file_size,
+    }))
 }
 
 // ── Covers ───────────────────────────────────────────────────────────────────
@@ -1761,10 +1968,10 @@ async fn list_collections(
 async fn get_collection_books(
     State(state): State<WebState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<crate::models::BookGridItem>>, (StatusCode, String)> {
+) -> Result<Json<Vec<PublicBookGridItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let books = db::get_books_in_collection_grid(&conn, &id).map_err(carrel_status)?;
-    Ok(Json(books))
+    Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────

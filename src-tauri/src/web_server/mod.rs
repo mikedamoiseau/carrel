@@ -5233,4 +5233,280 @@ mod tests {
 
         let _ = tx.send(());
     }
+
+    // ── Path fields stripped from success JSON (LAN hardening M4) ────────
+    //
+    // M1 and M3 sanitized *error* bodies; this closes the same class of leak
+    // in *success* bodies. `Book`/`BookGridItem`/`ContinueReadingItem` (all
+    // in carrel-core) carry `file_path` and/or `cover_path` — absolute
+    // filesystem paths — with no `serde(skip)`, so every route that
+    // serializes one handed a LAN client the book owner's on-disk layout.
+    // These tests seed a book whose `file_path`/`cover_path` contain a
+    // recognisable secret string, request each affected route, and assert
+    // the secret is absent AND that the response's key set is exactly what
+    // `PublicBook`/`PublicBookGridItem`/`PublicContinueReadingItem`
+    // (api.rs) declare — so a future field added to the carrel-core model
+    // doesn't silently reappear in the web response. A test that only
+    // checked the secret's absence would still pass against an endpoint
+    // that returned `{}`; the key-set assertion and the "clients-still-see-
+    // these-fields" assertions below rule that out.
+
+    const SECRET_FILE_PATH: &str = "/Volumes/media/BOOKS/secret-owner-nas-path/1945.cbr";
+    const SECRET_COVER_PATH: &str =
+        "/Users/secret-owner-username/Library/Application Support/com.mike.carrel/covers/secret-cover-id/cover.jpg";
+
+    /// A book row carrying a recognisable secret in both path fields, with
+    /// enough chapters for the continue-reading query's window.
+    fn secret_path_book(id: &str) -> crate::models::Book {
+        let mut book = corrupt_book(id, SECRET_FILE_PATH, crate::models::BookFormat::Epub);
+        book.cover_path = Some(SECRET_COVER_PATH.to_string());
+        book.total_chapters = 5;
+        book
+    }
+
+    fn json_keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("response is a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn key_set(keys: &[&str]) -> std::collections::BTreeSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn assert_no_secret(body: &str, context: &str) {
+        assert!(
+            !body.contains("secret-owner-nas-path")
+                && !body.contains("1945.cbr")
+                && !body.contains("secret-owner-username")
+                && !body.contains("secret-cover-id"),
+            "{context} leaked file_path or cover_path: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_book_detail_omits_file_path_and_cover_path() {
+        let state = test_state();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(&conn, &secret_path_book("secret-detail-1")).unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/books/secret-detail-1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body_text = resp.text().await.unwrap();
+        assert_no_secret(&body_text, "book detail response");
+
+        let value: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        assert_eq!(
+            json_keys(&value),
+            key_set(&[
+                "id",
+                "title",
+                "author",
+                "total_chapters",
+                "added_at",
+                "format",
+                "file_hash",
+                "description",
+                "genres",
+                "rating",
+                "isbn",
+                "openlibrary_key",
+                "enrichment_status",
+                "series",
+                "volume",
+                "language",
+                "publisher",
+                "publish_year",
+                "is_imported",
+                "want_to_read",
+                "file_size",
+            ]),
+            "book detail response key set changed"
+        );
+
+        // Fields the reader actually consumes are still present and correct.
+        assert_eq!(value["id"], "secret-detail-1");
+        assert_eq!(value["title"], "Corrupt Test");
+        assert_eq!(value["author"], "Author");
+        assert_eq!(value["format"], "epub");
+        assert!(value["file_size"].is_null()); // the book file doesn't exist on disk
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn list_books_omits_cover_path_from_grid_items() {
+        let state = test_state();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(&conn, &secret_path_book("secret-grid-1")).unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/books"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body_text = resp.text().await.unwrap();
+        assert_no_secret(&body_text, "book list response");
+
+        let value: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        let items = value.as_array().expect("list response is a JSON array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            json_keys(&items[0]),
+            key_set(&[
+                "id",
+                "title",
+                "author",
+                "total_chapters",
+                "added_at",
+                "format",
+                "series",
+                "volume",
+                "rating",
+                "language",
+                "publish_year",
+                "is_imported",
+                "want_to_read",
+            ]),
+            "book grid item key set changed"
+        );
+
+        assert_eq!(items[0]["id"], "secret-grid-1");
+        assert_eq!(items[0]["title"], "Corrupt Test");
+        assert_eq!(items[0]["author"], "Author");
+        assert_eq!(items[0]["format"], "epub");
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn continue_reading_omits_cover_path() {
+        let state = test_state();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(&conn, &secret_path_book("secret-continue-1")).unwrap();
+            crate::db::upsert_reading_progress(
+                &conn,
+                &crate::models::ReadingProgress {
+                    book_id: "secret-continue-1".to_string(),
+                    chapter_index: 2,
+                    scroll_position: 0.5,
+                    last_read_at: 100,
+                },
+            )
+            .unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/continue-reading"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body_text = resp.text().await.unwrap();
+        assert_no_secret(&body_text, "continue-reading response");
+
+        let value: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        let items = value.as_array().expect("continue-reading is a JSON array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            json_keys(&items[0]),
+            key_set(&[
+                "id",
+                "title",
+                "author",
+                "format",
+                "total_chapters",
+                "chapter_index",
+                "scroll_position",
+                "last_read_at",
+            ]),
+            "continue-reading item key set changed"
+        );
+
+        assert_eq!(items[0]["id"], "secret-continue-1");
+        assert_eq!(items[0]["chapter_index"], 2);
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn collection_books_omits_cover_path() {
+        let state = test_state();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(&conn, &secret_path_book("secret-collection-1")).unwrap();
+            crate::db::insert_collection(
+                &conn,
+                &crate::models::Collection {
+                    id: "coll-1".to_string(),
+                    name: "Test Collection".to_string(),
+                    r#type: crate::models::CollectionType::Manual,
+                    icon: None,
+                    color: None,
+                    created_at: 0,
+                    updated_at: 0,
+                    rules: vec![],
+                },
+            )
+            .unwrap();
+            crate::db::add_book_to_collection(&conn, "secret-collection-1", "coll-1").unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/api/collections/coll-1/books"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body_text = resp.text().await.unwrap();
+        assert_no_secret(&body_text, "collection books response");
+
+        let value: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        let items = value.as_array().expect("collection books is a JSON array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            json_keys(&items[0]),
+            key_set(&[
+                "id",
+                "title",
+                "author",
+                "total_chapters",
+                "added_at",
+                "format",
+                "series",
+                "volume",
+                "rating",
+                "language",
+                "publish_year",
+                "is_imported",
+                "want_to_read",
+            ]),
+            "collection book grid item key set changed"
+        );
+
+        assert_eq!(items[0]["id"], "secret-collection-1");
+
+        let _ = tx.send(());
+    }
 }

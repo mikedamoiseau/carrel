@@ -71,6 +71,18 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   return their own short, route-specific message on the same status code
   (404/400/403) that clients already act on, with the real error still
   logged server-side.
+- **Book listings no longer hand LAN clients the library owner's filesystem
+  layout.** `GET /api/books`, `/api/books/{id}`, `/api/books/continue-reading`
+  and `/api/collections/{id}/books` serialized the book's own `file_path`
+  and/or cover `cover_path` in every response — an absolute path that, under
+  the default `import_mode = link`, is the original file location outside
+  the library folder entirely (e.g. a NAS mount), and that always includes
+  the OS username via the app-data covers directory. Neither field is used
+  by the web UI, which already fetches the cover and the book file through
+  their own routes; both are now stripped from these four responses. The
+  GDPR data export (`/api/data-export`) is unaffected — it's the owner's own
+  data dump, already refuses to serve without a web PIN configured, and the
+  stored path is a legitimate part of that record.
 - **A web tab left open on a stale profile now notices its own writes.** The
   active profile is shared by the desktop app and every web client, so it can
   move while a browser tab sits open; every response carries a header the web
