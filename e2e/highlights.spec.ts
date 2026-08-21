@@ -15,8 +15,25 @@ async function openEpubReader(page: Page) {
   const restart = page.locator("#resume-restart-btn");
   const content = page.locator("#reader-content");
   await expect(restart.or(content)).toBeVisible({ timeout: 15_000 });
-  if (await restart.isVisible()) { await restart.click(); await content.waitFor(); }
-  await expect(content).toContainText("chapter zero", { timeout: 10_000 });
+  // The resume prompt is gated on the progress fetch, so on a book that
+  // carries progress from an earlier test it can appear *after* a first
+  // content render. A single point-in-time `restart.isVisible()` check then
+  // sees no prompt, skips Start Over, and waits out its timeout on content
+  // the prompt has since replaced — which is exactly how this failed on CI
+  // (the trace's page snapshot was "You left off at chapter 2 of 2").
+  // Dismissing it inside the poll copes with either order, and with a prompt
+  // that arrives late.
+  await expect
+    .poll(
+      async () => {
+        if (await restart.isVisible().catch(() => false)) {
+          await restart.click().catch(() => {});
+        }
+        return (await content.textContent().catch(() => null)) ?? "";
+      },
+      { timeout: 20_000 }
+    )
+    .toContain("chapter zero");
 }
 
 // Chapter-0 rendered text contains: "Fish & chips 🦀 the quick brown fox …"

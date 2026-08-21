@@ -284,9 +284,15 @@
   // worker is the one serving — so offline is switched off for the session
   // instead of risking one profile's content under another's book ids.
   let offlineUnavailable = false;
+  // Set when the active profile could not be established, so the namespace
+  // every offline read and write would use is unconfirmed. Unlike
+  // `offlineUnavailable` this is cleared the moment a profile request succeeds
+  // — a transient failure must not cost this document its offline mode.
+  let offlineProfileUnknown = false;
 
   function offlineSupported() {
     return !offlineUnavailable &&
+      !offlineProfileUnknown &&
       "serviceWorker" in navigator &&
       !!window.indexedDB &&
       !!window.caches &&
@@ -386,11 +392,32 @@
     }
   }
 
-  /// Re-scope to the server's active profile. Returns whether it changed.
+  /// Re-scope to the server's active profile. Returns "changed", "unchanged",
+  /// or "unknown".
+  ///
+  /// "unknown" is the case a boolean could not express: loadProfiles() swallows
+  /// a failed or non-OK /api/profiles and returns whatever it had cached, and
+  /// applyOfflineScope() reports its own publish failures as false too — so a
+  /// plain false meant either "nothing to do" or "no idea which profile is
+  /// active", and a caller about to permit offline *writes* needs to tell those
+  /// apart.
   async function syncOfflineScopeWithServer() {
     const active = (await loadProfiles()).find((p) => p.active);
-    if (!active || !offlineSupported()) return false;
-    return await applyOfflineScope(active.name);
+    // A stale cache can name an active profile that moved since it was built,
+    // so the outcome — not the list — decides whether this is knowledge.
+    if (profilesOutcome !== "ok" || !active) return "unknown";
+    // The profile is known again: lift a previous "unknown" (a transient
+    // /api/profiles failure must not disable offline for the whole document's
+    // life). Deliberately does NOT touch `offlineUnavailable`, which means the
+    // page and the worker could not be kept in agreement about the namespace —
+    // that one is only recoverable by a reload.
+    offlineProfileUnknown = false;
+    if (!offlineSupported()) return "unchanged"; // nothing to scope
+    // applyOfflineScope reports a failed marker publish as false as well, but
+    // it sets offlineUnavailable when it does, which disables offline entirely
+    // — so a false here is either "already correct" or "offline is now off",
+    // and both are safe to call unchanged.
+    return (await applyOfflineScope(active.name)) ? "changed" : "unchanged";
   }
 
   // Lazy singleton connection; a failed open clears the promise so a later
@@ -990,6 +1017,11 @@
     try {
       resp = await fetch(`/api/books/${row.bookId}/progress`, { credentials: "same-origin" });
     } catch (e) { return; }                 // still offline — keep the row
+    // Before any status handling: under a moved profile this book id belongs
+    // to the other library, so the GET 404s and the branch below would delete
+    // the queued row — discarding an offline reading position that is still
+    // valid in the profile it was recorded in.
+    if (noteProfileTag(resp)) return;      // keep the row; the page is reloading
     if (resp.status === 401) {
       // Session expired — surface login (same as a live save) and keep the
       // row so replay retries after re-auth, instead of failing silently.
@@ -1018,7 +1050,7 @@
         // Direct PUT (not sendProgress) — a queued row is the book's latest
         // offline intent, so it must bypass the live-session monotonic guard
         // (an offline Start Over to page 0 must replay, not be dropped).
-        const put = await fetch(`/api/books/${row.bookId}/progress`, {
+        const put = await apiWrite(`/api/books/${row.bookId}/progress`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chapter_index: row.chapterIndex, scroll_position: row.scrollPosition }),
@@ -1188,6 +1220,12 @@
   }
 
   function showToast(msg) {
+    // This document is being replaced (see `noteProfileTag`). Every write
+    // that was in flight when the profile move was noticed lands in its
+    // caller's failure branch and asks for a toast, so without this the last
+    // thing the user sees before the reload is a stack of "couldn't reach the
+    // server" messages describing a server that answered fine.
+    if (reloadPending) return;
     const container = ensureToastContainer();
     const toast = document.createElement("div");
     toast.className = "toast";
@@ -1222,19 +1260,41 @@
   // never decoded, and needs no crypto (so it works on a plain-HTTP LAN too).
   let seenProfileTag = null;
   let profileMoveHandled = false;
+  // Set only where a document replacement has actually been requested. Kept
+  // separate from profileMoveHandled on purpose: gating user feedback on
+  // "a move was handled" would silence the app permanently the first time
+  // some future path handles a move *without* replacing the document.
+  let reloadPending = false;
 
+  // Returns true when this response came back from a *different* profile than
+  // the page booted into — i.e. its data must not be acted on. The reload is
+  // fired once (later mismatches still report true: `location.reload()` does
+  // not stop the caller that is already running, so every stale caller has to
+  // be told, not just the first one).
   function noteProfileTag(resp) {
     let tag;
-    try { tag = resp && resp.headers ? resp.headers.get("x-carrel-profile") : null; } catch (e) { return; }
-    if (!tag) return; // pre-header server, or a response the SW synthesized
-    if (seenProfileTag === null) { seenProfileTag = tag; return; }
-    if (tag === seenProfileTag || profileMoveHandled) return;
-    // Reload rather than patch: books, ids, collections, series, progress and
-    // the offline namespace all belong to the profile this page booted into.
-    // Guarded so a burst of in-flight requests can't reload repeatedly.
-    profileMoveHandled = true;
-    location.reload();
+    try { tag = resp && resp.headers ? resp.headers.get("x-carrel-profile") : null; } catch (e) { return false; }
+    if (!tag) return false; // pre-header server, or a response the SW synthesized
+    if (seenProfileTag === null) { seenProfileTag = tag; return false; }
+    if (tag === seenProfileTag) return false;
+    if (!profileMoveHandled) {
+      // Reload rather than patch: books, ids, collections, series, progress and
+      // the offline namespace all belong to the profile this page booted into.
+      // Guarded so a burst of in-flight requests can't reload repeatedly.
+      profileMoveHandled = true;
+      reloadPending = true;
+      location.reload();
+    }
+    return true;
   }
+
+  // A write whose response came from another profile. Thrown by apiWrite so a
+  // stale caller stops instead of committing side effects: location.reload()
+  // only *queues* a navigation, so without this the caller runs on — 200-OK
+  // branches, optimistic-state commits, and (worst) the offline queue's
+  // "the push succeeded, drop the row" delete all execute against the wrong
+  // profile before the browser gets around to unloading the document.
+  class ProfileMovedError extends Error {}
 
   async function api(path) {
     let resp;
@@ -1245,6 +1305,19 @@
     }
     noteProfileTag(resp);
     if (resp.status === 401) { authenticated = false; showLogin(); return null; }
+    return resp;
+  }
+
+  // Write-path counterpart to api(): every write must also see
+  // noteProfileTag, since a write issued after the active profile moved
+  // would otherwise commit under the new profile with ids that belonged to
+  // the old one. Unlike api(), this does not interpret the response — write
+  // call sites each handle 401/403/404/409/423/204-vs-body differently, so
+  // it just forwards fetch()'s own resolution/rejection and lets the caller's
+  // existing try/catch and status checks run unchanged.
+  async function apiWrite(path, options) {
+    const resp = await fetch(path, options);
+    if (noteProfileTag(resp)) throw new ProfileMovedError("active profile moved");
     return resp;
   }
 
@@ -1650,7 +1723,7 @@
       if (!pin) return;
       btn.disabled = true;
       try {
-        const resp = await fetch("/api/auth", {
+        const resp = await apiWrite("/api/auth", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ pin }),
@@ -1666,7 +1739,10 @@
         // list and the offline scope are still unresolved here — resolve them
         // before the first render, or the header would have no switcher and
         // offline saves could land in the wrong profile's namespace.
-        if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+        const loginScope = await syncOfflineScopeWithServer();
+        // Same reasoning as init() below.
+        if (loginScope === "unknown") offlineProfileUnknown = true;
+        else if (loginScope === "changed") await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
     }
@@ -3154,7 +3230,7 @@
         wantBtn.setAttribute("aria-busy", "true");
         let resp;
         try {
-          resp = await fetch(`/api/books/${id}/want-to-read`, {
+          resp = await apiWrite(`/api/books/${id}/want-to-read`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ want_to_read: next }),
@@ -4662,13 +4738,12 @@
         ? clampScrollRatio(readerState.scrollPosition || 0)
         : (readerState.count > 1 ? readerState.index / readerState.count : 0);
     try {
-      const resp = await fetch(`/api/books/${bookId}/bookmarks`, {
+      const resp = await apiWrite(`/api/books/${bookId}/bookmarks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chapter_index: chapterIndex, scroll_position: scrollPosition }),
         credentials: "same-origin",
       });
-      noteProfileTag(resp);
       if (resp.status === 401) { authenticated = false; showLogin(); return; }
       if (!resp.ok) return;
       const created = await resp.json();
@@ -4688,7 +4763,7 @@
     if (!readerState) return;
     const bookId = readerState.id;
     try {
-      const resp = await fetch(`/api/books/${bookId}/bookmarks/${id}`, {
+      const resp = await apiWrite(`/api/books/${bookId}/bookmarks/${id}`, {
         method: "DELETE",
         credentials: "same-origin",
       });
@@ -4754,7 +4829,7 @@
     }
     const bookId = readerState.id;
     try {
-      const resp = await fetch(`/api/books/${bookId}/bookmarks/${id}`, {
+      const resp = await apiWrite(`/api/books/${bookId}/bookmarks/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: rawName }),
@@ -5476,7 +5551,7 @@
     const i = vocabState.items.findIndex((w) => w.id === id);
     const removed = i !== -1 ? vocabState.items.splice(i, 1)[0] : null;
     try {
-      const resp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
+      const resp = await apiWrite(`/api/vocabulary/${encodeURIComponent(id)}`, {
         method: "DELETE",
         credentials: "same-origin",
       });
@@ -5491,6 +5566,10 @@
       // Idempotent DELETE: 204 is success whether or not the row still existed.
       if (!resp.ok && resp.status !== 204) throw new Error(`HTTP ${resp.status}`);
     } catch {
+      // A moved profile is not a failed delete: the page is being replaced,
+      // and the re-read below would pull the *other* library's words into
+      // this list on the way out.
+      if (reloadPending) return;
       if (removed && vocabState === stateAtCall) {
         vocabState.items.splice(i, 0, removed);
         renderVocabListIfOpen();
@@ -6011,7 +6090,7 @@
       if (btn.disabled) return;
       btn.disabled = true; // guard double-taps for the duration of the request
       try {
-        const resp = await fetch("/api/vocabulary", {
+        const resp = await apiWrite("/api/vocabulary", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -6138,7 +6217,7 @@
     highlightsState.items.push(temp);
     rerenderChapterHighlights();
     try {
-      const resp = await fetch(`/api/books/${encodeURIComponent(bookId)}/highlights`, {
+      const resp = await apiWrite(`/api/books/${encodeURIComponent(bookId)}/highlights`, {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json" },
@@ -6239,7 +6318,7 @@
     const removed = i !== -1 ? highlightsState.items.splice(i, 1)[0] : null;
     rerenderChapterHighlights();
     try {
-      const resp = await fetch(
+      const resp = await apiWrite(
         `/api/books/${encodeURIComponent(bookId)}/highlights/${encodeURIComponent(hlId)}`,
         { method: "DELETE", credentials: "same-origin" });
       if (resp.status === 401) {
@@ -6296,7 +6375,7 @@
     const seq = (hlUpdateSeq.get(hlId) || 0) + 1;
     hlUpdateSeq.set(hlId, seq);
     try {
-      const resp = await fetch(
+      const resp = await apiWrite(
         `/api/books/${encodeURIComponent(bookId)}/highlights/${encodeURIComponent(hlId)}`,
         { method: "PUT", credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -7018,17 +7097,16 @@
       return;
     }
     try {
-      const resp = await fetch(`/api/books/${id}/progress`, {
+      // Checked on the reader's own write path, not just on reads (via
+      // apiWrite): this is the request most likely to be the first thing a
+      // long-open reader tab does after the active profile moved under it.
+      const resp = await apiWrite(`/api/books/${id}/progress`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chapter_index: chapterIndex, scroll_position: scrollPosition }),
         credentials: "same-origin",
         keepalive: true,
       });
-      // Checked on the reader's own write path, not just on reads: this is the
-      // request most likely to be the first thing a long-open reader tab does
-      // after the active profile moved under it.
-      noteProfileTag(resp);
       // F3: a debounced/flushed save (unlike the pagehide teardown flush)
       // can and should react to an expired session — route to the same
       // login redirect the rest of the app uses.
@@ -7061,6 +7139,10 @@
         if (saved && saved.last_read_at) await updateOfflineBaseline(id, saved.last_read_at);
       }
     } catch (e) {
+      // A moved profile is not a network failure: the PUT already committed
+      // under the *new* profile, and queueing would replay that position into
+      // whichever profile is active after the reload. Drop it.
+      if (e instanceof ProfileMovedError) return;
       // Network error: for a saved book, queue the position for
       // compare-then-push replay on reconnect instead of dropping it. Awaited
       // so two failed saves (both inside the saveChains link) can't race on
@@ -7826,7 +7908,7 @@
 
       let resp;
       try {
-        resp = await fetch(`/api/vocabulary/${encodeURIComponent(card.id)}/review`, {
+        resp = await apiWrite(`/api/vocabulary/${encodeURIComponent(card.id)}/review`, {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -7834,6 +7916,10 @@
         });
       } catch (e) {
         if (stale()) return;
+        // Same as above: `stale()` only tracks this screen's own visit token,
+        // not a profile move, and refreshDueCount() below would re-read the
+        // other library's queue.
+        if (reloadPending) return;
         // The outcome is genuinely UNKNOWN here: the request may have
         // committed with only the response lost. Retaining the card for a
         // blind retry would then record the same review twice, advancing the
@@ -7851,10 +7937,8 @@
       }
       // A profile switched on the desktop mid-session invalidates every queued
       // row id; without this the answers just 404 one by one while the page
-      // keeps showing the old profile's words. (deleteScreenWord and the
-      // drawer's deleteVocabWord still omit it — that sweep is tracked
-      // separately, across every web write path at once.)
-      noteProfileTag(resp);
+      // keeps showing the old profile's words. Now covered by every write
+      // path via apiWrite, not just this one.
       if (stale()) return;
       if (resp.status === 401) { showLogin(); return; }
       if (resp.status === 403) {
@@ -7914,7 +7998,7 @@
       const removedDue = dueIndex !== -1 ? dueWords.splice(dueIndex, 1)[0] : null;
       render();
       try {
-        const delResp = await fetch(`/api/vocabulary/${encodeURIComponent(id)}`, {
+        const delResp = await apiWrite(`/api/vocabulary/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "same-origin",
         });
@@ -7988,14 +8072,32 @@
   /// Fetches the profile list, caching it for the header. Also the single
   /// source for the active profile name (offline scoping reads it too), so a
   /// boot costs one request, not two.
+  // Whether the last loadProfiles() actually learned anything. The list alone
+  // cannot say: a failure returns the previous cache, so a caller that needs
+  // the *current* active profile — offline namespacing does — would otherwise
+  // act on stale data believing it fresh.
+  //
+  // Every non-OK status counts as a failure, 503 included. An earlier version
+  // treated 503 as "this server has no profile host, so there is one library
+  // and no namespace to get wrong" — but `profile_lock_gate` answers 503 with
+  // "Profile locked" too, so that read would mistake a locked multi-profile
+  // server for a single-library one. And every production caller builds
+  // `WebState` with `profile_host: Some(…)`, so the case it was protecting
+  // does not ship.
+  let profilesOutcome = "failed"; // "ok" | "failed"
+
   async function loadProfiles() {
     try {
       const resp = await fetch("/api/profiles", { credentials: "same-origin" });
       noteProfileTag(resp);
-      if (!resp.ok) return cachedProfiles;
+      if (!resp.ok) { profilesOutcome = "failed"; return cachedProfiles; }
       const list = await resp.json();
-      if (Array.isArray(list)) cachedProfiles = list;
-    } catch (e) { /* keep whatever we had; the switcher just won't render */ }
+      if (Array.isArray(list)) { cachedProfiles = list; profilesOutcome = "ok"; }
+      else profilesOutcome = "failed";
+    } catch (e) {
+      // Keep whatever we had; the switcher just won't render.
+      profilesOutcome = "failed";
+    }
     return cachedProfiles;
   }
 
@@ -8065,6 +8167,12 @@
     if (!name || name === activeProfileName()) return;
     let resp;
     try {
+      // Deliberately NOT apiWrite: this call's whole purpose is to move the
+      // active profile, so its response necessarily carries a different
+      // x-carrel-profile tag than the page's baseline. Routing it through
+      // noteProfileTag would fire location.reload() right here, racing the
+      // location.hash reset below and dropping the user back wherever they
+      // were instead of on the library.
       resp = await fetch("/api/profile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -8088,6 +8196,9 @@
     // collections, series, progress, offline scope. Reload into the new
     // profile's library rather than trying to invalidate each cache: the
     // boot path already re-fetches all of it and re-scopes offline storage.
+    // Same meaning as in noteProfileTag: writes still in flight will fail
+    // during teardown and must not toast about it.
+    reloadPending = true;
     location.hash = "#/";
     location.reload();
   }
@@ -8274,9 +8385,51 @@
       return;
     }
     if (superseded()) return;
-    offlineMode = false;
-    if (test.status === 401) return showLogin();
+    // Leaving offline mode is a boot in miniature, and it was the only server
+    // probe that skipped these two: without the tag check this page adopts a
+    // profile move instead of noticing it, and without the re-scope it then
+    // renders the new profile's library while every offline read and write
+    // still points at the old profile's namespace — so a "Save offline" from
+    // that state files the new profile's book under the old one.
+    if (noteProfileTag(test)) return; // the reload will re-run this properly
+    if (test.status === 401) { offlineMode = false; return showLogin(); }
     authenticated = true;
+    // Re-scope BEFORE leaving offline mode. `hashchange` still fires during
+    // these awaits, and route()'s offline branch is where that navigation
+    // belongs until the new namespace is in place — clearing the flag first
+    // would let an interleaved render read the *old* profile's namespace,
+    // which routeGen can't prevent because that render isn't this
+    // continuation.
+    const scope = await syncOfflineScopeWithServer();
+    if (scope === "unknown") {
+      // Fail closed. Leaving offline mode here would permit saves under a
+      // namespace nothing has confirmed matches the server's active profile —
+      // and this is the one path where the tag check above cannot cover for
+      // that, because a page that booted offline has no baseline tag yet, so
+      // the probe *establishes* the baseline instead of catching a move.
+      // (init() and doLogin() tolerate "unknown" for that reason: by the time
+      // they run, their probe either set the baseline at a cold boot or would
+      // have caught the move.)
+      //
+      // Staying offline keeps the banner and its Retry — which re-runs this
+      // whole probe — on screen, which is the recoverable end of the trade.
+      // Rendered rather than just returned, so a navigation that lands here
+      // does not change the URL and leave the previous view up with no word
+      // of why.
+      const rows = await getAllOfflineManifests();
+      if (superseded()) return;
+      if (rows.length) renderOfflineLibrary(rows);
+      else renderOfflineState();
+      showToast("Couldn't confirm which library is active — staying offline");
+      return;
+    }
+    if (scope === "changed") await verifyOfflineIntegrity();
+    // loadProfiles() inside the sync above is itself a request, so the move
+    // can be noticed *there* rather than on the probe — in which case the
+    // scope has already been moved to the profile the imminent reload lands
+    // in, which is where boot would put it anyway. Nothing below should run.
+    if (superseded() || reloadPending) return;
+    offlineMode = false;
     route();
   }
 
@@ -8336,7 +8489,19 @@
     // the desktop, or another web client — one active profile is shared by
     // all of them). Re-scope before anything reads offline storage, and
     // re-check integrity in the new namespace if it changed.
-    if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+    const bootScope = await syncOfflineScopeWithServer();
+    if (bootScope === "unknown") {
+      // Fail closed for offline only. The namespace every offline read, write
+      // and queue replay uses belongs to a profile, and this page could not
+      // confirm which profile is active — the profile tag says the server's
+      // answers are self-consistent, not which name the stored namespace was
+      // built from. `offlineUnavailable` gates all of that through
+      // offlineSupported() (replayProgressQueue included), so online browsing
+      // carries on unaffected. Cleared as soon as a profile request succeeds.
+      offlineProfileUnknown = true;
+    } else if (bootScope === "changed") {
+      await verifyOfflineIntegrity();
+    }
     // Reconnected (or a normal online launch): flush any progress queued
     // while offline. Fire-and-forget — it serializes per book via saveChains
     // and never blocks the first render.
@@ -8354,7 +8519,18 @@
 
   // Reconnect signal: the browser fires `online` when connectivity returns —
   // replay the offline progress queue without waiting for a navigation.
-  window.addEventListener("online", () => { replayProgressQueue(); });
+  window.addEventListener("online", async () => {
+    // If boot could not establish the active profile, offline is switched off
+    // and the queue is not replayable — and a dropped connection at boot is
+    // exactly how that happens. Reconnecting is the natural moment to ask
+    // again; a successful answer re-scopes and lifts the flag, and until one
+    // arrives replayProgressQueue() is a no-op anyway.
+    if (offlineProfileUnknown) {
+      const scope = await syncOfflineScopeWithServer();
+      if (scope === "changed") await verifyOfflineIntegrity();
+    }
+    replayProgressQueue();
+  });
 
   init();
 })();

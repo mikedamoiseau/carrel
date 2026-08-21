@@ -10,7 +10,7 @@ use axum::{
 use rusqlite::OptionalExtension;
 
 use super::auth::{log_login_attempt, LoginOutcome, WebAuthMethod};
-use super::{carrel_status, WebState};
+use super::{book_file_status, carrel_status, WebState};
 use crate::db;
 use crate::models::BookFormat;
 use carrel_core::events::{self, CarrelEvent};
@@ -757,10 +757,16 @@ async fn get_cover_thumb_bytes(
         .await
     {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(carrel_status(e)),
+        Ok(Err(e)) => Err(book_file_status(
+            "Cover image not found",
+            "Cover image could not be read",
+            e,
+        )),
         Err(join_err) => {
             log::warn!("cover thumbnail worker panicked for '{cover_path}': {join_err}");
-            let bytes = tokio::fs::read(&cover_path).await.map_err(carrel_status)?;
+            let bytes = tokio::fs::read(&cover_path).await.map_err(|e| {
+                book_file_status("Cover image not found", "Cover image could not be read", e)
+            })?;
             let mime = mime_guess::from_path(&cover_path)
                 .first_or_octet_stream()
                 .to_string();
@@ -787,7 +793,9 @@ async fn get_cover(
     let (bytes, mime) = if size.as_deref() == Some("thumb") {
         get_cover_thumb_bytes(state.covers_root(), cover_path).await?
     } else {
-        let bytes = std::fs::read(&cover_path).map_err(carrel_status)?;
+        let bytes = std::fs::read(&cover_path).map_err(|e| {
+            book_file_status("Cover image not found", "Cover image could not be read", e)
+        })?;
         let mime = mime_guess::from_path(&cover_path)
             .first_or_octet_stream()
             .to_string();
@@ -815,15 +823,21 @@ async fn get_chapters(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let toc_not_found = "Table of contents not available for this book";
+    let toc_invalid =
+        "Table of contents could not be read: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
     let toc = match book.format {
-        BookFormat::Epub => crate::epub::get_toc(&file_path).map_err(carrel_status)?,
+        BookFormat::Epub => crate::epub::get_toc(&file_path)
+            .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?,
         #[cfg(feature = "mobi")]
         BookFormat::Mobi => {
             // MOBI has no real TOC — mirror the desktop `get_toc` behaviour by
             // synthesising a flat list from the chapter list.
-            let chapters =
-                carrel_core::mobi::get_chapter_list(&file_path).map_err(carrel_status)?;
+            let chapters = carrel_core::mobi::get_chapter_list(&file_path)
+                .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
             chapters
                 .into_iter()
                 .map(|c| crate::models::TocEntry {
@@ -861,18 +875,24 @@ async fn get_chapter_content(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
-    let images_storage = state.images_storage().map_err(carrel_status)?;
+    let chapter_not_found = "Chapter not found";
+    let chapter_invalid = "Chapter could not be read: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
+    let images_storage = state
+        .images_storage()
+        .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
 
     let html = match book.format {
         BookFormat::Epub => {
             crate::epub::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(carrel_status)?
+                .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?
         }
         #[cfg(feature = "mobi")]
         BookFormat::Mobi => {
             carrel_core::mobi::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(carrel_status)?
+                .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?
         }
         #[cfg(not(feature = "mobi"))]
         BookFormat::Mobi => {
@@ -1090,7 +1110,12 @@ async fn get_page_image(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let page_not_found = "Page not found in this book";
+    let page_invalid =
+        "Page image could not be rendered: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
     let page_cache_control = session_cache_control(&state);
 
     // Stage the source locally when it lives on a network mount (M2). The web
@@ -1108,7 +1133,7 @@ async fn get_page_image(
     match book.format {
         BookFormat::Pdf => {
             let (bytes, mime) = crate::pdf::get_page_image_bytes(&file_path, index, width)
-                .map_err(carrel_status)?;
+                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime.to_string()),
@@ -1120,7 +1145,7 @@ async fn get_page_image(
         }
         BookFormat::Cbz => {
             let (bytes, mime) = crate::cbz::get_page_image_bytes(&file_path, index, width)
-                .map_err(carrel_status)?;
+                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1132,7 +1157,7 @@ async fn get_page_image(
         }
         BookFormat::Cbr => {
             let (bytes, mime) = crate::cbr::get_page_image_bytes(&file_path, index, width)
-                .map_err(carrel_status)?;
+                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1158,12 +1183,20 @@ async fn get_page_count(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let count_not_found = "Page count not available for this book";
+    let count_invalid =
+        "Page count could not be determined: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(count_not_found, count_invalid, e))?;
 
     let count = match book.format {
-        BookFormat::Pdf => crate::pdf::get_page_count(&file_path).map_err(carrel_status)?,
-        BookFormat::Cbz => crate::cbz::get_page_count(&file_path).map_err(carrel_status)?,
-        BookFormat::Cbr => crate::cbr::get_page_count(&file_path).map_err(carrel_status)?,
+        BookFormat::Pdf => crate::pdf::get_page_count(&file_path)
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
+        BookFormat::Cbz => crate::cbz::get_page_count(&file_path)
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
+        BookFormat::Cbr => crate::cbr::get_page_count(&file_path)
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1617,14 +1650,23 @@ async fn download_book(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    // Same treatment as the render routes: every error below is the OS
+    // talking about a path the client must never see.
+    let dl_not_found = "Book file not found";
+    let dl_invalid = "Book file could not be read";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(dl_not_found, dl_invalid, e))?;
 
     // R3-2: Stream the file instead of reading entirely into memory
     let file = tokio::fs::File::open(&file_path)
         .await
-        .map_err(carrel_status)?;
+        .map_err(|e| book_file_status(dl_not_found, dl_invalid, e))?;
 
-    let metadata = file.metadata().await.map_err(carrel_status)?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| book_file_status(dl_not_found, dl_invalid, e))?;
 
     let filename = std::path::Path::new(&file_path)
         .file_name()

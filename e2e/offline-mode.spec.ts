@@ -62,8 +62,55 @@ async function openReaderAtZero(page: Page, bookId: string) {
   const restart = page.locator("#resume-restart-btn");
   const stage = page.locator("#reader-stage");
   await expect(restart.or(stage)).toBeVisible({ timeout: 15_000 });
-  if (await restart.isVisible().catch(() => false)) await restart.click();
-  await expect(stage).toBeVisible({ timeout: 15_000 });
+  // Same race as highlights.spec.ts's openEpubReader: the prompt is gated on
+  // the progress fetch and can arrive after a first render, so dismissing it
+  // has to keep looking rather than checking once. (Its own comment above
+  // already notes this book carries progress from earlier tests.)
+  await expect
+    .poll(
+      async () => {
+        if (await restart.isVisible().catch(() => false)) {
+          await restart.click().catch(() => {});
+        }
+        return await stage.isVisible().catch(() => false);
+      },
+      { timeout: 20_000 }
+    )
+    .toBe(true);
+}
+
+// Read something out of the page after a reload the test triggered on purpose.
+// `page.evaluate` rejects with "Execution context was destroyed" if it lands
+// while a navigation is still settling, and the profile-move tests all read
+// IndexedDB immediately after the reload they asserted — so a bare evaluate
+// fails intermittently *because* the feature worked. IndexedDB survives the
+// navigation, so the value is stable and retrying is sound.
+async function evaluateSettled<Arg, Ret>(
+  page: Page,
+  fn: (arg: Arg) => Promise<Ret>,
+  arg: Arg
+): Promise<Ret> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await page.evaluate(fn, arg);
+    } catch (e) {
+      // Only the navigation race is worth another attempt. Anything else — a
+      // throw from inside the callback, an IndexedDB failure, a wrong result —
+      // is the signal this helper exists to preserve, so it is rethrown at
+      // once rather than possibly passing on a later attempt.
+      // Exactly the navigation race, and nothing else. "Target closed" and
+      // "frame was detached" were here too, but neither is recoverable by
+      // retrying, and both are messages a callback could plausibly produce
+      // itself — which would make this helper swallow the very failure it is
+      // supposed to preserve.
+      const message = e instanceof Error ? e.message : String(e);
+      if (!message.includes("Execution context was destroyed")) throw e;
+      lastError = e;
+      await page.waitForLoadState("load").catch(() => {});
+    }
+  }
+  throw lastError;
 }
 
 // Offline mode (spec docs/superpowers/specs/2026-07-17-web-reader-offline-design.md).
@@ -366,6 +413,100 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     await expect(page.locator(".offline-banner")).toHaveCount(0);
   });
 
+  test("a navigation stays offline when the active profile cannot be confirmed", async ({
+    page,
+    context,
+  }) => {
+    // LAN-hardening M3 review. Leaving offline mode re-scopes offline storage
+    // to the server's active profile first, because the namespace every
+    // offline read and write uses belongs to a profile. If that profile
+    // cannot be established — /api/profiles fails while /api/books answers —
+    // the old code carried on and left offline mode anyway, so a later "Save
+    // offline" would file the new profile's book under the old one's
+    // namespace. It must stay offline instead. Note the probe cannot cover
+    // for this via the profile tag: a page that booted offline has no
+    // baseline tag yet, so the probe establishes one rather than catching a
+    // move.
+    await saveBookOffline(page, EPUB_ID);
+    await page.goto("/#/");
+    await context.setOffline(true);
+    await reloadControlled(page);
+    await expect(page.locator(".offline-banner")).toBeVisible();
+
+    // /api/profiles is not one of the paths sw.js answers (it only claims
+    // /api/books/{id}… and the shell), so it reaches the network from the
+    // page and page.route really does intercept it.
+    //
+    // Aborted, i.e. the request never lands. Any non-OK status fails closed the
+    // same way — including 503, which `profile_lock_gate` also uses for a
+    // locked profile, so it cannot be read as "this server has no profiles".
+    await page.route("**/api/profiles", (route) => route.abort());
+    await context.setOffline(false);
+    // Any navigation while offline re-probes through showOfflineLibrary, which
+    // is the path that permits offline writes again. (The banner's Retry runs
+    // init() instead, which tolerates an unconfirmable profile by design — its
+    // own probe either establishes the baseline tag or catches a move.)
+    await page.evaluate(() => {
+      location.hash = "#/stats";
+    });
+
+    await expect(page.locator(".toast")).toContainText(/couldn't confirm which library/i, {
+      timeout: 15_000,
+    });
+    // Still offline: the banner stays and the online view never renders.
+    // Without the fix, offline mode is left and the stats page paints.
+    await expect(page.locator(".offline-banner")).toBeVisible();
+    await expect(page.locator(".stat-card")).toHaveCount(0);
+  });
+
+  test("boot with an unreachable profile list disables offline entirely", async ({ page }) => {
+    // The other half of the same fail-closed decision. init() cannot leave the
+    // tab offline the way showOfflineLibrary can — the app has to render — so
+    // instead it disables offline for the session: without knowing which
+    // profile is active, every offline read, write and queued-progress replay
+    // would run against a namespace nothing has confirmed. The observable
+    // consequence is that a book offers no "Save offline" at all.
+    await page.route("**/api/profiles", (route) => route.abort());
+    await page.goto(`/#/book/${EPUB_ID}`);
+    await openDetailMenu(page);
+
+    // The menu itself renders (online browsing is unaffected)…
+    await expect(page.locator("#detail-menu")).toBeVisible();
+    // …but the offline affordance is withheld. Without the fix it is offered,
+    // and using it would file this book under the wrong profile's namespace.
+    await expect(page.locator("#offline-save-btn")).toHaveCount(0);
+    await expect(page.locator("#offline-remove-btn")).toHaveCount(0);
+  });
+
+  test("offline recovers once the profile list is reachable again", async ({ page }) => {
+    // The flag set above must not cost the document its offline mode for good:
+    // a dropped connection at boot is the ordinary way into it, and
+    // reconnecting is the natural moment to ask again. (This is why the
+    // profile-unknown state is its own flag rather than the permanent
+    // `offlineUnavailable` one, which means the page and the service worker
+    // could not be kept in agreement and really is reload-only.)
+    let failProfiles = true;
+    await page.route("**/api/profiles", (route) => {
+      if (failProfiles) return route.abort();
+      return route.continue();
+    });
+    await page.goto(`/#/book/${EPUB_ID}`);
+    await openDetailMenu(page);
+    await expect(page.locator("#offline-save-btn")).toHaveCount(0);
+
+    // Connectivity back: the reconnect handler re-asks, re-scopes, and lifts
+    // the flag. Without that recovery the affordance stays gone until reload.
+    failProfiles = false;
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+    // Leave and come back so the detail view re-renders from scratch with its
+    // menu closed — the affordance is decided at render time.
+    await page.goto("/#/");
+    await expect(page.locator("#search")).toBeVisible({ timeout: 15_000 });
+    await page.goto(`/#/book/${EPUB_ID}`);
+    await openDetailMenu(page);
+    await expect(page.locator("#offline-save-btn")).toBeVisible({ timeout: 15_000 });
+  });
+
   test("offline deep-link to a NON-saved book redirects to the offline library", async ({
     page,
     context,
@@ -580,6 +721,218 @@ test.describe("offline mode — progress replay (M5)", () => {
       )
       .toBe(0);
     expect(putFired).toBe(false);
+  });
+
+  test("replay keeps the queued row when the profile moved under the tab", async ({
+    page,
+    context,
+    request,
+  }) => {
+    // LAN-hardening M2. Replay's compare-then-push starts with a GET, and the
+    // row is deleted once the decision is made — pushed or discarded. If the
+    // active profile moved while this tab sat open, that decision is being
+    // made against the *other* library: the book id means something else
+    // there, so the comparison is meaningless and the delete throws away an
+    // offline reading position that is still valid where it was recorded.
+    //
+    // Same setup as the discard test above — a baseline older than any real
+    // server timestamp — so the unguarded code takes the discard-and-delete
+    // path. The only difference is the spoofed profile tag on the compare
+    // GET, which must make replay bail with the row intact.
+    await saveBookOffline(page, CBZ_ID);
+    await openReaderAtZero(page, CBZ_ID);
+    await page.evaluate(async (id) => {
+      const db = await new Promise<IDBDatabase>((res, rej) => {
+        const req = indexedDB.open("carrel-offline");
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+      });
+      await new Promise<void>((res) => {
+        const tx = db.transaction("books", "readwrite");
+        const store = tx.objectStore("books");
+        const g = store.get(id);
+        g.onsuccess = () => {
+          const row = g.result;
+          row.baselineLastReadAt = 1;
+          store.put(row);
+        };
+        tx.oncomplete = () => res();
+        tx.onerror = () => res();
+      });
+    }, CBZ_ID);
+
+    await context.setOffline(true);
+    await page.locator("#reader-stage").focus();
+    await page.keyboard.press("ArrowRight");
+    await page.waitForTimeout(2500);
+
+    // Move the profile for real, from OUTSIDE the browser context: the
+    // `request` fixture is a standalone API client, so it is unaffected by
+    // setOffline and its call never touches this page's baseline tag. (An
+    // earlier version of this test spoofed the header with page.route
+    // instead — that never fires here, because in offline mode the service
+    // worker is controlling and page.route does not intercept a request the
+    // worker forwards to the network.)
+    let switched = false;
+    try {
+      const moved = await request.post("/api/profile", { data: { name: "magazines" } });
+      expect(moved.ok()).toBeTruthy();
+      switched = true;
+
+      // The staleness guard reloads the document; arm the wait before the
+      // trigger so a fast reload can't be missed. Without the guard on the
+      // compare GET there is no reload at all and this times out.
+      const reloaded = page.waitForEvent("load", { timeout: 20_000 });
+      await context.setOffline(false);
+      // setOffline(false) already fires `online` in the page, which is enough
+      // to start replay here. The synthetic dispatch the other replay tests
+      // use is kept only as a belt-and-braces trigger and must not be
+      // awaited on its own terms: unlike those tests, this one *does* reload,
+      // so the evaluate can land mid-navigation and reject with "Execution
+      // context was destroyed" — failing the test because the feature worked.
+      await page.evaluate(() => window.dispatchEvent(new Event("online"))).catch(() => {});
+      await reloaded;
+
+      // The row survived. Read it after the reload — IndexedDB outlives the
+      // navigation, and this opens the default profile's database by name
+      // (each non-default profile gets its own `carrel-offline-<scope>`
+      // database), which is the one the row was written into.
+      // Without the guard this is 0: baseline 1 never matches the server's
+      // timestamp, so replay discards the row and deletes it.
+      const rows = await evaluateSettled(
+        page,
+        async (id: string) => {
+          const db = await new Promise<IDBDatabase>((res, rej) => {
+            const req = indexedDB.open("carrel-offline");
+            req.onsuccess = () => res(req.result);
+            req.onerror = () => rej(req.error);
+          });
+          return new Promise<number>((res) => {
+            const tx = db.transaction("progressQueue", "readonly");
+            const r = tx.objectStore("progressQueue").getAll();
+            r.onsuccess = () =>
+              res(r.result.filter((x: { bookId: string }) => x.bookId === id).length);
+            r.onerror = () => res(-1);
+          });
+        },
+        CBZ_ID
+      );
+      expect(rows).toBe(1);
+    } finally {
+      // The active profile is server-global state shared with every other
+      // spec, and a surviving queue row would replay later and move this
+      // book's server progress out from under whichever test is running.
+      if (switched) {
+        const restored = await request.post("/api/profile", { data: { name: "default" } });
+        expect(restored.ok()).toBeTruthy();
+      }
+      // Retried rather than swallowed: if the assertion above failed while a
+      // reload was in flight, the first attempt hits a destroyed execution
+      // context — and a surviving queue row is exactly the cross-test
+      // contamination this cleanup exists to prevent.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const deleted = await page
+          .evaluate(async (id) => {
+            const db = await new Promise<IDBDatabase>((res, rej) => {
+              const req = indexedDB.open("carrel-offline");
+              req.onsuccess = () => res(req.result);
+              req.onerror = () => rej(req.error);
+            });
+            await new Promise<void>((res) => {
+              const tx = db.transaction("progressQueue", "readwrite");
+              tx.objectStore("progressQueue").delete(id);
+              tx.oncomplete = () => res();
+              tx.onerror = () => res();
+            });
+            return true;
+          }, CBZ_ID)
+          .catch(() => false);
+        if (deleted) break;
+        await page.waitForLoadState("load").catch(() => {});
+      }
+    }
+  });
+});
+
+test.describe("offline mode — stale-profile writes (LAN hardening M2)", () => {
+  test("a live progress save that comes back from another profile advances nothing", async ({
+    page,
+    request,
+  }) => {
+    // This is what `apiWrite`'s ProfileMovedError buys, and the only place
+    // it is observable after the reload: the offline sync baseline. On a
+    // successful PUT the reader advances that baseline to the timestamp the
+    // server returned. If the profile moved under the tab, that timestamp
+    // belongs to the *other* library, and a later replay would compare this
+    // book's queued position against it. `location.reload()` does not stop
+    // the caller, so without the throw the baseline write happens anyway.
+    const SENTINEL = 4242;
+    await saveBookOffline(page, CBZ_ID);
+    await openReaderAtZero(page, CBZ_ID);
+
+    // After the reader's own baseline refresh, plant a value no real server
+    // timestamp can equal.
+    await page.evaluate(
+      async ([id, sentinel]) => {
+        const db = await new Promise<IDBDatabase>((res, rej) => {
+          const req = indexedDB.open("carrel-offline");
+          req.onsuccess = () => res(req.result);
+          req.onerror = () => rej(req.error);
+        });
+        await new Promise<void>((res) => {
+          const tx = db.transaction("books", "readwrite");
+          const store = tx.objectStore("books");
+          const g = store.get(id as string);
+          g.onsuccess = () => {
+            const row = g.result;
+            row.baselineLastReadAt = sentinel;
+            store.put(row);
+          };
+          tx.oncomplete = () => res();
+          tx.onerror = () => res();
+        });
+      },
+      [CBZ_ID, SENTINEL] as const
+    );
+
+    let switched = false;
+    try {
+      const moved = await request.post("/api/profile", { data: { name: "magazines" } });
+      expect(moved.ok()).toBeTruthy();
+      switched = true;
+
+      // Turn a page and wait out the 2s progress debounce: the PUT is the
+      // next request this tab makes, and its response is the first one
+      // carrying the new profile's tag.
+      const reloaded = page.waitForEvent("load", { timeout: 20_000 });
+      await page.locator("#reader-stage").focus();
+      await page.keyboard.press("ArrowRight");
+      await reloaded;
+
+      const baseline = await evaluateSettled(
+        page,
+        async (id: string) => {
+          const db = await new Promise<IDBDatabase>((res, rej) => {
+            const req = indexedDB.open("carrel-offline");
+            req.onsuccess = () => res(req.result);
+            req.onerror = () => rej(req.error);
+          });
+          return new Promise<unknown>((res) => {
+            const tx = db.transaction("books", "readonly");
+            const r = tx.objectStore("books").get(id);
+            r.onsuccess = () => res(r.result ? r.result.baselineLastReadAt : null);
+            r.onerror = () => res(null);
+          });
+        },
+        CBZ_ID
+      );
+      expect(baseline).toBe(SENTINEL);
+    } finally {
+      if (switched) {
+        const restored = await request.post("/api/profile", { data: { name: "default" } });
+        expect(restored.ok()).toBeTruthy();
+      }
+    }
   });
 });
 

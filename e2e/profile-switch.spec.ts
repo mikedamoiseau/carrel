@@ -126,6 +126,87 @@ test.describe("web UI profile switcher", () => {
     await other.close();
   });
 
+  test("a write with a stale profile tag triggers a reload, not just a status check", async ({
+    page,
+  }) => {
+    // Writes (unlike GETs) used to bypass noteProfileTag entirely — a write
+    // issued after the profile moved would commit under the new profile with
+    // the old profile's book id and the tab would never notice. Model the
+    // move on a single write's response, without touching the server's real
+    // (shared) active profile: rewrite just this request's x-carrel-profile
+    // header to something other than the page's baseline.
+    const bookId = "e2e-book-001";
+    await page.goto(`/#/book/${bookId}`);
+    await expect(page.locator("#want-btn")).toBeVisible();
+
+    await page.route(`**/api/books/${bookId}/want-to-read`, async (route) => {
+      const response = await route.fetch();
+      const headers = { ...response.headers(), "x-carrel-profile": "e2e-spoofed-profile" };
+      await route.fulfill({ response, headers });
+    });
+
+    // A window global only a fresh document load clears — proves an actual
+    // reload happened, not merely that the write "succeeded" or that some
+    // DOM element changed.
+    await page.evaluate(() => {
+      (window as unknown as { __stalenessProbe?: string }).__stalenessProbe = "present";
+    });
+
+    try {
+      // Wait for the load event rather than polling the probe: `expect.poll`
+      // evaluates its callback OUTSIDE the try that converts failures into
+      // another attempt (playwright/lib/matchers/expect.js — `const value =
+      // await actual()`), and `page.evaluate` rejects with "Execution context
+      // was destroyed" if it lands mid-navigation. Polling across the very
+      // reload being asserted therefore fails the test *because* the feature
+      // worked. Arm the listener before the click so a fast reload can't be
+      // missed; without the feature no reload happens and this times out.
+      const reloaded = page.waitForEvent("load", { timeout: 10_000 });
+      await page.locator("#want-btn").click();
+      await reloaded;
+
+      expect(
+        await page.evaluate(
+          () => (window as unknown as { __stalenessProbe?: string }).__stalenessProbe
+        )
+      ).toBeUndefined();
+    } finally {
+      // The click's PUT really did commit server-side (only its response
+      // header was rewritten). want-to-read.spec.ts's flagged-book count
+      // assumes this book stays unflagged, and the DB persists across the
+      // whole (workers=1) run — reset it via page.request, which is a direct
+      // API client and isn't caught by the page.route above.
+      // Asserted, not swallowed: a silently failed reset surfaces as a
+      // baffling failure in want-to-read.spec.ts's empty-grid test instead.
+      const reset = await page.request.put(`/api/books/${bookId}/want-to-read`, {
+        data: { want_to_read: false },
+      });
+      expect(reset.ok()).toBeTruthy();
+    }
+  });
+
+  test("switching profile from a non-library view still lands on the library", async ({
+    page,
+  }) => {
+    // switchProfile's own write deliberately does NOT go through apiWrite:
+    // its response necessarily carries a different tag than the page's
+    // baseline, by design. Routing it through would now make apiWrite throw
+    // ProfileMovedError, so switchProfile's catch would report a connection
+    // failure and return — the hash reset and reload below it never run and
+    // the tab stays on the book-detail view of the profile it just left.
+    const bookId = "e2e-book-001";
+    await page.goto(`/#/book/${bookId}`);
+    await expect(page.locator("#want-btn")).toBeVisible();
+
+    await openProfileMenu(page);
+    await page.locator('.profile-row[data-profile="magazines"]').click();
+
+    await expect(page).toHaveURL(/#\/$/, { timeout: 15_000 });
+    await expect(page.locator("#profile-switcher-btn")).toContainText("magazines", {
+      timeout: 15_000,
+    });
+  });
+
   test("the menu closes on an outside click", async ({ page }) => {
     await page.goto("/");
     await openProfileMenu(page);

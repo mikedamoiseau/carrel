@@ -197,19 +197,117 @@ impl WebState {
 /// Map any error convertible to [`CarrelError`] into an HTTP `(status, message)`
 /// tuple for axum handlers.
 ///
-/// `NotFound` → 404, `PermissionDenied` → 403, `InvalidInput` → 400,
-/// `Network` → 502; everything else → 500. Accepts `CarrelError` directly or
-/// any source error with a `From<E> for CarrelError` impl (e.g. `std::io::Error`).
+/// `NotFound` → 404, `PermissionDenied` → 403, `InvalidInput` → 400 and
+/// `RateLimited` → 429 keep the error's own message text: clients rely on it,
+/// and it is normally this codebase's own validation and lookup wording.
+///
+/// Everything else gets a fixed, generic body with the real message logged
+/// server-side at error level, because the web server is reachable by anything
+/// on the user's LAN that gets past the PIN and those messages are not ours:
+///
+/// - `Database`, `Io`, `Serialization`, `LockRequired`, `Internal` → 500.
+///   These carry SQL fragments, filesystem paths and library diagnostics.
+/// - `Network` → 502. Kept its text until M1's review: `From<reqwest::Error>`
+///   and `From<opendal::Error>` populate it verbatim (see carrel-core's
+///   `error.rs`), so it hands out upstream URLs, hostnames, ports and storage
+///   endpoint config. No web route makes outbound requests today, which is
+///   why nothing was leaking through it yet — it is sanitized so that the
+///   first route which does cannot start.
+///
+/// Former gap, closed by [`book_file_status`]: the 4xx kinds above are also
+/// constructed by carrel-core from third-party parser text (e.g. `cbz.rs`'s
+/// `not_found(format!("Cannot read page '{name}': {e}"))`) and raw OS
+/// diagnostics (`From<std::io::Error>` mapping `ErrorKind::NotFound` straight
+/// to `NotFound(e.to_string())`). The routes that parse or render a book file
+/// or its cover — chapters, chapter content, page images, page counts, cover
+/// — use `book_file_status` instead of this function, so archive internals
+/// never reach those clients even on a 404/400.
+///
+/// Accepts `CarrelError` directly or any source error with a `From<E> for
+/// CarrelError` impl (e.g. `std::io::Error`).
 pub fn carrel_status<E: Into<CarrelError>>(e: E) -> (StatusCode, String) {
     let err: CarrelError = e.into();
-    let status = match err.kind() {
-        "NotFound" => StatusCode::NOT_FOUND,
-        "PermissionDenied" => StatusCode::FORBIDDEN,
-        "InvalidInput" => StatusCode::BAD_REQUEST,
-        "Network" => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, err.to_string())
+    match err.kind() {
+        "NotFound" => (StatusCode::NOT_FOUND, err.to_string()),
+        "PermissionDenied" => (StatusCode::FORBIDDEN, err.to_string()),
+        "InvalidInput" => (StatusCode::BAD_REQUEST, err.to_string()),
+        "RateLimited" => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
+        // Foreign text: upstream URLs, hosts and endpoint config.
+        "Network" => {
+            log::error!("web request failed (Network): {err}");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream request failed".to_string(),
+            )
+        }
+        kind => {
+            // The kind is in the log line because it is now the only place it
+            // survives — the body no longer distinguishes a Database failure
+            // from an Io or Serialization one, and that distinction is the
+            // first thing worth knowing when triaging a report.
+            log::error!("web request failed ({kind}): {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
+    }
+}
+
+/// Map an error from parsing, rendering, or locating a **book file or its
+/// cover** into an HTTP `(status, message)` tuple, for the routes that hand a
+/// book's own bytes to a parser: EPUB/MOBI table of contents and chapter
+/// text, PDF/CBZ/CBR page images and page counts, and cover images.
+///
+/// Unlike `carrel_status`, this never passes `NotFound`/`InvalidInput`/
+/// `PermissionDenied`'s own message through. carrel-core builds those kinds
+/// on these paths by interpolating third-party parser output (zip/unrar/
+/// pdfium text, archive entry names) and raw OS diagnostics
+/// (`From<std::io::Error>`'s `e.to_string()`) — see the construction sites in
+/// `cbz.rs`, `cbr.rs`, `pdf.rs`, `mobi/mod.rs` and `error.rs`. The web server
+/// is reachable by anything on the LAN that gets past the PIN, so none of
+/// that may reach the response body, even on a 404 or 400.
+///
+/// `not_found_msg` / `invalid_msg` give the calling route its own short,
+/// specific wording for those two statuses; `PermissionDenied` falls back to
+/// a fixed generic message, since none of these routes has route-specific
+/// wording for an OS permission failure. Every other kind (`Database`, `Io`,
+/// `Serialization`, `LockRequired`, `Internal`, `Network`, `RateLimited`)
+/// reuses `carrel_status`'s existing mapping and body unchanged. The real
+/// error, with its kind, is always logged first, so an operator can still
+/// triage a report from the log — at warn for the three client-fault kinds
+/// above (a routine 404 on these routes is not a server fault, and an
+/// unauthenticated client can produce them at will), at error for the kinds
+/// `carrel_status` handles.
+pub fn book_file_status<E: Into<CarrelError>>(
+    not_found_msg: &str,
+    invalid_msg: &str,
+    e: E,
+) -> (StatusCode, String) {
+    let err: CarrelError = e.into();
+    match err.kind() {
+        // Logged at warn, not error: on these routes the three kinds below are
+        // ordinary client-fault outcomes — a page index past the end, a cover
+        // the browser evicted, a book whose file moved. An unauthenticated
+        // client (a PIN is optional) can produce them as fast as it can send
+        // requests, and the log is a daily-rolling file with no retention cap,
+        // so logging them at error level would let anyone on the LAN grow it
+        // at will and would drown the failures that really are the server's
+        // fault. carrel_status still logs those at error below.
+        "NotFound" => {
+            log::warn!("book file request failed (NotFound): {err}");
+            (StatusCode::NOT_FOUND, not_found_msg.to_string())
+        }
+        "InvalidInput" => {
+            log::warn!("book file request failed (InvalidInput): {err}");
+            (StatusCode::BAD_REQUEST, invalid_msg.to_string())
+        }
+        "PermissionDenied" => {
+            log::warn!("book file request failed (PermissionDenied): {err}");
+            (StatusCode::FORBIDDEN, "Permission denied".to_string())
+        }
+        _ => carrel_status(err),
+    }
 }
 
 /// Handle to a running web server instance.
@@ -4732,5 +4830,407 @@ mod tests {
         let sizes: Vec<&str> = icons.iter().filter_map(|i| i["sizes"].as_str()).collect();
         assert!(sizes.contains(&"192x192"));
         assert!(sizes.contains(&"512x512"));
+    }
+
+    // ── carrel_status body sanitization (LAN hardening M1) ──────────────
+    //
+    // The web server is reachable by anything on the user's LAN behind a
+    // PIN session. Kinds that mean "something broke internally" must not
+    // hand the client SQL fragments, filesystem paths, or other internals
+    // via the response body. Same for Network, whose text comes verbatim
+    // from reqwest/opendal. Our own validation/lookup/rate-limit wording
+    // for NotFound/PermissionDenied/InvalidInput/RateLimited is relied on
+    // by clients, so it must survive unchanged.
+
+    #[test]
+    fn carrel_status_sanitizes_internal_failure_bodies() {
+        let secret = "/Users/mike/Library/secret-path near column token='abc123xyz'";
+        let errors: Vec<CarrelError> = vec![
+            CarrelError::database(secret),
+            CarrelError::io(secret),
+            CarrelError::Serialization(secret.to_string()),
+            CarrelError::lock_required(secret),
+            CarrelError::internal(secret),
+        ];
+        for err in errors {
+            let kind = err.kind();
+            let (status, body) = carrel_status(err);
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{kind} must map to 500"
+            );
+            assert!(
+                !body.contains(secret),
+                "{kind}: response body leaked internal detail: {body:?}"
+            );
+            assert_eq!(
+                body, "Internal server error",
+                "{kind}: body must be generic"
+            );
+        }
+    }
+
+    #[test]
+    fn carrel_status_keeps_message_text_for_client_facing_kinds() {
+        let (status, body) = carrel_status(CarrelError::not_found("Book file not found"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "Book file not found");
+
+        let (status, body) = carrel_status(CarrelError::permission("Not allowed"));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Not allowed");
+
+        let (status, body) = carrel_status(CarrelError::invalid("Bad input"));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Bad input");
+    }
+
+    #[test]
+    fn carrel_status_sanitizes_network_failure_bodies() {
+        // Network is populated verbatim from reqwest/opendal, so its text is
+        // foreign: upstream URLs, hostnames, ports, storage endpoint config.
+        let err = CarrelError::network(
+            "error sending request for url (https://sync.internal.example:8443/bucket/private): \
+             connection refused",
+        );
+        let (status, body) = carrel_status(err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            !body.contains("sync.internal.example"),
+            "Network body leaked the upstream host: {body:?}"
+        );
+        assert_eq!(body, "Upstream request failed");
+    }
+
+    #[test]
+    fn carrel_status_maps_rate_limited_to_429_and_keeps_its_message() {
+        let (status, body) = carrel_status(CarrelError::RateLimited(
+            "some-provider: rate limited after 3 attempts".to_string(),
+        ));
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, "some-provider: rate limited after 3 attempts");
+    }
+
+    // ── book_file_status body sanitization (LAN hardening M3) ───────────
+    //
+    // carrel-core builds NotFound/InvalidInput/PermissionDenied on the book-
+    // file parsing paths from third-party parser output (zip/unrar/pdfium
+    // text, archive entry names) and raw OS diagnostics, not this codebase's
+    // own wording. `book_file_status` must replace all three with the
+    // caller's own text rather than passing the error's message through.
+
+    #[test]
+    fn book_file_status_sanitizes_not_found_and_invalid_bodies() {
+        let secret_not_found = "No such file or directory (os error 2): /Users/mike/secret.epub";
+        let (status, body) = book_file_status(
+            "Chapter not found",
+            "Chapter unreadable",
+            CarrelError::not_found(secret_not_found),
+        );
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, "Chapter not found");
+        assert!(
+            !body.contains("secret.epub") && !body.contains("os error"),
+            "NotFound body leaked internal detail: {body:?}"
+        );
+
+        let secret_invalid = "Not a valid ZIP/CBZ archive: invalid Zip archive: crc32 mismatch";
+        let (status, body) = book_file_status(
+            "Chapter not found",
+            "Chapter unreadable",
+            CarrelError::invalid(secret_invalid),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Chapter unreadable");
+        assert!(
+            !body.contains("ZIP/CBZ") && !body.contains("crc32"),
+            "InvalidInput body leaked parser detail: {body:?}"
+        );
+    }
+
+    #[test]
+    fn book_file_status_sanitizes_permission_denied_body() {
+        let secret = "Permission denied (os error 13): /Users/mike/Library/private";
+        let (status, body) = book_file_status(
+            "Chapter not found",
+            "Chapter unreadable",
+            CarrelError::permission(secret),
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Permission denied");
+        assert!(
+            !body.contains("os error") && !body.contains("Library/private"),
+            "PermissionDenied body leaked internal detail: {body:?}"
+        );
+    }
+
+    #[test]
+    fn book_file_status_uses_route_specific_wording() {
+        let (_, body) = book_file_status(
+            "Page not found in this book",
+            "Page image could not be rendered",
+            CarrelError::not_found("archive entry missing"),
+        );
+        assert_eq!(body, "Page not found in this book");
+
+        let (_, body) = book_file_status(
+            "Page not found in this book",
+            "Page image could not be rendered",
+            CarrelError::invalid("bad archive"),
+        );
+        assert_eq!(body, "Page image could not be rendered");
+    }
+
+    #[test]
+    fn book_file_status_delegates_other_kinds_to_carrel_status() {
+        // Database/Io/Serialization/LockRequired/Internal/Network/RateLimited
+        // are already sanitized by `carrel_status` and carry no route-
+        // specific text here — confirm the delegation actually happens by
+        // checking a secret in one of them still doesn't survive.
+        let secret = "database is locked: near column token='abc123xyz'";
+        let (status, body) =
+            book_file_status("not found", "invalid", CarrelError::database(secret));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "Internal server error");
+
+        let (status, body) = book_file_status(
+            "not found",
+            "invalid",
+            CarrelError::RateLimited("provider: rate limited".to_string()),
+        );
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, "provider: rate limited");
+    }
+
+    // ── book-file route regression tests (LAN hardening M3) ──────────────
+    //
+    // `carrel-core` builds NotFound/InvalidInput for these routes from
+    // third-party parser text (zip/unrar/pdfium/libmobi) and raw OS
+    // diagnostics (`From<std::io::Error>`). These tests plant those exact
+    // failure modes — a `.cbz` that isn't a zip, and a book row whose
+    // `file_path`/`cover_path` doesn't exist on disk — and assert the
+    // response carries neither the parser's nor the OS's wording. A test
+    // that only checked the status code would still pass with `book_file_
+    // status` deleted (the status mapping predates this milestone); these
+    // assert the body too.
+
+    fn corrupt_book(
+        id: &str,
+        file_path: &str,
+        format: crate::models::BookFormat,
+    ) -> crate::models::Book {
+        crate::models::Book {
+            id: id.to_string(),
+            title: "Corrupt Test".to_string(),
+            author: "Author".to_string(),
+            file_path: file_path.to_string(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format,
+            file_hash: None,
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_cbz_page_and_page_count_do_not_leak_zip_error_text() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let cbz_path = dir.path().join("corrupt.cbz");
+        std::fs::write(&cbz_path, b"this is not a zip archive at all").unwrap();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(
+                &conn,
+                &corrupt_book(
+                    "corrupt-cbz-1",
+                    &cbz_path.to_string_lossy(),
+                    crate::models::BookFormat::Cbz,
+                ),
+            )
+            .unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/corrupt-cbz-1/pages/0"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert_eq!(
+            body,
+            "Page image could not be rendered: the book file may be corrupt or unsupported"
+        );
+        assert!(
+            !body.to_lowercase().contains("zip"),
+            "page image error body leaked the zip crate's own wording: {body:?}"
+        );
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/corrupt-cbz-1/page-count"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert_eq!(
+            body,
+            "Page count could not be determined: the book file may be corrupt or unsupported"
+        );
+        assert!(
+            !body.to_lowercase().contains("zip"),
+            "page count error body leaked the zip crate's own wording: {body:?}"
+        );
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn missing_epub_file_chapters_and_chapter_content_do_not_leak_os_error_text() {
+        let state = test_state();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(
+                &conn,
+                &corrupt_book(
+                    "missing-epub-1",
+                    "/nonexistent/definitely-missing-book-m3.epub",
+                    crate::models::BookFormat::Epub,
+                ),
+            )
+            .unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/missing-epub-1/chapters"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "Table of contents not available for this book");
+        assert!(
+            !body.to_lowercase().contains("os error") && !body.contains("nonexistent"),
+            "chapters error body leaked the OS diagnostic or the file path: {body:?}"
+        );
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/missing-epub-1/chapters/0"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "Chapter not found");
+        assert!(
+            !body.to_lowercase().contains("os error") && !body.contains("nonexistent"),
+            "chapter content error body leaked the OS diagnostic or the file path: {body:?}"
+        );
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn missing_cover_file_does_not_leak_os_error_text() {
+        let state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cover = dir.path().join("missing-cover.jpg");
+        {
+            let conn = state.conn().unwrap();
+            let mut book = corrupt_book(
+                "missing-cover-1",
+                "/nonexistent/missing-cover-book.epub",
+                crate::models::BookFormat::Epub,
+            );
+            book.cover_path = Some(missing_cover.to_string_lossy().to_string());
+            crate::db::insert_book(&conn, &book).unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/missing-cover-1/cover"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "Cover image not found");
+        assert!(
+            !body.to_lowercase().contains("os error") && !body.contains("missing-cover"),
+            "cover error body leaked the OS diagnostic or the file path: {body:?}"
+        );
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn missing_book_file_download_does_not_leak_os_error_text() {
+        // The download route hands over the book's own bytes, so it belongs to
+        // the same family as the render routes — and it opens the file
+        // directly, which is the shortest path from a stored `file_path` to an
+        // OS diagnostic in a response body.
+        let state = test_state();
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_book(
+                &conn,
+                &corrupt_book(
+                    "missing-download-1",
+                    "/nonexistent/private-library-path/secret-book.epub",
+                    crate::models::BookFormat::Epub,
+                ),
+            )
+            .unwrap();
+        }
+        let (_state, port, tx) = spawn_progress_test_server(state).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books/missing-download-1/download"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "Book file not found");
+        assert!(
+            !body.to_lowercase().contains("os error")
+                && !body.contains("private-library-path")
+                && !body.contains("secret-book"),
+            "download error body leaked the OS diagnostic or the stored path: {body:?}"
+        );
+
+        let _ = tx.send(());
     }
 }
