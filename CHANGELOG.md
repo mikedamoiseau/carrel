@@ -54,11 +54,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 - **Web server errors no longer leak internal details to LAN clients.**
   Database, filesystem, serialization, and other internal failures used to
   return the raw error text (which can include SQL fragments or filesystem
-  paths) as the response body. Those kinds now return a generic "Internal
-  server error" body — the real message is still logged server-side — while
-  the app's own validation and lookup error messages (not-found, permission,
-  invalid input) are unchanged. Rate-limited requests now correctly return
-  `429` instead of `500`.
+  paths) as the response body, and network failures returned the upstream
+  URL, host, and port. Those kinds now return a generic body — the real
+  message is still logged server-side, with its error kind — while the app's
+  own validation and lookup messages (not-found, permission, invalid input,
+  rate-limited) are unchanged.
 
 ## [3.0.6] - 2026-08-17
 

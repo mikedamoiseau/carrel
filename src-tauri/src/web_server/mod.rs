@@ -197,17 +197,31 @@ impl WebState {
 /// Map any error convertible to [`CarrelError`] into an HTTP `(status, message)`
 /// tuple for axum handlers.
 ///
-/// `NotFound` → 404, `PermissionDenied` → 403, `InvalidInput` → 400,
-/// `Network` → 502, `RateLimited` → 429 — these keep the error's own message
-/// text, since it's our own validation/lookup/rate-limit wording, not a
-/// leaked system detail, and clients rely on it.
+/// `NotFound` → 404, `PermissionDenied` → 403, `InvalidInput` → 400 and
+/// `RateLimited` → 429 keep the error's own message text: clients rely on it,
+/// and it is normally this codebase's own validation and lookup wording.
 ///
-/// Everything else (`Database`, `Io`, `Serialization`, `LockRequired`,
-/// `Internal`) means something broke internally. The web server is reachable
-/// by anything on the user's LAN behind a PIN session, so those bodies must
-/// not hand out SQL fragments, filesystem paths, or other internals: they map
-/// to 500 with a fixed, generic body, while the real message is logged
-/// server-side at error level for the operator.
+/// Everything else gets a fixed, generic body with the real message logged
+/// server-side at error level, because the web server is reachable by anything
+/// on the user's LAN that gets past the PIN and those messages are not ours:
+///
+/// - `Database`, `Io`, `Serialization`, `LockRequired`, `Internal` → 500.
+///   These carry SQL fragments, filesystem paths and library diagnostics.
+/// - `Network` → 502. Kept its text until M1's review: `From<reqwest::Error>`
+///   and `From<opendal::Error>` populate it verbatim (see carrel-core's
+///   `error.rs`), so it hands out upstream URLs, hostnames, ports and storage
+///   endpoint config. No web route makes outbound requests today, which is
+///   why nothing was leaking through it yet — it is sanitized so that the
+///   first route which does cannot start.
+///
+/// Known remaining gap, deliberately not addressed here: the 4xx kinds above
+/// are also constructed by carrel-core from third-party parser text (e.g.
+/// `cbz.rs`'s `not_found(format!("Cannot read page '{name}': {e}"))`, and
+/// `From<std::io::Error>` mapping `ErrorKind::NotFound` straight to
+/// `NotFound(e.to_string())`), so archive internals can still reach a client
+/// through a 404/400 on the page and cover routes. Fixing that means giving
+/// those routes their own client-facing wording rather than blanket-sanitizing
+/// bodies clients depend on.
 ///
 /// Accepts `CarrelError` directly or any source error with a `From<E> for
 /// CarrelError` impl (e.g. `std::io::Error`).
@@ -217,10 +231,21 @@ pub fn carrel_status<E: Into<CarrelError>>(e: E) -> (StatusCode, String) {
         "NotFound" => (StatusCode::NOT_FOUND, err.to_string()),
         "PermissionDenied" => (StatusCode::FORBIDDEN, err.to_string()),
         "InvalidInput" => (StatusCode::BAD_REQUEST, err.to_string()),
-        "Network" => (StatusCode::BAD_GATEWAY, err.to_string()),
         "RateLimited" => (StatusCode::TOO_MANY_REQUESTS, err.to_string()),
-        _ => {
-            log::error!("internal error: {err}");
+        // Foreign text: upstream URLs, hosts and endpoint config.
+        "Network" => {
+            log::error!("web request failed (Network): {err}");
+            (
+                StatusCode::BAD_GATEWAY,
+                "Upstream request failed".to_string(),
+            )
+        }
+        kind => {
+            // The kind is in the log line because it is now the only place it
+            // survives — the body no longer distinguishes a Database failure
+            // from an Io or Serialization one, and that distinction is the
+            // first thing worth knowing when triaging a report.
+            log::error!("web request failed ({kind}): {err}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
@@ -4756,9 +4781,10 @@ mod tests {
     // The web server is reachable by anything on the user's LAN behind a
     // PIN session. Kinds that mean "something broke internally" must not
     // hand the client SQL fragments, filesystem paths, or other internals
-    // via the response body — but our own validation/lookup wording for
-    // NotFound/PermissionDenied/InvalidInput is safe and relied on by
-    // clients, so it must survive unchanged.
+    // via the response body. Same for Network, whose text comes verbatim
+    // from reqwest/opendal. Our own validation/lookup/rate-limit wording
+    // for NotFound/PermissionDenied/InvalidInput/RateLimited is relied on
+    // by clients, so it must survive unchanged.
 
     #[test]
     fn carrel_status_sanitizes_internal_failure_bodies() {
@@ -4802,6 +4828,23 @@ mod tests {
         let (status, body) = carrel_status(CarrelError::invalid("Bad input"));
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, "Bad input");
+    }
+
+    #[test]
+    fn carrel_status_sanitizes_network_failure_bodies() {
+        // Network is populated verbatim from reqwest/opendal, so its text is
+        // foreign: upstream URLs, hostnames, ports, storage endpoint config.
+        let err = CarrelError::network(
+            "error sending request for url (https://sync.internal.example:8443/bucket/private): \
+             connection refused",
+        );
+        let (status, body) = carrel_status(err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            !body.contains("sync.internal.example"),
+            "Network body leaked the upstream host: {body:?}"
+        );
+        assert_eq!(body, "Upstream request failed");
     }
 
     #[test]
