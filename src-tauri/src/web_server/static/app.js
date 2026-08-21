@@ -386,11 +386,20 @@
     }
   }
 
-  /// Re-scope to the server's active profile. Returns whether it changed.
+  /// Re-scope to the server's active profile. Returns "changed", "unchanged",
+  /// or "unknown".
+  ///
+  /// "unknown" is the case a boolean could not express: loadProfiles() swallows
+  /// a failed or non-OK /api/profiles and returns whatever it had cached, and
+  /// applyOfflineScope() reports its own publish failures as false too — so a
+  /// plain false meant either "nothing to do" or "no idea which profile is
+  /// active", and a caller about to permit offline *writes* needs to tell those
+  /// apart.
   async function syncOfflineScopeWithServer() {
     const active = (await loadProfiles()).find((p) => p.active);
-    if (!active || !offlineSupported()) return false;
-    return await applyOfflineScope(active.name);
+    if (!active) return "unknown";
+    if (!offlineSupported()) return "unchanged"; // nothing to scope
+    return (await applyOfflineScope(active.name)) ? "changed" : "unchanged";
   }
 
   // Lazy singleton connection; a failed open clears the promise so a later
@@ -1712,7 +1721,7 @@
         // list and the offline scope are still unresolved here — resolve them
         // before the first render, or the header would have no switcher and
         // offline saves could land in the wrong profile's namespace.
-        if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+        if ((await syncOfflineScopeWithServer()) === "changed") await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
     }
@@ -8352,16 +8361,30 @@
     // would let an interleaved render read the *old* profile's namespace,
     // which routeGen can't prevent because that render isn't this
     // continuation.
-    try {
-      if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
-    } catch (e) {
-      // Fail closed, and say so: without a namespace known to match the
-      // server's active profile, leaving offline mode would let a save file
-      // one profile's book under another's. Staying offline keeps the banner
-      // (and its Retry, which re-runs this whole probe) on screen, which is
-      // the recoverable end of that trade.
+    const scope = await syncOfflineScopeWithServer();
+    if (scope === "unknown") {
+      // Fail closed. Leaving offline mode here would permit saves under a
+      // namespace nothing has confirmed matches the server's active profile —
+      // and this is the one path where the tag check above cannot cover for
+      // that, because a page that booted offline has no baseline tag yet, so
+      // the probe *establishes* the baseline instead of catching a move.
+      // (init() and doLogin() tolerate "unknown" for that reason: by the time
+      // they run, their probe either set the baseline at a cold boot or would
+      // have caught the move.)
+      //
+      // Staying offline keeps the banner and its Retry — which re-runs this
+      // whole probe — on screen, which is the recoverable end of the trade.
+      // Rendered rather than just returned, so a navigation that lands here
+      // does not change the URL and leave the previous view up with no word
+      // of why.
+      const rows = await getAllOfflineManifests();
+      if (superseded()) return;
+      if (rows.length) renderOfflineLibrary(rows);
+      else renderOfflineState();
+      showToast("Couldn't confirm which library is active — staying offline");
       return;
     }
+    if (scope === "changed") await verifyOfflineIntegrity();
     // loadProfiles() inside the sync above is itself a request, so the move
     // can be noticed *there* rather than on the probe — in which case the
     // scope has already been moved to the profile the imminent reload lands
@@ -8427,7 +8450,7 @@
     // the desktop, or another web client — one active profile is shared by
     // all of them). Re-scope before anything reads offline storage, and
     // re-check integrity in the new namespace if it changed.
-    if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
+    if ((await syncOfflineScopeWithServer()) === "changed") await verifyOfflineIntegrity();
     // Reconnected (or a normal online launch): flush any progress queued
     // while offline. Fire-and-forget — it serializes per book via saveChains
     // and never blocks the first render.

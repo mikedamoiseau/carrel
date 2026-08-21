@@ -283,16 +283,24 @@ pub fn book_file_status<E: Into<CarrelError>>(
 ) -> (StatusCode, String) {
     let err: CarrelError = e.into();
     match err.kind() {
+        // Logged at warn, not error: on these routes the three kinds below are
+        // ordinary client-fault outcomes — a page index past the end, a cover
+        // the browser evicted, a book whose file moved. An unauthenticated
+        // client (a PIN is optional) can produce them as fast as it can send
+        // requests, and the log is a daily-rolling file with no retention cap,
+        // so logging them at error level would let anyone on the LAN grow it
+        // at will and would drown the failures that really are the server's
+        // fault. carrel_status still logs those at error below.
         "NotFound" => {
-            log::error!("book file request failed (NotFound): {err}");
+            log::warn!("book file request failed (NotFound): {err}");
             (StatusCode::NOT_FOUND, not_found_msg.to_string())
         }
         "InvalidInput" => {
-            log::error!("book file request failed (InvalidInput): {err}");
+            log::warn!("book file request failed (InvalidInput): {err}");
             (StatusCode::BAD_REQUEST, invalid_msg.to_string())
         }
         "PermissionDenied" => {
-            log::error!("book file request failed (PermissionDenied): {err}");
+            log::warn!("book file request failed (PermissionDenied): {err}");
             (StatusCode::FORBIDDEN, "Permission denied".to_string())
         }
         _ => carrel_status(err),

@@ -66,6 +66,29 @@ async function openReaderAtZero(page: Page, bookId: string) {
   await expect(stage).toBeVisible({ timeout: 15_000 });
 }
 
+// Read something out of the page after a reload the test triggered on purpose.
+// `page.evaluate` rejects with "Execution context was destroyed" if it lands
+// while a navigation is still settling, and the profile-move tests all read
+// IndexedDB immediately after the reload they asserted — so a bare evaluate
+// fails intermittently *because* the feature worked. IndexedDB survives the
+// navigation, so the value is stable and retrying is sound.
+async function evaluateSettled<Arg, Ret>(
+  page: Page,
+  fn: (arg: Arg) => Promise<Ret>,
+  arg: Arg
+): Promise<Ret> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await page.evaluate(fn, arg);
+    } catch (e) {
+      lastError = e;
+      await page.waitForLoadState("load").catch(() => {});
+    }
+  }
+  throw lastError;
+}
+
 // Offline mode (spec docs/superpowers/specs/2026-07-17-web-reader-offline-design.md).
 //
 // M2 — service-worker foundations: the activate handler's shell-version
@@ -366,6 +389,50 @@ test.describe("offline mode — boot & offline library (M4)", () => {
     await expect(page.locator(".offline-banner")).toHaveCount(0);
   });
 
+  test("a navigation stays offline when the active profile cannot be confirmed", async ({
+    page,
+    context,
+  }) => {
+    // LAN-hardening M3 review. Leaving offline mode re-scopes offline storage
+    // to the server's active profile first, because the namespace every
+    // offline read and write uses belongs to a profile. If that profile
+    // cannot be established — /api/profiles fails while /api/books answers —
+    // the old code carried on and left offline mode anyway, so a later "Save
+    // offline" would file the new profile's book under the old one's
+    // namespace. It must stay offline instead. Note the probe cannot cover
+    // for this via the profile tag: a page that booted offline has no
+    // baseline tag yet, so the probe establishes one rather than catching a
+    // move.
+    await saveBookOffline(page, EPUB_ID);
+    await page.goto("/#/");
+    await context.setOffline(true);
+    await reloadControlled(page);
+    await expect(page.locator(".offline-banner")).toBeVisible();
+
+    // /api/profiles is not one of the paths sw.js answers (it only claims
+    // /api/books/{id}… and the shell), so it reaches the network from the
+    // page and page.route really does intercept it.
+    await page.route("**/api/profiles", (route) =>
+      route.fulfill({ status: 503, contentType: "text/plain", body: "no profile host" })
+    );
+    await context.setOffline(false);
+    // Any navigation while offline re-probes through showOfflineLibrary, which
+    // is the path that permits offline writes again. (The banner's Retry runs
+    // init() instead, which tolerates an unconfirmable profile by design — its
+    // own probe either establishes the baseline tag or catches a move.)
+    await page.evaluate(() => {
+      location.hash = "#/stats";
+    });
+
+    await expect(page.locator(".toast")).toContainText(/couldn't confirm which library/i, {
+      timeout: 15_000,
+    });
+    // Still offline: the banner stays and the online view never renders.
+    // Without the fix, offline mode is left and the stats page paints.
+    await expect(page.locator(".offline-banner")).toBeVisible();
+    await expect(page.locator(".stat-card")).toHaveCount(0);
+  });
+
   test("offline deep-link to a NON-saved book redirects to the offline library", async ({
     page,
     context,
@@ -658,20 +725,24 @@ test.describe("offline mode — progress replay (M5)", () => {
       // database), which is the one the row was written into.
       // Without the guard this is 0: baseline 1 never matches the server's
       // timestamp, so replay discards the row and deletes it.
-      const rows = await page.evaluate(async (id) => {
-        const db = await new Promise<IDBDatabase>((res, rej) => {
-          const req = indexedDB.open("carrel-offline");
-          req.onsuccess = () => res(req.result);
-          req.onerror = () => rej(req.error);
-        });
-        return new Promise<number>((res) => {
-          const tx = db.transaction("progressQueue", "readonly");
-          const r = tx.objectStore("progressQueue").getAll();
-          r.onsuccess = () =>
-            res(r.result.filter((x: { bookId: string }) => x.bookId === id).length);
-          r.onerror = () => res(-1);
-        });
-      }, CBZ_ID);
+      const rows = await evaluateSettled(
+        page,
+        async (id: string) => {
+          const db = await new Promise<IDBDatabase>((res, rej) => {
+            const req = indexedDB.open("carrel-offline");
+            req.onsuccess = () => res(req.result);
+            req.onerror = () => rej(req.error);
+          });
+          return new Promise<number>((res) => {
+            const tx = db.transaction("progressQueue", "readonly");
+            const r = tx.objectStore("progressQueue").getAll();
+            r.onsuccess = () =>
+              res(r.result.filter((x: { bookId: string }) => x.bookId === id).length);
+            r.onerror = () => res(-1);
+          });
+        },
+        CBZ_ID
+      );
       expect(rows).toBe(1);
     } finally {
       // The active profile is server-global state shared with every other
@@ -764,19 +835,23 @@ test.describe("offline mode — stale-profile writes (LAN hardening M2)", () => 
       await page.keyboard.press("ArrowRight");
       await reloaded;
 
-      const baseline = await page.evaluate(async (id) => {
-        const db = await new Promise<IDBDatabase>((res, rej) => {
-          const req = indexedDB.open("carrel-offline");
-          req.onsuccess = () => res(req.result);
-          req.onerror = () => rej(req.error);
-        });
-        return new Promise<unknown>((res) => {
-          const tx = db.transaction("books", "readonly");
-          const r = tx.objectStore("books").get(id);
-          r.onsuccess = () => res(r.result ? r.result.baselineLastReadAt : null);
-          r.onerror = () => res(null);
-        });
-      }, CBZ_ID);
+      const baseline = await evaluateSettled(
+        page,
+        async (id: string) => {
+          const db = await new Promise<IDBDatabase>((res, rej) => {
+            const req = indexedDB.open("carrel-offline");
+            req.onsuccess = () => res(req.result);
+            req.onerror = () => rej(req.error);
+          });
+          return new Promise<unknown>((res) => {
+            const tx = db.transaction("books", "readonly");
+            const r = tx.objectStore("books").get(id);
+            r.onsuccess = () => res(r.result ? r.result.baselineLastReadAt : null);
+            r.onerror = () => res(null);
+          });
+        },
+        CBZ_ID
+      );
       expect(baseline).toBe(SENTINEL);
     } finally {
       if (switched) {
