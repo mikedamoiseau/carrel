@@ -5539,7 +5539,7 @@
       // A moved profile is not a failed delete: the page is being replaced,
       // and the re-read below would pull the *other* library's words into
       // this list on the way out.
-      if (profileMoveHandled) return;
+      if (reloadPending) return;
       if (removed && vocabState === stateAtCall) {
         vocabState.items.splice(i, 0, removed);
         renderVocabListIfOpen();
@@ -7889,7 +7889,7 @@
         // Same as above: `stale()` only tracks this screen's own visit token,
         // not a profile move, and refreshDueCount() below would re-read the
         // other library's queue.
-        if (profileMoveHandled) return;
+        if (reloadPending) return;
         // The outcome is genuinely UNKNOWN here: the request may have
         // committed with only the response lost. Retaining the card for a
         // blind retry would then record the same review twice, advancing the
@@ -8148,6 +8148,9 @@
     // collections, series, progress, offline scope. Reload into the new
     // profile's library rather than trying to invalidate each cache: the
     // boot path already re-fetches all of it and re-scopes offline storage.
+    // Same meaning as in noteProfileTag: writes still in flight will fail
+    // during teardown and must not toast about it.
+    reloadPending = true;
     location.hash = "#/";
     location.reload();
   }
@@ -8341,11 +8344,20 @@
     // still points at the old profile's namespace — so a "Save offline" from
     // that state files the new profile's book under the old one.
     if (noteProfileTag(test)) return; // the reload will re-run this properly
-    offlineMode = false;
-    if (test.status === 401) return showLogin();
+    if (test.status === 401) { offlineMode = false; return showLogin(); }
     authenticated = true;
+    // Re-scope BEFORE leaving offline mode. `hashchange` still fires during
+    // these awaits, and route()'s offline branch is where that navigation
+    // belongs until the new namespace is in place — clearing the flag first
+    // would let an interleaved render read the *old* profile's namespace,
+    // which routeGen can't prevent because that render isn't this
+    // continuation.
     if (await syncOfflineScopeWithServer()) await verifyOfflineIntegrity();
-    if (superseded()) return;
+    // loadProfiles() inside the sync above is itself a request, so the move
+    // can be noticed *here* rather than on the probe. reloadPending then
+    // means the document is already going away and nothing below should run.
+    if (superseded() || reloadPending) return;
+    offlineMode = false;
     route();
   }
 
