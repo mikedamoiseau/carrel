@@ -59,6 +59,18 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   message is still logged server-side, with its error kind — while the app's
   own validation and lookup messages (not-found, permission, invalid input,
   rate-limited) are unchanged.
+- **Reading a corrupt or missing book file no longer leaks parser or OS text
+  to LAN clients.** The fix above kept the message text for not-found,
+  permission, and invalid-input errors on the reasoning that it's this
+  codebase's own validation wording — true everywhere except the routes that
+  hand a book's own bytes to a parser or straight to the client (chapters,
+  chapter content, page images, page counts, cover images, and file
+  download), where that same text is built from third-party parser output
+  (zip/unrar/pdfium/libmobi messages, archive entry names) or a raw OS error
+  string — including the stored path of the book itself. Those routes now
+  return their own short, route-specific message on the same status code
+  (404/400/403) that clients already act on, with the real error still
+  logged server-side.
 - **A web tab left open on a stale profile now notices its own writes.** The
   active profile is shared by the desktop app and every web client, so it can
   move while a browser tab sits open; every response carries a header the web
