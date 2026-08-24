@@ -96,6 +96,62 @@ mod tests {
         );
     }
 
+    /// The main window must *open* wide enough for the library toolbar in the
+    /// widest locale, and must not be resizable below what the narrowest one
+    /// needs. Measured against the built CSS with the app's own fonts, the
+    /// toolbar needs 928 px in English and 1090 px in French for
+    /// `+ Add books` to be fully visible — and that is already with the
+    /// search field collapsed to its magnifier. The old 800x600 default
+    /// clipped the button off the right edge on every launch (there is no
+    /// window-state plugin, so the config default *is* every launch).
+    ///
+    /// The floor is deliberately set to the English figure rather than the
+    /// French one: a floor above 1024 would exceed the width of a 1024-px
+    /// display entirely, leaving such a user unable to resize the window to
+    /// fit their screen at all. The default covers every locale; the floor
+    /// only stops a resize from hiding the button outright.
+    #[test]
+    fn main_window_opens_and_stays_wide_enough_for_the_library_toolbar() {
+        /// Narrowest locale (English) toolbar requirement, rounded up.
+        const TOOLBAR_MIN_WIDTH: u64 = 960;
+        /// Widest locale (French) toolbar requirement, rounded up.
+        const TOOLBAR_DEFAULT_WIDTH: u64 = 1090;
+        let base = parse(BASE);
+        let window = base
+            .pointer("/app/windows/0")
+            .expect("tauri.conf.json must configure a main window");
+
+        let num = |key: &str| -> u64 {
+            window
+                .get(key)
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| panic!("main window must set `{key}`"))
+        };
+
+        let (min_width, min_height) = (num("minWidth"), num("minHeight"));
+        assert!(
+            min_width >= TOOLBAR_MIN_WIDTH,
+            "minWidth must be at least {TOOLBAR_MIN_WIDTH} so the library toolbar's \
+             `+ Add books` button cannot be resized off-screen, got {min_width}"
+        );
+        assert!(
+            min_height >= 600,
+            "minHeight must be at least 600, got {min_height}"
+        );
+
+        let (width, height) = (num("width"), num("height"));
+        assert!(
+            width >= TOOLBAR_DEFAULT_WIDTH,
+            "the default width must be at least {TOOLBAR_DEFAULT_WIDTH} so the \
+             window opens with `+ Add books` visible in every locale, got {width}"
+        );
+        assert!(
+            width >= min_width && height >= min_height,
+            "the default size ({width}x{height}) must not be smaller than the \
+             minimum ({min_width}x{min_height})"
+        );
+    }
+
     #[test]
     fn overlay_is_schema_valid_for_tauri_merge() {
         // The overlay must have the `$schema` key so IDE tooling picks it up
