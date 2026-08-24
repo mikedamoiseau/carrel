@@ -27,14 +27,24 @@ use carrel_core::events::{self, CarrelEvent};
 ///   surfacing in a PIN-gated export reachable over the network
 const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_providers", "opds_auth"];
 
-/// Refuse a route that bulk-dumps personal data unless a web PIN is actually
+/// Refuse an *administrative* dump route unless a web PIN is actually
 /// configured.
 ///
 /// `auth_middleware` lets every request through when there is no PIN — an
 /// acceptable posture for reading one's own library on a home LAN, and the
-/// documented default. It is not acceptable for the routes that hand over a
-/// pile of personal records in one response, so those ask for this gate by
-/// name. Poisoned mutex → fail closed (500), never open access, mirroring
+/// documented default. It is not acceptable for the two routes that exist to
+/// hand the whole account over in one response: the settings/annotations
+/// export and the authentication audit log. Neither backs a screen, so
+/// requiring a PIN for them costs a no-PIN install nothing.
+///
+/// The criterion is deliberately "administrative dump", not "returns many
+/// personal rows". Ordinary reading data the web UI renders — the grid's
+/// progress badges (`GET /api/reading-progress`) and the vocabulary list
+/// (`GET /api/vocabulary`) — is bulk and personal too, and is *not* gated:
+/// gating it would break the no-PIN default outright, which is a different
+/// (and user-visible) decision from hardening an admin endpoint.
+///
+/// Poisoned mutex → fail closed (500), never open access, mirroring
 /// `auth_middleware` itself.
 fn require_configured_pin(state: &WebState, what: &str) -> Result<(), (StatusCode, String)> {
     let has_pin = match state.pin_hash.lock() {
@@ -457,15 +467,18 @@ async fn login_history(
 // ── Books ────────────────────────────────────────────────────────────────────
 
 // The three structs below are web-safe views of carrel-core's `Book`,
-// `BookGridItem` and `ContinueReadingItem`: every field except `file_path`
-// and/or `cover_path`. Both are absolute filesystem paths — `file_path` is
-// the book's own location (under `import_mode = link`, the owner's original
-// path outside the library folder entirely) and `cover_path` is under the
-// app-data covers directory, which embeds the OS username — and the web
-// server is reachable by anything on the LAN that gets past the (optional)
-// PIN, so neither may reach a response body. Clients that need the bytes
-// already use `GET /api/books/{id}/download` and `.../cover`, which serve
-// the file directly rather than its path.
+// `BookGridItem` and `ContinueReadingItem`: every field except `file_path`,
+// `cover_path` and (on `Book`) `file_hash`. The first two are absolute
+// filesystem paths — `file_path` is the book's own location (under
+// `import_mode = link`, the owner's original path outside the library folder
+// entirely) and `cover_path` is under the app-data covers directory, which
+// embeds the OS username. `file_hash` is not a path but leaks in the same
+// direction: it fingerprints the exact file the owner holds (see the note on
+// the field itself). The web server is reachable by anything on the LAN that
+// gets past the (optional) PIN, so none of the three may reach a response
+// body. Clients that need the bytes already use
+// `GET /api/books/{id}/download` and `.../cover`, which serve the file
+// directly rather than its path.
 //
 // Deliberately field-listed rather than "serialize to `Value` and strip two
 // keys": the concise shape republishes any new field `carrel-core` adds to
@@ -793,7 +806,8 @@ async fn continue_reading(
 }
 
 /// Item 8: the book-detail response is the shared `Book` model (minus
-/// `file_path`/`cover_path` — see [`PublicBook`]) plus `file_size`, which
+/// `file_path`, `cover_path` and `file_hash` — see [`PublicBook`]) plus
+/// `file_size`, which
 /// isn't a DB column — it's stat'd from the resolved book file on disk
 /// (same path `download_book` reads) so no schema change is needed. `None`
 /// when the file can't be stat'd (e.g. missing/unlinked).

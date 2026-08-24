@@ -1888,6 +1888,11 @@ mod tests {
         let _ = tx.send(());
     }
 
+    /// Companion to the test above, and honest about what it proves: this one
+    /// would still pass with the PIN gate removed, because a valid Basic auth
+    /// reaches the handler either way. Its job is the opposite direction —
+    /// catching a gate that over-refuses and takes the audit log away from a
+    /// properly authenticated request on a PIN'd server.
     #[tokio::test]
     async fn login_history_serves_an_authed_request_on_a_pinned_server() {
         // The gate must not cost the feature its actual use: with a PIN set and
