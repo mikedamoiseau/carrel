@@ -10,7 +10,7 @@ use axum::{
 use rusqlite::OptionalExtension;
 
 use super::auth::{log_login_attempt, LoginOutcome, WebAuthMethod};
-use super::{carrel_status, WebState};
+use super::{book_file_status, carrel_status, WebState};
 use crate::db;
 use crate::models::BookFormat;
 use carrel_core::events::{self, CarrelEvent};
@@ -27,8 +27,54 @@ use carrel_core::events::{self, CarrelEvent};
 ///   surfacing in a PIN-gated export reachable over the network
 const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_providers", "opds_auth"];
 
+/// Refuse an *administrative* dump route unless a web PIN is actually
+/// configured.
+///
+/// `auth_middleware` lets every request through when there is no PIN — an
+/// acceptable posture for reading one's own library on a home LAN, and the
+/// documented default. It is not acceptable for the two routes that exist to
+/// hand the whole account over in one response: the settings/annotations
+/// export and the authentication audit log. Neither backs a screen, so
+/// requiring a PIN for them costs a no-PIN install nothing.
+///
+/// The criterion is deliberately "administrative dump", not "returns many
+/// personal rows". Ordinary reading data the web UI renders — the grid's
+/// progress badges (`GET /api/reading-progress`) and the vocabulary list
+/// (`GET /api/vocabulary`) — is bulk and personal too, and is *not* gated:
+/// gating it would break the no-PIN default outright, which is a different
+/// (and user-visible) decision from hardening an admin endpoint.
+///
+/// Poisoned mutex → fail closed (500), never open access, mirroring
+/// `auth_middleware` itself.
+fn require_configured_pin(state: &WebState, what: &str) -> Result<(), (StatusCode, String)> {
+    let has_pin = match state.pin_hash.lock() {
+        Ok(guard) => guard.is_some(),
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            ))
+        }
+    };
+    if !has_pin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("{what} requires a configured web PIN."),
+        ));
+    }
+    Ok(())
+}
+
 /// Build the full GDPR export document: the shared core metadata plus the
 /// activity log and a redacted settings map.
+///
+/// Unlike `PublicBook`/`PublicBookGridItem`/`PublicContinueReadingItem`
+/// elsewhere in this file, the `books` array here (via
+/// `db::build_core_export`) keeps `file_path` and `cover_path` — this is the
+/// library owner's own data dump, so the stored path is a legitimate part of
+/// the record, not a leak. It's also not reachable without a web PIN
+/// configured (`data_export`, below), unlike the routes those wrappers
+/// guard.
 fn build_gdpr_export(
     conn: &rusqlite::Connection,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
@@ -91,21 +137,7 @@ async fn data_export(State(state): State<WebState>) -> Result<Response, (StatusC
     // settings). Refuse to serve it on an unauthenticated server — the GDPR
     // export requires that web auth actually be set up. Poisoned mutex → fail
     // closed (500), never open access (mirrors `auth_middleware`).
-    let has_pin = match state.pin_hash.lock() {
-        Ok(guard) => guard.is_some(),
-        Err(_) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-            ))
-        }
-    };
-    if !has_pin {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Data export requires a configured web PIN.".to_string(),
-        ));
-    }
+    require_configured_pin(&state, "Data export")?;
 
     let conn = state.conn().map_err(carrel_status)?;
     let value = build_gdpr_export(&conn)?;
@@ -416,10 +448,16 @@ struct HistoryQuery {
     limit: Option<u32>,
 }
 
+/// Every login attempt this server has seen: client IP, user agent, outcome.
+/// Gated like the data export — it is the same kind of payload, and the rows
+/// outlive the PIN that produced them, so an owner who configures a PIN, uses
+/// the web UI, then clears the PIN would otherwise leave that log readable by
+/// anything on the LAN.
 async fn login_history(
     State(state): State<WebState>,
     Query(params): Query<HistoryQuery>,
 ) -> Result<Json<Vec<crate::models::WebSessionEntry>>, (StatusCode, String)> {
+    require_configured_pin(&state, "The login history")?;
     let conn = state.conn().map_err(carrel_status)?;
     let rows = db::get_web_session_log(&conn, params.limit.unwrap_or(100).min(1000))
         .map_err(carrel_status)?;
@@ -427,6 +465,202 @@ async fn login_history(
 }
 
 // ── Books ────────────────────────────────────────────────────────────────────
+
+// The three structs below are web-safe views of carrel-core's `Book`,
+// `BookGridItem` and `ContinueReadingItem`: every field except `file_path`,
+// `cover_path` and (on `Book`) `file_hash`. The first two are absolute
+// filesystem paths — `file_path` is the book's own location (under
+// `import_mode = link`, the owner's original path outside the library folder
+// entirely) and `cover_path` is under the app-data covers directory, which
+// embeds the OS username. `file_hash` is not a path but leaks in the same
+// direction: it fingerprints the exact file the owner holds (see the note on
+// the field itself). The web server is reachable by anything on the LAN that
+// gets past the (optional) PIN, so none of the three may reach a response
+// body. Clients that need the bytes already use
+// `GET /api/books/{id}/download` and `.../cover`, which serve the file
+// directly rather than its path.
+//
+// Deliberately field-listed rather than "serialize to `Value` and strip two
+// keys": the concise shape republishes any new field `carrel-core` adds to
+// these models by default, which is how this defect exists in the first
+// place. Each `From` impl below also destructures its source struct
+// exhaustively (no `..`), so a new field on `Book`/`BookGridItem`/
+// `ContinueReadingItem` fails this file to compile until someone decides
+// whether it belongs on the web-facing side too — the key-set tests in
+// `mod::tests` are the second, independent guard against the same field
+// reappearing.
+//
+// Not done in carrel-core itself: it's a git dependency Carrel Server pins
+// to a release tag, and the desktop frontend reads `cover_path` over IPC
+// from these same structs, so a `skip_serializing` there would break both.
+
+#[derive(serde::Serialize)]
+struct PublicBook {
+    id: String,
+    title: String,
+    author: String,
+    total_chapters: u32,
+    added_at: i64,
+    format: BookFormat,
+    description: Option<String>,
+    genres: Option<String>,
+    rating: Option<f64>,
+    isbn: Option<String>,
+    openlibrary_key: Option<String>,
+    enrichment_status: Option<String>,
+    series: Option<String>,
+    volume: Option<u32>,
+    language: Option<String>,
+    publisher: Option<String>,
+    publish_year: Option<u16>,
+    is_imported: bool,
+    want_to_read: bool,
+}
+
+impl From<crate::models::Book> for PublicBook {
+    fn from(book: crate::models::Book) -> Self {
+        let crate::models::Book {
+            id,
+            title,
+            author,
+            file_path: _,
+            cover_path: _,
+            total_chapters,
+            added_at,
+            format,
+            // The file's SHA-256. Nothing on the web side reads it, and it is
+            // an exact-copy fingerprint of the owner's file — enough to match
+            // against a known-file database and identify the precise edition
+            // they hold. Dropped for the same reason as the two paths.
+            file_hash: _,
+            description,
+            genres,
+            rating,
+            isbn,
+            openlibrary_key,
+            enrichment_status,
+            series,
+            volume,
+            language,
+            publisher,
+            publish_year,
+            is_imported,
+            want_to_read,
+        } = book;
+        Self {
+            id,
+            title,
+            author,
+            total_chapters,
+            added_at,
+            format,
+            description,
+            genres,
+            rating,
+            isbn,
+            openlibrary_key,
+            enrichment_status,
+            series,
+            volume,
+            language,
+            publisher,
+            publish_year,
+            is_imported,
+            want_to_read,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PublicBookGridItem {
+    id: String,
+    title: String,
+    author: String,
+    total_chapters: u32,
+    added_at: i64,
+    format: BookFormat,
+    series: Option<String>,
+    volume: Option<u32>,
+    rating: Option<f64>,
+    language: Option<String>,
+    publish_year: Option<u16>,
+    is_imported: bool,
+    want_to_read: bool,
+}
+
+impl From<crate::models::BookGridItem> for PublicBookGridItem {
+    fn from(item: crate::models::BookGridItem) -> Self {
+        let crate::models::BookGridItem {
+            id,
+            title,
+            author,
+            cover_path: _,
+            total_chapters,
+            added_at,
+            format,
+            series,
+            volume,
+            rating,
+            language,
+            publish_year,
+            is_imported,
+            want_to_read,
+        } = item;
+        Self {
+            id,
+            title,
+            author,
+            total_chapters,
+            added_at,
+            format,
+            series,
+            volume,
+            rating,
+            language,
+            publish_year,
+            is_imported,
+            want_to_read,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PublicContinueReadingItem {
+    id: String,
+    title: String,
+    author: String,
+    format: BookFormat,
+    total_chapters: u32,
+    chapter_index: u32,
+    scroll_position: f64,
+    last_read_at: i64,
+}
+
+impl From<crate::models::ContinueReadingItem> for PublicContinueReadingItem {
+    fn from(item: crate::models::ContinueReadingItem) -> Self {
+        let crate::models::ContinueReadingItem {
+            id,
+            title,
+            author,
+            cover_path: _,
+            format,
+            total_chapters,
+            chapter_index,
+            scroll_position,
+            last_read_at,
+        } = item;
+        Self {
+            id,
+            title,
+            author,
+            format,
+            total_chapters,
+            chapter_index,
+            scroll_position,
+            last_read_at,
+        }
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct BookQuery {
@@ -536,7 +770,8 @@ async fn list_books(
             let total = books.len();
             let offset = params.offset.unwrap_or(0).min(total);
             let end = offset.saturating_add(limit).min(total);
-            let page = books[offset..end].to_vec();
+            let page: Vec<PublicBookGridItem> =
+                books[offset..end].iter().cloned().map(Into::into).collect();
             Ok((
                 [(
                     axum::http::HeaderName::from_static("x-total-count"),
@@ -546,7 +781,10 @@ async fn list_books(
             )
                 .into_response())
         }
-        None => Ok(Json(books).into_response()),
+        None => {
+            let books: Vec<PublicBookGridItem> = books.into_iter().map(Into::into).collect();
+            Ok(Json(books).into_response())
+        }
     }
 }
 
@@ -560,21 +798,23 @@ struct ContinueReadingQuery {
 async fn continue_reading(
     State(state): State<WebState>,
     Query(params): Query<ContinueReadingQuery>,
-) -> Result<Json<Vec<crate::models::ContinueReadingItem>>, (StatusCode, String)> {
+) -> Result<Json<Vec<PublicContinueReadingItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let limit = params.limit.unwrap_or(12).min(50);
     let books = db::get_continue_reading_books(&conn, limit).map_err(carrel_status)?;
-    Ok(Json(books))
+    Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
-/// Item 8: the book-detail response is the shared `Book` model plus
-/// `file_size`, which isn't a DB column — it's stat'd from the resolved
-/// book file on disk (same path `download_book` reads) so no schema change
-/// is needed. `None` when the file can't be stat'd (e.g. missing/unlinked).
+/// Item 8: the book-detail response is the shared `Book` model (minus
+/// `file_path`, `cover_path` and `file_hash` — see [`PublicBook`]) plus
+/// `file_size`, which
+/// isn't a DB column — it's stat'd from the resolved book file on disk
+/// (same path `download_book` reads) so no schema change is needed. `None`
+/// when the file can't be stat'd (e.g. missing/unlinked).
 #[derive(serde::Serialize)]
 struct BookDetail {
     #[serde(flatten)]
-    book: crate::models::Book,
+    book: PublicBook,
     file_size: Option<u64>,
 }
 
@@ -605,7 +845,10 @@ async fn get_book(
         }
         Err(_) => None,
     };
-    Ok(Json(BookDetail { book, file_size }))
+    Ok(Json(BookDetail {
+        book: book.into(),
+        file_size,
+    }))
 }
 
 // ── Covers ───────────────────────────────────────────────────────────────────
@@ -757,10 +1000,16 @@ async fn get_cover_thumb_bytes(
         .await
     {
         Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(carrel_status(e)),
+        Ok(Err(e)) => Err(book_file_status(
+            "Cover image not found",
+            "Cover image could not be read",
+            e,
+        )),
         Err(join_err) => {
             log::warn!("cover thumbnail worker panicked for '{cover_path}': {join_err}");
-            let bytes = tokio::fs::read(&cover_path).await.map_err(carrel_status)?;
+            let bytes = tokio::fs::read(&cover_path).await.map_err(|e| {
+                book_file_status("Cover image not found", "Cover image could not be read", e)
+            })?;
             let mime = mime_guess::from_path(&cover_path)
                 .first_or_octet_stream()
                 .to_string();
@@ -787,7 +1036,9 @@ async fn get_cover(
     let (bytes, mime) = if size.as_deref() == Some("thumb") {
         get_cover_thumb_bytes(state.covers_root(), cover_path).await?
     } else {
-        let bytes = std::fs::read(&cover_path).map_err(carrel_status)?;
+        let bytes = std::fs::read(&cover_path).map_err(|e| {
+            book_file_status("Cover image not found", "Cover image could not be read", e)
+        })?;
         let mime = mime_guess::from_path(&cover_path)
             .first_or_octet_stream()
             .to_string();
@@ -815,15 +1066,21 @@ async fn get_chapters(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let toc_not_found = "Table of contents not available for this book";
+    let toc_invalid =
+        "Table of contents could not be read: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
     let toc = match book.format {
-        BookFormat::Epub => crate::epub::get_toc(&file_path).map_err(carrel_status)?,
+        BookFormat::Epub => crate::epub::get_toc(&file_path)
+            .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?,
         #[cfg(feature = "mobi")]
         BookFormat::Mobi => {
             // MOBI has no real TOC — mirror the desktop `get_toc` behaviour by
             // synthesising a flat list from the chapter list.
-            let chapters =
-                carrel_core::mobi::get_chapter_list(&file_path).map_err(carrel_status)?;
+            let chapters = carrel_core::mobi::get_chapter_list(&file_path)
+                .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
             chapters
                 .into_iter()
                 .map(|c| crate::models::TocEntry {
@@ -861,18 +1118,24 @@ async fn get_chapter_content(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
-    let images_storage = state.images_storage().map_err(carrel_status)?;
+    let chapter_not_found = "Chapter not found";
+    let chapter_invalid = "Chapter could not be read: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
+    let images_storage = state
+        .images_storage()
+        .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
 
     let html = match book.format {
         BookFormat::Epub => {
             crate::epub::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(carrel_status)?
+                .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?
         }
         #[cfg(feature = "mobi")]
         BookFormat::Mobi => {
             carrel_core::mobi::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(carrel_status)?
+                .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?
         }
         #[cfg(not(feature = "mobi"))]
         BookFormat::Mobi => {
@@ -1090,7 +1353,12 @@ async fn get_page_image(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let page_not_found = "Page not found in this book";
+    let page_invalid =
+        "Page image could not be rendered: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
     let page_cache_control = session_cache_control(&state);
 
     // Stage the source locally when it lives on a network mount (M2). The web
@@ -1108,7 +1376,7 @@ async fn get_page_image(
     match book.format {
         BookFormat::Pdf => {
             let (bytes, mime) = crate::pdf::get_page_image_bytes(&file_path, index, width)
-                .map_err(carrel_status)?;
+                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime.to_string()),
@@ -1120,7 +1388,7 @@ async fn get_page_image(
         }
         BookFormat::Cbz => {
             let (bytes, mime) = crate::cbz::get_page_image_bytes(&file_path, index, width)
-                .map_err(carrel_status)?;
+                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1132,7 +1400,7 @@ async fn get_page_image(
         }
         BookFormat::Cbr => {
             let (bytes, mime) = crate::cbr::get_page_image_bytes(&file_path, index, width)
-                .map_err(carrel_status)?;
+                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1158,12 +1426,20 @@ async fn get_page_count(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    let count_not_found = "Page count not available for this book";
+    let count_invalid =
+        "Page count could not be determined: the book file may be corrupt or unsupported";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(count_not_found, count_invalid, e))?;
 
     let count = match book.format {
-        BookFormat::Pdf => crate::pdf::get_page_count(&file_path).map_err(carrel_status)?,
-        BookFormat::Cbz => crate::cbz::get_page_count(&file_path).map_err(carrel_status)?,
-        BookFormat::Cbr => crate::cbr::get_page_count(&file_path).map_err(carrel_status)?,
+        BookFormat::Pdf => crate::pdf::get_page_count(&file_path)
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
+        BookFormat::Cbz => crate::cbz::get_page_count(&file_path)
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
+        BookFormat::Cbr => crate::cbr::get_page_count(&file_path)
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1617,14 +1893,23 @@ async fn download_book(
         .map_err(carrel_status)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
 
-    let file_path = state.resolve_book_path(&book).map_err(carrel_status)?;
+    // Same treatment as the render routes: every error below is the OS
+    // talking about a path the client must never see.
+    let dl_not_found = "Book file not found";
+    let dl_invalid = "Book file could not be read";
+    let file_path = state
+        .resolve_book_path(&book)
+        .map_err(|e| book_file_status(dl_not_found, dl_invalid, e))?;
 
     // R3-2: Stream the file instead of reading entirely into memory
     let file = tokio::fs::File::open(&file_path)
         .await
-        .map_err(carrel_status)?;
+        .map_err(|e| book_file_status(dl_not_found, dl_invalid, e))?;
 
-    let metadata = file.metadata().await.map_err(carrel_status)?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| book_file_status(dl_not_found, dl_invalid, e))?;
 
     let filename = std::path::Path::new(&file_path)
         .file_name()
@@ -1719,10 +2004,10 @@ async fn list_collections(
 async fn get_collection_books(
     State(state): State<WebState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<crate::models::BookGridItem>>, (StatusCode, String)> {
+) -> Result<Json<Vec<PublicBookGridItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let books = db::get_books_in_collection_grid(&conn, &id).map_err(carrel_status)?;
-    Ok(Json(books))
+    Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────
