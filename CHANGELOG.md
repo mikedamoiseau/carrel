@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-08-24
+
 ### Added
 - **Dictionary lookups ("Define") in the web reader.** Selecting text while
   reading an EPUB or MOBI now offers a **Define** button alongside the
