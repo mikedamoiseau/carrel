@@ -51,6 +51,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   screenful was left off-screen — the reader's post-render scroll restore ran
   after the jump and overwrote it. Both the highlight jump and the new
   saved-words jump now suppress that restore.
+- **The app window no longer opens too small for its own toolbar.** The
+  default window was 800x600, which cut the **+ Add books** button (and part
+  of the filter row) off the right edge on every launch — measured against
+  the built stylesheet, the library toolbar needs 928 px in English and
+  1090 px in French even with the search field collapsed to its icon. The
+  window now opens at 1200x800, which covers every locale, and cannot be
+  resized below 960x600 — a floor set to the English requirement rather than
+  the French one so it can't exceed a 1024-px-wide display.
 
 ## [3.0.6] - 2026-08-17
 
