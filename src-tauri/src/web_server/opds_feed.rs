@@ -817,6 +817,7 @@ mod tests {
             }
         }
         WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
             pool: Arc::new(Mutex::new(pool)),
             data_dir: PathBuf::from("/tmp"),
             cache_dir: std::env::temp_dir(),

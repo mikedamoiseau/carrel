@@ -384,6 +384,7 @@ mod tests {
         let pool =
             crate::db::create_pool(&std::path::PathBuf::from(":memory:")).expect("in-memory DB");
         WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
             pool: Arc::new(Mutex::new(pool)),
             data_dir: std::path::PathBuf::from("/tmp"),
             cache_dir: std::env::temp_dir(),

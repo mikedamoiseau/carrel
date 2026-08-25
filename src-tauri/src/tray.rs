@@ -269,6 +269,7 @@ async fn toggle_mode(app: &AppHandle, which: ToggleWhich) {
             active_profile_name: state.shared_active_profile_name.clone(),
             unlocked_profiles: state.unlocked_profiles.clone(),
             private_mode: state.private_mode.clone(),
+            archives: state.archive_caches(),
             profile_host: Some(crate::profile_host::for_app(app)),
             dictionary_pool: state.dictionary_pool.clone(),
         };

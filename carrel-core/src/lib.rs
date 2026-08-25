@@ -34,6 +34,7 @@ pub mod pdf;
 pub mod plugins;
 pub mod profile_lock;
 pub mod providers;
+pub mod reader;
 pub mod search;
 pub mod source_cache;
 pub mod storage;
