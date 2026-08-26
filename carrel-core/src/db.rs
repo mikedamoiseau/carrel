@@ -3123,16 +3123,13 @@ mod tests {
         let book = sample_book("book-3");
         insert_book(&conn, &book).unwrap();
 
-        let now = chrono::Local::now().timestamp();
-        let day_secs = 86_400;
-        insert_reading_session(&conn, "s-recent", "book-3", now - day_secs, 600, 1).unwrap();
-        insert_reading_session(&conn, "s-40d", "book-3", now - 40 * day_secs, 900, 1).unwrap();
-        insert_reading_session(&conn, "s-400d", "book-3", now - 400 * day_secs, 1200, 1).unwrap();
-
-        // Calendar-window edge: exactly 364 days ago (included), one day
-        // further back at 365 days ago (excluded). Built from local calendar
-        // dates at noon (not `now` minus a day count) so the test is
-        // independent of what time of day it happens to run.
+        // Every session is anchored to local noon on a calendar date rather
+        // than to `now` minus a day count. `now`-relative timestamps make the
+        // test time-of-day dependent: a session started within its own
+        // duration of local midnight is *correctly* split across two days by
+        // `accumulate_session_by_local_day` (F-5-2), so `any(secs == 600)`
+        // stops holding. That is how this test failed in CI on runs that
+        // landed in the last ten minutes of the UTC day.
         let today = chrono::Local::now().date_naive();
         let local_noon_timestamp = |date: chrono::NaiveDate| -> i64 {
             date.and_hms_opt(12, 0, 0)
@@ -3141,8 +3138,16 @@ mod tests {
                 .unwrap()
                 .timestamp()
         };
-        let day_364_ago = local_noon_timestamp(today - chrono::Duration::days(364));
-        let day_365_ago = local_noon_timestamp(today - chrono::Duration::days(365));
+        let days_ago = |n: i64| local_noon_timestamp(today - chrono::Duration::days(n));
+
+        insert_reading_session(&conn, "s-recent", "book-3", days_ago(1), 600, 1).unwrap();
+        insert_reading_session(&conn, "s-40d", "book-3", days_ago(40), 900, 1).unwrap();
+        insert_reading_session(&conn, "s-400d", "book-3", days_ago(400), 1200, 1).unwrap();
+
+        // Calendar-window edge: exactly 364 days ago (included), one day
+        // further back at 365 days ago (excluded).
+        let day_364_ago = days_ago(364);
+        let day_365_ago = days_ago(365);
         insert_reading_session(&conn, "s-364d", "book-3", day_364_ago, 300, 1).unwrap();
         insert_reading_session(&conn, "s-365d", "book-3", day_365_ago, 450, 1).unwrap();
 
