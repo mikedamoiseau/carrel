@@ -550,7 +550,12 @@ where
     };
 
     let Some(hash) = book_hash else {
-        // No hash to key the cache on — render straight from the file.
+        // No hash to key the cache on — render straight from the file. The
+        // guard mirrors the comic arm's: neither pdfium nor
+        // `ensure_pdf_prewarmed` preserves `NotFound` for a missing book
+        // file, so without it the web adapter answers 400 for a file that
+        // is simply gone.
+        ensure_file_exists(file_path)?;
         return direct();
     };
 
@@ -558,6 +563,18 @@ where
         .map(|m| m.format == BookFormat::Pdf)
         .unwrap_or(false);
     if !has_pdf_manifest {
+        // The comic arm's guard, and it must sit *inside* this branch:
+        // once a manifest exists a page can be served with the file gone,
+        // which is this milestone's whole point, so a blanket check at the
+        // top would refuse exactly the reads the cache makes possible.
+        // Here it does two jobs — neither pdfium nor `ensure_pdf_prewarmed`
+        // preserves `NotFound`, so without it the web adapter answers 400
+        // for a file that is simply gone; and it keeps an unreachable file
+        // out of the cache-error swallow below, which would otherwise log
+        // it as a cache failure and then re-open it in `direct()` just to
+        // produce the real error (M2 review round 2, finding 3).
+        ensure_file_exists(file_path)?;
+
         // Private mode never *creates* a cache entry (M2 review, finding
         // F2). The manifest holds no page content, but it does record
         // `book_id` and a `last_accessed` this call would then keep
@@ -631,16 +648,23 @@ where
 /// PDF (M2 review, finding F3) gets the same treatment for the same
 /// reason: once [`page_image`]'s PDF arm serves pages with no source
 /// access, a `page_count` that still always opens the file is what stops a
-/// fully-cached PDF from opening at all when its source is gone — the
-/// exact scenario the caching exists for. Its completeness test is
-/// [`page_cache::complete_pdf_manifest`] rather than
-/// [`page_cache::complete_manifest`], since PDF manifests list no page
-/// names; the standard it holds them to is the same.
+/// cached PDF from opening at all when its source is gone — the exact
+/// scenario the caching exists for. Its test is deliberately *weaker* than
+/// the comic one, not the same:
+/// [`page_cache::pdf_manifest_page_count`] trusts a PDF manifest's count
+/// whether or not any page is cached, because unlike a comic manifest it
+/// makes no claim about what is on disk. That function's doc comment has
+/// the full argument.
+///
+/// `pages` is optional (M2 review round 2, finding 1) so that a caller
+/// whose cache directory cannot even be opened degrades to reading the
+/// file instead of failing — the same principle as [`page_image`]'s
+/// fallbacks. `None` simply skips the manifest lookup.
 pub fn page_count(
     format: BookFormat,
     file_path: &str,
     book_hash: Option<&str>,
-    pages: &dyn Storage,
+    pages: Option<&dyn Storage>,
 ) -> CarrelResult<u32> {
     if !matches!(format, BookFormat::Cbz | BookFormat::Cbr | BookFormat::Pdf) {
         return Err(CarrelError::invalid(format!(
@@ -648,17 +672,16 @@ pub fn page_count(
         )));
     }
 
-    if let Some(hash) = book_hash {
-        // PDF manifests list no page names, so the comic completeness test
-        // reports `None` for every PDF — see
-        // [`page_cache::complete_pdf_manifest`], which applies the same
-        // two-page sample to the derived filenames.
-        let cached = if format == BookFormat::Pdf {
-            page_cache::complete_pdf_manifest(pages, hash)
-        } else {
-            page_cache::complete_manifest(pages, hash)
-        };
-        if let Some(manifest) = cached {
+    if let (Some(hash), Some(pages)) = (book_hash, pages) {
+        // The two formats get different tests on purpose — see
+        // [`page_cache::pdf_manifest_page_count`] for why a PDF manifest is
+        // trustworthy without any page being cached, while a comic
+        // manifest is not.
+        if format == BookFormat::Pdf {
+            if let Some(count) = page_cache::pdf_manifest_page_count(pages, hash) {
+                return Ok(count);
+            }
+        } else if let Some(manifest) = page_cache::complete_manifest(pages, hash) {
             if manifest.format == format {
                 return Ok(manifest.page_count);
             }
@@ -1648,7 +1671,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_cbz(dir.path(), &[encode_jpeg(10, 10), encode_jpeg(10, 10)]);
         let pages = pages_storage(dir.path());
-        assert_eq!(page_count(BookFormat::Cbz, &path, None, &pages).unwrap(), 2);
+        assert_eq!(
+            page_count(BookFormat::Cbz, &path, None, Some(&pages)).unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -1656,8 +1682,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pages = pages_storage(dir.path());
         let missing = dir.path().join("nope.cbr");
-        let err =
-            page_count(BookFormat::Cbr, &missing.to_string_lossy(), None, &pages).unwrap_err();
+        let err = page_count(
+            BookFormat::Cbr,
+            &missing.to_string_lossy(),
+            None,
+            Some(&pages),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
     }
 
@@ -1667,7 +1698,7 @@ mod tests {
         let pages = pages_storage(dir.path());
         for format in [BookFormat::Epub, BookFormat::Mobi] {
             let name = format.to_string();
-            let err = page_count(format, "/nope", None, &pages).unwrap_err();
+            let err = page_count(format, "/nope", None, Some(&pages)).unwrap_err();
             assert!(
                 err.to_string().contains("not supported"),
                 "unexpected error for {name}: {err}"
@@ -1711,17 +1742,22 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
 
-        let count = page_count(BookFormat::Pdf, &path, Some("pdf-count"), &pages).unwrap();
+        let count = page_count(BookFormat::Pdf, &path, Some("pdf-count"), Some(&pages)).unwrap();
         assert_eq!(count, 1);
     }
 
-    /// The other half of F3: a manifest alone must not be trusted.
-    /// `ensure_pdf_prewarmed` writes one carrying the real page count
-    /// before any page has been rendered, so a book whose pages are not
-    /// actually on disk must fall back to opening the file — and report
-    /// `NotFound` when it is gone, rather than a count it cannot serve.
+    /// A PDF manifest is trusted for its count even with no page cached —
+    /// deliberately weaker than the comic standard, and the reason is in
+    /// [`page_cache::pdf_manifest_page_count`]'s doc comment.
+    ///
+    /// The case that makes it matter (M2 review round 2, finding 2): PDF
+    /// pages are cached one at a time as they are read, so a book read only
+    /// part-way through has its early pages and not its last. Demanding
+    /// first-and-last the way comics do would refuse the count for it, and
+    /// a book with plenty of readable cached pages would not open at all
+    /// once its source went away — the exact case the cache is for.
     #[test]
-    fn a_pdf_manifest_with_no_cached_pages_is_not_trusted() {
+    fn a_partly_cached_pdf_still_reports_its_page_count() {
         if !pdfium_available() {
             eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
             return;
@@ -1730,19 +1766,52 @@ mod tests {
         let path = write_pdf(dir.path());
         let pages = pages_storage(dir.path());
 
-        // Manifest only: the real page count, zero pages rendered.
+        // Manifest carrying the real count, with nothing cached — the state
+        // a book is in the moment before its first page is rendered, and
+        // the state a partly-read long book is in for its later pages.
         page_cache::ensure_pdf_prewarmed(&pages, "bk", "pdf-bare", &path, 0).unwrap();
-        assert!(page_cache::read_manifest(&pages, "pdf-bare").is_some());
-
-        // With the file present, the fallback answers.
-        assert_eq!(
-            page_count(BookFormat::Pdf, &path, Some("pdf-bare"), &pages).unwrap(),
-            1
-        );
 
         std::fs::remove_file(&path).unwrap();
-        let err = page_count(BookFormat::Pdf, &path, Some("pdf-bare"), &pages).unwrap_err();
+        assert_eq!(
+            page_count(BookFormat::Pdf, &path, Some("pdf-bare"), Some(&pages)).unwrap(),
+            1,
+            "the manifest's count comes from pdfium and is keyed by content \
+             hash — it is correct whether or not a page is cached"
+        );
+    }
+
+    /// A PDF with no manifest and no reachable file has nothing to answer
+    /// from, and must say `NotFound` rather than inventing a count.
+    #[test]
+    fn a_pdf_with_no_manifest_and_no_file_is_reported_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages = pages_storage(dir.path());
+        let missing = dir.path().join("gone.pdf");
+
+        let err = page_count(
+            BookFormat::Pdf,
+            &missing.to_string_lossy(),
+            Some("pdf-none"),
+            Some(&pages),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    /// M2 review round 2, finding 1: a caller whose cache directory cannot
+    /// be opened at all passes `None`, and must still get a count from the
+    /// file rather than an error. Before this route consulted the cache it
+    /// simply read the file, so a broken cache dir must cost the cache, not
+    /// the book.
+    #[test]
+    fn page_count_without_a_cache_reads_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(10, 10), encode_jpeg(10, 10)]);
+
+        assert_eq!(
+            page_count(BookFormat::Cbz, &path, Some("hash-nocache"), None).unwrap(),
+            2
+        );
     }
 
     /// F5 (M1 review): a fully cached comic must still report its page
@@ -1772,7 +1841,7 @@ mod tests {
         .unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        let count = page_count(BookFormat::Cbz, &path, Some("hash-count"), &pages).unwrap();
+        let count = page_count(BookFormat::Cbz, &path, Some("hash-count"), Some(&pages)).unwrap();
         assert_eq!(count, 2);
     }
 
@@ -1807,14 +1876,15 @@ mod tests {
         // missing), so this falls through to the archive, which knows the
         // real count.
         assert_eq!(
-            page_count(BookFormat::Cbz, &path, Some("hash-partial"), &pages).unwrap(),
+            page_count(BookFormat::Cbz, &path, Some("hash-partial"), Some(&pages)).unwrap(),
             3
         );
 
         // Source gone: must fail rather than report the manifest's
         // unverified `page_count` field.
         std::fs::remove_file(&path).unwrap();
-        let err = page_count(BookFormat::Cbz, &path, Some("hash-partial"), &pages).unwrap_err();
+        let err =
+            page_count(BookFormat::Cbz, &path, Some("hash-partial"), Some(&pages)).unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
     }
 }

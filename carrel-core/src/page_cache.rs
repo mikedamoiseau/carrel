@@ -604,34 +604,35 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
     }
 }
 
-/// PDF analogue of [`complete_manifest`]: whether `book_hash`'s cached PDF
-/// is complete enough to trust its page count without reopening the source
-/// file. Returns the manifest when so, `None` otherwise.
+/// The PDF manifest for `book_hash`, when one exists and carries a page
+/// count — the counterpart of [`complete_manifest`], deliberately *not* the
+/// same test.
 ///
-/// PDF manifests deliberately keep `pages` empty — a PDF page's filename is
-/// derived from its index rather than listed (see the comment at the top of
-/// [`ensure_cached`]) — so [`complete_manifest`]'s "first and last entry of
-/// `pages` are on disk" sample reports `None` for *every* PDF, however
-/// completely cached. This applies the same two-page sample against the
-/// derived names instead, so the two formats are held to one standard: a
-/// manifest that merely exists is never enough, because
-/// [`ensure_pdf_prewarmed`] writes one with the real page count before any
-/// page has been rendered.
-pub fn complete_pdf_manifest(storage: &dyn Storage, book_hash: &str) -> Option<CacheManifest> {
+/// [`complete_manifest`] samples two of a comic's listed pages because a
+/// comic manifest makes a claim about what is on disk: `ensure_comic_fast`
+/// writes a complete-looking `pages` list while the extraction is still
+/// running, so trusting it would report a count for pages that are not
+/// there. A PDF manifest makes no such claim — `pages` is empty, filenames
+/// derive from the index, and pages are cached one at a time on demand —
+/// and its `page_count` comes straight from pdfium at
+/// [`ensure_pdf_prewarmed`] time. It is keyed by content hash, so a changed
+/// file is a different key, and a prewarm that fails leaves no manifest at
+/// all. The count is therefore correct whether or not any page is cached.
+///
+/// Requiring cached pages here would buy no correctness and would cost the
+/// availability this exists for: PDF pages fill in as they are read, so a
+/// 300-page book read to page 20 has page 0 but not page 299. Demanding
+/// both would refuse the count for it, and the book that has 21 perfectly
+/// readable cached pages would not open at all once its source went away —
+/// the exact case the page cache is for. A caller that opens such a book
+/// gets working pages where they are cached and an error where they are
+/// not, which is strictly better than no book.
+pub fn pdf_manifest_page_count(storage: &dyn Storage, book_hash: &str) -> Option<u32> {
     let manifest = read_manifest(storage, book_hash)?;
     if manifest.format != BookFormat::Pdf || manifest.page_count == 0 {
         return None;
     }
-    let present = |idx: u32| {
-        storage
-            .exists(&page_key(book_hash, &format!("{idx:03}.jpg")))
-            .unwrap_or(false)
-    };
-    if present(0) && present(manifest.page_count - 1) {
-        Some(manifest)
-    } else {
-        None
-    }
+    Some(manifest.page_count)
 }
 
 pub fn ensure_cached(

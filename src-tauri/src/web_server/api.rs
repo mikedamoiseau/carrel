@@ -1583,9 +1583,20 @@ async fn get_page_count(
         // fully-cached PDF still could not be opened with its source gone,
         // which is the case the caching is for.
         BookFormat::Cbz | BookFormat::Cbr | BookFormat::Pdf => {
-            let pages_storage = state
-                .pages_storage()
-                .map_err(|e| book_file_status(count_not_found, count_invalid, e))?;
+            // A cache directory that cannot even be opened must cost the
+            // cache, not the book (M2 review round 2, finding 1): before
+            // this route consulted the cache at all, it just read the file,
+            // and a `LocalStorage::new` failure — an unwritable or missing
+            // cache parent — would otherwise 500 a count the file itself
+            // can still answer. `page_count` skips the manifest lookup when
+            // handed `None`.
+            let pages_storage = match state.pages_storage() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("page cache unavailable for page count, reading the file: {e}");
+                    None
+                }
+            };
             let format = book.format.clone();
             let file_hash = book.file_hash.clone();
             tokio::task::spawn_blocking(move || {
@@ -1593,7 +1604,7 @@ async fn get_page_count(
                     format,
                     &file_path,
                     file_hash.as_deref(),
-                    pages_storage.as_ref(),
+                    pages_storage.as_deref(),
                 )
             })
             .await

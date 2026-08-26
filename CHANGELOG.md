@@ -26,8 +26,9 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   page request once it's been viewed once. A PDF whose pages are already
   cached now also opens when its source file is unreachable (a disconnected
   network library), which previously failed at the page-count step. A book
-  read in private mode renders normally but leaves nothing in the shared
-  cache — neither its pages nor a record that it was opened.
+  read in private mode renders normally but no longer starts a cache entry
+  for itself, so a private read of a book that was never opened before
+  leaves nothing behind.
 
 ## [3.1.0] - 2026-08-24
 
