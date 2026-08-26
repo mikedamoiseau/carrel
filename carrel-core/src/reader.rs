@@ -1949,6 +1949,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+        // The message, not just the kind: an out-of-range page is also
+        // `NotFound`, so kind alone would keep passing if the remap were
+        // widened to swallow every error — and the web adapter would go
+        // back to answering 400 for a file that is simply gone.
+        assert!(
+            err.to_string().contains("Book file not found"),
+            "unexpected error: {err}"
+        );
     }
 
     /// The page-0 probe in `page_cache::pdf_manifest_page_count` is a fast

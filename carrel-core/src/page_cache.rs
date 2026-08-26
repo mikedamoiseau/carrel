@@ -635,12 +635,13 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
 /// "At least one page" is what separates them.
 ///
 /// Answering that cheaply matters, because this runs on book open. Page 0
-/// is the overwhelmingly common case — it is where a book is read from, and
-/// where `prepare_pdf`'s reserved first-page render puts one — so an
-/// `exists` probe answers almost every call in one stat. Only when page 0
-/// is absent does this fall back to a listing, which keeps the book
-/// resumed part-way (cached from page 50 up, page 0 never visited) opening
-/// while confining the cost to that rare shape. The fallback is worth
+/// is the common case — it is where reading a book starts, and where the
+/// desktop's background prerender pass fills in first — so an `exists`
+/// probe answers most calls in one stat. It is not the rule, though: a book
+/// resumed at page 50 is cached from there up, and `prepare_pdf`'s reserved
+/// render targets that resume page rather than page 0, so on such a book
+/// nothing is at index 0 at all. That is what the listing fallback is for,
+/// and why it must not be deleted as redundant. The fallback is worth
 /// confining rather than defaulting to: `Storage::list` filters by prefix
 /// but the local implementation walks the whole storage root to build the
 /// list first, and that root is the entire app cache — exactly the
