@@ -1459,6 +1459,10 @@ async fn get_page_image(
                     // doesn't persist rendered pages to the shared
                     // page-cache directory.
                     is_private,
+                    // The web reader has no book-open event of its own — a
+                    // miss must prime the cache itself, or a book never gets
+                    // cached at all. See `carrel_core::reader::OnMiss`.
+                    carrel_core::reader::OnMiss::Prime,
                 )
             })
             .await
@@ -1550,6 +1554,11 @@ async fn get_page_image(
                     // so fixing that gap later is a deliberate, reviewed
                     // change, not an accidental side effect of this one.
                     false,
+                    // The web reader has no book-open event of its own — a
+                    // miss must prime the whole archive itself, or a book
+                    // never gets cached at all. See
+                    // `carrel_core::reader::OnMiss`.
+                    carrel_core::reader::OnMiss::Prime,
                 )
             })
             .await

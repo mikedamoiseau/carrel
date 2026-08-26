@@ -78,14 +78,18 @@
 //! fallback documented on [`page_image`] — that turns the user-visible
 //! symptom into a slower direct decode rather than an error. `EXTRACTION_LOCKS`
 //! (below) closes the equivalent race *between concurrent web requests*, but
-//! not this one: `prepare_comic` doesn't take that lock, since wiring the
-//! desktop path through this module is milestone M3, not this one.
-//! Reworking `page_cache`'s manifest protocol itself is also out of scope
-//! here. What would actually resolve this is a shared in-flight/extraction
-//! protocol both surfaces participate in — the desktop command taking
-//! (or being routed through) the same per-`book_hash` lock this module uses,
-//! so "someone is already priming this book" is visible process-wide, not
-//! just within this module's own callers.
+//! not this one: `prepare_comic` doesn't take that lock. M3 routed the
+//! desktop's page-*read* commands through this module (via
+//! [`OnMiss::ReadSource`], which never primes and so never contends for
+//! this lock either), but `prepare_comic`/`prepare_pdf` themselves and their
+//! background prerender passes stay outside it — reworking `page_cache`'s
+//! manifest protocol, or giving the desktop's priming path a stake in
+//! `EXTRACTION_LOCKS`, is still out of scope. What would actually resolve
+//! this is a shared in-flight/extraction protocol both surfaces participate
+//! in — the desktop command taking (or being routed through) the same
+//! per-`book_hash` lock this module uses, so "someone is already priming
+//! this book" is visible process-wide, not just within this module's own
+//! callers.
 //!
 //! # PDF page reads (M2)
 //!
@@ -265,6 +269,42 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// What a cache miss in [`page_image`] should do about it (M3).
+///
+/// Both desktop and web read through the same page cache, but only the
+/// desktop has a book-open event (`commands::prepare_comic` /
+/// `commands::prepare_pdf`, both outside this crate) plus a background
+/// prerender pass that primes the cache ahead of the first page request.
+/// The web reader has neither — its page read is the only place that can
+/// ever prime its cache, so a miss there must do that priming work itself,
+/// or a book never gets cached at all. The desktop's page read runs *after*
+/// its own open event already had the chance to prime: a miss there is
+/// either "the background pass hasn't gotten to this page yet, and will"
+/// (in which case blocking this foreground request on a full prime would
+/// fight that background pass for the same network-mounted file and CPU —
+/// precisely what the background pass exists to avoid) or "nothing is
+/// coming for this book" (nothing to wait for either way). So the desktop's
+/// miss must read just the page it was asked for and leave priming to the
+/// open event and its background pass.
+///
+/// A future reader will be tempted to collapse these into one path — don't.
+/// The asymmetry is not an accident of how the two surfaces happened to be
+/// written; it is a direct consequence of only one of them having a
+/// book-open event at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnMiss {
+    /// A miss primes the cache for the whole book — the entire archive for
+    /// a comic, or an established manifest for a PDF — then serves the
+    /// requested page from it. What the web adapter passes: it has no other
+    /// event that could ever prime the cache.
+    Prime,
+    /// A miss reads just the requested page from the source and leaves
+    /// priming to whoever else owns it. What the desktop passes: its own
+    /// book-open command and background prerender pass already own priming,
+    /// so the page read must not duplicate — or race — that work.
+    ReadSource,
+}
+
 /// Read one comic or PDF page's image bytes, downscaled to `target_width`
 /// when given and the source is wider (see
 /// [`crate::image_util::maybe_resize_to_jpeg`]).
@@ -362,6 +402,12 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// Comics ignore it: there is no equivalent write-suppression path for
 /// CBZ/CBR yet (tracked in
 /// `docs/backlog/comic-cache-ignores-private-mode.md`).
+///
+/// `on_miss` (M3) is what makes this one function usable by both surfaces
+/// despite their different book-open behaviour — see [`OnMiss`]'s doc
+/// comment for the full argument. It changes nothing about the cache-*hit*
+/// path above; it only changes what happens when there is nothing to serve
+/// yet.
 #[allow(clippy::too_many_arguments)]
 pub fn page_image<F>(
     format: BookFormat,
@@ -373,6 +419,7 @@ pub fn page_image<F>(
     pages: Option<&dyn Storage>,
     on_extracted: F,
     is_private: bool,
+    on_miss: OnMiss,
 ) -> CarrelResult<(Vec<u8>, String)>
 where
     F: Fn(),
@@ -387,6 +434,7 @@ where
             pages,
             on_extracted,
             is_private,
+            on_miss,
         );
     }
 
@@ -395,6 +443,15 @@ where
             "page reads are not supported for format {format}"
         )));
     }
+
+    // Restores the two `[page-load]` timing lines the desktop's inline
+    // implementation carried before M3 folded it in here (`CARREL_DEBUG_PAGES`
+    // gates them). They report the *end-to-end* cost of serving one page,
+    // resize included, which is the number this repo's page-turn and
+    // PDF-render perf epics were measured against — `page_cache`'s own
+    // `page_dbg!` lines time its internals, not this. Both surfaces get
+    // them now; the web adapter never had them.
+    let started = std::time::Instant::now();
 
     // Both a hash to key on and a usable cache, or there is no cache path
     // to take: a caller whose cache directory cannot even be opened passes
@@ -412,7 +469,26 @@ where
             // happen at human speed, so a manifest write per hit is cheap
             // enough not to need throttling.
             page_cache::touch_last_accessed(pages, hash);
-            return crate::image_util::maybe_resize_to_jpeg(data, mime, target_width);
+            let (bytes, out_mime) =
+                crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+            page_cache::page_dbg!(
+                "bytes cache HIT: page={} size={}KB total={:?}",
+                page_index,
+                bytes.len() / 1024,
+                started.elapsed()
+            );
+            return Ok((bytes, out_mime));
+        }
+
+        if on_miss == OnMiss::ReadSource {
+            // Desktop: priming is `prepare_comic`'s and its background
+            // `extract_comic_remaining` pass's job, not this call's — see
+            // [`OnMiss`]. Read just the requested page straight from the
+            // archive and leave the cache exactly as it was: no lock, no
+            // `ensure_cached`, no `on_extracted`. This is the same fallback
+            // the pre-M3 desktop implementation always used on a miss.
+            ensure_file_exists(file_path)?;
+            return direct_comic_page(format, file_path, page_index, target_width, started);
         }
 
         // Cache miss: prime the *whole* archive into the cache before
@@ -441,7 +517,15 @@ where
         // exactly what turns "three extractions" into "one".
         if let Ok((data, mime)) = page_cache::get_cached_page(pages, hash, page_index) {
             page_cache::touch_last_accessed(pages, hash);
-            return crate::image_util::maybe_resize_to_jpeg(data, mime, target_width);
+            let (bytes, out_mime) =
+                crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+            page_cache::page_dbg!(
+                "bytes cache HIT: page={} size={}KB total={:?}",
+                page_index,
+                bytes.len() / 1024,
+                started.elapsed()
+            );
+            return Ok((bytes, out_mime));
         }
 
         // `ensure_file_exists` runs first because neither `ensure_cached`
@@ -470,15 +554,42 @@ where
         // to a direct decode (see this function's doc comment) rather than
         // propagating `get_cached_page`'s error. `on_extracted` does not
         // fire: there is nothing usable in the cache to run eviction around.
-        return if format == BookFormat::Cbz {
-            crate::cbz::get_page_image_bytes(file_path, page_index, target_width)
-        } else {
-            crate::cbr::get_page_image_bytes(file_path, page_index, target_width)
-        };
+        return direct_comic_page(format, file_path, page_index, target_width, started);
     }
 
     // No hash to key the cache on — render straight from the archive.
     ensure_file_exists(file_path)?;
+    direct_comic_page(format, file_path, page_index, target_width, started)
+}
+
+/// Decode one comic page straight from the archive, bypassing the page
+/// cache entirely. Shared by every path in [`page_image`]'s comic arm that
+/// has nothing (or nothing usable) cached to serve from: no hash, no usable
+/// `pages` storage, [`OnMiss::ReadSource`]'s miss, and the degrade-on-failed
+/// read-back fallback.
+fn direct_comic_page(
+    format: BookFormat,
+    file_path: &str,
+    page_index: u32,
+    target_width: Option<u32>,
+    started: std::time::Instant,
+) -> CarrelResult<(Vec<u8>, String)> {
+    let (bytes, mime) = direct_comic_decode(format, file_path, page_index, target_width)?;
+    page_cache::page_dbg!(
+        "bytes archive read: page={} size={}KB total={:?}",
+        page_index,
+        bytes.len() / 1024,
+        started.elapsed()
+    );
+    Ok((bytes, mime))
+}
+
+fn direct_comic_decode(
+    format: BookFormat,
+    file_path: &str,
+    page_index: u32,
+    target_width: Option<u32>,
+) -> CarrelResult<(Vec<u8>, String)> {
     if format == BookFormat::Cbz {
         crate::cbz::get_page_image_bytes(file_path, page_index, target_width)
     } else {
@@ -502,24 +613,32 @@ where
 /// book-open via `page_cache::ensure_pdf_prewarmed(..., 0)` (zero pages
 /// rendered up front, just the page count recorded so later lazy writes
 /// have a manifest to attach to). The web reader has no equivalent "open"
-/// event, so this lazily runs that exact same zero-prewarm call — not a new
-/// whole-book prime, just the page count — the first time it sees a book
-/// with no manifest yet. Once a manifest exists (created by either
-/// surface), every later call for that `book_hash` goes straight to
-/// `get_or_render_pdf_page_with_eviction`: a hit reads the disk cache only
-/// (never touches `file_path`, which is what lets a caller prove the cache
-/// is doing its job by deleting the source file between two reads of the
-/// same page), a miss renders one page via pdfium and writes it.
+/// event, so with `on_miss` set to [`OnMiss::Prime`] this lazily runs that
+/// exact same zero-prewarm call — not a new whole-book prime, just the page
+/// count — the first time it sees a book with no manifest yet. With
+/// [`OnMiss::ReadSource`] (desktop) a missing manifest is never established
+/// here at all — only `prepare_pdf` does that — and a book with none yet
+/// simply renders at the viewport width on every call, exactly as it did
+/// before this module existed. Once a manifest exists (created by either
+/// surface, or by `prepare_pdf` out-of-band), every later call for that
+/// `book_hash` goes straight to `get_or_render_pdf_page_with_eviction`
+/// regardless of `on_miss`: a hit reads the disk cache only (never touches
+/// `file_path`, which is what lets a caller prove the cache is doing its
+/// job by deleting the source file between two reads of the same page), a
+/// miss renders one page via pdfium and writes it.
 ///
-/// When `is_private` is true and no manifest exists yet, that establishing
-/// step is skipped entirely and the page renders directly: the manifest
-/// holds no page content, but it does record `book_id` and a
-/// `last_accessed` that later reads keep refreshing, which a private web
-/// read left nowhere before this milestone. (Desktop's `prepare_pdf` writes
-/// it unconditionally, but it runs on an explicit book-open, not on every
-/// page request.) For a book whose manifest already exists, `is_private`
-/// forwards to `get_or_render_pdf_page_with_eviction`'s `suppress_write`,
-/// which skips only the page-bytes disk write.
+/// When `on_miss` is [`OnMiss::Prime`] and `is_private` is true and no
+/// manifest exists yet, that establishing step is skipped entirely and the
+/// page renders directly: the manifest holds no page content, but it does
+/// record `book_id` and a `last_accessed` that later reads keep refreshing,
+/// which a private web read left nowhere before this milestone. (Desktop's
+/// `prepare_pdf` writes it unconditionally, but it runs on an explicit
+/// book-open, not on every page request — and `on_miss` being
+/// [`OnMiss::ReadSource`] there makes this specific check moot, since
+/// desktop never reaches it.) For a book whose manifest already exists,
+/// `is_private` forwards to `get_or_render_pdf_page_with_eviction`'s
+/// `suppress_write`, which skips only the page-bytes disk write — this part
+/// applies on both surfaces alike.
 ///
 /// # Degrading instead of failing
 ///
@@ -547,6 +666,7 @@ fn pdf_page_image<F>(
     pages: Option<&dyn Storage>,
     on_extracted: F,
     is_private: bool,
+    on_miss: OnMiss,
 ) -> CarrelResult<(Vec<u8>, String)>
 where
     F: Fn(),
@@ -585,6 +705,15 @@ where
         // it as a cache failure and then re-open it in `direct()` just to
         // produce the real error (M2 review round 2, finding 3).
         ensure_file_exists(file_path)?;
+
+        if on_miss == OnMiss::ReadSource {
+            // Desktop: only `commands::prepare_pdf` establishes a manifest
+            // (see [`OnMiss`]) — a page read must never create one itself.
+            // With none in place yet this renders at the viewport width
+            // directly and touches the cache not at all, the same fallback
+            // the pre-M3 desktop implementation always used here.
+            return direct();
+        }
 
         // Private mode never *creates* a cache entry (M2 review, finding
         // F2). The manifest holds no page content, but it does record
@@ -655,6 +784,37 @@ where
     // widthless request gets the bytes it always got.
     let target_width = target_width.or(Some(crate::pdf::DEFAULT_RENDER_WIDTH));
     crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)
+}
+
+/// Probe `pages` for `book_hash`'s copy of `page_index`, downscaled to
+/// `target_width` when given — never touching `file_path` or writing
+/// anything. `Ok(None)` on a cache miss, so a caller (the desktop reader's
+/// background preloader) can serve "not cached yet" without ever falling
+/// through to a source read: that is the whole point of a probe like this
+/// one, since decoding a comic archive or rendering a PDF page to warm a
+/// neighbor page the reader has not turned to yet would contend with the
+/// foreground page turn the user actually is waiting on for the same
+/// network-mounted file or CPU (see [`OnMiss::ReadSource`]'s doc comment for
+/// why the desktop's *foreground* page read already avoids that; this
+/// function is the same discipline applied to the *background* one).
+///
+/// Shares [`page_cache::get_cached_page`] with [`page_image`]'s own
+/// cache-hit path, but — unlike that path — does not call
+/// [`page_cache::touch_last_accessed`]: this is a speculative probe fired
+/// for pages the reader has not necessarily turned to yet, and treating it
+/// as a real read would let `run_eviction` protect pages nobody has looked
+/// at over ones that were.
+pub fn cached_page(
+    pages: &dyn Storage,
+    book_hash: &str,
+    page_index: u32,
+    target_width: Option<u32>,
+) -> CarrelResult<Option<(Vec<u8>, String)>> {
+    let Ok((data, mime)) = page_cache::get_cached_page(pages, book_hash, page_index) else {
+        return Ok(None);
+    };
+    let (bytes, out_mime) = crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+    Ok(Some((bytes, out_mime)))
 }
 
 /// Page count for CBZ/CBR/PDF. Other formats error with
@@ -921,6 +1081,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(page_cache::read_manifest(&pages, "hash1").is_some());
@@ -937,6 +1098,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(second, first);
@@ -967,6 +1129,7 @@ mod tests {
                 calls.set(calls.get() + 1);
             },
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(calls.get(), 1, "must fire on the priming miss");
@@ -983,6 +1146,7 @@ mod tests {
                 calls.set(calls.get() + 1);
             },
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(calls.get(), 1, "must not fire again on a cache hit");
@@ -1012,6 +1176,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
 
@@ -1026,6 +1191,7 @@ mod tests {
             Some(&pages),
             || calls.set(calls.get() + 1),
             false,
+            OnMiss::Prime,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1052,6 +1218,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         let before = page_cache::read_manifest(&pages, "hash-touch")
@@ -1073,6 +1240,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         let after = page_cache::read_manifest(&pages, "hash-touch")
@@ -1113,6 +1281,7 @@ mod tests {
             Some(&pages),
             evict_to_zero,
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(!first.0.is_empty());
@@ -1134,6 +1303,7 @@ mod tests {
             Some(&pages),
             evict_to_zero,
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(second, first);
@@ -1181,6 +1351,7 @@ mod tests {
                             extractions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         },
                         false,
+                        OnMiss::Prime,
                     )
                     .unwrap();
                 });
@@ -1220,6 +1391,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -1234,6 +1406,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(mime, "image/jpeg");
@@ -1265,6 +1438,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1287,6 +1461,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1311,6 +1486,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(!bytes.is_empty());
@@ -1337,6 +1513,7 @@ mod tests {
                 Some(&pages),
                 || {},
                 false,
+                OnMiss::Prime,
             )
             .unwrap_err();
             assert!(
@@ -1344,6 +1521,116 @@ mod tests {
                 "unexpected error for {name}: {err}"
             );
         }
+    }
+
+    // ── OnMiss::ReadSource — desktop page reads (M3) ────────────────────
+
+    /// M3's acceptance criterion: the desktop's `on_miss` (`ReadSource`)
+    /// must NEVER prime the cache on a miss — it may only read the one page
+    /// it was asked for. Deleting the source file straight after the read
+    /// is what makes "nothing was primed" observable as a *behaviour*
+    /// rather than an implementation detail: if this call had primed the
+    /// whole archive (the `OnMiss::Prime` behaviour every other comic test
+    /// in this module pins), a manifest would exist and a second read of a
+    /// *different* page would still succeed with the file gone. Asserting
+    /// only "no manifest" would be enough on its own, but this goes one step
+    /// further and proves the negative behaviourally too.
+    #[test]
+    fn read_source_miss_reads_just_the_page_without_priming_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(
+            dir.path(),
+            &[
+                encode_jpeg(50, 50),
+                encode_jpeg(50, 50),
+                encode_jpeg(50, 50),
+            ],
+        );
+        let pages = pages_storage(dir.path());
+        let calls = std::cell::Cell::new(0u32);
+
+        let got = page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-readsource"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            false,
+            OnMiss::ReadSource,
+        )
+        .unwrap();
+
+        let direct = crate::cbz::get_page_image_bytes(&path, 0, None).unwrap();
+        assert_eq!(got, direct);
+        assert_eq!(
+            calls.get(),
+            0,
+            "on_extracted must not fire — nothing was primed"
+        );
+        assert!(
+            page_cache::read_manifest(&pages, "hash-readsource").is_none(),
+            "a ReadSource miss must never write a cache manifest — a foreground \
+             desktop page turn priming a whole network-mounted archive is the \
+             exact regression this milestone exists to prevent"
+        );
+
+        // Confirms the negative behaviourally: with nothing primed, a
+        // *different* page can no longer be read once the source is gone —
+        // if the miss above had gone through `OnMiss::Prime` instead, this
+        // would succeed from the cache it would have written.
+        std::fs::remove_file(&path).unwrap();
+        let err = page_image(
+            BookFormat::Cbz,
+            &path,
+            1,
+            None,
+            "bk",
+            Some("hash-readsource"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::ReadSource,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    /// A `ReadSource` miss must not disable the cache entirely — it only
+    /// refuses to *prime* it on a miss. A book already fully cached by
+    /// someone else (the desktop's own `prepare_comic`, out of scope for
+    /// this crate, so simulated here via `ensure_cached` directly) must
+    /// still serve every page from that cache, source deleted, exactly like
+    /// `OnMiss::Prime`'s cache-hit path — the two variants only disagree
+    /// about what to do when there is nothing to serve yet.
+    #[test]
+    fn read_source_still_serves_a_cache_primed_by_someone_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50), encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+
+        // Stands in for the desktop's `prepare_comic` command, which this
+        // crate does not own.
+        page_cache::ensure_cached(&pages, "bk", "hash-preprimed", &path, &BookFormat::Cbz).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let (bytes, mime) = page_image(
+            BookFormat::Cbz,
+            &path,
+            1,
+            None,
+            "bk",
+            Some("hash-preprimed"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::ReadSource,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
     }
 
     // ── PDF page reads (M2) ─────────────────────────────────────────────
@@ -1474,6 +1761,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(first.1, "image/jpeg");
@@ -1492,6 +1780,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(second, first);
@@ -1538,6 +1827,7 @@ mod tests {
                 Some(&pages),
                 || {},
                 false,
+                OnMiss::Prime,
             )
             .unwrap();
             assert_eq!(
@@ -1571,6 +1861,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(!bytes.is_empty());
@@ -1607,6 +1898,7 @@ mod tests {
             Some(&pages),
             || {},
             true,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(!bytes.is_empty(), "private mode must still render the page");
@@ -1663,6 +1955,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         );
 
         // Restore before the assert, so a failure does not also leak the
@@ -1709,6 +2002,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(page_cache::read_manifest(&pages, "pdf-evict").is_some());
@@ -1732,9 +2026,118 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert_eq!(second, first);
+    }
+
+    // ── OnMiss::ReadSource — desktop PDF reads (M3) ─────────────────────
+
+    /// M3's other acceptance criterion: with no manifest yet, a `ReadSource`
+    /// miss must render at the viewport width directly and never establish
+    /// one — only `commands::prepare_pdf` (out of scope for this crate) may
+    /// do that. Deleting the source right after the render, then asking for
+    /// the SAME page again, is what makes "no manifest was written" a
+    /// behaviour rather than an implementation detail: had a manifest been
+    /// established (the `OnMiss::Prime` behaviour every other PDF test in
+    /// this module pins), the second read would succeed from the disk cache
+    /// with the file gone.
+    #[test]
+    fn read_source_pdf_miss_renders_without_establishing_a_manifest() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+        let calls = std::cell::Cell::new(0u32);
+
+        let (bytes, mime) = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-readsource"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            false,
+            OnMiss::ReadSource,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(calls.get(), 0, "no cache write happened, nothing to evict");
+        assert!(
+            page_cache::read_manifest(&pages, "pdf-readsource").is_none(),
+            "a ReadSource miss must never establish a PDF manifest — only \
+             `prepare_pdf` may do that"
+        );
+
+        // Confirms the negative behaviourally: with no manifest, the same
+        // page cannot be recovered once the source is gone.
+        std::fs::remove_file(&path).unwrap();
+        let err = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-readsource"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::ReadSource,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    /// A `ReadSource` miss must not disable the cache entirely: once a
+    /// manifest already exists — established by `prepare_pdf`, out of scope
+    /// for this crate, so simulated here via `ensure_pdf_prewarmed` directly
+    /// — a page read still goes through
+    /// `get_or_render_pdf_page_with_eviction` exactly as `OnMiss::Prime`
+    /// does, writing the page to disk. This is the desktop's actual steady
+    /// state after a book has been opened once: `ReadSource` only refuses to
+    /// establish a *new* manifest, it does not stop using one that is
+    /// already there.
+    #[test]
+    fn read_source_writes_a_page_once_a_manifest_already_exists() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        // Stands in for `commands::prepare_pdf`'s zero-prewarm call.
+        page_cache::ensure_pdf_prewarmed(&pages, "bk", "pdf-preprimed", &path, 0).unwrap();
+
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-preprimed"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::ReadSource,
+        )
+        .unwrap();
+
+        assert!(
+            pages
+                .exists("page-cache/pdf-preprimed/000.jpg")
+                .unwrap_or(false),
+            "a page read against an already-established manifest must still \
+             write through to disk, exactly like OnMiss::Prime"
+        );
     }
 
     #[test]
@@ -1809,6 +2212,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
 
@@ -1847,6 +2251,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
 
@@ -1917,6 +2322,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -1932,6 +2338,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
 
@@ -1946,6 +2353,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1984,6 +2392,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(
@@ -2025,6 +2434,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -2039,6 +2449,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -2067,6 +2478,7 @@ mod tests {
             None,
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         assert!(!bytes.is_empty());
@@ -2130,6 +2542,7 @@ mod tests {
             Some(&pages),
             || {},
             false,
+            OnMiss::Prime,
         )
         .unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -2179,5 +2592,88 @@ mod tests {
         let err =
             page_count(BookFormat::Cbz, &path, Some("hash-partial"), Some(&pages)).unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    // ── cached_page (M3) ─────────────────────────────────────────────────
+
+    /// The desktop preloader probe's whole point: a hit reads `pages`
+    /// only. Deleting the source file between priming the cache and probing
+    /// it is what makes that observable — a probe that fell through to a
+    /// source read would fail here, and a test that only asserted "returns
+    /// Some" would pass even with that fallback still in place.
+    #[test]
+    fn cached_page_hit_never_touches_the_source_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(200, 300)]);
+        let pages = pages_storage(dir.path());
+
+        page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-probe"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let (bytes, mime) = cached_page(&pages, "hash-probe", 0, None)
+            .unwrap()
+            .expect("a page primed before the source was deleted must still be found in the cache");
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
+    }
+
+    /// The other half: a page never written to the cache is `Ok(None)`, not
+    /// an error and not a fallback render — the preloader's contract is
+    /// "tell me if it's already there", never "get it for me".
+    #[test]
+    fn cached_page_miss_is_none_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages = pages_storage(dir.path());
+        assert_eq!(
+            cached_page(&pages, "hash-nothing-cached", 0, None).unwrap(),
+            None
+        );
+    }
+
+    /// The probe must honor `target_width` on a hit, the same way
+    /// [`page_image`]'s own cache-hit path does — the desktop preloader
+    /// requests neighbor pages at the same viewport width as the page the
+    /// reader is actually looking at.
+    #[test]
+    fn cached_page_probe_is_resized_to_target_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(800, 1200)]);
+        let pages = pages_storage(dir.path());
+
+        page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-probe-width"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap();
+
+        let (bytes, _) = cached_page(&pages, "hash-probe-width", 0, Some(200))
+            .unwrap()
+            .unwrap();
+        let (w, _h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!(w, 200, "the probe must still honor target_width on a hit");
     }
 }
