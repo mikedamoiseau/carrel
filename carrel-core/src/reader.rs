@@ -547,7 +547,18 @@ where
         // regardless of what eviction does immediately afterward.
         if let Ok((data, mime)) = page_cache::get_cached_page(pages, hash, page_index) {
             on_extracted();
-            return crate::image_util::maybe_resize_to_jpeg(data, mime, target_width);
+            let (bytes, out_mime) =
+                crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
+            // The priming miss is the expensive path — a whole-archive
+            // extraction — so it is the one an end-to-end number is most
+            // wanted for (M3 review, finding 2).
+            page_cache::page_dbg!(
+                "bytes primed then read: page={} size={}KB total={:?}",
+                page_index,
+                bytes.len() / 1024,
+                started.elapsed()
+            );
+            return Ok((bytes, out_mime));
         }
 
         // The cache still can't serve the page we just extracted — degrade

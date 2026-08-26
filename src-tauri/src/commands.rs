@@ -2586,7 +2586,29 @@ pub async fn get_comic_page_bytes(
         .await;
     }
 
+    // `reader::page_image` accepts PDF as well as CBZ/CBR, so it cannot be
+    // this command's format guard (M3 review, finding 1). Without one, a PDF
+    // passed to the *comic* command would reach the PDF arm carrying this
+    // call site's hardcoded `is_private = false` — correct for comics, which
+    // have no private-mode plumbing yet, but it would write rendered pages to
+    // the shared cache during a private session, the exact write
+    // `get_pdf_page_bytes` suppresses. The frontend dispatches on format and
+    // never does this; these are public IPC commands, so the guard the
+    // pre-M3 inline `match` provided has to stay somewhere.
+    if !matches!(book.format, BookFormat::Cbz | BookFormat::Cbr) {
+        return Err(CarrelError::invalid(format!(
+            "get_comic_page_bytes is not supported for {:?}",
+            book.format
+        )));
+    }
+
     let file_path = state.resolve_book_path(&book)?;
+    // Deliberately kept even though `reader::page_image` runs its own
+    // `ensure_file_exists` on the miss path: this one also rejects symlinks
+    // (traversal defence shared with every other file-backed command) and
+    // attaches the SMB unicode hint, neither of which the module's check
+    // does. The duplicate `metadata()` call on a cache miss is the price;
+    // the archive open that follows dwarfs it (M3 review, finding 3).
     validate_file_exists(&file_path)?;
 
     // Mark a foreground render in flight so a still-running PDF prerender pass
