@@ -300,10 +300,10 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// would 404 on *every* request, forever, for a book that rendered fine
 /// before this milestone.
 ///
-/// PDF (M2) does not need an equivalent fallback: a miss's returned bytes
-/// come directly from the pdfium render, never from a disk read-back, so
-/// there is no window where an eviction pass reclaiming what this exact call
-/// just wrote could turn a successful render into an error. See
+/// PDF (M2) needs no fallback for that exact race — a miss's returned bytes
+/// come directly from the pdfium render, never from a disk read-back — but
+/// it degrades the same way when the cache is unusable at all (a failed
+/// manifest write) or when private mode declines to start one. See
 /// [`pdf_page_image`]'s doc comment.
 ///
 /// # `on_extracted` (M1 review, findings F1 and F7; widened to `Fn` for M2)
@@ -348,10 +348,11 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// count, a much sparser cadence than "every priming miss" — see
 /// [`pdf_page_image`].
 ///
-/// `is_private`, when true, suppresses persisting rendered page *bytes* to
-/// disk (M2) — forwarded unchanged to
-/// [`page_cache::get_or_render_pdf_page_with_eviction`]'s `suppress_write`
-/// for PDF, matching `commands::get_pdf_page_bytes`'s desktop behaviour.
+/// `is_private`, when true, keeps a read out of the page cache (M2): for a
+/// PDF whose cache entry already exists it forwards to
+/// [`page_cache::get_or_render_pdf_page_with_eviction`]'s `suppress_write`,
+/// matching `commands::get_pdf_page_bytes`'s desktop behaviour, and for one
+/// with no entry yet it declines to create it at all.
 /// Comics ignore it: there is no equivalent write-suppression path for
 /// CBZ/CBR yet (tracked in
 /// `docs/backlog/comic-cache-ignores-private-mode.md`).
@@ -499,11 +500,17 @@ where
 /// is doing its job by deleting the source file between two reads of the
 /// same page), a miss renders one page via pdfium and writes it.
 ///
-/// The zero-prewarm manifest write happens even when `is_private` is true —
-/// it records only the page count and timestamps, never a page's content,
-/// matching `prepare_pdf`'s own unconditional call. `is_private` instead
+/// When `is_private` is true and no manifest exists yet, that establishing
+/// step is skipped entirely and the page renders directly: the manifest
+/// holds no page content, but it does record `book_id` and a
+/// `last_accessed` that later reads keep refreshing, which a private web
+/// read left nowhere before this milestone. (Desktop's `prepare_pdf` writes
+/// it unconditionally, but it runs on an explicit book-open, not on every
+/// page request.) For a book whose manifest already exists, `is_private`
 /// forwards to `get_or_render_pdf_page_with_eviction`'s `suppress_write`,
 /// which skips only the page-bytes disk write.
+///
+/// # Degrading instead of failing
 ///
 /// A miss's returned bytes always come from the render itself, not a disk
 /// read-back, so unlike the comic arm there is no window where an eviction
@@ -512,6 +519,13 @@ where
 /// failing" doc section) — `on_extracted` (playing the role
 /// `get_or_render_pdf_page_with_eviction` calls `on_batch`) only ever runs
 /// after the bytes to return are already in hand.
+///
+/// That covers the eviction race but not an unusable cache: a failing
+/// `ensure_pdf_prewarmed` (a full disk, a read-only cache dir) would
+/// otherwise fail every request for a page pdfium renders fine, and keep
+/// failing, since the manifest never gets written. Every such path falls
+/// back to the plain render this arm replaced, so cache health can slow
+/// this route down but never break it.
 #[allow(clippy::too_many_arguments)]
 fn pdf_page_image<F>(
     file_path: &str,
@@ -526,17 +540,49 @@ fn pdf_page_image<F>(
 where
     F: Fn(),
 {
+    // The pre-M2 behaviour of this arm, kept as the thing every path that
+    // cannot use the cache degrades to — a plain pdfium render, uninvolved
+    // with the cache's health. `get_page_image_bytes` applies the same
+    // `None` -> `DEFAULT_RENDER_WIDTH` default as the resize below.
+    let direct = || -> CarrelResult<(Vec<u8>, String)> {
+        let (data, mime) = crate::pdf::get_page_image_bytes(file_path, page_index, target_width)?;
+        Ok((data, mime.to_string()))
+    };
+
     let Some(hash) = book_hash else {
         // No hash to key the cache on — render straight from the file.
-        let (data, mime) = crate::pdf::get_page_image_bytes(file_path, page_index, target_width)?;
-        return Ok((data, mime.to_string()));
+        return direct();
     };
 
     let has_pdf_manifest = page_cache::read_manifest(pages, hash)
         .map(|m| m.format == BookFormat::Pdf)
         .unwrap_or(false);
     if !has_pdf_manifest {
-        page_cache::ensure_pdf_prewarmed(pages, book_id, hash, file_path, 0)?;
+        // Private mode never *creates* a cache entry (M2 review, finding
+        // F2). The manifest holds no page content, but it does record
+        // `book_id` and a `last_accessed` this call would then keep
+        // refreshing — a durable "book X was being read at time T" that a
+        // private web read left nowhere before this milestone, visible in
+        // the Settings cache-stats panel, and occupying one of
+        // `page_cache::MAX_CACHED_BOOKS` LRU slots against books that do
+        // hold bytes. A book already cached from a non-private read still
+        // serves from that cache; private mode just never starts one.
+        if is_private {
+            return direct();
+        }
+        // A failed manifest write must not take the page down with it (M2
+        // review, finding F1). `ensure_pdf_prewarmed` returns `Err` when
+        // the final `write_manifest` fails — a full disk, a read-only or
+        // quota'd cache dir — and propagating that would turn every request
+        // for a page pdfium renders fine into a 500, on every retry,
+        // forever, for a book that worked before this milestone. Both
+        // comparable paths already degrade instead: the comic arm has its
+        // explicit fallback, and `commands::get_pdf_page_bytes` falls
+        // through to a viewport render when it cannot even open the cache.
+        if let Err(e) = page_cache::ensure_pdf_prewarmed(pages, book_id, hash, file_path, 0) {
+            log::warn!("pdf page cache unavailable for {hash}, rendering directly: {e}");
+            return direct();
+        }
     }
 
     let (data, mime) = page_cache::get_or_render_pdf_page_with_eviction(
@@ -559,8 +605,8 @@ where
     crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)
 }
 
-/// Page count for CBZ/CBR. Other formats error with [`CarrelError::invalid`],
-/// mirroring [`page_image`].
+/// Page count for CBZ/CBR/PDF. Other formats error with
+/// [`CarrelError::invalid`], mirroring [`page_image`].
 ///
 /// Consults the page cache first (M1 review, finding F5) — same
 /// `book_hash`/`pages` as [`page_image`] — so a book cached by a previous
@@ -581,20 +627,38 @@ where
 /// when there is no manifest yet, the manifest is incomplete, or there is
 /// no `book_hash`; that fallback does need the file and, on an async
 /// runtime, a blocking thread pool — same reason as [`page_image`].
+///
+/// PDF (M2 review, finding F3) gets the same treatment for the same
+/// reason: once [`page_image`]'s PDF arm serves pages with no source
+/// access, a `page_count` that still always opens the file is what stops a
+/// fully-cached PDF from opening at all when its source is gone — the
+/// exact scenario the caching exists for. Its completeness test is
+/// [`page_cache::complete_pdf_manifest`] rather than
+/// [`page_cache::complete_manifest`], since PDF manifests list no page
+/// names; the standard it holds them to is the same.
 pub fn page_count(
     format: BookFormat,
     file_path: &str,
     book_hash: Option<&str>,
     pages: &dyn Storage,
 ) -> CarrelResult<u32> {
-    if !matches!(format, BookFormat::Cbz | BookFormat::Cbr) {
+    if !matches!(format, BookFormat::Cbz | BookFormat::Cbr | BookFormat::Pdf) {
         return Err(CarrelError::invalid(format!(
             "page count is not supported for format {format}"
         )));
     }
 
     if let Some(hash) = book_hash {
-        if let Some(manifest) = page_cache::complete_manifest(pages, hash) {
+        // PDF manifests list no page names, so the comic completeness test
+        // reports `None` for every PDF — see
+        // [`page_cache::complete_pdf_manifest`], which applies the same
+        // two-page sample to the derived filenames.
+        let cached = if format == BookFormat::Pdf {
+            page_cache::complete_pdf_manifest(pages, hash)
+        } else {
+            page_cache::complete_manifest(pages, hash)
+        };
+        if let Some(manifest) = cached {
             if manifest.format == format {
                 return Ok(manifest.page_count);
             }
@@ -602,10 +666,10 @@ pub fn page_count(
     }
 
     ensure_file_exists(file_path)?;
-    if format == BookFormat::Cbz {
-        crate::cbz::get_page_count(file_path)
-    } else {
-        crate::cbr::get_page_count(file_path)
+    match format {
+        BookFormat::Cbz => crate::cbz::get_page_count(file_path),
+        BookFormat::Cbr => crate::cbr::get_page_count(file_path),
+        _ => crate::pdf::get_page_count(file_path),
     }
 }
 
@@ -1458,6 +1522,62 @@ mod tests {
             !entries.iter().any(|e| e.ends_with(".jpg")),
             "private mode must not write page bytes to disk: {entries:?}"
         );
+        // M2 review, finding F2: nor the manifest, which carries `book_id`
+        // and a `last_accessed` — a durable record of the read surviving a
+        // session that asked not to be recorded.
+        assert!(
+            page_cache::read_manifest(&pages, "pdf-private").is_none(),
+            "private mode must not create a cache entry: {entries:?}"
+        );
+    }
+
+    /// M2 review, finding F1: an unusable page cache must slow this route
+    /// down, never break it. `ensure_pdf_prewarmed` returns `Err` when its
+    /// manifest write fails (a full disk, a read-only cache dir) — and
+    /// since that write is what would have made the next call skip it,
+    /// propagating the error would fail every request for a page pdfium
+    /// renders fine, forever, for a book that worked before this milestone.
+    ///
+    /// A read-only cache directory is the reachable version of that. Unix
+    /// only: Windows ignores the mode bits, and pdfium is absent there
+    /// anyway.
+    #[cfg(unix)]
+    #[test]
+    fn a_pdf_page_still_renders_when_the_cache_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+        let cache_root = dir.path().join("cache");
+
+        // Read+execute but not write: `read_manifest` still works (and
+        // finds nothing), every `put` fails.
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let rendered = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-ro"),
+            &pages,
+            || {},
+            false,
+        );
+
+        // Restore before the assert, so a failure does not also leak the
+        // temp dir by breaking its cleanup.
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (bytes, mime) = rendered.expect("an unwritable cache must not fail the page");
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
     }
 
     /// M2 trap #4 (inherited from the M1 review's finding F1): a page whose
@@ -1542,10 +1662,10 @@ mod tests {
     }
 
     #[test]
-    fn page_count_rejects_non_comic_formats() {
+    fn page_count_rejects_non_page_formats() {
         let dir = tempfile::tempdir().unwrap();
         let pages = pages_storage(dir.path());
-        for format in [BookFormat::Epub, BookFormat::Mobi, BookFormat::Pdf] {
+        for format in [BookFormat::Epub, BookFormat::Mobi] {
             let name = format.to_string();
             let err = page_count(format, "/nope", None, &pages).unwrap_err();
             assert!(
@@ -1553,6 +1673,76 @@ mod tests {
                 "unexpected error for {name}: {err}"
             );
         }
+    }
+
+    /// F3 (M2 review): a fully cached PDF must report its page count with
+    /// the source file gone, the way a fully cached comic already does.
+    /// The web reader fetches the count before its first page request, so
+    /// without this a PDF whose every page is cached still cannot be
+    /// opened once its source goes away — the exact case the caching is
+    /// for.
+    ///
+    /// Deleting the file is what makes it a test: asserting the count
+    /// alone would pass with the manifest lookup removed.
+    #[test]
+    fn a_fully_cached_pdf_reports_its_page_count_without_the_source_file() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        // One page, so reading page 0 caches both the "first" and the
+        // "last" page `complete_pdf_manifest` samples.
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-count"),
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+
+        let count = page_count(BookFormat::Pdf, &path, Some("pdf-count"), &pages).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The other half of F3: a manifest alone must not be trusted.
+    /// `ensure_pdf_prewarmed` writes one carrying the real page count
+    /// before any page has been rendered, so a book whose pages are not
+    /// actually on disk must fall back to opening the file — and report
+    /// `NotFound` when it is gone, rather than a count it cannot serve.
+    #[test]
+    fn a_pdf_manifest_with_no_cached_pages_is_not_trusted() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        // Manifest only: the real page count, zero pages rendered.
+        page_cache::ensure_pdf_prewarmed(&pages, "bk", "pdf-bare", &path, 0).unwrap();
+        assert!(page_cache::read_manifest(&pages, "pdf-bare").is_some());
+
+        // With the file present, the fallback answers.
+        assert_eq!(
+            page_count(BookFormat::Pdf, &path, Some("pdf-bare"), &pages).unwrap(),
+            1
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let err = page_count(BookFormat::Pdf, &path, Some("pdf-bare"), &pages).unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
     }
 
     /// F5 (M1 review): a fully cached comic must still report its page

@@ -1571,13 +1571,18 @@ async fn get_page_count(
         .map_err(|e| book_file_status(count_not_found, count_invalid, e))?;
 
     let count = match book.format {
-        BookFormat::Pdf => crate::pdf::get_page_count(&file_path)
-            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
         // Answers from the cache when a complete manifest is already on disk
         // (M1 review, finding 5) rather than opening the archive on every
         // call; falls back to the archive otherwise. Blocking pool for the
         // same reason as the page-image route above (M1 review, finding 1).
-        BookFormat::Cbz | BookFormat::Cbr => {
+        //
+        // PDF joined this arm in M2 (review finding F3): the page-image
+        // route above now serves cached PDF pages without touching the
+        // source, and the web reader fetches this count *before* its first
+        // page request — so leaving this one always opening the file meant a
+        // fully-cached PDF still could not be opened with its source gone,
+        // which is the case the caching is for.
+        BookFormat::Cbz | BookFormat::Cbr | BookFormat::Pdf => {
             let pages_storage = state
                 .pages_storage()
                 .map_err(|e| book_file_status(count_not_found, count_invalid, e))?;
@@ -1593,7 +1598,7 @@ async fn get_page_count(
             })
             .await
             .map_err(|e| {
-                log::error!("comic page-count task panicked: {e}");
+                log::error!("page-count task panicked: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error".to_string(),

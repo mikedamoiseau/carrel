@@ -604,6 +604,36 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
     }
 }
 
+/// PDF analogue of [`complete_manifest`]: whether `book_hash`'s cached PDF
+/// is complete enough to trust its page count without reopening the source
+/// file. Returns the manifest when so, `None` otherwise.
+///
+/// PDF manifests deliberately keep `pages` empty — a PDF page's filename is
+/// derived from its index rather than listed (see the comment at the top of
+/// [`ensure_cached`]) — so [`complete_manifest`]'s "first and last entry of
+/// `pages` are on disk" sample reports `None` for *every* PDF, however
+/// completely cached. This applies the same two-page sample against the
+/// derived names instead, so the two formats are held to one standard: a
+/// manifest that merely exists is never enough, because
+/// [`ensure_pdf_prewarmed`] writes one with the real page count before any
+/// page has been rendered.
+pub fn complete_pdf_manifest(storage: &dyn Storage, book_hash: &str) -> Option<CacheManifest> {
+    let manifest = read_manifest(storage, book_hash)?;
+    if manifest.format != BookFormat::Pdf || manifest.page_count == 0 {
+        return None;
+    }
+    let present = |idx: u32| {
+        storage
+            .exists(&page_key(book_hash, &format!("{idx:03}.jpg")))
+            .unwrap_or(false)
+    };
+    if present(0) && present(manifest.page_count - 1) {
+        Some(manifest)
+    } else {
+        None
+    }
+}
+
 pub fn ensure_cached(
     storage: &dyn Storage,
     book_id: &str,
