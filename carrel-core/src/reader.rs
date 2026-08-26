@@ -354,21 +354,29 @@ pub enum OnMiss {
 /// already satisfied it (none consumed anything they captured), so this is
 /// not a behavior change for comics.
 ///
-/// For comics, fires **at most once**, and only when this call both (a) performed a
-/// real extraction via `ensure_cached` — not when `ensure_cached`
-/// short-circuited on an already-complete manifest — and (b) then
-/// successfully read the requested page back out of the cache it just
-/// wrote. Condition (b) is what makes (a) safe to check so cheaply: any
-/// `ensure_cached` short-circuit that still can't serve the requested page
-/// (most easily an out-of-range page index on an already-cached book) fails
-/// the same read the *first* extraction would have failed too, so gating on
-/// a successful post-extraction read is equivalent to gating on "a real
-/// extraction happened AND it actually produced this page" — without
-/// needing `ensure_cached` to separately report which case it hit. This
-/// matters beyond correctness: an unconditional fire lets a LAN client (the
-/// PIN is optional) trigger a full-cache eviction walk in a tight loop by
-/// repeatedly requesting an invalid page index on a warm book, without ever
-/// causing a real extraction.
+/// For comics, fires **at most once**, and exactly when this call performed
+/// a real extraction via `ensure_cached` — not when `ensure_cached`
+/// short-circuited on an already-complete manifest. Whether the page then
+/// read back successfully is deliberately *not* part of the condition (M3
+/// review rounds 4 and 5): `ensure_cached` has no size cap of its own, so
+/// this callback is the only thing bounding what it just wrote against the
+/// caller's budget, and a request that goes on to fail — an out-of-range
+/// index, a failed read-back, a resize error — has still put a whole
+/// archive on disk that something must sweep. So it fires on those paths
+/// too, including ones that return `Err`.
+///
+/// An earlier version inferred "a real extraction happened" from "the
+/// post-extraction read succeeded", which is cheaper but wrong in exactly
+/// that direction: it skipped the sweep on every failing path, leaving the
+/// cache over budget until an unrelated request happened to trigger one.
+/// The predicate is now read directly, from
+/// [`page_cache::complete_manifest`] before `ensure_cached` runs — the same
+/// test `ensure_cached` itself uses to decide whether to short-circuit.
+///
+/// Gating on a real extraction (rather than firing unconditionally) is what
+/// stops a LAN client — the PIN is optional — from triggering a full-cache
+/// eviction walk in a tight loop by repeatedly requesting an invalid page
+/// index on an already-warm book, where nothing is ever written.
 ///
 /// Never fires on a cache hit (the hot path — the callback is where a
 /// caller is expected to run eviction, which walks the whole cache and does
@@ -488,7 +496,14 @@ where
             // `ensure_cached`, no `on_extracted`. This is the same fallback
             // the pre-M3 desktop implementation always used on a miss.
             ensure_file_exists(file_path)?;
-            return direct_comic_page(format, file_path, page_index, target_width, started);
+            return direct_comic_page(
+                format,
+                file_path,
+                page_index,
+                target_width,
+                started,
+                std::time::Duration::ZERO,
+            );
         }
 
         // Cache miss: prime the *whole* archive into the cache before
@@ -544,7 +559,20 @@ where
         // because nothing was written — while still letting the degrade path
         // below fire it when an extraction really did happen.
         let extracted = page_cache::complete_manifest(pages, hash).is_none();
-        page_cache::ensure_cached(pages, book_id, hash, file_path, &format)?;
+        // A *failing* `ensure_cached` can still have written page blobs:
+        // `extract_comic_full` writes them first and the manifest last, with
+        // no cleanup, so a failure on entry 900 of 1000 — or on the manifest
+        // write after every page landed — leaves bytes on disk. Round 4's
+        // rule applies to that too, and propagating with `?` would have been
+        // the same hole one branch further up (M3 review round 5). Sweeping
+        // manifest-less bytes is exactly what `run_eviction`'s orphan-prefix
+        // pass is for; it just has to actually be asked to run.
+        if let Err(e) = page_cache::ensure_cached(pages, book_id, hash, file_path, &format) {
+            if extracted {
+                on_extracted();
+            }
+            return Err(e);
+        }
 
         // Read back before firing `on_extracted` (finding F1): the callback
         // is the caller's eviction hook, and an eviction pass can reclaim
@@ -606,15 +634,35 @@ where
         // rather than after, so a decode that also fails still sweeps; the
         // decode reads the archive, not the cache, so eviction cannot take
         // its bytes away.
+        // Timed and subtracted for the same reason the success path above
+        // does it: the web adapter runs `run_eviction` inline in this
+        // callback, and the desktop `[page-load]` lines this number is
+        // modelled on never included a sweep (M3 review round 5).
+        let sweep_started = std::time::Instant::now();
         if extracted {
             on_extracted();
         }
-        return direct_comic_page(format, file_path, page_index, target_width, started);
+        let sweep_cost = sweep_started.elapsed();
+        return direct_comic_page(
+            format,
+            file_path,
+            page_index,
+            target_width,
+            started,
+            sweep_cost,
+        );
     }
 
     // No hash to key the cache on — render straight from the archive.
     ensure_file_exists(file_path)?;
-    direct_comic_page(format, file_path, page_index, target_width, started)
+    direct_comic_page(
+        format,
+        file_path,
+        page_index,
+        target_width,
+        started,
+        std::time::Duration::ZERO,
+    )
 }
 
 /// Decode one comic page straight from the archive, bypassing the page
@@ -628,13 +676,18 @@ fn direct_comic_page(
     page_index: u32,
     target_width: Option<u32>,
     started: std::time::Instant,
+    // Time already spent inside the caller's eviction hook, subtracted from
+    // the reported total so this number stays comparable with the desktop
+    // `[page-load]` lines it is modelled on, which never included a sweep.
+    // Zero on every path that reaches here without firing the hook.
+    sweep_cost: std::time::Duration,
 ) -> CarrelResult<(Vec<u8>, String)> {
     let (bytes, mime) = direct_comic_decode(format, file_path, page_index, target_width)?;
     page_cache::page_dbg!(
         "bytes archive read: page={} size={}KB total={:?}",
         page_index,
         bytes.len() / 1024,
-        started.elapsed()
+        started.elapsed().saturating_sub(sweep_cost)
     );
     Ok((bytes, mime))
 }
@@ -1207,7 +1260,6 @@ mod tests {
         assert_eq!(calls.get(), 1, "must not fire again on a cache hit");
     }
 
-    /// F7 (M1 review): a page index past the end of an already-cached book
     /// M3 review round 4: the mirror of F7 below. An out-of-range page of a
     /// *cold* book DOES fire the eviction hook, because `ensure_cached` just
     /// wrote the whole archive to disk before the read-back failed, and this
@@ -1256,6 +1308,7 @@ mod tests {
         );
     }
 
+    /// F7 (M1 review): a page index past the end of an already-cached book
     /// must not fire `on_extracted`. It enters the miss branch (the first
     /// `get_cached_page` fails, since the index itself is invalid), but
     /// `ensure_cached` finds the manifest already complete and does no real
