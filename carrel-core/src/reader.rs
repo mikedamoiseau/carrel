@@ -348,6 +348,12 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// count, a much sparser cadence than "every priming miss" — see
 /// [`pdf_page_image`].
 ///
+/// `pages` is optional (M2 review round 3, finding 3): a caller whose cache
+/// directory cannot even be opened passes `None` and gets the same uncached
+/// read as a book with no `book_hash` — an unusable cache must cost the
+/// cache, not the book. `on_extracted` never fires in that case, there
+/// being nothing to evict around.
+///
 /// `is_private`, when true, keeps a read out of the page cache (M2): for a
 /// PDF whose cache entry already exists it forwards to
 /// [`page_cache::get_or_render_pdf_page_with_eviction`]'s `suppress_write`,
@@ -364,7 +370,7 @@ pub fn page_image<F>(
     target_width: Option<u32>,
     book_id: &str,
     book_hash: Option<&str>,
-    pages: &dyn Storage,
+    pages: Option<&dyn Storage>,
     on_extracted: F,
     is_private: bool,
 ) -> CarrelResult<(Vec<u8>, String)>
@@ -390,7 +396,12 @@ where
         )));
     }
 
-    if let Some(hash) = book_hash {
+    // Both a hash to key on and a usable cache, or there is no cache path
+    // to take: a caller whose cache directory cannot even be opened passes
+    // `None` and gets the same uncached read as a book with no hash (M2
+    // review round 3, finding 3), rather than an error for a page the
+    // archive can still serve.
+    if let (Some(hash), Some(pages)) = (book_hash, pages) {
         if let Ok((data, mime)) = page_cache::get_cached_page(pages, hash, page_index) {
             // A hit — refresh recency (M1 review, finding F4). Without this,
             // a book read only through this cache-hit path never touches
@@ -533,7 +544,7 @@ fn pdf_page_image<F>(
     target_width: Option<u32>,
     book_id: &str,
     book_hash: Option<&str>,
-    pages: &dyn Storage,
+    pages: Option<&dyn Storage>,
     on_extracted: F,
     is_private: bool,
 ) -> CarrelResult<(Vec<u8>, String)>
@@ -549,12 +560,12 @@ where
         Ok((data, mime.to_string()))
     };
 
-    let Some(hash) = book_hash else {
-        // No hash to key the cache on — render straight from the file. The
-        // guard mirrors the comic arm's: neither pdfium nor
-        // `ensure_pdf_prewarmed` preserves `NotFound` for a missing book
-        // file, so without it the web adapter answers 400 for a file that
-        // is simply gone.
+    let (Some(hash), Some(pages)) = (book_hash, pages) else {
+        // No hash to key the cache on, or no usable cache to key it in —
+        // render straight from the file. The guard mirrors the comic arm's:
+        // neither pdfium nor `ensure_pdf_prewarmed` preserves `NotFound`
+        // for a missing book file, so without it the web adapter answers
+        // 400 for a file that is simply gone.
         ensure_file_exists(file_path)?;
         return direct();
     };
@@ -602,14 +613,28 @@ where
         }
     }
 
-    let (data, mime) = page_cache::get_or_render_pdf_page_with_eviction(
+    let (data, mime) = match page_cache::get_or_render_pdf_page_with_eviction(
         pages,
         hash,
         file_path,
         page_index,
         on_extracted,
         is_private,
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            // A cache *hit* needs no file; a miss renders, and pdfium maps
+            // every open failure to `InvalidInput`, which the web adapter
+            // answers as 400 "the book file may be corrupt". Since a
+            // manifest lets a part-cached book open with its source
+            // unreachable, an uncached page of that book is a routine
+            // request — and "this page is not here" is `NotFound`, not a
+            // corrupt file. Only on the error path, so a hit pays nothing
+            // (M2 review round 3, finding 1).
+            ensure_file_exists(file_path)?;
+            return Err(e);
+        }
+    };
     // Both a hit and a miss yield `pdf::CACHE_CANONICAL_WIDTH` (2400 px)
     // bytes, whereas the direct render this arm replaced turned a `None`
     // width into `pdf::DEFAULT_RENDER_WIDTH` (1200 px) inside
@@ -882,7 +907,7 @@ mod tests {
             None,
             "bk",
             Some("hash1"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -898,7 +923,7 @@ mod tests {
             None,
             "bk",
             Some("hash1"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -926,7 +951,7 @@ mod tests {
             None,
             "bk",
             Some("hash-evict"),
-            &pages,
+            Some(&pages),
             || {
                 calls.set(calls.get() + 1);
             },
@@ -942,7 +967,7 @@ mod tests {
             None,
             "bk",
             Some("hash-evict"),
-            &pages,
+            Some(&pages),
             || {
                 calls.set(calls.get() + 1);
             },
@@ -973,7 +998,7 @@ mod tests {
             None,
             "bk",
             Some("hash-oor"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -987,7 +1012,7 @@ mod tests {
             None,
             "bk",
             Some("hash-oor"),
-            &pages,
+            Some(&pages),
             || calls.set(calls.get() + 1),
             false,
         )
@@ -1013,7 +1038,7 @@ mod tests {
             None,
             "bk",
             Some("hash-touch"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1034,7 +1059,7 @@ mod tests {
             None,
             "bk",
             Some("hash-touch"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1074,7 +1099,7 @@ mod tests {
             None,
             "bk",
             Some("hash-oversized"),
-            &pages,
+            Some(&pages),
             evict_to_zero,
             false,
         )
@@ -1095,7 +1120,7 @@ mod tests {
             None,
             "bk",
             Some("hash-oversized"),
-            &pages,
+            Some(&pages),
             evict_to_zero,
             false,
         )
@@ -1140,7 +1165,7 @@ mod tests {
                         None,
                         "bk",
                         Some("hash-concurrent"),
-                        storage,
+                        Some(storage),
                         || {
                             extractions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         },
@@ -1181,7 +1206,7 @@ mod tests {
             None,
             "bk",
             Some("hash2"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1195,7 +1220,7 @@ mod tests {
             Some(200),
             "bk",
             Some("hash2"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1226,7 +1251,7 @@ mod tests {
             None,
             "bk",
             Some("hash3"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1248,7 +1273,7 @@ mod tests {
             None,
             "bk",
             None,
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1272,7 +1297,7 @@ mod tests {
             None,
             "bk",
             None,
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1291,8 +1316,18 @@ mod tests {
         let pages = pages_storage(dir.path());
         for format in [BookFormat::Epub, BookFormat::Mobi] {
             let name = format.to_string();
-            let err =
-                page_image(format, "/nope", 0, None, "bk", None, &pages, || {}, false).unwrap_err();
+            let err = page_image(
+                format,
+                "/nope",
+                0,
+                None,
+                "bk",
+                None,
+                Some(&pages),
+                || {},
+                false,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("not supported"),
                 "unexpected error for {name}: {err}"
@@ -1336,19 +1371,44 @@ mod tests {
     /// Simplified from `pdf::tests::crafted_pdf` (fixed ordinary page size;
     /// nothing here exercises that helper's aspect-ratio clamp).
     fn write_pdf(dir: &std::path::Path) -> String {
+        write_pdf_with_pages(dir, 1)
+    }
+
+    /// `write_pdf` for more than one page, so a test can distinguish "some
+    /// pages cached" from "every page cached" — the two states
+    /// [`page_cache::pdf_manifest_page_count`] deliberately treats alike,
+    /// and which a one-page fixture cannot tell apart. Every page shares
+    /// one content stream; only the page count matters here.
+    fn write_pdf_with_pages(dir: &std::path::Path, page_count: usize) -> String {
+        assert!(page_count > 0);
         let content = b"0 0 1 rg 0 0 10 10 re f\n";
-        let bodies: Vec<Vec<u8>> = vec![
+        // Objects: 1 catalog, 2 page tree, 3..=2+n the pages, then the
+        // shared content stream.
+        let content_obj = 3 + page_count;
+        let kids: Vec<String> = (0..page_count).map(|i| format!("{} 0 R", 3 + i)).collect();
+        let mut bodies: Vec<Vec<u8>> = vec![
             b"<</Type/Catalog/Pages 2 0 R>>".to_vec(),
-            b"<</Type/Pages/Kids[3 0 R]/Count 1>>".to_vec(),
-            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R/Resources<<>>>>"
-                .to_vec(),
+            format!(
+                "<</Type/Pages/Kids[{}]/Count {}>>",
+                kids.join(" "),
+                page_count
+            )
+            .into_bytes(),
+        ];
+        bodies.extend((0..page_count).map(|_| {
+            format!(
+                "<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents {content_obj} 0 R/Resources<<>>>>"
+            )
+            .into_bytes()
+        }));
+        bodies.push(
             format!(
                 "<</Length {}>>stream\n{}\nendstream",
                 content.len(),
                 std::str::from_utf8(content).unwrap()
             )
             .into_bytes(),
-        ];
+        );
 
         let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
         let mut offsets = Vec::new();
@@ -1400,7 +1460,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-hash1"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1418,7 +1478,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-hash1"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1464,7 +1524,7 @@ mod tests {
                 None,
                 "bk",
                 Some("pdf-width"),
-                &pages,
+                Some(&pages),
                 || {},
                 false,
             )
@@ -1497,7 +1557,7 @@ mod tests {
             None,
             "bk",
             None,
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1533,7 +1593,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-private"),
-            &pages,
+            Some(&pages),
             || {},
             true,
         )
@@ -1589,7 +1649,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-ro"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         );
@@ -1635,7 +1695,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-evict"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1658,7 +1718,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-evict"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1725,8 +1785,9 @@ mod tests {
         let path = write_pdf(dir.path());
         let pages = pages_storage(dir.path());
 
-        // One page, so reading page 0 caches both the "first" and the
-        // "last" page `complete_pdf_manifest` samples.
+        // Reading page 0 puts a page on disk, which is what
+        // `page_cache::pdf_manifest_page_count` requires before it will
+        // answer from the manifest.
         page_image(
             BookFormat::Pdf,
             &path,
@@ -1734,7 +1795,7 @@ mod tests {
             None,
             "bk",
             Some("pdf-count"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )
@@ -1746,16 +1807,15 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    /// A PDF manifest is trusted for its count even with no page cached —
-    /// deliberately weaker than the comic standard, and the reason is in
-    /// [`page_cache::pdf_manifest_page_count`]'s doc comment.
+    /// A part-cached PDF must still report its count with the source gone:
+    /// the comic standard (first *and* last page on disk) is the wrong test
+    /// here, because PDF pages fill in as they are visited, so a book read
+    /// part-way has its early pages and not its last. See
+    /// [`page_cache::pdf_manifest_page_count`] for the full argument.
     ///
-    /// The case that makes it matter (M2 review round 2, finding 2): PDF
-    /// pages are cached one at a time as they are read, so a book read only
-    /// part-way through has its early pages and not its last. Demanding
-    /// first-and-last the way comics do would refuse the count for it, and
-    /// a book with plenty of readable cached pages would not open at all
-    /// once its source went away — the exact case the cache is for.
+    /// Three pages, only the first read, then the file deleted — a
+    /// first-and-last test would refuse this book, leaving it unopenable
+    /// despite having a readable cached page.
     #[test]
     fn a_partly_cached_pdf_still_reports_its_page_count() {
         if !pdfium_available() {
@@ -1763,21 +1823,146 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let path = write_pdf(dir.path());
+        let path = write_pdf_with_pages(dir.path(), 3);
         let pages = pages_storage(dir.path());
 
-        // Manifest carrying the real count, with nothing cached — the state
-        // a book is in the moment before its first page is rendered, and
-        // the state a partly-read long book is in for its later pages.
-        page_cache::ensure_pdf_prewarmed(&pages, "bk", "pdf-bare", &path, 0).unwrap();
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-partial"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap();
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            page_count(BookFormat::Pdf, &path, Some("pdf-bare"), Some(&pages)).unwrap(),
-            1,
+            page_count(BookFormat::Pdf, &path, Some("pdf-partial"), Some(&pages)).unwrap(),
+            3,
             "the manifest's count comes from pdfium and is keyed by content \
-             hash — it is correct whether or not a page is cached"
+             hash — one cached page is enough to trust it"
         );
+    }
+
+    /// The other side of that line (M2 review round 3, finding 2): a
+    /// manifest with *nothing* cached must not be trusted, because it is a
+    /// routine state rather than an edge case — `commands::prepare_pdf`
+    /// prewarms zero pages, and a private-mode read caches none — so
+    /// answering from it would open a reader in which every page then
+    /// fails. With the source gone there is nothing to serve and nothing to
+    /// count.
+    #[test]
+    fn a_pdf_manifest_with_nothing_cached_is_not_trusted() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf_with_pages(dir.path(), 3);
+        let pages = pages_storage(dir.path());
+
+        // Exactly what `prepare_pdf` leaves behind: the real page count,
+        // zero pages rendered.
+        page_cache::ensure_pdf_prewarmed(&pages, "bk", "pdf-bare", &path, 0).unwrap();
+        assert!(page_cache::read_manifest(&pages, "pdf-bare").is_some());
+
+        // The file is still here, so the fallback answers.
+        assert_eq!(
+            page_count(BookFormat::Pdf, &path, Some("pdf-bare"), Some(&pages)).unwrap(),
+            3
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let err = page_count(BookFormat::Pdf, &path, Some("pdf-bare"), Some(&pages)).unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    /// M2 review round 3, finding 1: with a manifest present a part-cached
+    /// book opens with its source gone, so a request for one of its
+    /// *uncached* pages is routine — and "that page is not here" is
+    /// `NotFound` (404), not pdfium's `InvalidInput` (which the web adapter
+    /// answers as 400 "the book file may be corrupt").
+    #[test]
+    fn an_uncached_page_of_a_cached_pdf_with_no_file_is_not_found() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf_with_pages(dir.path(), 3);
+        let pages = pages_storage(dir.path());
+
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-uncached"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // Page 0 still serves from the cache.
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-uncached"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap();
+
+        // Page 2 never was cached, and the file is gone.
+        let err = page_image(
+            BookFormat::Pdf,
+            &path,
+            2,
+            None,
+            "bk",
+            Some("pdf-uncached"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    /// M2 review round 3, finding 3: a caller whose cache directory cannot
+    /// be opened passes `None` and must still get its page, the same way a
+    /// book with no hash does. An unusable cache costs the cache, not the
+    /// book.
+    #[test]
+    fn page_image_without_a_cache_reads_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(100, 100)]);
+
+        let (bytes, mime) = page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-nocache"),
+            None,
+            || {},
+            false,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
     }
 
     /// A PDF with no manifest and no reachable file has nothing to answer
@@ -1834,7 +2019,7 @@ mod tests {
             None,
             "bk",
             Some("hash-count"),
-            &pages,
+            Some(&pages),
             || {},
             false,
         )

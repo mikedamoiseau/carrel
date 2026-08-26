@@ -1407,9 +1407,21 @@ async fn get_page_image(
         // pool (a pdfium render is CPU-heavy) but for a bounded, single-page
         // cost rather than a whole-archive one.
         BookFormat::Pdf => {
-            let pages_storage = state
-                .pages_storage()
-                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
+            // An unopenable cache directory must cost the cache, not the
+            // book (M2 review round 3, finding 3): before this route used
+            // the cache it just read the file, and `LocalStorage::new`
+            // fails on an unwritable or missing cache parent. Left as an
+            // error it would also contradict the page-count route below,
+            // which degrades — the book would open and then every page
+            // would fail. `page_image` treats `None` as "no cache", the
+            // same path a book with no hash takes.
+            let pages_storage = match state.pages_storage() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("page cache unavailable for page read, rendering without it: {e}");
+                    None
+                }
+            };
             let book_id = id.clone();
             let file_hash = book.file_hash.clone();
             let is_private = state.is_private();
@@ -1422,7 +1434,7 @@ async fn get_page_image(
                     width,
                     &book_id,
                     file_hash.as_deref(),
-                    pages_storage.as_ref(),
+                    pages_storage.as_deref(),
                     // Fires when the lazy-write counter crosses a multiple
                     // of `page_cache::LAZY_EVICTION_BATCH` — a sparser
                     // cadence than the comic arm's "every priming miss",
@@ -1432,10 +1444,12 @@ async fn get_page_image(
                     // is honored regardless of which format primed the
                     // cache first.
                     move || {
-                        if let Err(e) = crate::page_cache::run_eviction(
-                            evict_storage.as_ref(),
-                            max_cache_size_mb,
-                        ) {
+                        let Some(storage) = evict_storage.as_ref() else {
+                            return;
+                        };
+                        if let Err(e) =
+                            crate::page_cache::run_eviction(storage.as_ref(), max_cache_size_mb)
+                        {
                             log::warn!("pdf page-cache eviction failed: {e}");
                         }
                     },
@@ -1480,9 +1494,21 @@ async fn get_page_image(
         // unrelated route behind them (M1 review, finding 1). Everything
         // moved into the closure is owned, not borrowed from `state`/`book`.
         BookFormat::Cbz | BookFormat::Cbr => {
-            let pages_storage = state
-                .pages_storage()
-                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
+            // An unopenable cache directory must cost the cache, not the
+            // book (M2 review round 3, finding 3): before this route used
+            // the cache it just read the file, and `LocalStorage::new`
+            // fails on an unwritable or missing cache parent. Left as an
+            // error it would also contradict the page-count route below,
+            // which degrades — the book would open and then every page
+            // would fail. `page_image` treats `None` as "no cache", the
+            // same path a book with no hash takes.
+            let pages_storage = match state.pages_storage() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("page cache unavailable for page read, rendering without it: {e}");
+                    None
+                }
+            };
             let format = book.format.clone();
             let book_id = id.clone();
             let file_hash = book.file_hash.clone();
@@ -1495,7 +1521,7 @@ async fn get_page_image(
                     width,
                     &book_id,
                     file_hash.as_deref(),
-                    pages_storage.as_ref(),
+                    pages_storage.as_deref(),
                     // Fires only on the miss that just extracted the whole
                     // archive (M1 review, finding 2) — `run_eviction` walks
                     // the entire page cache, so it must never run on the hit
@@ -1509,10 +1535,12 @@ async fn get_page_image(
                     // swallowed rather than failing a page request that
                     // already has its bytes.
                     move || {
-                        if let Err(e) = crate::page_cache::run_eviction(
-                            evict_storage.as_ref(),
-                            max_cache_size_mb,
-                        ) {
+                        let Some(storage) = evict_storage.as_ref() else {
+                            return;
+                        };
+                        if let Err(e) =
+                            crate::page_cache::run_eviction(storage.as_ref(), max_cache_size_mb)
+                        {
                             log::warn!("comic page-cache eviction failed: {e}");
                         }
                     },

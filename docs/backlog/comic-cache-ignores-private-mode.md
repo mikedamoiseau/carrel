@@ -51,3 +51,25 @@ milestone to touch.
 - Whatever the fix, it must update `prepare_comic` and
   `carrel_core::reader::page_image` together, or reopen the exact
   cross-surface disagreement this note exists to avoid.
+
+## Related: source staging ignores private mode too (noted 2026-08-26, M2 review round 3)
+
+`web_server/api.rs`'s page-image route calls
+`commands::ensure_web_source_staged` unconditionally, *before* the
+format-specific arms that do consult `is_private`. On a network-mounted
+library that copies the whole book to
+`{cache_dir}/source-cache/{hash}.{ext}` and bumps its mtime — a durable
+on-disk record that the book was read, left behind by a session that asked
+not to be recorded, and one that survives independently of the page cache.
+
+M2 wired `is_private` through the PDF page-cache write and made private
+reads stop *creating* a page-cache entry, so the page cache no longer
+records a private read of a book that was never opened before. The source
+cache still does.
+
+This belongs with the fix above rather than on its own: the same question —
+"does private mode mean don't persist, or mean don't read at all?" — decides
+both, and gating staging on `is_private` would make a private read of a
+network-mounted book slow in a way a user may not expect or want. Note also
+that the desktop has its own staging path, so the cross-surface rule at the
+end of the section above applies here too.
