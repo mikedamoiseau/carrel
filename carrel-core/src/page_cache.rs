@@ -340,8 +340,6 @@ fn build_comic_manifest(
 /// Full comic extraction: every page into the cache plus a complete
 /// manifest. Backs [`extract_cbz`]/[`extract_cbr`] and the `ensure_cached`
 /// comic path.
-/// Extract every page of a comic into the cache and write its manifest.
-///
 /// **All or nothing**: a failure part-way through removes whatever was
 /// already written, so this either leaves a complete cache entry or leaves
 /// the cache exactly as it found it. Page blobs are written first and the
@@ -371,9 +369,20 @@ fn extract_comic_full(
     let names = comic_page_names(format, file_path)?;
     let want: BTreeSet<usize> = (0..names.len()).collect();
 
+    // Counted through `extract_comic_subset`'s existing per-page callback,
+    // which fires immediately after each successful `put`. A failure with
+    // this still at zero wrote nothing, and must not pay for a cleanup:
+    // `evict_book` lists the book's prefix, and `LocalStorage::list` walks
+    // the *whole* cache root before filtering. Without this guard a corrupt
+    // comic — or a permanently unwritable cache, where the very first `put`
+    // fails — would walk the entire cache on every request, and the web
+    // route's PIN is optional (M3 review round 8).
+    let mut written = 0usize;
     let extracted = (|| {
         let total_size =
-            extract_comic_subset(storage, book_hash, format, file_path, &names, &want, |_| {})?;
+            extract_comic_subset(storage, book_hash, format, file_path, &names, &want, |_| {
+                written += 1
+            })?;
         let manifest = build_comic_manifest(book_id, book_hash, format, &names, total_size);
         write_manifest(storage, book_hash, &manifest)?;
         Ok(manifest)
@@ -381,16 +390,27 @@ fn extract_comic_full(
 
     match extracted {
         Ok(manifest) => Ok(manifest),
+        Err(e) if written == 0 => Err(e),
         Err(e) => {
             // Best effort: a cleanup that itself fails (the same full disk,
             // the same unwritable storage) must not replace the real error
-            // with a second one. `run_eviction`'s orphan-prefix pass is the
-            // backstop for that residue.
+            // with a second one.
+            //
+            // There is no backstop if it does. `run_eviction`'s
+            // `evict_orphan_prefixes` pass deliberately spares manifest-less
+            // page files — it removes only an orphaned `text-index.json`,
+            // because a prefix without a manifest may be an extraction still
+            // in flight — and `collect_cached_books` skips hashes with no
+            // manifest, so those bytes never count toward the size budget
+            // either. They survive until `clear_cache`. That is precisely
+            // the "extraction path's own orphan handling" that pass's
+            // comment defers to, and this is it, so it is worth getting
+            // right rather than relying on a later sweep (M3 review round 8;
+            // earlier rounds asserted a backstop that does not exist).
             if let Err(cleanup) = evict_book(storage, book_hash) {
-                page_dbg!(
-                    "extract_comic_full: cleanup after failure also failed for {}: {}",
-                    book_hash,
-                    cleanup
+                log::warn!(
+                    "page cache: cleanup after a failed extraction of {book_hash} also failed \
+                     ({cleanup}); manifest-less pages may remain until the cache is cleared"
                 );
             }
             Err(e)
@@ -398,6 +418,13 @@ fn extract_comic_full(
     }
 }
 
+/// Extract a CBZ into the page cache. See [`extract_comic_full`] for the
+/// all-or-nothing contract: **on failure this removes the book's cached
+/// pages**, including any that were already there before the call, so it is
+/// destructive toward `book_hash`'s prefix rather than merely unsuccessful
+/// (M3 review round 8). Callers that already hold a complete cache entry
+/// should not re-run it speculatively — [`ensure_cached`] short-circuits on
+/// a complete manifest for exactly that reason.
 pub fn extract_cbz(
     storage: &dyn Storage,
     book_id: &str,
@@ -407,6 +434,8 @@ pub fn extract_cbz(
     extract_comic_full(storage, book_id, book_hash, file_path, &BookFormat::Cbz)
 }
 
+/// Extract a CBR into the page cache. Same all-or-nothing, destructive-on-
+/// failure contract as [`extract_cbz`].
 pub fn extract_cbr(
     storage: &dyn Storage,
     book_id: &str,
@@ -1887,23 +1916,39 @@ mod tests {
         assert_eq!(books[2].page_count, 1);
     }
 
-    /// A `Storage` that starts failing writes after the first `limit` of
-    /// them succeed — the only way to reach a genuinely *partial*
-    /// extraction. A read-only directory fails the very first `put`, which
-    /// leaves nothing written and so cannot tell the cleanup apart from its
-    /// absence.
-    struct FailsAfter {
+    /// A `Storage` that fails writes after the first `put_limit` succeed and
+    /// counts `list` calls. Both knobs are needed to pin `extract_comic_full`'s
+    /// cleanup: a partial write (some pages down, then a failure) and a
+    /// zero-write failure look identical from the outside — the prefix is
+    /// empty either way — so the difference has to be observed as whether the
+    /// cleanup ran at all, and `list` is what it costs.
+    struct FlakyStorage {
         inner: LocalStorage,
-        limit: usize,
+        put_limit: usize,
         writes: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
     }
 
-    impl Storage for FailsAfter {
+    impl FlakyStorage {
+        fn new(root: std::path::PathBuf, put_limit: usize) -> Self {
+            Self {
+                inner: LocalStorage::new(root).unwrap(),
+                put_limit,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn lists(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Storage for FlakyStorage {
         fn put(&self, key: &str, bytes: &[u8]) -> CarrelResult<()> {
             let n = self
                 .writes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n >= self.limit {
+            if n >= self.put_limit {
                 return Err(CarrelError::io("disk full (test)"));
             }
             self.inner.put(key, bytes)
@@ -1918,6 +1963,7 @@ mod tests {
             self.inner.delete(key)
         }
         fn list(&self, prefix: &str) -> CarrelResult<Vec<String>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.list(prefix)
         }
         fn size(&self, key: &str) -> CarrelResult<u64> {
@@ -1926,6 +1972,53 @@ mod tests {
         fn local_path(&self, key: &str) -> CarrelResult<std::path::PathBuf> {
             self.inner.local_path(key)
         }
+    }
+
+    /// A small, valid multi-page CBZ for the cleanup tests.
+    fn write_cleanup_fixture_cbz(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("book.cbz");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for i in 0..5 {
+            zip.start_file(format!("{i:03}.jpg"), options).unwrap();
+            std::io::Write::write_all(&mut zip, b"\xff\xd8\xff\xe0jpeg-ish").unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    /// M3 review round 8: a failure that wrote nothing must not pay for a
+    /// cleanup. `evict_book` lists the book's prefix, and
+    /// `LocalStorage::list` walks the whole cache root before filtering, so
+    /// cleaning up after a write that never landed would walk the entire
+    /// cache on every request — on a route an unauthenticated LAN client can
+    /// loop.
+    ///
+    /// Observed as the `list` count, because the visible outcome (an empty
+    /// prefix) is the same whether or not the cleanup ran.
+    #[test]
+    fn a_failure_that_wrote_nothing_does_not_walk_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        // put_limit 0: `comic_page_names` still succeeds, so extraction
+        // starts, but the very first page write fails.
+        let storage = FlakyStorage::new(dir.path().join("cache"), 0);
+        let path = write_cleanup_fixture_cbz(dir.path());
+
+        let result = ensure_cached(
+            &storage,
+            "bk",
+            "hash-nowrite",
+            path.to_str().unwrap(),
+            &BookFormat::Cbz,
+        );
+
+        assert!(result.is_err(), "the failing write must fail the extract");
+        assert_eq!(
+            storage.lists(),
+            0,
+            "an extraction that wrote nothing must not list (and so walk) the cache"
+        );
     }
 
     /// M3 review round 7: `extract_comic_full` is all-or-nothing. A failure
@@ -1943,24 +2036,9 @@ mod tests {
     #[test]
     fn a_failed_extraction_leaves_nothing_behind() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = FailsAfter {
-            inner: LocalStorage::new(dir.path().join("cache")).unwrap(),
-            // Two pages land, the third write fails: a real partial write.
-            limit: 2,
-            writes: std::sync::atomic::AtomicUsize::new(0),
-        };
-
-        let path = dir.path().join("book.cbz");
-        {
-            let file = std::fs::File::create(&path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default();
-            for i in 0..5 {
-                zip.start_file(format!("{i:03}.jpg"), options).unwrap();
-                std::io::Write::write_all(&mut zip, b"\xff\xd8\xff\xe0jpeg-ish").unwrap();
-            }
-            zip.finish().unwrap();
-        }
+        // Two pages land, the third write fails: a real partial write.
+        let storage = FlakyStorage::new(dir.path().join("cache"), 2);
+        let path = write_cleanup_fixture_cbz(dir.path());
 
         let result = ensure_cached(
             &storage,

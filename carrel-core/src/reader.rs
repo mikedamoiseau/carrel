@@ -366,10 +366,15 @@ pub enum OnMiss {
 /// whole archive on disk. It fires on those paths too, including ones that
 /// return `Err`.
 ///
-/// A *failed* `ensure_cached` does not fire it, because that function is
-/// all-or-nothing: a failure part-way through removes what it had written,
-/// so there is nothing to sweep (M3 review round 7). Do not replace that
-/// with an inference here. Earlier rounds tried to derive "were bytes
+/// A *failed* `ensure_cached` does not fire it, because that function
+/// cleans up after itself: a failure part-way through removes what it had
+/// written, so there is nothing to sweep (M3 review round 7). That cleanup
+/// is best effort — if it fails too, for the same full disk that failed the
+/// write, manifest-less pages can survive, and nothing else reclaims them
+/// (M3 review round 8; see `extract_comic_full`). Firing the hook would not
+/// help in that case either: `collect_cached_books` skips hashes with no
+/// manifest, so an eviction pass would not count those bytes, let alone
+/// free them. Do not replace this with an inference here. Earlier rounds tried to derive "were bytes
 /// written?" from "was the manifest complete beforehand?" and got it wrong
 /// in both directions — skipping the sweep after a real extraction left the
 /// cache over budget, and running it after an archive that never opened

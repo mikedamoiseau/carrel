@@ -79,13 +79,25 @@ Telling the two cases apart cheaply is not possible in that spot either:
 `Storage::list` walks the whole storage root, so probing on every error would
 cost more than the sweep it was guarding.
 
-So the bytes linger. They are manifest-less, which is what `run_eviction`'s
-orphan-prefix pass reclaims, so the next sweep triggered by any other request
-collects them — self-healing, with lag.
+**Resolved in round 7, and the reasoning above was wrong twice over.**
 
-Closing the lag properly needs the same `page_cache` change the section above
-wants: `ensure_cached` reporting whether it did real work, rather than the
-caller inferring it from the manifest. With that, the hook could fire on a
-genuine partial write and stay silent on an archive that never opened.
-`a_comic_that_will_not_open_does_not_fire_on_extracted` pins the half that
-must not regress while that is outstanding.
+`extract_comic_full` now cleans up its own partial writes, so a failed
+extraction leaves the cache as it found it and there is nothing for the
+caller to infer. `a_failed_extraction_leaves_nothing_behind` pins it.
+
+The claim that lingering bytes were "self-healing" was false, and round 8
+caught it: `run_eviction`'s `evict_orphan_prefixes` deliberately spares
+manifest-less page files — it removes only an orphaned `text-index.json`,
+since a prefix without a manifest may be an extraction still in flight, and
+`orphan_sweep_spares_manifestless_page_files` asserts exactly that. Nor does
+`collect_cached_books` count them, so they never reach the size budget
+either. Such bytes survive until `clear_cache`. That pass's own comment
+defers orphan handling to "the prewarm/extraction paths", and the round-7
+cleanup is that handling for comics.
+
+What remains: the cleanup is best effort. If it fails for the same reason the
+write did — a full disk — manifest-less pages persist with nothing reclaiming
+them. Widening `evict_orphan_prefixes` to collect page files whose prefix has
+no manifest *and* no writer in flight would close it, but distinguishing
+"abandoned" from "in flight" is what that pass avoids today, and it would need
+an explicit in-flight marker to do safely.
