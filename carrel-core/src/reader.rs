@@ -86,6 +86,19 @@
 //! (or being routed through) the same per-`book_hash` lock this module uses,
 //! so "someone is already priming this book" is visible process-wide, not
 //! just within this module's own callers.
+//!
+//! # PDF page reads (M2)
+//!
+//! [`page_image`]'s PDF arm shares the `pages` [`crate::storage::Storage`]
+//! with comics but not their cache shape: PDF rendering is per-page, and
+//! [`crate::page_cache::get_or_render_pdf_page_with_eviction`] already
+//! implements the disk-first / render-on-miss / lazy-eviction-batch protocol
+//! that needs, one page at a time — there is no `ensure_cached` equivalent
+//! to prime a whole PDF, and inventing one would repeat the very
+//! whole-archive-on-one-request cost the comic arm's design note above
+//! warns about, just for a format where it isn't necessary. See
+//! [`pdf_page_image`]'s doc comment for the manifest-establishment and
+//! private-mode details.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -252,12 +265,15 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// Read one comic page's image bytes, downscaled to `target_width` when
-/// given and the source is wider (see [`crate::image_util::maybe_resize_to_jpeg`]).
+/// Read one comic or PDF page's image bytes, downscaled to `target_width`
+/// when given and the source is wider (see
+/// [`crate::image_util::maybe_resize_to_jpeg`]).
 ///
-/// CBZ/CBR only in this milestone; every other format errors with
-/// [`CarrelError::invalid`], mirroring [`chapter_html`]'s rejection of the
-/// image-only formats.
+/// CBZ/CBR/PDF only; every other format errors with [`CarrelError::invalid`],
+/// mirroring [`chapter_html`]'s rejection of the image-only formats. The PDF
+/// arm is [`pdf_page_image`] (below), which this delegates to — its own doc
+/// comment has the PDF-specific cache shape, the manifest-establishment
+/// step, and `is_private`.
 ///
 /// `book_id`/`book_hash` identify the book for [`page_cache`] — `book_hash`
 /// is the cache key, `book_id` is carried into the manifest for
@@ -265,11 +281,12 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// cache-miss / no-hash behaviour.
 ///
 /// This function is synchronous and, on a cache miss, does the CPU/I/O-bound
-/// work of extracting a whole comic archive — callers on an async runtime
-/// (the web adapter) must run it on a blocking thread pool
-/// (`tokio::task::spawn_blocking`), not inline on an async worker.
+/// work of extracting a whole comic archive or rendering one PDF page —
+/// callers on an async runtime (the web adapter) must run it on a blocking
+/// thread pool (`tokio::task::spawn_blocking`), not inline on an async
+/// worker.
 ///
-/// # Degrading instead of failing (M1 review, finding F1)
+/// # Degrading instead of failing — comics (M1 review, finding F1)
 ///
 /// A cache that has just been primed can still fail to serve the page it
 /// was primed for: `page_cache_max_size_mb` can be smaller than this one
@@ -283,9 +300,21 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// would 404 on *every* request, forever, for a book that rendered fine
 /// before this milestone.
 ///
-/// # `on_extracted` (M1 review, findings F1 and F7)
+/// PDF (M2) does not need an equivalent fallback: a miss's returned bytes
+/// come directly from the pdfium render, never from a disk read-back, so
+/// there is no window where an eviction pass reclaiming what this exact call
+/// just wrote could turn a successful render into an error. See
+/// [`pdf_page_image`]'s doc comment.
 ///
-/// Fires **at most once**, and only when this call both (a) performed a
+/// # `on_extracted` (M1 review, findings F1 and F7; widened to `Fn` for M2)
+///
+/// The bound widened from `FnOnce` to `Fn` in M2 so the PDF arm can forward
+/// this straight into [`page_cache::get_or_render_pdf_page_with_eviction`]'s
+/// `on_batch`, which requires `Fn`; every pre-existing caller's closure
+/// already satisfied it (none consumed anything they captured), so this is
+/// not a behavior change for comics.
+///
+/// For comics, fires **at most once**, and only when this call both (a) performed a
 /// real extraction via `ensure_cached` — not when `ensure_cached`
 /// short-circuited on an already-complete manifest — and (b) then
 /// successfully read the requested page back out of the cache it just
@@ -312,6 +341,20 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 /// for the existing convention this mirrors. A caller that fails inside the
 /// callback must swallow that error itself — a failed eviction must not
 /// fail the page request that already has its bytes.
+///
+/// For PDF, this same parameter is forwarded straight through as that
+/// function's own `on_batch`: it fires only once every
+/// [`page_cache::LAZY_EVICTION_BATCH`] disk writes cross a multiple of that
+/// count, a much sparser cadence than "every priming miss" — see
+/// [`pdf_page_image`].
+///
+/// `is_private`, when true, suppresses persisting rendered page *bytes* to
+/// disk (M2) — forwarded unchanged to
+/// [`page_cache::get_or_render_pdf_page_with_eviction`]'s `suppress_write`
+/// for PDF, matching `commands::get_pdf_page_bytes`'s desktop behaviour.
+/// Comics ignore it: there is no equivalent write-suppression path for
+/// CBZ/CBR yet (tracked in
+/// `docs/backlog/comic-cache-ignores-private-mode.md`).
 #[allow(clippy::too_many_arguments)]
 pub fn page_image<F>(
     format: BookFormat,
@@ -322,10 +365,24 @@ pub fn page_image<F>(
     book_hash: Option<&str>,
     pages: &dyn Storage,
     on_extracted: F,
+    is_private: bool,
 ) -> CarrelResult<(Vec<u8>, String)>
 where
-    F: FnOnce(),
+    F: Fn(),
 {
+    if format == BookFormat::Pdf {
+        return pdf_page_image(
+            file_path,
+            page_index,
+            target_width,
+            book_id,
+            book_hash,
+            pages,
+            on_extracted,
+            is_private,
+        );
+    }
+
     if !matches!(format, BookFormat::Cbz | BookFormat::Cbr) {
         return Err(CarrelError::invalid(format!(
             "page reads are not supported for format {format}"
@@ -415,6 +472,91 @@ where
     } else {
         crate::cbr::get_page_image_bytes(file_path, page_index, target_width)
     }
+}
+
+/// PDF arm of [`page_image`] (M2).
+///
+/// Unlike comics, there is no `ensure_cached`-style whole-book prime to
+/// reuse here: [`page_cache::get_or_render_pdf_page_with_eviction`] already
+/// implements the disk-first / render-on-miss / lazy-eviction-batch protocol
+/// this needs, one page at a time — which is the right granularity for PDF,
+/// where a single page render is already comparable in cost to decoding a
+/// whole comic archive, so priming every page on the book's first request
+/// would repeat the very "block the request on the whole book" problem the
+/// comic arm's whole-book prime exists to accept only once.
+///
+/// That function only *writes* a page once a cache manifest already exists
+/// for `book_hash` — on desktop, `commands::prepare_pdf` establishes one on
+/// book-open via `page_cache::ensure_pdf_prewarmed(..., 0)` (zero pages
+/// rendered up front, just the page count recorded so later lazy writes
+/// have a manifest to attach to). The web reader has no equivalent "open"
+/// event, so this lazily runs that exact same zero-prewarm call — not a new
+/// whole-book prime, just the page count — the first time it sees a book
+/// with no manifest yet. Once a manifest exists (created by either
+/// surface), every later call for that `book_hash` goes straight to
+/// `get_or_render_pdf_page_with_eviction`: a hit reads the disk cache only
+/// (never touches `file_path`, which is what lets a caller prove the cache
+/// is doing its job by deleting the source file between two reads of the
+/// same page), a miss renders one page via pdfium and writes it.
+///
+/// The zero-prewarm manifest write happens even when `is_private` is true —
+/// it records only the page count and timestamps, never a page's content,
+/// matching `prepare_pdf`'s own unconditional call. `is_private` instead
+/// forwards to `get_or_render_pdf_page_with_eviction`'s `suppress_write`,
+/// which skips only the page-bytes disk write.
+///
+/// A miss's returned bytes always come from the render itself, not a disk
+/// read-back, so unlike the comic arm there is no window where an eviction
+/// pass reclaiming what this very call just wrote could turn a successful
+/// render into an error (see [`page_image`]'s "degrading instead of
+/// failing" doc section) — `on_extracted` (playing the role
+/// `get_or_render_pdf_page_with_eviction` calls `on_batch`) only ever runs
+/// after the bytes to return are already in hand.
+#[allow(clippy::too_many_arguments)]
+fn pdf_page_image<F>(
+    file_path: &str,
+    page_index: u32,
+    target_width: Option<u32>,
+    book_id: &str,
+    book_hash: Option<&str>,
+    pages: &dyn Storage,
+    on_extracted: F,
+    is_private: bool,
+) -> CarrelResult<(Vec<u8>, String)>
+where
+    F: Fn(),
+{
+    let Some(hash) = book_hash else {
+        // No hash to key the cache on — render straight from the file.
+        let (data, mime) = crate::pdf::get_page_image_bytes(file_path, page_index, target_width)?;
+        return Ok((data, mime.to_string()));
+    };
+
+    let has_pdf_manifest = page_cache::read_manifest(pages, hash)
+        .map(|m| m.format == BookFormat::Pdf)
+        .unwrap_or(false);
+    if !has_pdf_manifest {
+        page_cache::ensure_pdf_prewarmed(pages, book_id, hash, file_path, 0)?;
+    }
+
+    let (data, mime) = page_cache::get_or_render_pdf_page_with_eviction(
+        pages,
+        hash,
+        file_path,
+        page_index,
+        on_extracted,
+        is_private,
+    )?;
+    // Both a hit and a miss yield `pdf::CACHE_CANONICAL_WIDTH` (2400 px)
+    // bytes, whereas the direct render this arm replaced turned a `None`
+    // width into `pdf::DEFAULT_RENDER_WIDTH` (1200 px) inside
+    // `pdf::get_page_image_bytes` itself. The web reader sends no `?width=`
+    // on an ordinary page turn, so passing `None` straight through would
+    // silently double every page's resolution on the wire — the opposite of
+    // what caching this route is for. Default it here the same way, so a
+    // widthless request gets the bytes it always got.
+    let target_width = target_width.or(Some(crate::pdf::DEFAULT_RENDER_WIDTH));
+    crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)
 }
 
 /// Page count for CBZ/CBR. Other formats error with [`CarrelError::invalid`],
@@ -655,6 +797,7 @@ mod tests {
             Some("hash1"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         assert!(page_cache::read_manifest(&pages, "hash1").is_some());
@@ -670,6 +813,7 @@ mod tests {
             Some("hash1"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         assert_eq!(second, first);
@@ -699,6 +843,7 @@ mod tests {
             || {
                 calls.set(calls.get() + 1);
             },
+            false,
         )
         .unwrap();
         assert_eq!(calls.get(), 1, "must fire on the priming miss");
@@ -714,6 +859,7 @@ mod tests {
             || {
                 calls.set(calls.get() + 1);
             },
+            false,
         )
         .unwrap();
         assert_eq!(calls.get(), 1, "must not fire again on a cache hit");
@@ -742,6 +888,7 @@ mod tests {
             Some("hash-oor"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
 
@@ -755,6 +902,7 @@ mod tests {
             Some("hash-oor"),
             &pages,
             || calls.set(calls.get() + 1),
+            false,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -780,6 +928,7 @@ mod tests {
             Some("hash-touch"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         let before = page_cache::read_manifest(&pages, "hash-touch")
@@ -800,6 +949,7 @@ mod tests {
             Some("hash-touch"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         let after = page_cache::read_manifest(&pages, "hash-touch")
@@ -839,6 +989,7 @@ mod tests {
             Some("hash-oversized"),
             &pages,
             evict_to_zero,
+            false,
         )
         .unwrap();
         assert!(!first.0.is_empty());
@@ -859,6 +1010,7 @@ mod tests {
             Some("hash-oversized"),
             &pages,
             evict_to_zero,
+            false,
         )
         .unwrap();
         assert_eq!(second, first);
@@ -905,6 +1057,7 @@ mod tests {
                         || {
                             extractions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         },
+                        false,
                     )
                     .unwrap();
                 });
@@ -943,6 +1096,7 @@ mod tests {
             Some("hash2"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -956,6 +1110,7 @@ mod tests {
             Some("hash2"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         assert_eq!(mime, "image/jpeg");
@@ -986,6 +1141,7 @@ mod tests {
             Some("hash3"),
             &pages,
             || {},
+            false,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1007,6 +1163,7 @@ mod tests {
             None,
             &pages,
             || {},
+            false,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1021,8 +1178,18 @@ mod tests {
         let path = write_cbz(dir.path(), &[encode_jpeg(100, 100)]);
         let pages = pages_storage(dir.path());
 
-        let (bytes, mime) =
-            page_image(BookFormat::Cbz, &path, 0, None, "bk", None, &pages, || {}).unwrap();
+        let (bytes, mime) = page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            None,
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
         assert!(!bytes.is_empty());
         assert_eq!(mime, "image/jpeg");
         assert!(
@@ -1032,17 +1199,328 @@ mod tests {
     }
 
     #[test]
-    fn page_image_rejects_non_comic_formats() {
+    fn page_image_rejects_non_page_formats() {
         let dir = tempfile::tempdir().unwrap();
         let pages = pages_storage(dir.path());
-        for format in [BookFormat::Epub, BookFormat::Mobi, BookFormat::Pdf] {
+        for format in [BookFormat::Epub, BookFormat::Mobi] {
             let name = format.to_string();
-            let err = page_image(format, "/nope", 0, None, "bk", None, &pages, || {}).unwrap_err();
+            let err =
+                page_image(format, "/nope", 0, None, "bk", None, &pages, || {}, false).unwrap_err();
             assert!(
                 err.to_string().contains("not supported"),
                 "unexpected error for {name}: {err}"
             );
         }
+    }
+
+    // ── PDF page reads (M2) ─────────────────────────────────────────────
+
+    /// Point pdfium at the bundled library and return whether it is usable.
+    ///
+    /// Mirrors `pdf::tests::pdfium_available`: the binary is downloaded by
+    /// `scripts/download-pdfium.sh` (and by CI on Linux/macOS) into
+    /// `src-tauri/resources/`, which is gitignored — a fresh clone that
+    /// skipped the script, and the Windows CI job (which builds this test
+    /// binary but has no library at all), skip PDF tests rather than fail
+    /// them. The path is a process-global `OnceLock`, so setting it here is
+    /// idempotent and harmless alongside `pdf.rs`'s own copy of this helper.
+    fn pdfium_available() -> bool {
+        let lib_name = if cfg!(target_os = "windows") {
+            "pdfium.dll"
+        } else if cfg!(target_os = "macos") {
+            "libpdfium.dylib"
+        } else {
+            "libpdfium.so"
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("src-tauri")
+            .join("resources")
+            .join(lib_name);
+        if !path.exists() {
+            return false;
+        }
+        crate::pdf::set_pdfium_library_path(Some(path));
+        true
+    }
+
+    /// A minimal one-page, hand-crafted PDF — no PDF-writing crate needed.
+    /// Simplified from `pdf::tests::crafted_pdf` (fixed ordinary page size;
+    /// nothing here exercises that helper's aspect-ratio clamp).
+    fn write_pdf(dir: &std::path::Path) -> String {
+        let content = b"0 0 1 rg 0 0 10 10 re f\n";
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<</Type/Catalog/Pages 2 0 R>>".to_vec(),
+            b"<</Type/Pages/Kids[3 0 R]/Count 1>>".to_vec(),
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R/Resources<<>>>>"
+                .to_vec(),
+            format!(
+                "<</Length {}>>stream\n{}\nendstream",
+                content.len(),
+                std::str::from_utf8(content).unwrap()
+            )
+            .into_bytes(),
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"endobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref
+            )
+            .as_bytes(),
+        );
+
+        let path = dir.join("book.pdf");
+        std::fs::write(&path, out).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// M2's acceptance criterion: a second read of the same PDF page is
+    /// served from the disk page cache, not by re-rendering with pdfium.
+    /// Deleting the source file between the two reads is what makes that
+    /// observable — a re-render would fail, and a test that only asserted
+    /// "both calls returned Ok" would pass even with the caching removed.
+    #[test]
+    fn second_pdf_page_read_does_not_reopen_the_file() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        let first = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-hash1"),
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.1, "image/jpeg");
+        assert!(!first.0.is_empty());
+        assert!(page_cache::read_manifest(&pages, "pdf-hash1").is_some());
+
+        std::fs::remove_file(&path).unwrap();
+
+        let second = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-hash1"),
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
+        assert_eq!(second, first);
+    }
+
+    /// A widthless request must still get `pdf::DEFAULT_RENDER_WIDTH`
+    /// (1200 px), not the cache's `CACHE_CANONICAL_WIDTH` (2400 px).
+    ///
+    /// Routing this route through the page cache changed what `None` means:
+    /// `pdf::get_page_image_bytes` — the direct render this arm replaced —
+    /// turns `None` into 1200 itself, while the cache always stores 2400 and
+    /// `maybe_resize_to_jpeg(_, _, None)` is a no-op. The web reader's
+    /// ordinary page turn sends no `?width=`, so handing the cached bytes
+    /// back unresized would have quadrupled every LAN page turn's payload —
+    /// a caching change that made page turns *heavier*. Both the miss and
+    /// the hit are checked, since only the hit reads from disk.
+    #[test]
+    fn a_widthless_pdf_page_keeps_the_legacy_render_width() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        let width_of = |bytes: &[u8]| -> u32 {
+            image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .unwrap()
+                .into_dimensions()
+                .unwrap()
+                .0
+        };
+
+        for pass in ["miss", "hit"] {
+            let (bytes, _) = page_image(
+                BookFormat::Pdf,
+                &path,
+                0,
+                None,
+                "bk",
+                Some("pdf-width"),
+                &pages,
+                || {},
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                width_of(&bytes),
+                crate::pdf::DEFAULT_RENDER_WIDTH,
+                "widthless request on the {pass} must keep the legacy render width"
+            );
+        }
+    }
+
+    /// A PDF with no `file_hash` has nothing to key the page cache on — it
+    /// must still render (uncached) rather than erroring, and must not write
+    /// anything to the cache.
+    #[test]
+    fn a_pdf_with_no_hash_renders_uncached() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        let (bytes, mime) = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            None,
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
+        assert!(
+            pages.list("page-cache/").unwrap().is_empty(),
+            "a hash-less book must not write to the page cache"
+        );
+    }
+
+    /// M2's private-mode requirement: the page still renders, but private
+    /// mode must suppress the page-content write specifically — a `.jpg`
+    /// must never land under the book's cache prefix, even though the
+    /// (metadata-only: page count and timestamps, never page bytes)
+    /// manifest still does, matching `commands::prepare_pdf`'s own
+    /// unconditional manifest write.
+    #[test]
+    fn pdf_private_mode_renders_but_does_not_write_page_bytes() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        let (bytes, _) = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-private"),
+            &pages,
+            || {},
+            true,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty(), "private mode must still render the page");
+
+        let entries = pages.list("page-cache/pdf-private/").unwrap();
+        assert!(
+            !entries.iter().any(|e| e.ends_with(".jpg")),
+            "private mode must not write page bytes to disk: {entries:?}"
+        );
+    }
+
+    /// M2 trap #4 (inherited from the M1 review's finding F1): a page whose
+    /// cache entry gets reclaimed by eviction must never come back as an
+    /// error on a later request — it must degrade to a fresh direct render,
+    /// the way `commands::get_pdf_page_bytes` always has. Unlike the comic
+    /// arm, a single `page_image` call for PDF can't fail this way on its
+    /// own (`get_or_render_pdf_page_with_eviction` returns the bytes it just
+    /// rendered directly, never reading them back from disk — see
+    /// `pdf_page_image`'s doc comment) — the reachable version of this
+    /// failure is a *later* call finding the manifest an earlier eviction
+    /// pass reclaimed. Eviction is run directly here (budget 0, guaranteed
+    /// to reclaim every book) rather than through `on_extracted`, since that
+    /// callback only fires once every `page_cache::LAZY_EVICTION_BATCH`
+    /// writes cross a multiple of that count — a global counter shared with
+    /// every other test in this binary, so forcing it deterministically here
+    /// would be flaky by construction.
+    #[test]
+    fn pdf_page_survives_eviction_between_two_reads() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf(dir.path());
+        let pages = pages_storage(dir.path());
+
+        let first = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-evict"),
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
+        assert!(page_cache::read_manifest(&pages, "pdf-evict").is_some());
+
+        page_cache::run_eviction(&pages, 0).unwrap();
+        assert!(
+            page_cache::read_manifest(&pages, "pdf-evict").is_none(),
+            "the 0 MB budget must actually have reclaimed the book, or this test proves nothing"
+        );
+
+        // A second read, now against an empty cache, must ALSO succeed —
+        // `pdf_page_image` re-establishes the manifest and renders fresh,
+        // exactly as it would for a book it had never seen before.
+        let second = page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-evict"),
+            &pages,
+            || {},
+            false,
+        )
+        .unwrap();
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -1099,6 +1577,7 @@ mod tests {
             Some("hash-count"),
             &pages,
             || {},
+            false,
         )
         .unwrap();
         std::fs::remove_file(&path).unwrap();

@@ -20,6 +20,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   back and forth — is a pure cache read with no archive access. Noticeable on
   large or network-mounted comics; a book without a computed file hash still
   renders, just without the cache.
+- **PDF page turns in the web reader are now served from the disk page
+  cache**, matching the comic fix above. Each page is cached individually the
+  first time it's rendered — a PDF no longer re-renders with pdfium on every
+  page request once it's been viewed once. A book read in private mode still
+  renders normally but does not persist its pages to the shared cache.
 
 ## [3.1.0] - 2026-08-24
 

@@ -1395,12 +1395,70 @@ async fn get_page_image(
     }
 
     match book.format {
+        // Reads through the disk page cache (M2): before this, every PDF
+        // page request re-rendered with pdfium from scratch, while the
+        // desktop reader had been reading from a warm cache all along (once
+        // `commands::prepare_pdf` had run on book-open). This route has no
+        // equivalent open event, so `carrel_core::reader::page_image`'s PDF
+        // arm establishes the same zero-prewarm manifest lazily on its own
+        // first call for a book — see that function's doc comment. Unlike
+        // the comic arm below, a miss renders exactly the one requested
+        // page, not the whole document, so this still runs on the blocking
+        // pool (a pdfium render is CPU-heavy) but for a bounded, single-page
+        // cost rather than a whole-archive one.
         BookFormat::Pdf => {
-            let (bytes, mime) = crate::pdf::get_page_image_bytes(&file_path, index, width)
+            let pages_storage = state
+                .pages_storage()
                 .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
+            let book_id = id.clone();
+            let file_hash = book.file_hash.clone();
+            let is_private = state.is_private();
+            let (bytes, mime) = tokio::task::spawn_blocking(move || {
+                let evict_storage = pages_storage.clone();
+                carrel_core::reader::page_image(
+                    BookFormat::Pdf,
+                    &file_path,
+                    index,
+                    width,
+                    &book_id,
+                    file_hash.as_deref(),
+                    pages_storage.as_ref(),
+                    // Fires when the lazy-write counter crosses a multiple
+                    // of `page_cache::LAZY_EVICTION_BATCH` — a sparser
+                    // cadence than the comic arm's "every priming miss",
+                    // since a PDF page cache fills one page at a time. Same
+                    // budget resolution as the comic arm below: the user's
+                    // `page_cache_max_size_mb` setting, so a lowered budget
+                    // is honored regardless of which format primed the
+                    // cache first.
+                    move || {
+                        if let Err(e) = crate::page_cache::run_eviction(
+                            evict_storage.as_ref(),
+                            max_cache_size_mb,
+                        ) {
+                            log::warn!("pdf page-cache eviction failed: {e}");
+                        }
+                    },
+                    // Private mode: suppress only the page-bytes disk write,
+                    // matching `commands::get_pdf_page_bytes`'s desktop
+                    // behaviour, so a "don't track this session" read
+                    // doesn't persist rendered pages to the shared
+                    // page-cache directory.
+                    is_private,
+                )
+            })
+            .await
+            .map_err(|e| {
+                log::error!("pdf page render task panicked: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            })?
+            .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
-                    (header::CONTENT_TYPE, mime.to_string()),
+                    (header::CONTENT_TYPE, mime),
                     (header::CACHE_CONTROL, page_cache_control.to_string()),
                 ],
                 bytes,
@@ -1458,6 +1516,12 @@ async fn get_page_image(
                             log::warn!("comic page-cache eviction failed: {e}");
                         }
                     },
+                    // Comics do not yet consult private mode (tracked in
+                    // `docs/backlog/comic-cache-ignores-private-mode.md`) —
+                    // hardcoded rather than wired to `state.is_private()`
+                    // so fixing that gap later is a deliberate, reviewed
+                    // change, not an accidental side effect of this one.
+                    false,
                 )
             })
             .await
@@ -2911,6 +2975,208 @@ mod tests {
              configured 1 MB budget; both present means eviction used a larger budget \
              than what was set"
         );
+    }
+
+    // ── PDF page reads (M2) ─────────────────────────────────────────────
+
+    /// Point pdfium at the bundled library and return whether it is usable.
+    ///
+    /// Mirrors `carrel_core::pdf::tests::pdfium_available`: the binary is
+    /// downloaded by `scripts/download-pdfium.sh` (and by CI on
+    /// Linux/macOS) into `src-tauri/resources/`, which is gitignored — a
+    /// fresh clone that skipped the script, and the Windows CI job (which
+    /// builds this test binary but has no library at all), skip PDF tests
+    /// rather than fail them.
+    fn pdfium_available() -> bool {
+        let lib_name = if cfg!(target_os = "windows") {
+            "pdfium.dll"
+        } else if cfg!(target_os = "macos") {
+            "libpdfium.dylib"
+        } else {
+            "libpdfium.so"
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(lib_name);
+        if !path.exists() {
+            return false;
+        }
+        carrel_core::pdf::set_pdfium_library_path(Some(path));
+        true
+    }
+
+    /// A minimal one-page, hand-crafted PDF — no PDF-writing crate needed.
+    /// Mirrors `carrel_core::reader::tests::write_pdf`.
+    fn write_pdf(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let content = b"0 0 1 rg 0 0 10 10 re f\n";
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<</Type/Catalog/Pages 2 0 R>>".to_vec(),
+            b"<</Type/Pages/Kids[3 0 R]/Count 1>>".to_vec(),
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R/Resources<<>>>>"
+                .to_vec(),
+            format!(
+                "<</Length {}>>stream\n{}\nendstream",
+                content.len(),
+                std::str::from_utf8(content).unwrap()
+            )
+            .into_bytes(),
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"endobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref
+            )
+            .as_bytes(),
+        );
+
+        let path = dir.join(name);
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// A linked PDF book row pointing at `path`, seeded into `state`'s DB.
+    fn seed_pdf_book(state: &WebState, id: &str, path: &std::path::Path, file_hash: Option<&str>) {
+        let book = crate::models::Book {
+            id: id.to_string(),
+            title: "PDF Page Read Test Book".to_string(),
+            author: "Test Author".to_string(),
+            file_path: path.to_string_lossy().into_owned(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: BookFormat::Pdf,
+            file_hash: file_hash.map(|s| s.to_string()),
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        };
+        let conn = state.conn().unwrap();
+        crate::db::insert_book(&conn, &book).unwrap();
+    }
+
+    /// M2's acceptance criterion: a second PDF page request is served from
+    /// the disk page cache rather than by re-rendering with pdfium, which is
+    /// what this route did on *every* request before.
+    ///
+    /// Deleting the file between the two requests is what makes that
+    /// observable — asserting two 200s would pass with the caching removed.
+    #[tokio::test]
+    async fn web_pdf_page_reads_reuse_the_page_cache() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let pdf = write_pdf(dir.path(), "book.pdf");
+        seed_pdf_book(&state, "bk-pdf", &pdf, Some("pdf-hash-1"));
+
+        let first = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+        let first_bytes = body_bytes(first).await;
+        assert!(!first_bytes.is_empty());
+
+        std::fs::remove_file(&pdf).unwrap();
+
+        let second = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("second read must be served from the cached page");
+        assert_eq!(body_bytes(second).await, first_bytes);
+    }
+
+    /// M2's private-mode requirement, proven at the web-route level (not
+    /// just core): with `WebState::private_mode` on, the page still renders,
+    /// but the page BYTES must never reach disk — only `is_private` reaching
+    /// `carrel_core::reader::page_image` unchanged makes that true; a wiring
+    /// bug that dropped or hardcoded the flag would still pass a test that
+    /// only checked the response was 200.
+    #[tokio::test]
+    async fn web_pdf_page_private_mode_does_not_write_page_bytes() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        state
+            .private_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pdf = write_pdf(dir.path(), "book.pdf");
+        seed_pdf_book(&state, "bk-pdf-private", &pdf, Some("pdf-hash-private"));
+
+        let resp = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf-private".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("private mode must still render the page");
+        assert!(!body_bytes(resp).await.is_empty());
+
+        let pages_storage = state.pages_storage().unwrap();
+        let entries = pages_storage.list("page-cache/pdf-hash-private/").unwrap();
+        assert!(
+            !entries.iter().any(|e| e.ends_with(".jpg")),
+            "private mode must not write page bytes to disk: {entries:?}"
+        );
+    }
+
+    /// A PDF with no `file_hash` has nothing to key the page cache on — the
+    /// route must still serve it (uncached) rather than erroring.
+    #[tokio::test]
+    async fn web_pdf_page_without_hash_still_renders() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let pdf = write_pdf(dir.path(), "book.pdf");
+        seed_pdf_book(&state, "bk-pdf-nohash", &pdf, None);
+
+        let resp = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf-nohash".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("a book with no file_hash must still render");
+        assert!(!body_bytes(resp).await.is_empty());
     }
 
     #[tokio::test]
