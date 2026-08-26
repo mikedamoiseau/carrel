@@ -546,6 +546,64 @@ pub fn get_cached_page(
     Ok((data, mime_for_page_name(&page_name).to_string()))
 }
 
+/// Bump `book_hash`'s `last_accessed` to now, without touching any cached
+/// page content.
+///
+/// Every `ensure_*` function in this module already does this on its own
+/// cache-hit path. This is for a caller whose cache-hit path reads pages
+/// directly via [`get_cached_page`] instead of going through one of those —
+/// without it, a book read only that way looks, to [`run_eviction`], like
+/// the coldest entry in the whole cache and is first in line for both its
+/// size cap and its 20-book cap, even while it's the one actively being
+/// read. A no-op when there is no manifest to touch; like every other
+/// manifest write in this module, a failure is swallowed rather than
+/// surfaced — the worst case is this read being treated as slightly colder
+/// than it really was, not a failed page request.
+pub fn touch_last_accessed(storage: &dyn Storage, book_hash: &str) {
+    if let Some(mut manifest) = read_manifest(storage, book_hash) {
+        manifest.last_accessed = now_iso();
+        let _ = write_manifest(storage, book_hash, &manifest);
+    }
+}
+
+/// Whether `book_hash`'s cached comic is complete enough to trust without
+/// reopening the source archive: the manifest exists, and its first and
+/// last listed page are both actually on disk. Returns the manifest when
+/// so, `None` otherwise.
+///
+/// This is the exact completeness test [`ensure_cached`] and
+/// [`ensure_comic_fast`] already use to decide "cache hit, skip extraction"
+/// vs. "partial, evict and re-extract" — a sample of two pages, not a full
+/// per-page existence scan (a caller that needs a scan on every book open
+/// would put a whole-cache stat storm on that path; this reuses the same
+/// evidence those two functions already consider sufficient for their own
+/// decisions). `ensure_comic_fast`'s own manifest is the case that makes
+/// the sample matter to a caller outside this module: it writes a
+/// *complete-looking* manifest immediately but extracts only the first page
+/// (plus any priority pages), filling the rest in later via
+/// [`extract_comic_remaining`]. A caller that only checked "does a manifest
+/// exist" would trust that manifest before the background pass finishes,
+/// and report a page count — or serve a read — for pages that are not
+/// actually there yet.
+pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<CacheManifest> {
+    let manifest = read_manifest(storage, book_hash)?;
+    let first_ok = manifest
+        .pages
+        .first()
+        .and_then(|p| storage.exists(&page_key(book_hash, p)).ok())
+        .unwrap_or(false);
+    let last_ok = manifest
+        .pages
+        .last()
+        .and_then(|p| storage.exists(&page_key(book_hash, p)).ok())
+        .unwrap_or(false);
+    if first_ok && last_ok {
+        Some(manifest)
+    } else {
+        None
+    }
+}
+
 pub fn ensure_cached(
     storage: &dyn Storage,
     book_id: &str,

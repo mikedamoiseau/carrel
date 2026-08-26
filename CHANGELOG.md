@@ -13,6 +13,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   desktop reader has always used instead of reopening and reparsing the whole
   file per request. Noticeable on large or network-mounted books; the desktop
   reader's output is unchanged.
+- **Comic (CBZ/CBR) page turns in the web reader are now served from the disk
+  page cache** instead of decoding the archive on every request. The first
+  page of a comic primes the whole book into the same on-disk cache the
+  desktop reader has always used; every page after that — including flipping
+  back and forth — is a pure cache read with no archive access. Noticeable on
+  large or network-mounted comics; a book without a computed file hash still
+  renders, just without the cache.
 
 ## [3.1.0] - 2026-08-24
 
