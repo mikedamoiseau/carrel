@@ -559,19 +559,42 @@ where
         // because nothing was written — while still letting the degrade path
         // below fire it when an extraction really did happen.
         let extracted = page_cache::complete_manifest(pages, hash).is_none();
-        // A *failing* `ensure_cached` can still have written page blobs:
-        // `extract_comic_full` writes them first and the manifest last, with
-        // no cleanup, so a failure on entry 900 of 1000 — or on the manifest
-        // write after every page landed — leaves bytes on disk. Round 4's
-        // rule applies to that too, and propagating with `?` would have been
-        // the same hole one branch further up (M3 review round 5). Sweeping
-        // manifest-less bytes is exactly what `run_eviction`'s orphan-prefix
-        // pass is for; it just has to actually be asked to run.
+        // A failing `ensure_cached` degrades to a direct decode rather than
+        // failing the request (M3 review round 6). Its errors are not all
+        // about the archive: a full disk, an unwritable `Storage`, a failed
+        // manifest write are all about the *cache*, and this module's
+        // standing rule is that an unusable cache costs the cache, not the
+        // book (M2 review round 3). `ensure_file_exists` has already run, so
+        // a genuinely broken archive still errors — from the direct decode
+        // below, which fails too.
+        //
+        // The eviction hook deliberately does NOT fire here, reversing round
+        // 5's attempt to sweep a partial extraction. `extracted` means "the
+        // manifest was not complete", not "bytes were written", and the two
+        // come apart precisely on this path: `extract_comic_full` calls
+        // `comic_page_names` before writing anything, so a corrupt CBZ or an
+        // unopenable CBR fails having written nothing at all. Firing anyway
+        // hands an unauthenticated LAN client a full-cache eviction walk per
+        // request against one broken comic — the amplification the
+        // `on_extracted` contract above exists to prevent. Telling the two
+        // apart cheaply is not possible here either: `Storage::list` walks
+        // the whole storage root (see `page_cache::pdf_manifest_page_count`),
+        // so probing per error would be worse than the sweep it guards.
+        //
+        // The cost is that a genuinely partial extraction's bytes linger.
+        // They are manifest-less, which is exactly what `run_eviction`'s
+        // orphan-prefix pass reclaims, so the next sweep from any other
+        // request collects them. Self-healing lag beats an abuse amplifier.
         if let Err(e) = page_cache::ensure_cached(pages, book_id, hash, file_path, &format) {
-            if extracted {
-                on_extracted();
-            }
-            return Err(e);
+            page_cache::page_dbg!("ensure_cached failed, decoding directly: {}", e);
+            return direct_comic_page(
+                format,
+                file_path,
+                page_index,
+                target_width,
+                started,
+                std::time::Duration::ZERO,
+            );
         }
 
         // Read back before firing `on_extracted` (finding F1): the callback
@@ -1258,6 +1281,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls.get(), 1, "must not fire again on a cache hit");
+    }
+
+    /// M3 review round 6: a comic whose archive will not open must not fire
+    /// the eviction hook. `extracted` means "the manifest was not complete",
+    /// not "bytes were written", and `extract_comic_full` reads the entry
+    /// list before writing anything — so a corrupt archive fails having
+    /// written nothing.
+    ///
+    /// Firing anyway is not a wasted call, it is an abuse vector: the web
+    /// route's PIN is optional, the callback runs a full-cache eviction walk
+    /// inline, and a client can loop this request on one broken comic. Round
+    /// 5 introduced exactly that while trying to sweep partial extractions;
+    /// this pins it shut.
+    #[test]
+    fn a_comic_that_will_not_open_does_not_fire_on_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.cbz");
+        std::fs::write(&path, b"not a zip file!!").unwrap();
+        let pages = pages_storage(dir.path());
+        let calls = std::cell::Cell::new(0);
+
+        for _ in 0..3 {
+            page_image(
+                BookFormat::Cbz,
+                path.to_str().unwrap(),
+                0,
+                None,
+                "bk",
+                Some("hash-broken"),
+                Some(&pages),
+                || calls.set(calls.get() + 1),
+                false,
+                OnMiss::Prime,
+            )
+            .unwrap_err();
+        }
+
+        assert_eq!(
+            calls.get(),
+            0,
+            "an archive that never opened wrote nothing — firing the hook \
+             would let a LAN client loop one broken comic into a full-cache \
+             eviction walk per request"
+        );
+    }
+
+    /// M3 review round 6: a cache that cannot be written must cost the
+    /// cache, not the book — the same rule M2 round 3 established for the
+    /// PDF arm. A read-only cache directory fails `ensure_cached`; the page
+    /// still has to come back, decoded straight from the archive.
+    ///
+    /// Unix only: Windows ignores the mode bits.
+    #[cfg(unix)]
+    #[test]
+    fn a_comic_page_still_serves_when_the_cache_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(100, 100)]);
+        let pages = pages_storage(dir.path());
+        let cache_root = dir.path().join("cache");
+        let calls = std::cell::Cell::new(0);
+
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let served = page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-ro-cache"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            false,
+            OnMiss::Prime,
+        );
+
+        // Restore before asserting, so a failure does not also break the
+        // temp dir's cleanup.
+        std::fs::set_permissions(&cache_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (bytes, mime) = served.expect("an unwritable cache must not fail the page");
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(
+            calls.get(),
+            0,
+            "nothing reached the cache, so there is nothing to evict around"
+        );
     }
 
     /// M3 review round 4: the mirror of F7 below. An out-of-range page of a

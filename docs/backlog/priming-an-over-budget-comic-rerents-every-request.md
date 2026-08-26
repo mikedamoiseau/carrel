@@ -60,3 +60,32 @@ sweep, so it has not been worth a fix. The clean version is for
 `ensure_cached` to report whether it did real work, rather than having the
 caller infer it — that is a `page_cache` signature change and should happen
 with the work above, not on its own.
+
+## Related: a partially-written extraction is not swept promptly (M3 round 6)
+
+`extract_comic_full` writes page blobs first and the manifest last, with no
+cleanup on error, so a failure partway through leaves manifest-less bytes on
+disk. `page_image` deliberately does **not** fire the eviction hook on that
+path.
+
+Round 5 tried to: the reasoning was that an archive had been written and
+something must bound it. Round 6 showed that reversing it was wrong, because
+`extracted` means "the manifest was not complete", not "bytes were written",
+and the two come apart exactly here — `extract_comic_full` reads the entry
+list before writing anything, so a corrupt CBZ or an unopenable CBR fails
+having written nothing at all. Firing there gave an unauthenticated LAN
+client a full-cache eviction walk per request against a single broken comic.
+Telling the two cases apart cheaply is not possible in that spot either:
+`Storage::list` walks the whole storage root, so probing on every error would
+cost more than the sweep it was guarding.
+
+So the bytes linger. They are manifest-less, which is what `run_eviction`'s
+orphan-prefix pass reclaims, so the next sweep triggered by any other request
+collects them — self-healing, with lag.
+
+Closing the lag properly needs the same `page_cache` change the section above
+wants: `ensure_cached` reporting whether it did real work, rather than the
+caller inferring it from the manifest. With that, the hook could fire on a
+genuine partial write and stay silent on an archive that never opened.
+`a_comic_that_will_not_open_does_not_fire_on_extracted` pins the half that
+must not regress while that is outstanding.
