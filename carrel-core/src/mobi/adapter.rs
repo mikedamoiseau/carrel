@@ -113,8 +113,10 @@ pub fn get_chapter_content(
 ///
 /// Emits the desktop's [`crate::reader::asset_localhost_url`] URLs. This
 /// signature is frozen for out-of-repo consumers, so a caller that needs
-/// different image URLs uses
-/// [`get_chapter_content_from_cache_with_url_policy`] instead.
+/// different image URLs goes through [`crate::reader::chapter_html`] (which
+/// owns the book cache and takes the policy), or calls
+/// [`get_chapter_content_from_cache_with_url_policy`] directly if it already
+/// holds a [`CachedMobiBook`].
 pub fn get_chapter_content_from_cache(
     cached: &CachedMobiBook,
     chapter_index: usize,
@@ -410,7 +412,7 @@ fn mobi_resource_to_url(
         }
     }
     let path = storage.local_path(&key).ok()?;
-    Some(image_url(&key, &path))
+    Some(crate::reader::attr_safe_url(image_url(&key, &path)))
 }
 
 /// Split a MOBI subject string into a list of genres. EXTH subject fields

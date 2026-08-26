@@ -2872,8 +2872,14 @@ mod tests {
         assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
     }
 
-    /// Characterization lock for the web chapter read's inline-image URLs,
-    /// recorded BEFORE the URL policy moves out of core (M5).
+    /// Characterization lock for the web chapter read's inline-image URLs
+    /// across M5's move of the URL policy out of core.
+    ///
+    /// It ships in the same commit as that change, so on its own it is a lock
+    /// going forward rather than evidence the bytes did not move; the evidence
+    /// for that was a byte-for-byte diff of this route's output between the
+    /// two commits, over adversarial filenames (space, `&`, non-ASCII, an
+    /// embedded `%2F`, a `?query`).
     ///
     /// Until M5 these URLs were produced by core emitting
     /// `asset://localhost/<url-encoded absolute path>` and this adapter

@@ -766,8 +766,13 @@ pub fn get_chapter_list(file_path: &str) -> Result<Vec<ChapterInfo>, EpubError> 
 ///
 /// Hard-wired to the desktop's [`crate::reader::asset_localhost_url`] policy.
 /// A caller that needs different URLs (the LAN web server serves them over
-/// HTTP) goes through [`get_chapter_content_from_cache_with_url_policy`]; this
-/// signature is frozen for out-of-repo consumers.
+/// HTTP) goes through [`crate::reader::chapter_html`], which owns the archive
+/// cache and takes the policy — or through
+/// [`get_chapter_content_from_cache_with_url_policy`] directly if it already
+/// holds a [`CachedEpubArchive`]. There is deliberately no path-based
+/// policy-taking variant: opening the zip per chapter is the cost
+/// `chapter_html` exists to avoid. This signature is frozen for out-of-repo
+/// consumers.
 pub fn get_chapter_content(
     file_path: &str,
     chapter_index: usize,
@@ -1325,7 +1330,7 @@ fn rewrite_img_srcs(
                         if written {
                             match storage.local_path(&key) {
                                 Ok(p) => {
-                                    let url = image_url(&key, &p);
+                                    let url = crate::reader::attr_safe_url(image_url(&key, &p));
                                     replace_attr_value(tag, "src", &src, &url)
                                 }
                                 Err(_) => tag.to_string(),
@@ -2316,6 +2321,34 @@ pub(crate) mod tests {
         let result = rewrite_img_srcs_to_asset_urls(html, &mut archive, "", &storage, "b/0");
 
         assert_eq!(result, html, "missing images should leave tag unchanged");
+    }
+
+    /// The guard from [`crate::reader::attr_safe_url`], proved end-to-end
+    /// through the rewriter rather than only on the helper: a policy whose
+    /// return value carries a quote must not be able to close the `src`
+    /// attribute and inject a new one. Reachable only via a caller-supplied
+    /// policy, which is exactly what M5 introduced.
+    #[test]
+    fn test_rewrite_img_srcs_cannot_break_out_of_the_src_attribute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = create_test_zip_with_images(tmp.path(), "t.zip", &[("cover.png", b"AAAA")]);
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let result = rewrite_img_srcs(
+            r#"<img src="cover.png"/>"#,
+            &mut archive,
+            "",
+            &storage,
+            "b/0",
+            &|_key: &str, _p: &std::path::Path| r#"x" onerror="alert(1)"#.to_string(),
+        );
+
+        assert_eq!(
+            result, r#"<img src="x%22 onerror=%22alert(1)"/>"#,
+            "policy output must stay inside the attribute: {result}"
+        );
     }
 
     /// The sanitize-then-inject order in [`get_chapter_content`] and

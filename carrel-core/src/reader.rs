@@ -195,6 +195,34 @@ pub fn asset_localhost_url(_key: &str, local_path: &std::path::Path) -> String {
     )
 }
 
+/// Percent-encode the one character in a policy's URL that could break out of
+/// the `src="…"` attribute it gets spliced into.
+///
+/// Before M5 core built that value itself with `urlencoding::encode`, so it
+/// *structurally* could not contain a quote. Now the value comes from a
+/// caller-supplied policy — including out-of-repo ones — and the splice does
+/// no escaping, so the guarantee has to be restored here rather than left as
+/// a convention each caller is trusted to honour on untrusted book content.
+///
+/// Only `"` is encoded, deliberately:
+///
+/// - `'` is left alone. Attributes reach the rewriter ammonia-serialized and
+///   ammonia always double-quotes, so the single-quoted splice path is dead —
+///   while a filename like `Alice's cover.png` is perfectly ordinary, and
+///   encoding its apostrophe would change bytes the pre-M5 scanner emitted
+///   raw. Byte-identity is this milestone's acceptance criterion.
+/// - `&` is left alone for the same byte-identity reason.
+///
+/// A no-op for both in-tree policies: the desktop's url-encodes everything,
+/// and a `"` cannot survive ammonia's attribute escaping to reach the web's.
+pub(crate) fn attr_safe_url(url: String) -> String {
+    if url.contains('"') {
+        url.replace('"', "%22")
+    } else {
+        url
+    }
+}
+
 /// Read one chapter's sanitized HTML.
 ///
 /// Dispatches on `format`, keeps the parsed archive in `caches` so a repeat
@@ -1265,6 +1293,28 @@ mod tests {
         .unwrap();
         assert_eq!(second, first);
         assert_eq!(caches.epub.lock().unwrap().len(), 1);
+    }
+
+    /// The policy's return value is spliced into `src="…"` without escaping,
+    /// so a quote in it would break out of the attribute. Core used to
+    /// guarantee that structurally (it url-encoded the value itself); M5 moved
+    /// the value to a caller-supplied policy, so the guarantee moved here.
+    /// The apostrophe half is not an oversight — see [`attr_safe_url`].
+    #[test]
+    fn attr_safe_url_encodes_only_the_attribute_delimiter() {
+        assert_eq!(
+            attr_safe_url("/api/x/a\"onerror=alert(1) b.png".to_string()),
+            "/api/x/a%22onerror=alert(1) b.png"
+        );
+        // Ordinary filenames pass through byte-for-byte.
+        assert_eq!(
+            attr_safe_url("/api/x/Alice's cover.png".to_string()),
+            "/api/x/Alice's cover.png"
+        );
+        assert_eq!(
+            attr_safe_url("/api/x/Tom & Jerry.png".to_string()),
+            "/api/x/Tom & Jerry.png"
+        );
     }
 
     /// M5's acceptance criterion: the `<img src>` URL policy belongs to the
