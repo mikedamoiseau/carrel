@@ -546,18 +546,29 @@ where
         // *this* request always gets what it just paid to extract,
         // regardless of what eviction does immediately afterward.
         if let Ok((data, mime)) = page_cache::get_cached_page(pages, hash, page_index) {
-            on_extracted();
             let (bytes, out_mime) =
                 crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
             // The priming miss is the expensive path — a whole-archive
             // extraction — so it is the one an end-to-end number is most
             // wanted for (M3 review, finding 2).
+            //
+            // Logged *before* `on_extracted`, not after (M3 review round 2,
+            // finding 3): that callback is the caller's eviction hook, and
+            // the web adapter runs `run_eviction` inline in it — a full walk
+            // of the page cache. Timing across it would make this number
+            // measure something the desktop `[page-load]` lines it is
+            // modelled on never included, on exactly the path where the
+            // comparison matters most.
             page_cache::page_dbg!(
                 "bytes primed then read: page={} size={}KB total={:?}",
                 page_index,
                 bytes.len() / 1024,
                 started.elapsed()
             );
+            // Still after the read-back and the resize, so F1's guarantee
+            // holds unchanged: this request has its bytes in hand before any
+            // eviction pass can reclaim what the extraction just wrote.
+            on_extracted();
             return Ok((bytes, out_mime));
         }
 

@@ -2234,6 +2234,19 @@ pub async fn get_all_reading_progress(
     Ok(db::get_all_reading_progress(&conn)?)
 }
 
+/// Whether `format` is one of the comic archive formats the comic-specific
+/// commands accept.
+///
+/// Extracted so the commands that gate on it cannot drift apart (M3 review
+/// round 2, finding 2): `get_comic_page_bytes` lost its check entirely when
+/// M3 folded its body into `carrel_core::reader` — which accepts PDF too —
+/// and nothing failed, because the check existed only as an inline `match`
+/// arm nobody tested. Callers keep their own error text; only the predicate
+/// is shared.
+fn is_comic_format(format: &BookFormat) -> bool {
+    matches!(format, BookFormat::Cbz | BookFormat::Cbr)
+}
+
 fn validate_file_exists(file_path: &str) -> CarrelResult<()> {
     let path = std::path::Path::new(file_path);
     if !path.exists() {
@@ -2571,6 +2584,27 @@ pub async fn get_comic_page_bytes(
             .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
 
+    // `reader::page_image` accepts PDF as well as CBZ/CBR, so it cannot be
+    // this command's format guard (M3 review, finding 1). Without one, a PDF
+    // passed to the *comic* command would reach the PDF arm carrying this
+    // call site's hardcoded `is_private = false` — correct for comics, which
+    // have no private-mode plumbing yet, but it would write rendered pages to
+    // the shared cache during a private session, the exact write
+    // `get_pdf_page_bytes` suppresses. The frontend dispatches on format and
+    // never does this; these are public IPC commands, so the guard the
+    // pre-M3 inline `match` provided has to stay somewhere.
+    //
+    // Above the `cached_only` branch, matching `get_pdf_page_bytes`: the page
+    // cache is keyed by `{hash}/{NNN}` with no format discriminator, so a
+    // probe would otherwise happily return a PDF's cached page through the
+    // comic command (M3 review round 2, finding 1).
+    if !is_comic_format(&book.format) {
+        return Err(CarrelError::invalid(format!(
+            "get_comic_page_bytes is not supported for {:?}",
+            book.format
+        )));
+    }
+
     // A cached_only probe touches ONLY the local page cache — never the source
     // archive — so it must skip resolve_book_path / validate_file_exists, which
     // stat the (possibly network-mounted) file and would defeat the point of a
@@ -2584,22 +2618,6 @@ pub async fn get_comic_page_bytes(
             "comic",
         )
         .await;
-    }
-
-    // `reader::page_image` accepts PDF as well as CBZ/CBR, so it cannot be
-    // this command's format guard (M3 review, finding 1). Without one, a PDF
-    // passed to the *comic* command would reach the PDF arm carrying this
-    // call site's hardcoded `is_private = false` — correct for comics, which
-    // have no private-mode plumbing yet, but it would write rendered pages to
-    // the shared cache during a private session, the exact write
-    // `get_pdf_page_bytes` suppresses. The frontend dispatches on format and
-    // never does this; these are public IPC commands, so the guard the
-    // pre-M3 inline `match` provided has to stay somewhere.
-    if !matches!(book.format, BookFormat::Cbz | BookFormat::Cbr) {
-        return Err(CarrelError::invalid(format!(
-            "get_comic_page_bytes is not supported for {:?}",
-            book.format
-        )));
     }
 
     let file_path = state.resolve_book_path(&book)?;
@@ -2861,7 +2879,7 @@ pub async fn prepare_comic(
 
     validate_file_exists(&file_path)?;
 
-    if book.format != BookFormat::Cbz && book.format != BookFormat::Cbr {
+    if !is_comic_format(&book.format) {
         return Err(CarrelError::invalid(
             "prepare_comic only supports CBZ/CBR formats",
         ));
@@ -9756,6 +9774,25 @@ mod tests {
         assert_eq!(validate_scroll_position(0.0).unwrap(), 0.0);
         assert_eq!(validate_scroll_position(0.5).unwrap(), 0.5);
         assert_eq!(validate_scroll_position(1.0).unwrap(), 1.0);
+    }
+
+    /// M3 review round 2, finding 2. The predicate the comic commands gate
+    /// on had no test, which is how M3 deleted one of its three copies
+    /// without a single failure. PDF is the case that matters: it is the
+    /// one format `carrel_core::reader::page_image` also accepts, so it is
+    /// the one a missing guard lets through.
+    #[test]
+    fn is_comic_format_accepts_only_the_comic_archives() {
+        assert!(is_comic_format(&BookFormat::Cbz));
+        assert!(is_comic_format(&BookFormat::Cbr));
+        assert!(
+            !is_comic_format(&BookFormat::Pdf),
+            "PDF must not pass the comic guard: `reader::page_image` accepts \
+             it, so the comic command's hardcoded is_private=false would \
+             reach the PDF cache-write path"
+        );
+        assert!(!is_comic_format(&BookFormat::Epub));
+        assert!(!is_comic_format(&BookFormat::Mobi));
     }
 
     #[test]
