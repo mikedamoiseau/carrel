@@ -2237,12 +2237,14 @@ pub async fn get_all_reading_progress(
 /// Whether `format` is one of the comic archive formats the comic-specific
 /// commands accept.
 ///
-/// Extracted so the commands that gate on it cannot drift apart (M3 review
+/// Extracted so the commands that *gate* on it cannot drift apart (M3 review
 /// round 2, finding 2): `get_comic_page_bytes` lost its check entirely when
 /// M3 folded its body into `carrel_core::reader` — which accepts PDF too —
 /// and nothing failed, because the check existed only as an inline `match`
 /// arm nobody tested. Callers keep their own error text; only the predicate
-/// is shared.
+/// is shared. `get_comic_page_count` is not one of them: its `match` is a
+/// per-format dispatch rather than a gate, so it cannot use this and cannot
+/// silently lose an arm either.
 fn is_comic_format(format: &BookFormat) -> bool {
     matches!(format, BookFormat::Cbz | BookFormat::Cbr)
 }

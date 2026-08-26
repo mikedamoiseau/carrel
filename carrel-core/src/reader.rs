@@ -546,29 +546,36 @@ where
         // *this* request always gets what it just paid to extract,
         // regardless of what eviction does immediately afterward.
         if let Ok((data, mime)) = page_cache::get_cached_page(pages, hash, page_index) {
+            // Fire the eviction hook here — after the read-back, so F1's
+            // guarantee holds (this request has its bytes in hand before any
+            // sweep can reclaim what the extraction just wrote), but before
+            // anything that can fail (M3 review round 3). `ensure_cached`
+            // has by now written the *whole archive* to disk, and this hook
+            // is what bounds that write against `page_cache_max_size_mb`;
+            // skipping it on a later error would leave the cache over budget
+            // until some unrelated request happened to sweep.
+            //
+            // Its cost is measured and subtracted rather than simply timed
+            // around, because the web adapter runs `run_eviction` inline in
+            // this callback — a full walk of the page cache. The desktop
+            // `[page-load]` lines this number is modelled on never included a
+            // sweep, and this is the path where that comparison matters most
+            // (M3 review round 2, finding 3).
+            let sweep_started = std::time::Instant::now();
+            on_extracted();
+            let sweep_cost = sweep_started.elapsed();
+
             let (bytes, out_mime) =
                 crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
             // The priming miss is the expensive path — a whole-archive
             // extraction — so it is the one an end-to-end number is most
             // wanted for (M3 review, finding 2).
-            //
-            // Logged *before* `on_extracted`, not after (M3 review round 2,
-            // finding 3): that callback is the caller's eviction hook, and
-            // the web adapter runs `run_eviction` inline in it — a full walk
-            // of the page cache. Timing across it would make this number
-            // measure something the desktop `[page-load]` lines it is
-            // modelled on never included, on exactly the path where the
-            // comparison matters most.
             page_cache::page_dbg!(
                 "bytes primed then read: page={} size={}KB total={:?}",
                 page_index,
                 bytes.len() / 1024,
-                started.elapsed()
+                started.elapsed().saturating_sub(sweep_cost)
             );
-            // Still after the read-back and the resize, so F1's guarantee
-            // holds unchanged: this request has its bytes in hand before any
-            // eviction pass can reclaim what the extraction just wrote.
-            on_extracted();
             return Ok((bytes, out_mime));
         }
 
