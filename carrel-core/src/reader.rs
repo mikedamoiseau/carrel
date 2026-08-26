@@ -536,6 +536,14 @@ where
         // adapter answers 400/500 instead of 404, the exact class of bug
         // `ensure_epub_cached` guards against above.
         ensure_file_exists(file_path)?;
+        // Whether `ensure_cached` is about to do real work, decided before
+        // it runs: it short-circuits on an already-complete manifest, and
+        // `complete_manifest` is the very test it uses to decide that (see
+        // its doc comment). This is what keeps F7 true — an out-of-range
+        // page of an *already cached* book must not fire the eviction hook,
+        // because nothing was written — while still letting the degrade path
+        // below fire it when an extraction really did happen.
+        let extracted = page_cache::complete_manifest(pages, hash).is_none();
         page_cache::ensure_cached(pages, book_id, hash, file_path, &format)?;
 
         // Read back before firing `on_extracted` (finding F1): the callback
@@ -562,7 +570,9 @@ where
             // sweep, and this is the path where that comparison matters most
             // (M3 review round 2, finding 3).
             let sweep_started = std::time::Instant::now();
-            on_extracted();
+            if extracted {
+                on_extracted();
+            }
             let sweep_cost = sweep_started.elapsed();
 
             let (bytes, out_mime) =
@@ -581,8 +591,24 @@ where
 
         // The cache still can't serve the page we just extracted — degrade
         // to a direct decode (see this function's doc comment) rather than
-        // propagating `get_cached_page`'s error. `on_extracted` does not
-        // fire: there is nothing usable in the cache to run eviction around.
+        // propagating `get_cached_page`'s error.
+        //
+        // The eviction hook still fires when an extraction actually happened
+        // (M3 review round 4). The earlier comment here reasoned that there
+        // was "nothing usable in the cache to run eviction around", which had
+        // it backwards: `ensure_cached` has no size cap of its own, so if it
+        // just wrote a whole archive to disk, this callback is the only thing
+        // bounding that write against `page_cache_max_size_mb` — and the
+        // read-back failing is no reason to leave it unbounded. The reachable
+        // case is an out-of-range page of a cold book: extract 800 MB, fail
+        // the read-back, degrade, error — with the archive on disk and, until
+        // this fix, nothing sweeping it. Firing before the direct decode
+        // rather than after, so a decode that also fails still sweeps; the
+        // decode reads the archive, not the cache, so eviction cannot take
+        // its bytes away.
+        if extracted {
+            on_extracted();
+        }
         return direct_comic_page(format, file_path, page_index, target_width, started);
     }
 
@@ -1182,6 +1208,54 @@ mod tests {
     }
 
     /// F7 (M1 review): a page index past the end of an already-cached book
+    /// M3 review round 4: the mirror of F7 below. An out-of-range page of a
+    /// *cold* book DOES fire the eviction hook, because `ensure_cached` just
+    /// wrote the whole archive to disk before the read-back failed, and this
+    /// callback is the only thing that bounds that write against
+    /// `page_cache_max_size_mb` — `ensure_cached` has no size cap of its own.
+    ///
+    /// Without it, `GET /books/{id}/pages/999` on a cold 800 MB comic
+    /// extracts the archive, errors, and leaves it on disk unswept; repeated
+    /// across books that grows the cache past its budget with nothing
+    /// reclaiming it. Together with F7 this pins the actual rule: fire iff an
+    /// extraction really happened, regardless of whether the read-back after
+    /// it succeeded.
+    #[test]
+    fn out_of_range_page_on_a_cold_book_still_fires_on_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(10, 10), encode_jpeg(10, 10)]);
+        let pages = pages_storage(dir.path());
+        let calls = std::cell::Cell::new(0);
+
+        // Cold: nothing cached yet, so the miss primes the whole archive and
+        // only then discovers the page index is out of range.
+        let err = page_image(
+            BookFormat::Cbz,
+            &path,
+            99,
+            None,
+            "bk",
+            Some("hash-cold-oor"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+
+        assert!(
+            page_cache::complete_manifest(&pages, "hash-cold-oor").is_some(),
+            "the archive really was extracted, or this test proves nothing"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "a real extraction must fire the eviction hook even though the \
+             read-back failed — nothing else bounds what it just wrote"
+        );
+    }
+
     /// must not fire `on_extracted`. It enters the miss branch (the first
     /// `get_cached_page` fails, since the index itself is invalid), but
     /// `ensure_cached` finds the manifest already complete and does no real
