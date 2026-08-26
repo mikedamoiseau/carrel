@@ -28,6 +28,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   network library), which previously failed at the page-count step. A book
   read in private mode renders normally but no longer starts a page-cache
   entry for itself.
+- **The web reader's Contents (table of contents) panel no longer re-opens
+  the book file on every request.** TOC reads for EPUB and MOBI now go
+  through the same `carrel-core` module (`reader::toc`) used for chapter
+  reads, so the LAN reader reads from the same warm archive cache the desktop
+  reader has always used instead of reopening and reparsing the whole file
+  per request. Also fixes the desktop app reporting a generic "Failed to open
+  EPUB archive" error for a corrupt (but present) EPUB's table of contents;
+  it now reports the real, more specific error.
 
 ## [3.1.0] - 2026-08-24
 

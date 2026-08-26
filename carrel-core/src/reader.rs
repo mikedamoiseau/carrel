@@ -1,4 +1,4 @@
-//! Chapter and comic-page reads, behind one interface.
+//! Chapter, table-of-contents, and comic-page reads, behind one interface.
 //!
 //! # Why this module exists
 //!
@@ -110,7 +110,7 @@ use std::sync::{Arc, Mutex};
 use crate::cache::LruCache;
 use crate::epub;
 use crate::error::{CarrelError, CarrelResult};
-use crate::models::BookFormat;
+use crate::models::{BookFormat, TocEntry};
 use crate::page_cache;
 use crate::storage::Storage;
 
@@ -190,6 +190,59 @@ pub fn chapter_html(
         )),
         other => Err(CarrelError::invalid(format!(
             "chapter reads are not supported for format {other}"
+        ))),
+    }
+}
+
+/// Read a book's table of contents (M4).
+///
+/// Dispatches on `format` and shares `caches` exactly like [`chapter_html`] —
+/// same cache, same feature-gated MOBI arm, same rejection of the image-only
+/// formats. Kept as a separate function rather than folded into
+/// [`chapter_html`] because a TOC read has no `chapter_index` and no
+/// `images`/`book_id` (a TOC has no inline images to extract).
+///
+/// MOBI has no real table of contents: this synthesizes a flat list from the
+/// adapter's chapter list, one depth-0 leaf per chapter — the same
+/// synthesis both the pre-M4 desktop and web adapters carried independently.
+pub fn toc(
+    format: BookFormat,
+    file_path: &str,
+    caches: &ArchiveCaches,
+) -> CarrelResult<Vec<TocEntry>> {
+    match format {
+        BookFormat::Epub => {
+            let mut cache = caches.epub.lock()?;
+            ensure_epub_cached(&mut cache, file_path)?;
+            let cached = cache
+                .get_mut(file_path)
+                .ok_or_else(|| CarrelError::internal("Failed to open EPUB archive"))?;
+            Ok(epub::get_toc_from_cache(cached)?)
+        }
+        #[cfg(feature = "mobi")]
+        BookFormat::Mobi => {
+            let mut cache = caches.mobi.lock()?;
+            ensure_mobi_cached(&mut cache, file_path)?;
+            let cached = cache
+                .get(file_path)
+                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
+            let chapters = crate::mobi::get_chapter_list_from_cache(cached);
+            Ok(chapters
+                .into_iter()
+                .map(|c| TocEntry {
+                    chapter_index: c.index as u32,
+                    label: c.title,
+                    play_order: format!("{}", c.index + 1),
+                    children: Vec::new(),
+                })
+                .collect())
+        }
+        #[cfg(not(feature = "mobi"))]
+        BookFormat::Mobi => Err(CarrelError::invalid(
+            "MOBI support is not enabled in this build",
+        )),
+        other => Err(CarrelError::invalid(format!(
+            "table of contents reads are not supported for format {other}"
         ))),
     }
 }
@@ -1157,6 +1210,61 @@ mod tests {
         for format in [BookFormat::Pdf, BookFormat::Cbz, BookFormat::Cbr] {
             let name = format.to_string();
             let err = chapter_html(format, "/nope", 0, &store, "bk", &caches()).unwrap_err();
+            assert!(
+                err.to_string().contains("not supported"),
+                "unexpected error for {name}: {err}"
+            );
+        }
+    }
+
+    // ── Table of contents (M4) ──────────────────────────────────────────
+
+    /// M4's acceptance criterion for the web adapter: a second TOC read of
+    /// the same book is served from the cached archive, not by reopening the
+    /// file. Deleting the file between the two reads is what makes that
+    /// observable — a reopen would fail, and a test that merely asserted
+    /// "both calls returned Ok" would pass even with the caching removed.
+    #[test]
+    fn second_toc_read_does_not_reopen_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_epub(dir.path());
+        let caches = caches();
+
+        let first = toc(BookFormat::Epub, &path, &caches).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].label, "Chapter 1");
+        assert_eq!(caches.epub.lock().unwrap().len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+
+        let second = toc(BookFormat::Epub, &path, &caches).unwrap();
+        assert_eq!(second.len(), first.len());
+        assert_eq!(second[0].label, first[0].label);
+        assert_eq!(caches.epub.lock().unwrap().len(), 1);
+    }
+
+    /// M4's acceptance criterion for the desktop adapter: a missing book file
+    /// must stay a `NotFound`, the same fix [`chapter_html`] already carries.
+    /// Before this function existed, the desktop's own copy of
+    /// `ensure_epub_cached` swallowed the open error and reported a generic
+    /// internal failure instead.
+    #[test]
+    fn toc_of_a_missing_file_is_reported_as_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = toc(
+            BookFormat::Epub,
+            &dir.path().join("nope.epub").to_string_lossy(),
+            &caches(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    #[test]
+    fn toc_image_only_formats_are_rejected() {
+        for format in [BookFormat::Pdf, BookFormat::Cbz, BookFormat::Cbr] {
+            let name = format.to_string();
+            let err = toc(format, "/nope", &caches()).unwrap_err();
             assert!(
                 err.to_string().contains("not supported"),
                 "unexpected error for {name}: {err}"

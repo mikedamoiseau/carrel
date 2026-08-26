@@ -2175,44 +2175,7 @@ pub async fn get_toc(
 
     validate_file_exists(&file_path)?;
 
-    match format {
-        BookFormat::Epub => {
-            let mut cache = state.epub_cache.lock()?;
-            ensure_epub_cached(&mut cache, &file_path);
-            let cached = cache
-                .get_mut(&file_path)
-                .ok_or("Failed to open EPUB archive")?;
-            Ok(epub::get_toc_from_cache(cached)?)
-        }
-        #[cfg(feature = "mobi")]
-        BookFormat::Mobi => {
-            // MOBI has no real TOC — synthesize a flat list from the
-            // adapter's chapter list so the Contents sidebar works. Each
-            // entry is a depth-0 leaf (no children).
-            let mut cache = state.mobi_cache.lock()?;
-            ensure_mobi_cached(&mut cache, &file_path)?;
-            let cached = cache
-                .get(&file_path)
-                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
-            let chapters = carrel_core::mobi::get_chapter_list_from_cache(cached);
-            Ok(chapters
-                .into_iter()
-                .map(|c| crate::models::TocEntry {
-                    chapter_index: c.index as u32,
-                    label: c.title,
-                    play_order: format!("{}", c.index + 1),
-                    children: Vec::new(),
-                })
-                .collect())
-        }
-        #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(CarrelError::invalid(
-            "MOBI support is not enabled in this build",
-        )),
-        other => Err(CarrelError::invalid(format!(
-            "get_toc is not supported for format {other}"
-        ))),
-    }
+    carrel_core::reader::toc(format, &file_path, &state.archive_caches())
 }
 
 // --- Progress ---
@@ -11366,6 +11329,66 @@ mod tests {
         assert_eq!(
             normalized,
             "<p>Hello</p><img src=\"asset://localhost/{IMAGES}%2Fbk-chapter-read%2F0%2F2fcbc7ca6bddbb6f-img.png\" alt=\"a\">"
+        );
+    }
+
+    /// Characterization: `get_toc` still returns the same fallback TOC (no
+    /// nav/NCX in this fixture, so the spine-derived "Chapter N" labels)
+    /// after routing through `carrel_core::reader::toc` (M4) instead of its
+    /// own local `ensure_epub_cached`.
+    #[tokio::test]
+    async fn get_toc_desktop_output_is_stable() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let epub_path = crate::test_epub::write_epub_with_image_chapter(dir.path(), "toc-read");
+        let mut book = progress_test_book("bk-toc-read", 1);
+        book.file_path = epub_path.to_string_lossy().into_owned();
+        {
+            let conn = state.active_db().unwrap().get().unwrap();
+            db::insert_book(&conn, &book).unwrap();
+        }
+
+        let toc = get_toc("bk-toc-read".to_string(), state.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].label, "Chapter 1");
+        assert_eq!(toc[0].chapter_index, 0);
+    }
+
+    /// M4: before this milestone, `get_toc`'s own `ensure_epub_cached`
+    /// silently discarded the archive-open error (`if let Ok(archive) = …`)
+    /// and reported a generic `CarrelError::internal("Failed to open EPUB
+    /// archive")` for both a missing AND a corrupt file — collapsing every
+    /// failure into the same opaque `Internal` kind regardless of cause.
+    /// Routing through `carrel_core::reader::toc` (which propagates the real
+    /// open error via `?`) now surfaces this corrupt-but-present file's real
+    /// `InvalidInput` kind instead.
+    #[tokio::test]
+    async fn get_toc_desktop_does_not_swallow_a_corrupt_archives_error() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let epub_path = dir.path().join("corrupt.epub");
+        std::fs::write(&epub_path, b"not a zip file!!").unwrap();
+        let mut book = progress_test_book("bk-toc-corrupt", 1);
+        book.file_path = epub_path.to_string_lossy().into_owned();
+        {
+            let conn = state.active_db().unwrap().get().unwrap();
+            db::insert_book(&conn, &book).unwrap();
+        }
+
+        let err = get_toc("bk-toc-corrupt".to_string(), state.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            "InvalidInput",
+            "corrupt archive must surface its real error kind, not a generic \
+             internal failure: {err}"
         );
     }
 

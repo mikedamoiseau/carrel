@@ -1072,39 +1072,30 @@ async fn get_chapters(
     let file_path = state
         .resolve_book_path(&book)
         .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
-    let toc = match book.format {
-        BookFormat::Epub => crate::epub::get_toc(&file_path)
-            .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?,
-        #[cfg(feature = "mobi")]
-        BookFormat::Mobi => {
-            // MOBI has no real TOC — mirror the desktop `get_toc` behaviour by
-            // synthesising a flat list from the chapter list.
-            let chapters = carrel_core::mobi::get_chapter_list(&file_path)
-                .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
-            chapters
-                .into_iter()
-                .map(|c| crate::models::TocEntry {
-                    chapter_index: c.index as u32,
-                    label: c.title,
-                    play_order: format!("{}", c.index + 1),
-                    children: Vec::new(),
-                })
-                .collect()
-        }
-        #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "MOBI support is not enabled in this build".to_string(),
-            ));
-        }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "TOC is only available for EPUB and MOBI books".to_string(),
-            ));
-        }
-    };
+
+    // Reject the unsupported formats here rather than letting the reader
+    // module do it, so each rejection keeps its own client-facing wording —
+    // `book_file_status` would flatten both into the generic "corrupt or
+    // unsupported" body. Mirrors `get_chapter_content`'s guard.
+    #[cfg(not(feature = "mobi"))]
+    if matches!(book.format, BookFormat::Mobi) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MOBI support is not enabled in this build".to_string(),
+        ));
+    }
+    if !matches!(book.format, BookFormat::Epub | BookFormat::Mobi) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "TOC is only available for EPUB and MOBI books".to_string(),
+        ));
+    }
+
+    // Reads through the process-wide archive cache (M4): before this, every
+    // TOC request reopened and reparsed the whole book file, while the
+    // desktop reader had been reading from a warm archive all along.
+    let toc = carrel_core::reader::toc(book.format, &file_path, &state.archives)
+        .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
 
     Ok(Json(serde_json::to_value(toc).unwrap_or_default()))
 }
@@ -2882,6 +2873,43 @@ mod tests {
                 .await
                 .expect("second read must be served from the cached archive");
         assert_eq!(body_string(second).await, first);
+        assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
+    }
+
+    /// M4's acceptance criterion for the web adapter: a second TOC request is
+    /// served from the cached archive rather than by reopening the book
+    /// file. Before this milestone the route called the path-based
+    /// `epub::get_toc` directly, with no cache at all — every request
+    /// reopened and reparsed the whole file, unlike the desktop reader which
+    /// had read through a warm archive cache all along.
+    ///
+    /// Deleting the file between the two requests is what makes that
+    /// observable — asserting two 200s would pass with the caching removed.
+    #[tokio::test]
+    async fn web_toc_reads_reuse_the_cached_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_image_chapter(dir.path(), "web-toc");
+        seed_epub_book(&state, "bk-web-toc", &epub);
+
+        let first = get_chapters(State(state.clone()), Path("bk-web-toc".to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            first.as_array().map(|a| a.len()),
+            Some(1),
+            "unexpected first body: {first}"
+        );
+        assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
+
+        std::fs::remove_file(&epub).unwrap();
+
+        let second = get_chapters(State(state.clone()), Path("bk-web-toc".to_string()))
+            .await
+            .expect("second read must be served from the cached archive")
+            .0;
+        assert_eq!(second, first);
         assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
     }
 
