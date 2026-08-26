@@ -857,8 +857,11 @@ pub fn get_chapter_content_from_cache(
 ///
 /// `image_url` is called once per image this chapter actually references,
 /// *after* the bytes are in `storage`, with that image's storage key and the
-/// local path the key resolved to. Whatever it returns becomes the `<img src>`
-/// verbatim. Core deliberately does not know which URL scheme its caller
+/// local path the key resolved to. What it returns becomes the `<img src>`
+/// value, save for one transformation: a `"` in it is percent-encoded so it
+/// cannot close the attribute ([`crate::reader::attr_safe_url`]), which is a
+/// no-op for any URL containing none. Core deliberately does not know which
+/// URL scheme its caller
 /// serves: the desktop passes [`crate::reader::asset_localhost_url`] (Tauri's
 /// asset protocol), the LAN web server passes its own HTTP route. Before this,
 /// core emitted `asset://` unconditionally and the web adapter string-scanned
@@ -1221,8 +1224,10 @@ fn rewrite_img_srcs_to_asset_urls(
 /// HTML string, which can cause memory issues with illustrated books.
 ///
 /// `image_url` receives the storage key and its resolved local path, and its
-/// return value becomes the `src` verbatim — no encoding or escaping is
-/// applied to it afterwards. See
+/// return value becomes the `src` value. The only transformation applied
+/// afterwards is [`crate::reader::attr_safe_url`], which percent-encodes a `"`
+/// so a policy cannot close the attribute it is spliced into; a URL with no
+/// quote in it comes through byte-for-byte. See
 /// [`get_chapter_content_from_cache_with_url_policy`] for why the policy is
 /// the caller's.
 ///
@@ -2321,6 +2326,31 @@ pub(crate) mod tests {
         let result = rewrite_img_srcs_to_asset_urls(html, &mut archive, "", &storage, "b/0");
 
         assert_eq!(result, html, "missing images should leave tag unchanged");
+    }
+
+    /// [`crate::reader::attr_safe_url`] escapes only `"`, and the reason is an
+    /// undocumented detail of a third-party serializer: ammonia re-quotes every
+    /// attribute with double quotes, so the rewriter's single-quoted splice
+    /// path — which is live, and covered by
+    /// `test_rewrite_img_srcs_handles_gt_in_single_quoted_attribute` — is
+    /// unreachable for production callers, all of which `clean()` first.
+    ///
+    /// That assumption is load-bearing: if it broke, a book-controlled filename
+    /// like `x' onerror='alert(1).png` would close a single-quoted attribute
+    /// and the guard would silently be a no-op. So pin it here rather than
+    /// leave it as prose — an ammonia bump that changed attribute quoting
+    /// should fail in CI, not in a reader.
+    #[test]
+    fn ammonia_rewrites_single_quoted_attributes_to_double_quotes() {
+        let cleaned = clean(r#"<img src='a.png'>"#);
+        assert!(
+            cleaned.contains(r#"src="a.png""#),
+            "ammonia stopped normalizing attribute quoting: {cleaned}"
+        );
+        assert!(
+            !cleaned.contains(r#"src='"#),
+            "single-quoted attribute survived clean(): {cleaned}"
+        );
     }
 
     /// The guard from [`crate::reader::attr_safe_url`], proved end-to-end

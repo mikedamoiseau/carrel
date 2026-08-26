@@ -232,7 +232,10 @@ pub(crate) fn attr_safe_url(url: String) -> String {
 /// `image_url` is the caller's URL policy for those inline images (M5): it is
 /// called once per image the chapter references, after the bytes are in
 /// `images`, with that image's storage key and resolved local path, and its
-/// return value becomes the `<img src>` verbatim. The desktop passes
+/// return value becomes the `<img src>` value, with one transformation: a `"`
+/// in it is percent-encoded so it cannot close the attribute (see
+/// [`attr_safe_url`]) — a no-op for any URL that contains none. The desktop
+/// passes
 /// [`asset_localhost_url`]; the web server passes its own HTTP route, because
 /// the browser cannot fetch an `asset://` URL. Core has no business knowing
 /// which — see the module docs' "Image URL policy" section.
