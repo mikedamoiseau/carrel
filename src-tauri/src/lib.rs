@@ -16,6 +16,9 @@ pub mod tray;
 pub mod update;
 pub mod web_server;
 
+#[cfg(test)]
+mod test_epub;
+
 // Re-export every module that now lives in carrel-core so existing `crate::…`
 // call sites in commands.rs, web_server, and tray keep compiling unchanged.
 // New code should prefer `use carrel_core::…` directly.
@@ -346,6 +349,7 @@ pub fn run() {
                     active_profile_name: state.shared_active_profile_name.clone(),
                     unlocked_profiles: state.unlocked_profiles.clone(),
                     private_mode: state.private_mode.clone(),
+                    archives: state.archive_caches(),
                     profile_host: Some(crate::profile_host::for_app(&app_handle)),
                     dictionary_pool: state.dictionary_pool.clone(),
                 };

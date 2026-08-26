@@ -79,6 +79,12 @@ pub struct WebState {
     /// exactly like its desktop counterpart. The only runtime mutator is
     /// the desktop-side `set_private_mode` command.
     pub private_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Parsed-archive caches for chapter reads, shared with `AppState` (the
+    /// production sites clone them from `AppState::archive_caches`). Sharing
+    /// rather than duplicating means one byte budget for the process, a warm
+    /// cache whichever surface opened the book first, and web-served reads
+    /// showing up in the desktop's `get_unified_cache_stats`.
+    pub archives: carrel_core::reader::ArchiveCaches,
     /// Remote profile switching (`GET /api/profiles`, `POST /api/profile`).
     /// `None` in harnesses with no Tauri app behind them — the endpoints then
     /// report 503 instead of pretending there are no profiles.
@@ -579,6 +585,7 @@ mod tests {
         let pool =
             crate::db::create_pool(&std::path::PathBuf::from(":memory:")).expect("in-memory DB");
         WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
             pool: Arc::new(Mutex::new(pool)),
             data_dir: PathBuf::from("/tmp"),
             cache_dir: std::env::temp_dir(),
@@ -2118,6 +2125,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let pool = crate::db::create_pool(&PathBuf::from(":memory:")).expect("in-memory DB");
         let state = WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
             pool: Arc::new(Mutex::new(pool)),
             data_dir: PathBuf::from("/tmp"),
             cache_dir: cache.path().to_path_buf(),
@@ -2173,6 +2181,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let pool = crate::db::create_pool(&PathBuf::from(":memory:")).expect("in-memory DB");
         let state = WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
             pool: Arc::new(Mutex::new(pool)),
             data_dir: PathBuf::from("/tmp"),
             cache_dir: cache.path().to_path_buf(),

@@ -5,6 +5,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **The web reader no longer re-opens the book file on every chapter turn.**
+  Chapter reads for EPUB and MOBI now go through one module in `carrel-core`
+  (`reader::chapter_html`) that both the desktop app and the embedded web
+  server call, so the LAN reader reads from the same warm archive cache the
+  desktop reader has always used instead of reopening and reparsing the whole
+  file per request. Noticeable on large or network-mounted books; the desktop
+  reader's output is unchanged.
+
 ## [3.1.0] - 2026-08-24
 
 ### Added

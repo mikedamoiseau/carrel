@@ -483,6 +483,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         "default".to_string()
     ])));
     let state = WebState {
+        archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
         pool: Arc::new(Mutex::new(pool)),
         data_dir,
         cache_dir,

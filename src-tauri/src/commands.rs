@@ -240,6 +240,18 @@ impl AppState {
         self.data_dir.join("dictionary")
     }
 
+    /// The parsed-archive caches this process shares with
+    /// `carrel_core::reader`. Hands over the same `Arc`s that
+    /// `cache_registry` reports on, so `get_unified_cache_stats` and
+    /// `clear_all_caches` still see every entry a chapter read creates.
+    pub fn archive_caches(&self) -> carrel_core::reader::ArchiveCaches {
+        carrel_core::reader::ArchiveCaches {
+            epub: self.epub_cache.clone(),
+            #[cfg(feature = "mobi")]
+            mobi: self.mobi_cache.clone(),
+        }
+    }
+
     /// Returns a `Storage` handle for EPUB inline chapter images, rooted at
     /// `{data_dir}/images` — matches the on-disk layout used before #64 M6.
     /// Image keys take the form `{book_id}/{chapter_index}/{basename}`.
@@ -1850,42 +1862,14 @@ pub async fn get_chapter_content(
     validate_file_exists(&file_path)?;
     let images_storage = state.images_storage()?;
 
-    match format {
-        BookFormat::Epub => {
-            let mut cache = state.epub_cache.lock()?;
-            ensure_epub_cached(&mut cache, &file_path);
-            let cached = cache
-                .get_mut(&file_path)
-                .ok_or_else(|| CarrelError::internal("Failed to open EPUB archive"))?;
-            Ok(epub::get_chapter_content_from_cache(
-                cached,
-                chapter_index as usize,
-                images_storage.as_ref(),
-                &book_id,
-            )?)
-        }
-        #[cfg(feature = "mobi")]
-        BookFormat::Mobi => {
-            let mut cache = state.mobi_cache.lock()?;
-            ensure_mobi_cached(&mut cache, &file_path)?;
-            let cached = cache
-                .get(&file_path)
-                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
-            Ok(carrel_core::mobi::get_chapter_content_from_cache(
-                cached,
-                chapter_index as usize,
-                images_storage.as_ref(),
-                &book_id,
-            )?)
-        }
-        #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(CarrelError::invalid(
-            "MOBI support is not enabled in this build",
-        )),
-        other => Err(CarrelError::invalid(format!(
-            "get_chapter_content is not supported for format {other}"
-        ))),
-    }
+    carrel_core::reader::chapter_html(
+        format,
+        &file_path,
+        chapter_index as usize,
+        images_storage.as_ref(),
+        &book_id,
+        &state.archive_caches(),
+    )
 }
 
 #[tauri::command]
@@ -9048,6 +9032,7 @@ pub async fn web_server_set_modes(
             active_profile_name: state.shared_active_profile_name.clone(),
             unlocked_profiles: state.unlocked_profiles.clone(),
             private_mode: state.private_mode.clone(),
+            archives: state.archive_caches(),
             profile_host: Some(crate::profile_host::for_app(&app)),
             dictionary_pool: state.dictionary_pool.clone(),
         };
@@ -11328,6 +11313,42 @@ mod tests {
         .unwrap();
         zip.finish().unwrap();
         path
+    }
+
+    /// Characterization lock for the desktop chapter read, recorded BEFORE the
+    /// chapter-read path moves behind `carrel_core::reader` (slice 1 of the
+    /// core-reader work). The React reader consumes these `asset://localhost/…`
+    /// URLs directly, so the refactor must not move a byte of this output.
+    ///
+    /// The absolute images root is tempdir-dependent, so it is normalized to
+    /// `{IMAGES}` before comparison — everything else, including the
+    /// `{book_id}/{chapter}/{zip-path-hash}-{basename}` key shape, is asserted
+    /// literally.
+    #[tokio::test]
+    async fn get_chapter_content_desktop_output_is_stable() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let epub_path = crate::test_epub::write_epub_with_image_chapter(dir.path(), "chapter-read");
+        let mut book = progress_test_book("bk-chapter-read", 1);
+        book.file_path = epub_path.to_string_lossy().into_owned();
+        {
+            let conn = state.active_db().unwrap().get().unwrap();
+            db::insert_book(&conn, &book).unwrap();
+        }
+
+        let html = get_chapter_content("bk-chapter-read".to_string(), 0, state.clone())
+            .await
+            .unwrap();
+
+        let images_root = state.data_dir.join("images");
+        let encoded_root = urlencoding::encode(&images_root.to_string_lossy()).into_owned();
+        let normalized = html.replace(&encoded_root, "{IMAGES}");
+
+        assert_eq!(
+            normalized,
+            "<p>Hello</p><img src=\"asset://localhost/{IMAGES}%2Fbk-chapter-read%2F0%2F2fcbc7ca6bddbb6f-img.png\" alt=\"a\">"
+        );
     }
 
     #[test]

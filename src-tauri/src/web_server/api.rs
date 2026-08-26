@@ -1127,30 +1127,36 @@ async fn get_chapter_content(
         .images_storage()
         .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
 
-    let html = match book.format {
-        BookFormat::Epub => {
-            crate::epub::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?
-        }
-        #[cfg(feature = "mobi")]
-        BookFormat::Mobi => {
-            carrel_core::mobi::get_chapter_content(&file_path, index, images_storage.as_ref(), &id)
-                .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?
-        }
-        #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "MOBI support is not enabled in this build".to_string(),
-            ));
-        }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Chapter content is only available for EPUB and MOBI books".to_string(),
-            ));
-        }
-    };
+    // Reject the unsupported formats here rather than letting the reader
+    // module do it, so each rejection keeps its own client-facing wording —
+    // `book_file_status` would flatten both into the generic "corrupt or
+    // unsupported" body.
+    #[cfg(not(feature = "mobi"))]
+    if matches!(book.format, BookFormat::Mobi) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MOBI support is not enabled in this build".to_string(),
+        ));
+    }
+    if !matches!(book.format, BookFormat::Epub | BookFormat::Mobi) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Chapter content is only available for EPUB and MOBI books".to_string(),
+        ));
+    }
+
+    // Reads through the process-wide archive cache (M1): before this, every
+    // chapter request reopened and reparsed the whole book file, while the
+    // desktop reader had been reading from a warm archive all along.
+    let html = carrel_core::reader::chapter_html(
+        book.format,
+        &file_path,
+        index,
+        images_storage.as_ref(),
+        &id,
+        &state.archives,
+    )
+    .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
 
     // Rewrite asset:// URLs to HTTP URLs for web serving
     let html = rewrite_asset_urls_to_http(&html, &id, index);
@@ -2501,6 +2507,7 @@ mod tests {
         let pool =
             crate::db::create_pool(&std::path::PathBuf::from(":memory:")).expect("in-memory DB");
         WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
             pool: std::sync::Arc::new(std::sync::Mutex::new(pool)),
             data_dir,
             cache_dir: std::env::temp_dir(),
@@ -2515,6 +2522,73 @@ mod tests {
             profile_host: None,
             dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// A linked EPUB book row pointing at `path`, seeded into `state`'s DB.
+    fn seed_epub_book(state: &WebState, id: &str, path: &std::path::Path) {
+        let book = crate::models::Book {
+            id: id.to_string(),
+            title: "Chapter Read Test Book".to_string(),
+            author: "Test Author".to_string(),
+            file_path: path.to_string_lossy().into_owned(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: BookFormat::Epub,
+            file_hash: None,
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        };
+        let conn = state.conn().unwrap();
+        crate::db::insert_book(&conn, &book).unwrap();
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// M1's acceptance criterion: a second chapter request is served from the
+    /// cached archive rather than by reopening the book file, which is what
+    /// this route did on *every* request before.
+    ///
+    /// Deleting the file between the two requests is what makes that
+    /// observable — asserting two 200s would pass with the caching removed.
+    #[tokio::test]
+    async fn web_chapter_reads_reuse_the_cached_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_image_chapter(dir.path(), "web-chapter");
+        seed_epub_book(&state, "bk-web", &epub);
+
+        let first = get_chapter_content(State(state.clone()), Path(("bk-web".to_string(), 0usize)))
+            .await
+            .unwrap();
+        let first = body_string(first).await;
+        assert!(first.contains("Hello"), "unexpected first body: {first}");
+        assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
+
+        std::fs::remove_file(&epub).unwrap();
+
+        let second =
+            get_chapter_content(State(state.clone()), Path(("bk-web".to_string(), 0usize)))
+                .await
+                .expect("second read must be served from the cached archive");
+        assert_eq!(body_string(second).await, first);
+        assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
