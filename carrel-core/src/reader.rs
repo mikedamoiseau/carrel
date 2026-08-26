@@ -622,6 +622,11 @@ where
         is_private,
     ) {
         Ok(v) => v,
+        // Already `NotFound` — an out-of-range page index. Return it as it
+        // is: the check below would replace a precise "page N out of range"
+        // with a vaguer "book file not found", and would stat the source
+        // for no reason (M2 review round 4, finding 3).
+        Err(e) if e.kind() == "NotFound" => return Err(e),
         Err(e) => {
             // A cache *hit* needs no file; a miss renders, and pdfium maps
             // every open failure to `InvalidInput`, which the web adapter
@@ -631,6 +636,11 @@ where
             // request — and "this page is not here" is `NotFound`, not a
             // corrupt file. Only on the error path, so a hit pays nothing
             // (M2 review round 3, finding 1).
+            //
+            // This does stat a possibly network-mounted source, but only
+            // where the render just tried to open that same source and
+            // failed, so the mount's timeout has already been paid once by
+            // the time we get here.
             ensure_file_exists(file_path)?;
             return Err(e);
         }
@@ -674,12 +684,13 @@ where
 /// reason: once [`page_image`]'s PDF arm serves pages with no source
 /// access, a `page_count` that still always opens the file is what stops a
 /// cached PDF from opening at all when its source is gone — the exact
-/// scenario the caching exists for. Its test is deliberately *weaker* than
-/// the comic one, not the same:
-/// [`page_cache::pdf_manifest_page_count`] trusts a PDF manifest's count
-/// whether or not any page is cached, because unlike a comic manifest it
-/// makes no claim about what is on disk. That function's doc comment has
-/// the full argument.
+/// scenario the caching exists for. Its test is a different one, not the
+/// comic test: [`page_cache::pdf_manifest_page_count`] asks only that
+/// *some* page be cached, where the comic test wants a manifest's first and
+/// last listed pages both present. A PDF manifest makes no claim about what
+/// is on disk, so its count is always right — but answering with nothing
+/// cached would open a reader in which every page fails. That function's
+/// doc comment has the full argument.
 ///
 /// `pages` is optional (M2 review round 2, finding 1) so that a caller
 /// whose cache directory cannot even be opened degrades to reading the
@@ -699,9 +710,9 @@ pub fn page_count(
 
     if let (Some(hash), Some(pages)) = (book_hash, pages) {
         // The two formats get different tests on purpose — see
-        // [`page_cache::pdf_manifest_page_count`] for why a PDF manifest is
-        // trustworthy without any page being cached, while a comic
-        // manifest is not.
+        // `page_cache::pdf_manifest_page_count` for why a PDF manifest
+        // needs only one cached page where a comic manifest needs its
+        // first and last.
         if format == BookFormat::Pdf {
             if let Some(count) = page_cache::pdf_manifest_page_count(pages, hash) {
                 return Ok(count);
@@ -1938,6 +1949,95 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+    }
+
+    /// The page-0 probe in `page_cache::pdf_manifest_page_count` is a fast
+    /// path, not the rule: a book resumed part-way — cached from a later
+    /// page, page 0 never visited — must still report its count. Without
+    /// the listing fallback this book would not open with its source gone.
+    #[test]
+    fn a_pdf_cached_from_a_later_page_still_reports_its_page_count() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf_with_pages(dir.path(), 3);
+        let pages = pages_storage(dir.path());
+
+        // Page 1 only — the state of a book resumed from the middle.
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            1,
+            None,
+            "bk",
+            Some("pdf-resumed"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap();
+        assert!(
+            !pages
+                .exists("page-cache/pdf-resumed/000.jpg")
+                .unwrap_or(false),
+            "page 0 must be absent, or this exercises the fast path instead"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            page_count(BookFormat::Pdf, &path, Some("pdf-resumed"), Some(&pages)).unwrap(),
+            3
+        );
+    }
+
+    /// M2 review round 4, finding 3: an out-of-range page is already
+    /// `NotFound`, and must keep saying so precisely. The round-3 remap
+    /// would otherwise overwrite "page N out of range" with "book file not
+    /// found" — the same status, a worse answer — and stat a possibly
+    /// dead mount to do it.
+    #[test]
+    fn an_out_of_range_pdf_page_says_out_of_range_not_missing_file() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pdf_with_pages(dir.path(), 3);
+        let pages = pages_storage(dir.path());
+
+        page_image(
+            BookFormat::Pdf,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("pdf-oor"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let err = page_image(
+            BookFormat::Pdf,
+            &path,
+            99,
+            None,
+            "bk",
+            Some("pdf-oor"),
+            Some(&pages),
+            || {},
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
     }
 
     /// M2 review round 3, finding 3: a caller whose cache directory cannot

@@ -632,18 +632,32 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
 /// a private-mode read caches none at all. Trusting that count would open
 /// a reader in which every single page then fails.
 ///
-/// "At least one page" is what separates them, and it is a listing rather
-/// than a `present(0)` probe so that a book resumed part-way — cached from
-/// page 50 up, page 0 never visited — still opens.
+/// "At least one page" is what separates them.
+///
+/// Answering that cheaply matters, because this runs on book open. Page 0
+/// is the overwhelmingly common case — it is where a book is read from, and
+/// where `prepare_pdf`'s reserved first-page render puts one — so an
+/// `exists` probe answers almost every call in one stat. Only when page 0
+/// is absent does this fall back to a listing, which keeps the book
+/// resumed part-way (cached from page 50 up, page 0 never visited) opening
+/// while confining the cost to that rare shape. The fallback is worth
+/// confining rather than defaulting to: `Storage::list` filters by prefix
+/// but the local implementation walks the whole storage root to build the
+/// list first, and that root is the entire app cache — exactly the
+/// "whole-cache stat storm on the book-open path" that
+/// [`complete_manifest`]'s doc comment above avoids for comics.
 pub fn pdf_manifest_page_count(storage: &dyn Storage, book_hash: &str) -> Option<u32> {
     let manifest = read_manifest(storage, book_hash)?;
     if manifest.format != BookFormat::Pdf || manifest.page_count == 0 {
         return None;
     }
     let any_page_cached = storage
-        .list(&book_prefix(book_hash))
-        .map(|keys| keys.iter().any(|k| k.ends_with(".jpg")))
-        .unwrap_or(false);
+        .exists(&page_key(book_hash, "000.jpg"))
+        .unwrap_or(false)
+        || storage
+            .list(&book_prefix(book_hash))
+            .map(|keys| keys.iter().any(|k| k.ends_with(".jpg")))
+            .unwrap_or(false);
     if any_page_cached {
         Some(manifest.page_count)
     } else {
