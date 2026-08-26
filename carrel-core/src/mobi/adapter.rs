@@ -3,7 +3,9 @@
 //! The wrapper in [`super`] exposes libmobi primitives (parts, resources,
 //! cover); this module composes them into the same interface the Reader
 //! already uses for EPUBs — metadata, ordered chapters, sanitized HTML with
-//! `asset://` image URLs, and per-chapter word counts.
+//! inline-image URLs in whatever scheme the caller's policy asks for
+//! (`asset://` for the desktop — see [`crate::reader::asset_localhost_url`]),
+//! and per-chapter word counts.
 //!
 //! The module has no Tauri / IPC dependencies; it is consumed by both the
 //! desktop commands and the OPDS web server.
@@ -83,8 +85,10 @@ pub fn get_chapter_list_from_cache(cached: &CachedMobiBook) -> Vec<ChapterInfo> 
 ///
 /// The `{book_id}/{chapter_index}/` layout matches the EPUB adapter and
 /// the web reader's asset-serving contract (`api.rs` resolves inline
-/// images via `/api/books/{id}/images/{chapter}/{filename}`), so the
-/// rewriter output is valid for both the desktop and HTTP reader paths.
+/// images via `/api/books/{id}/images/{chapter}/{filename}`), so the same
+/// extracted files back both surfaces. The *URLs* are the desktop's
+/// (`asset://`); the web server reads through
+/// [`get_chapter_content_from_cache_with_url_policy`] and supplies its own.
 ///
 /// Only raster formats (jpeg/png/gif/bmp) are rewritten; SVG and CSS
 /// references are left alone because they aren't meaningful for the
@@ -106,11 +110,40 @@ pub fn get_chapter_content(
 /// [`CachedMobiBook`], avoiding the libmobi reopen/reparse on each call.
 /// Used by desktop hot paths (continuous-scroll loads, per-chapter
 /// search) where the same book is touched many times in a row.
+///
+/// Emits the desktop's [`crate::reader::asset_localhost_url`] URLs. This
+/// signature is frozen for out-of-repo consumers, so a caller that needs
+/// different image URLs uses
+/// [`get_chapter_content_from_cache_with_url_policy`] instead.
 pub fn get_chapter_content_from_cache(
     cached: &CachedMobiBook,
     chapter_index: usize,
     storage: &dyn Storage,
     book_id: &str,
+) -> CarrelResult<String> {
+    get_chapter_content_from_cache_with_url_policy(
+        cached,
+        chapter_index,
+        storage,
+        book_id,
+        &crate::reader::asset_localhost_url,
+    )
+}
+
+/// [`get_chapter_content_from_cache`] with the inline-image URL policy
+/// supplied by the caller instead of hard-coded here (M5).
+///
+/// The MOBI half of the same change as
+/// [`crate::epub::get_chapter_content_from_cache_with_url_policy`] — see that
+/// function and [`crate::reader`]'s module docs. Both formats emit these URLs,
+/// so threading the policy through EPUB alone would have left the web reader
+/// with broken images for MOBI books only.
+pub fn get_chapter_content_from_cache_with_url_policy(
+    cached: &CachedMobiBook,
+    chapter_index: usize,
+    storage: &dyn Storage,
+    book_id: &str,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> CarrelResult<String> {
     let part = cached.parts.get(chapter_index).ok_or_else(|| {
         CarrelError::invalid(format!(
@@ -125,6 +158,7 @@ pub fn get_chapter_content_from_cache(
         storage,
         book_id,
         chapter_index,
+        image_url,
     )
 }
 
@@ -138,21 +172,25 @@ fn render_chapter_html(
     storage: &dyn Storage,
     book_id: &str,
     chapter_index: usize,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> CarrelResult<String> {
     // Sanitize first so ammonia strips the XML prologue, `<html>/<head>/
     // <body>`, scripts, and external link rels before our rewriter sees
     // the markup. The result is fragment-level HTML suitable for the
-    // Reader pane.
+    // Reader pane — and it has to happen before the image URLs are
+    // injected, because `asset://` is not in ammonia's default scheme
+    // allowlist. See [`crate::epub::get_chapter_content`].
     let raw_html = str::from_utf8(part_data)
         .map_err(|e| CarrelError::invalid(format!("MOBI chapter is not valid UTF-8: {e}")))?;
     let cleaned = clean(raw_html);
 
     let key_prefix = format!("{book_id}/{chapter_index}");
-    Ok(rewrite_mobi_image_refs(
+    Ok(rewrite_mobi_image_refs_with_url_policy(
         &cleaned,
         storage,
         &key_prefix,
         image_resources,
+        image_url,
     ))
 }
 
@@ -290,8 +328,9 @@ impl CachedMobiBook {
 
 /// Walk the sanitized HTML looking for quoted attribute values that match
 /// libmobi's `resource{NNNNN}.{ext}` naming, persist only the referenced
-/// images to `storage`, and replace the references with
-/// `asset://localhost/<url-encoded-local-path>` URLs.
+/// images to `storage`, and replace the references with the URLs `image_url`
+/// returns (M5 — the desktop's `asset://localhost/…` is
+/// [`crate::reader::asset_localhost_url`], one policy among others).
 ///
 /// Persisting inside the rewriter — as opposed to eagerly writing every
 /// image in the rawml — prevents on-disk amplification: illustrated MOBI
@@ -304,11 +343,12 @@ impl CachedMobiBook {
 /// deterministic and restrictive enough that a false positive would
 /// require a literal `"resource00000.jpg"` string inside text content,
 /// which isn't a realistic collision.
-fn rewrite_mobi_image_refs(
+fn rewrite_mobi_image_refs_with_url_policy(
     html: &str,
     storage: &dyn Storage,
     key_prefix: &str,
     image_resources: &HashMap<String, &[u8]>,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
@@ -324,7 +364,7 @@ fn rewrite_mobi_image_refs(
             return out;
         };
         let value = &after[..end];
-        match mobi_resource_to_asset_url(value, storage, key_prefix, image_resources) {
+        match mobi_resource_to_url(value, storage, key_prefix, image_resources, image_url) {
             Some(url) => out.push_str(&url),
             None => out.push_str(value),
         }
@@ -335,19 +375,21 @@ fn rewrite_mobi_image_refs(
     out
 }
 
-/// Try to resolve a libmobi resource filename (`resource00001.jpg`) to an
-/// `asset://` URL, persisting the underlying bytes to `storage` on first
-/// use. Returns `None` when the reference does not match libmobi's
-/// naming, when there is no matching entry in `image_resources`, or when
-/// the persist fails — in each case the caller leaves the original
+/// Try to resolve a libmobi resource filename (`resource00001.jpg`) to the
+/// URL `image_url` gives for it, persisting the underlying bytes to
+/// `storage` on first use. Returns `None` when the reference does not match
+/// libmobi's naming, when there is no matching entry in `image_resources`,
+/// or when the persist fails — in each case the caller leaves the original
 /// reference untouched so the Reader shows a single broken-image icon
-/// rather than emitting an `asset://` URL that points at a file that
-/// never landed on disk.
-fn mobi_resource_to_asset_url(
+/// rather than emitting a URL that points at a file that never landed on
+/// disk. `image_url` is therefore never called for an image that isn't
+/// there.
+fn mobi_resource_to_url(
     value: &str,
     storage: &dyn Storage,
     key_prefix: &str,
     image_resources: &HashMap<String, &[u8]>,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> Option<String> {
     let rest = value.strip_prefix("resource")?;
     let (digits, ext) = rest.split_once('.')?;
@@ -368,8 +410,7 @@ fn mobi_resource_to_asset_url(
         }
     }
     let path = storage.local_path(&key).ok()?;
-    let encoded = urlencoding::encode(&path.to_string_lossy()).into_owned();
-    Some(format!("asset://localhost/{}", encoded))
+    Some(image_url(&key, &path))
 }
 
 /// Split a MOBI subject string into a list of genres. EXTH subject fields
@@ -507,7 +548,13 @@ mod tests {
         resources.insert("resource00000.jpg".into(), bytes);
 
         let html = r#"<p><img src="resource00000.jpg" alt="x"/></p>"#;
-        let out = rewrite_mobi_image_refs(html, &storage, "bk/0", &resources);
+        let out = rewrite_mobi_image_refs_with_url_policy(
+            html,
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url,
+        );
         assert!(
             out.contains("asset://localhost/"),
             "expected asset:// URL, got {out}"
@@ -518,6 +565,44 @@ mod tests {
         );
         // Persisted under the per-chapter key as a side effect of the
         // rewrite.
+        assert!(storage.exists("bk/0/resource00000.jpg").unwrap());
+    }
+
+    /// M5: the MOBI arm's URL policy is the caller's too. Both formats emit
+    /// these URLs, so a policy threaded through EPUB alone would leave the
+    /// web reader with broken images for MOBI books only — and no EPUB test
+    /// would catch it. It has to be a synthetic resource map rather than a
+    /// fixture read: `alice.mobi`'s 19 chapters reference no image resources
+    /// at all (verified by driving `get_chapter_content` over every chapter
+    /// and finding storage empty), so a fixture-based test could not tell a
+    /// working policy from a missing one.
+    #[test]
+    fn rewrite_mobi_image_refs_applies_the_callers_url_policy() {
+        let dir = tempdir().unwrap();
+        let storage = LocalStorage::new(dir.path().to_path_buf()).unwrap();
+        let bytes: &[u8] = b"\xFF\xD8\xFFdata";
+        let mut resources: HashMap<String, &[u8]> = HashMap::new();
+        resources.insert("resource00000.jpg".into(), bytes);
+
+        let html = r#"<p><img src="resource00000.jpg" alt="x"/></p>"#;
+        let out = rewrite_mobi_image_refs_with_url_policy(
+            html,
+            &storage,
+            "bk/0",
+            &resources,
+            &|key: &str, _local_path: &std::path::Path| format!("web:{key}"),
+        );
+
+        assert_eq!(
+            out,
+            r#"<p><img src="web:bk/0/resource00000.jpg" alt="x"/></p>"#
+        );
+        assert!(
+            !out.contains("asset://"),
+            "core must not inject a scheme of its own: {out}"
+        );
+        // Still persisted under the per-chapter key — the policy decides the
+        // URL, not whether the bytes land on disk.
         assert!(storage.exists("bk/0/resource00000.jpg").unwrap());
     }
 
@@ -533,7 +618,13 @@ mod tests {
         // `asset://` URL pointing at nothing.
         let resources: HashMap<String, &[u8]> = HashMap::new();
         let html = r#"<p><img src="resource00000.jpg" alt="x"/></p>"#;
-        let out = rewrite_mobi_image_refs(html, &storage, "bk/0", &resources);
+        let out = rewrite_mobi_image_refs_with_url_policy(
+            html,
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url,
+        );
         assert!(out.contains("\"resource00000.jpg\""), "got {out}");
         assert!(!out.contains("asset://localhost"), "got {out}");
         // Nothing was persisted — the chapter doesn't own this image.
@@ -557,7 +648,13 @@ mod tests {
         resources.insert("resource00002.jpg".into(), img2);
 
         let html = r#"<p><img src="resource00001.jpg"/></p>"#;
-        let _ = rewrite_mobi_image_refs(html, &storage, "bk/5", &resources);
+        let _ = rewrite_mobi_image_refs_with_url_policy(
+            html,
+            &storage,
+            "bk/5",
+            &resources,
+            &crate::reader::asset_localhost_url,
+        );
 
         assert!(
             !storage.exists("bk/5/resource00000.jpg").unwrap(),
@@ -585,7 +682,13 @@ mod tests {
         resources.insert("resource00001.jpg".into(), bytes);
 
         let html = r#"<img src="resource00001.jpg"/><img src="resource00001.jpg"/>"#;
-        let out = rewrite_mobi_image_refs(html, &storage, "bk/0", &resources);
+        let out = rewrite_mobi_image_refs_with_url_policy(
+            html,
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url,
+        );
 
         assert!(storage.exists("bk/0/resource00001.jpg").unwrap());
         // Both references rewritten to an asset URL.
@@ -598,7 +701,13 @@ mod tests {
         let storage = LocalStorage::new(dir.path().to_path_buf()).unwrap();
         let resources: HashMap<String, &[u8]> = HashMap::new();
         let html = r#"<link href="flow00001.css"/><img src="resource00001.svg"/><img src="flow00004.svg"/>"#;
-        let out = rewrite_mobi_image_refs(html, &storage, "bk/0", &resources);
+        let out = rewrite_mobi_image_refs_with_url_policy(
+            html,
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url,
+        );
         // CSS and SVG references pass through untouched.
         assert!(out.contains("flow00001.css"));
         assert!(out.contains("flow00004.svg"));
@@ -630,18 +739,38 @@ mod tests {
         resources.insert("resource00000.svg".into(), bytes);
         resources.insert("resource00.jpg".into(), bytes);
         resources.insert("flow00000.jpg".into(), bytes);
-        assert!(
-            mobi_resource_to_asset_url("resource00000.css", &storage, "bk/0", &resources).is_none()
-        );
-        assert!(
-            mobi_resource_to_asset_url("resource00000.svg", &storage, "bk/0", &resources).is_none()
-        );
-        assert!(
-            mobi_resource_to_asset_url("resource00.jpg", &storage, "bk/0", &resources).is_none()
-        );
-        assert!(
-            mobi_resource_to_asset_url("flow00000.jpg", &storage, "bk/0", &resources).is_none()
-        );
+        assert!(mobi_resource_to_url(
+            "resource00000.css",
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url
+        )
+        .is_none());
+        assert!(mobi_resource_to_url(
+            "resource00000.svg",
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url
+        )
+        .is_none());
+        assert!(mobi_resource_to_url(
+            "resource00.jpg",
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url
+        )
+        .is_none());
+        assert!(mobi_resource_to_url(
+            "flow00000.jpg",
+            &storage,
+            "bk/0",
+            &resources,
+            &crate::reader::asset_localhost_url
+        )
+        .is_none());
     }
 
     #[test]

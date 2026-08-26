@@ -1146,11 +1146,14 @@ async fn get_chapter_content(
         images_storage.as_ref(),
         &id,
         &state.archives,
+        // The inline-image URL policy for this surface (M5): a browser cannot
+        // fetch Tauri's `asset://`, so core is handed the HTTP route this
+        // server serves those same extracted files from. Before M5 core
+        // emitted `asset://` here too and this adapter string-scanned it back
+        // apart — a parser undoing a formatter.
+        &|_key, local_path| web_image_url(&id, index, local_path),
     )
     .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
-
-    // Rewrite asset:// URLs to HTTP URLs for web serving
-    let html = rewrite_asset_urls_to_http(&html, &id, index);
 
     // R3-1: Sanitize HTML to prevent XSS from malicious book content
     let html = sanitize_chapter_html(&html);
@@ -1228,34 +1231,27 @@ fn sanitize_chapter_html(html: &str) -> String {
         .to_string()
 }
 
-/// Rewrite `asset://localhost/...` image URLs to HTTP `/api/books/{id}/images/{chapter}/{filename}`.
-fn rewrite_asset_urls_to_http(html: &str, book_id: &str, chapter_index: usize) -> String {
-    // The epub module produces URLs like: asset://localhost/{url_encoded_path}
-    // We need to extract the filename and rewrite to our HTTP route.
-    let mut result = html.to_string();
-
-    while let Some(start) = result.find("asset://localhost/") {
-        let rest = &result[start + 18..]; // skip "asset://localhost/"
-        let url_end = rest
-            .find('"')
-            .or_else(|| rest.find('\''))
-            .or_else(|| rest.find(')'))
-            .unwrap_or(rest.len());
-
-        let encoded_path = &rest[..url_end];
-        let decoded = urlencoding::decode(encoded_path).unwrap_or_default();
-        let filename = decoded.rsplit('/').next().unwrap_or("image");
-
-        let new_url = format!("/api/books/{book_id}/images/{chapter_index}/{filename}");
-        result = format!(
-            "{}{}{}",
-            &result[..start],
-            new_url,
-            &result[start + 18 + url_end..]
-        );
-    }
-
-    result
+/// This server's inline-image URL policy (M5), handed to
+/// `carrel_core::reader::chapter_html` so core never has to know which URL
+/// scheme its caller serves.
+///
+/// `local_path` is where core's storage resolved the image's key —
+/// `{data_dir}/images/{book_id}/{chapter}/{filename}` — and only the last
+/// segment goes into the URL, because [`get_epub_image`] re-joins exactly that
+/// onto `{data_dir}/images/{id}/{chapter}/` (guarding it with
+/// [`is_safe_filename`]). The filename is *not* percent-encoded, which is what
+/// the `rewrite_asset_urls_to_http` scanner this replaced produced: it decoded
+/// the path out of core's `asset://` URL and never re-encoded the basename.
+/// Keeping that byte-for-byte matters — the web reader's service worker caches
+/// these URLs, so a changed one is a cache miss on every offline-saved book.
+fn web_image_url(book_id: &str, chapter_index: usize, local_path: &std::path::Path) -> String {
+    let filename = local_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        // Unreachable — every storage key ends in a filename component — but
+        // the scanner this replaced carried the same fallback.
+        .unwrap_or_else(|| "image".to_string());
+    format!("/api/books/{book_id}/images/{chapter_index}/{filename}")
 }
 
 async fn get_epub_image(
@@ -2876,6 +2872,37 @@ mod tests {
         assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
     }
 
+    /// Characterization lock for the web chapter read's inline-image URLs,
+    /// recorded BEFORE the URL policy moves out of core (M5).
+    ///
+    /// Until M5 these URLs were produced by core emitting
+    /// `asset://localhost/<url-encoded absolute path>` and this adapter
+    /// string-scanning it back apart (`rewrite_asset_urls_to_http`); after M5
+    /// this adapter injects the policy and core never sees `asset://` at all.
+    /// The web reader, its service worker, and the offline-save path all
+    /// consume these `/api/books/{id}/images/{chapter}/{filename}` URLs
+    /// directly, so the refactor must not move a byte of this output — hence
+    /// an exact-equality assertion rather than a `contains`.
+    #[tokio::test]
+    async fn web_chapter_output_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_image_chapter(dir.path(), "web-stable");
+        seed_epub_book(&state, "bk-web-stable", &epub);
+
+        let resp = get_chapter_content(
+            State(state.clone()),
+            Path(("bk-web-stable".to_string(), 0usize)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            body_string(resp).await,
+            "<p>Hello</p><img src=\"/api/books/bk-web-stable/images/0/2fcbc7ca6bddbb6f-img.png\" alt=\"a\">"
+        );
+    }
+
     /// M4's acceptance criterion for the web adapter: a second TOC request is
     /// served from the cached archive rather than by reopening the book
     /// file. Before this milestone the route called the path-based
@@ -4186,19 +4213,54 @@ mod tests {
         assert_eq!(parse_width(Some("width=+800")), None);
     }
 
+    /// Successor to the deleted `test_rewrite_asset_urls`: the same
+    /// filename-extraction contract, asserted on the policy that now *produces*
+    /// the URL rather than on the scanner that used to repair it. The path is
+    /// the one core resolves the storage key to; only its last segment reaches
+    /// the URL, because that is what `get_epub_image` re-joins onto
+    /// `{data_dir}/images/{id}/{chapter}/`.
     #[test]
-    fn test_rewrite_asset_urls() {
-        let html = r#"<img src="asset://localhost/%2Ftmp%2Fimages%2Fbook1%2F0%2Fchapter1.jpg" />"#;
-        let result = rewrite_asset_urls_to_http(html, "book1", 0);
-        assert!(result.contains("/api/books/book1/images/0/chapter1.jpg"));
-        assert!(!result.contains("asset://"));
+    fn web_image_url_uses_the_paths_last_segment() {
+        assert_eq!(
+            web_image_url(
+                "book1",
+                0,
+                std::path::Path::new("/tmp/images/book1/0/chapter1.jpg")
+            ),
+            "/api/books/book1/images/0/chapter1.jpg"
+        );
+        assert_eq!(
+            web_image_url(
+                "bk",
+                3,
+                std::path::Path::new("/var/data/images/bk/3/ab12-fig.png")
+            ),
+            "/api/books/bk/images/3/ab12-fig.png"
+        );
     }
 
+    /// Successor to the deleted `test_rewrite_asset_urls_utf8_filename`. The
+    /// old rewriter percent-*decoded* the path it scanned and never re-encoded
+    /// the filename, so a non-ASCII basename landed in the `src` as raw UTF-8.
+    /// Byte-identity with that output is the acceptance criterion for M5, so
+    /// this pins it: no percent-encoding is applied here.
     #[test]
-    fn test_rewrite_asset_urls_no_assets() {
-        let html = "<p>Hello world</p>";
-        let result = rewrite_asset_urls_to_http(html, "book1", 0);
-        assert_eq!(result, html);
+    fn web_image_url_leaves_a_non_ascii_filename_unencoded() {
+        assert_eq!(
+            web_image_url("book1", 0, std::path::Path::new("/tmp/images/图片.jpg")),
+            "/api/books/book1/images/0/图片.jpg"
+        );
+    }
+
+    /// A path with no final component cannot arise — every storage key ends in
+    /// a filename — but the deleted rewriter carried an explicit fallback for
+    /// the degenerate case, so keep one rather than dropping it in passing.
+    #[test]
+    fn web_image_url_falls_back_when_the_path_has_no_filename() {
+        assert_eq!(
+            web_image_url("bk", 2, std::path::Path::new("/")),
+            "/api/books/bk/images/2/image"
+        );
     }
 
     // R2-1: Path traversal prevention
@@ -4244,24 +4306,6 @@ mod tests {
         assert!(sanitized.contains("<h1>"));
         assert!(sanitized.contains("<em>"));
         assert!(sanitized.contains("<img"));
-    }
-
-    // R2-4: URL rewriting with regex handles multiple URLs
-    #[test]
-    fn test_rewrite_asset_urls_multiple_images() {
-        let html = r#"<img src="asset://localhost/a/b/c/img1.jpg"><img src="asset://localhost/x/y/z/img2.png">"#;
-        let result = rewrite_asset_urls_to_http(html, "book1", 3);
-        assert!(result.contains("/api/books/book1/images/3/img1.jpg"));
-        assert!(result.contains("/api/books/book1/images/3/img2.png"));
-        assert!(!result.contains("asset://"));
-    }
-
-    // R2-4: URL rewriting handles UTF-8 filenames
-    #[test]
-    fn test_rewrite_asset_urls_utf8_filename() {
-        let html = r#"<img src="asset://localhost/path/%E5%9B%BE%E7%89%87.jpg">"#;
-        let result = rewrite_asset_urls_to_http(html, "book1", 0);
-        assert!(!result.contains("asset://"));
     }
 
     #[test]

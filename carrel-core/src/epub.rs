@@ -763,6 +763,11 @@ pub fn get_chapter_list(file_path: &str) -> Result<Vec<ChapterInfo>, EpubError> 
 /// Relative `<img src>` attributes are rewritten to `asset://` URLs pointing to
 /// images extracted from the EPUB into `storage`, avoiding large base64
 /// strings in memory. Keys land under `{book_id}/{chapter_index}/{basename}`.
+///
+/// Hard-wired to the desktop's [`crate::reader::asset_localhost_url`] policy.
+/// A caller that needs different URLs (the LAN web server serves them over
+/// HTTP) goes through [`get_chapter_content_from_cache_with_url_policy`]; this
+/// signature is frozen for out-of-repo consumers.
 pub fn get_chapter_content(
     file_path: &str,
     chapter_index: usize,
@@ -791,7 +796,12 @@ pub fn get_chapter_content(
         .ok_or_else(|| EpubError::MissingFile(format!("{base_dir}{href}")))?;
 
     let raw_html = read_zip_entry(&mut archive, &entry_name)?;
-    // Sanitize first so ammonia never sees the asset URLs we are about to inject.
+    // Sanitize first so ammonia never sees the image URLs we are about to
+    // inject: `asset://` is not in its default scheme allowlist, so injecting
+    // first would silently delete every image under the desktop's policy. A
+    // relative `/api/…` URL would survive, which is why the order must not be
+    // made conditional on the policy — core cannot know which one it got.
+    // See `tests::ammonia_drops_asset_scheme_srcs_but_keeps_relative_ones`.
     let cleaned = clean(&raw_html);
 
     // Compute the directory of the chapter file within the zip so relative
@@ -817,11 +827,47 @@ pub fn get_chapter_content(
 
 /// Like [`get_chapter_content`] but operates on a [`CachedEpubArchive`],
 /// avoiding the cost of re-opening the zip and re-parsing OPF metadata.
+///
+/// Emits the desktop's [`crate::reader::asset_localhost_url`] URLs. This
+/// signature is frozen — out-of-repo consumers (Carrel Server pins this crate
+/// by release tag) call it — so a caller that needs different image URLs uses
+/// [`get_chapter_content_from_cache_with_url_policy`] instead.
 pub fn get_chapter_content_from_cache(
     cached: &mut CachedEpubArchive,
     chapter_index: usize,
     storage: &dyn crate::storage::Storage,
     book_id: &str,
+) -> Result<String, EpubError> {
+    get_chapter_content_from_cache_with_url_policy(
+        cached,
+        chapter_index,
+        storage,
+        book_id,
+        &crate::reader::asset_localhost_url,
+    )
+}
+
+/// [`get_chapter_content_from_cache`] with the inline-image URL policy
+/// supplied by the caller instead of hard-coded here (M5).
+///
+/// `image_url` is called once per image this chapter actually references,
+/// *after* the bytes are in `storage`, with that image's storage key and the
+/// local path the key resolved to. Whatever it returns becomes the `<img src>`
+/// verbatim. Core deliberately does not know which URL scheme its caller
+/// serves: the desktop passes [`crate::reader::asset_localhost_url`] (Tauri's
+/// asset protocol), the LAN web server passes its own HTTP route. Before this,
+/// core emitted `asset://` unconditionally and the web adapter string-scanned
+/// the result back apart — a parser undoing a formatter.
+///
+/// An image that is missing from the zip, or whose write to `storage` fails,
+/// never reaches `image_url`: the `<img>` tag is left exactly as it was, so
+/// one broken asset can't abort the chapter. See [`rewrite_img_srcs`].
+pub fn get_chapter_content_from_cache_with_url_policy(
+    cached: &mut CachedEpubArchive,
+    chapter_index: usize,
+    storage: &dyn crate::storage::Storage,
+    book_id: &str,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> Result<String, EpubError> {
     let idref = cached.spine.get(chapter_index).ok_or_else(|| {
         EpubError::InvalidFormat(format!("Chapter index {chapter_index} out of range"))
@@ -838,6 +884,9 @@ pub fn get_chapter_content_from_cache(
         .ok_or_else(|| EpubError::MissingFile(format!("{base_dir}{href}")))?;
 
     let raw_html = read_zip_entry(&mut cached.archive, &entry_name)?;
+    // Sanitize before injecting, for the reason spelled out in
+    // [`get_chapter_content`] — ammonia's default allowlist has no `asset://`,
+    // so the order here is load-bearing.
     let cleaned = clean(&raw_html);
 
     let chapter_dir = {
@@ -850,12 +899,13 @@ pub fn get_chapter_content_from_cache(
 
     let key_prefix = format!("{book_id}/{chapter_index}");
 
-    Ok(rewrite_img_srcs_to_asset_urls(
+    Ok(rewrite_img_srcs(
         &cleaned,
         &mut cached.archive,
         &chapter_dir,
         storage,
         &key_prefix,
+        image_url,
     ))
 }
 
@@ -1138,10 +1188,38 @@ fn short_zip_path_hash(resolved_zip_path: &str) -> String {
     out
 }
 
+/// [`rewrite_img_srcs`] with the desktop's `asset://localhost/` policy.
+///
+/// The default the frozen path-based [`get_chapter_content`] uses; also what
+/// this module's own rewriter tests exercise, which is what keeps the exact
+/// `asset://` string those tests assert covered after M5 moved the policy out.
+fn rewrite_img_srcs_to_asset_urls(
+    html: &str,
+    archive: &mut ZipArchive<std::fs::File>,
+    chapter_dir: &str,
+    storage: &dyn crate::storage::Storage,
+    key_prefix: &str,
+) -> String {
+    rewrite_img_srcs(
+        html,
+        archive,
+        chapter_dir,
+        storage,
+        key_prefix,
+        &crate::reader::asset_localhost_url,
+    )
+}
+
 /// Walk the sanitized chapter HTML and replace relative `<img src>` values
-/// with `asset://localhost/` URLs pointing to images extracted from the EPUB
-/// zip through `storage`. This avoids base64-encoding large images into the
+/// with the URLs `image_url` returns for images extracted from the EPUB zip
+/// through `storage`. This avoids base64-encoding large images into the
 /// HTML string, which can cause memory issues with illustrated books.
+///
+/// `image_url` receives the storage key and its resolved local path, and its
+/// return value becomes the `src` verbatim — no encoding or escaping is
+/// applied to it afterwards. See
+/// [`get_chapter_content_from_cache_with_url_policy`] for why the policy is
+/// the caller's.
 ///
 /// Images are keyed as `{key_prefix}/{hash}-{basename}` where `hash` is a
 /// short SHA-256 of the resolved zip path (see [`short_zip_path_hash`]).
@@ -1156,15 +1234,17 @@ fn short_zip_path_hash(resolved_zip_path: &str) -> String {
 /// images and storage failures fall back to leaving the `<img>` tag
 /// unchanged so a single broken asset doesn't abort the whole chapter.
 ///
-/// The `asset://` URL is derived from `storage.local_path(key)` — remote
-/// backends that need a command-fetch fallback should implement a
-/// caching-aware `local_path` or return an error to trigger the fallback.
-fn rewrite_img_srcs_to_asset_urls(
+/// The local path handed to `image_url` comes from `storage.local_path(key)` —
+/// remote backends that need a command-fetch fallback should implement a
+/// caching-aware `local_path` or return an error to trigger the fallback. A
+/// `local_path` error keeps the tag unchanged, exactly like a failed write.
+fn rewrite_img_srcs(
     html: &str,
     archive: &mut ZipArchive<std::fs::File>,
     chapter_dir: &str,
     storage: &dyn crate::storage::Storage,
     key_prefix: &str,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> String {
     let mut result = String::with_capacity(html.len());
     let mut rest = html;
@@ -1245,10 +1325,8 @@ fn rewrite_img_srcs_to_asset_urls(
                         if written {
                             match storage.local_path(&key) {
                                 Ok(p) => {
-                                    let abs_path = p.to_string_lossy();
-                                    let encoded = urlencoding::encode(&abs_path);
-                                    let asset_url = format!("asset://localhost/{}", encoded);
-                                    replace_attr_value(tag, "src", &src, &asset_url)
+                                    let url = image_url(&key, &p);
+                                    replace_attr_value(tag, "src", &src, &url)
                                 }
                                 Err(_) => tag.to_string(),
                             }
@@ -2238,6 +2316,75 @@ pub(crate) mod tests {
         let result = rewrite_img_srcs_to_asset_urls(html, &mut archive, "", &storage, "b/0");
 
         assert_eq!(result, html, "missing images should leave tag unchanged");
+    }
+
+    /// The sanitize-then-inject order in [`get_chapter_content`] and
+    /// [`get_chapter_content_from_cache_with_url_policy`] is load-bearing, so
+    /// pin the reason here rather than only asserting it in prose. `asset://`
+    /// is not in ammonia's default scheme allowlist and gets dropped; a
+    /// relative URL is not (its default `url_relative` is `PassThrough`) and
+    /// survives. So injecting before the clean would silently delete every
+    /// image under the desktop's policy while the web's came through fine —
+    /// the worst shape of bug, and the reason core must not make the order
+    /// depend on which policy it was handed. An ammonia upgrade that changed
+    /// either half would fail here instead of in a user's reader.
+    #[test]
+    fn ammonia_drops_asset_scheme_srcs_but_keeps_relative_ones() {
+        let asset = clean(r#"<img src="asset://localhost/%2Ftmp%2Fimages%2Fa.png">"#);
+        assert!(
+            !asset.contains("asset://"),
+            "ammonia kept an asset:// src: {asset}"
+        );
+
+        let relative = clean(r#"<img src="/api/books/bk/images/0/a.png">"#);
+        assert!(
+            relative.contains("/api/books/bk/images/0/a.png"),
+            "ammonia dropped a relative src: {relative}"
+        );
+    }
+
+    /// M5: the caller's policy decides *every* `<img src>` in the chapter,
+    /// and is handed each image's own storage key — so two images in one
+    /// chapter get two distinct URLs and core injects no scheme of its own.
+    /// Successor to the web adapter's deleted
+    /// `test_rewrite_asset_urls_multiple_images`, one layer down.
+    #[test]
+    fn test_rewrite_img_srcs_applies_the_url_policy_to_every_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = create_test_zip_with_images(
+            tmp.path(),
+            "test.zip",
+            &[
+                ("dir_a/cover.png", b"AAAA-distinct-bytes-a"),
+                ("dir_b/cover.png", b"BBBB-distinct-bytes-b"),
+            ],
+        );
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+        let html = r#"<img src="dir_a/cover.png"/><img src="dir_b/cover.png"/>"#;
+        let result = rewrite_img_srcs(
+            html,
+            &mut archive,
+            "",
+            &storage,
+            "book1/0",
+            &|key: &str, _local_path: &std::path::Path| format!("web:{key}"),
+        );
+
+        assert!(
+            !result.contains("asset://"),
+            "core must not inject a scheme of its own: {result}"
+        );
+        assert_eq!(
+            result,
+            format!(
+                r#"<img src="web:book1/0/{}-cover.png"/><img src="web:book1/0/{}-cover.png"/>"#,
+                short_zip_path_hash("dir_a/cover.png"),
+                short_zip_path_hash("dir_b/cover.png"),
+            )
+        );
     }
 
     #[test]

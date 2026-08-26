@@ -1870,6 +1870,12 @@ pub async fn get_chapter_content(
         images_storage.as_ref(),
         &book_id,
         &state.archive_caches(),
+        // The desktop's inline-image URL policy (M5): Tauri's asset protocol,
+        // which is what the React reader's DOMPurify configuration allows
+        // through and what `tauri.conf.json` scopes to `$APPDATA/**`. Core
+        // used to hard-code this; now it is passed in, so the LAN web server
+        // can pass its own HTTP route instead of unpicking this one.
+        &carrel_core::reader::asset_localhost_url,
     )
 }
 

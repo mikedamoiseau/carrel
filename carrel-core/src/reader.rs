@@ -22,6 +22,38 @@
 //! 3. An adapter with no cache-management surface (the web server) can hold
 //!    its own caches with its own capacity without inheriting a registry.
 //!
+//! # Image URL policy (M5)
+//!
+//! [`chapter_html`] takes the `<img src>` URL policy as a parameter, the same
+//! "caller supplies the policy" shape as [`ArchiveCaches`] and
+//! [`page_image`]'s `on_extracted`. Before M5 the format modules hard-coded
+//! `asset://localhost/<url-encoded absolute path>` — Tauri's asset protocol,
+//! a desktop concept this crate has no business knowing. A browser cannot
+//! fetch that, so the web adapter string-scanned core's finished HTML,
+//! decoded each path, threw away everything but the filename and rebuilt an
+//! HTTP URL: a parser undoing a formatter, and the sibling `carrel-server`
+//! project wrote a second copy of that undo for the same reason.
+//!
+//! So the policy is now injected: the desktop passes
+//! [`asset_localhost_url`], the web server passes
+//! `/api/books/{id}/images/{chapter}/{filename}`, and neither surface's
+//! bytes changed. Two consequences worth keeping in mind:
+//!
+//! 1. **Sanitize-then-inject stays.** Both format modules clean the chapter
+//!    with ammonia *before* the rewrite, because `asset://` is not in
+//!    ammonia's default scheme allowlist — so injecting first would silently
+//!    delete every image under the desktop's policy. A relative `/api/…` URL
+//!    would survive it (ammonia's default `url_relative` is `PassThrough`),
+//!    which is precisely why core must not make the order conditional on the
+//!    policy it was handed: it cannot know it got the surviving one.
+//!    `epub::tests::ammonia_drops_asset_scheme_srcs_but_keeps_relative_ones`
+//!    pins both halves.
+//! 2. **The pre-M5 entry points are frozen, not deprecated.**
+//!    [`epub::get_chapter_content_from_cache`] and its MOBI counterpart keep
+//!    their exact signatures (Carrel Server consumes this crate as a git
+//!    dependency pinned to a release tag) and delegate to the policy-taking
+//!    variants with [`asset_localhost_url`].
+//!
 //! # Locking
 //!
 //! [`crate::epub::CachedEpubArchive`] carries an `unsafe impl Send` whose
@@ -140,11 +172,42 @@ impl ArchiveCaches {
     }
 }
 
+/// The desktop's inline-image URL policy: `asset://localhost/` followed by the
+/// url-encoded absolute local path, which is what Tauri's asset protocol
+/// serves (scoped to `$APPDATA/**` by `tauri.conf.json`) and what the React
+/// reader's DOMPurify configuration allows through.
+///
+/// Pass it as [`chapter_html`]'s `image_url` from the desktop adapter. It also
+/// backs the pre-M5 entry points whose signatures are frozen for out-of-repo
+/// consumers ([`epub::get_chapter_content`],
+/// [`epub::get_chapter_content_from_cache`] and their MOBI counterparts), so
+/// the exact string lives here once instead of drifting between the format
+/// modules and the adapter.
+///
+/// `key` is unused here — Tauri serves the file from wherever storage put it,
+/// so the resolved path is all this policy needs — but it has to match the
+/// signature [`chapter_html`] takes, which passes both halves of the boundary
+/// so a policy can key off whichever it needs.
+pub fn asset_localhost_url(_key: &str, local_path: &std::path::Path) -> String {
+    format!(
+        "asset://localhost/{}",
+        urlencoding::encode(&local_path.to_string_lossy())
+    )
+}
+
 /// Read one chapter's sanitized HTML.
 ///
 /// Dispatches on `format`, keeps the parsed archive in `caches` so a repeat
 /// read of the same book does not reopen the file, and extracts inline images
 /// into `images` under `{book_id}/{chapter_index}/…`.
+///
+/// `image_url` is the caller's URL policy for those inline images (M5): it is
+/// called once per image the chapter references, after the bytes are in
+/// `images`, with that image's storage key and resolved local path, and its
+/// return value becomes the `<img src>` verbatim. The desktop passes
+/// [`asset_localhost_url`]; the web server passes its own HTTP route, because
+/// the browser cannot fetch an `asset://` URL. Core has no business knowing
+/// which — see the module docs' "Image URL policy" section.
 ///
 /// Errors with [`CarrelError::invalid`] for the image-only formats (PDF, CBZ,
 /// CBR), which have no chapters to read.
@@ -155,6 +218,7 @@ pub fn chapter_html(
     images: &dyn Storage,
     book_id: &str,
     caches: &ArchiveCaches,
+    image_url: &dyn Fn(&str, &std::path::Path) -> String,
 ) -> CarrelResult<String> {
     match format {
         BookFormat::Epub => {
@@ -163,11 +227,12 @@ pub fn chapter_html(
             let cached = cache
                 .get_mut(file_path)
                 .ok_or_else(|| CarrelError::internal("Failed to open EPUB archive"))?;
-            Ok(epub::get_chapter_content_from_cache(
+            Ok(epub::get_chapter_content_from_cache_with_url_policy(
                 cached,
                 chapter_index,
                 images,
                 book_id,
+                image_url,
             )?)
         }
         #[cfg(feature = "mobi")]
@@ -177,11 +242,12 @@ pub fn chapter_html(
             let cached = cache
                 .get(file_path)
                 .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
-            Ok(crate::mobi::get_chapter_content_from_cache(
+            Ok(crate::mobi::get_chapter_content_from_cache_with_url_policy(
                 cached,
                 chapter_index,
                 images,
                 book_id,
+                image_url,
             )?)
         }
         #[cfg(not(feature = "mobi"))]
@@ -1173,14 +1239,83 @@ mod tests {
         let store = images(dir.path());
         let caches = caches();
 
-        let first = chapter_html(BookFormat::Epub, &path, 0, &store, "bk", &caches).unwrap();
+        let first = chapter_html(
+            BookFormat::Epub,
+            &path,
+            0,
+            &store,
+            "bk",
+            &caches,
+            &asset_localhost_url,
+        )
+        .unwrap();
         assert_eq!(caches.epub.lock().unwrap().len(), 1);
 
         std::fs::remove_file(&path).unwrap();
 
-        let second = chapter_html(BookFormat::Epub, &path, 0, &store, "bk", &caches).unwrap();
+        let second = chapter_html(
+            BookFormat::Epub,
+            &path,
+            0,
+            &store,
+            "bk",
+            &caches,
+            &asset_localhost_url,
+        )
+        .unwrap();
         assert_eq!(second, first);
         assert_eq!(caches.epub.lock().unwrap().len(), 1);
+    }
+
+    /// M5's acceptance criterion: the `<img src>` URL policy belongs to the
+    /// caller, not to this crate. The web adapter needs
+    /// `/api/books/{id}/images/{chapter}/{filename}`; the desktop needs
+    /// `asset://localhost/…`. Passing a web-shaped policy and asserting the
+    /// exact HTML is what pins that — a version that ignored the closure and
+    /// injected its own scheme would fail on the `asset://` it emitted
+    /// instead.
+    #[test]
+    fn chapter_html_uses_the_callers_image_url_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_epub(dir.path());
+        let store = images(dir.path());
+        let seen: Mutex<Vec<(String, std::path::PathBuf)>> = Mutex::new(Vec::new());
+
+        let html = chapter_html(
+            BookFormat::Epub,
+            &path,
+            0,
+            &store,
+            "bk",
+            &caches(),
+            &|key: &str, local_path: &std::path::Path| {
+                seen.lock()
+                    .unwrap()
+                    .push((key.to_string(), local_path.to_path_buf()));
+                format!(
+                    "/api/books/bk/images/0/{}",
+                    local_path.file_name().unwrap().to_string_lossy()
+                )
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            html,
+            "<p>Hello</p><img src=\"/api/books/bk/images/0/2fcbc7ca6bddbb6f-img.png\">"
+        );
+
+        // The policy is handed both halves of the boundary: the storage key
+        // the image was written under, and where that key resolved on disk.
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 1, "one image, one policy call: {seen:?}");
+        assert_eq!(seen[0].0, "bk/0/2fcbc7ca6bddbb6f-img.png");
+        assert_eq!(
+            seen[0].1,
+            dir.path()
+                .join("images")
+                .join("bk/0/2fcbc7ca6bddbb6f-img.png")
+        );
     }
 
     /// A missing book file must stay a `NotFound`, because that is the kind
@@ -1198,6 +1333,7 @@ mod tests {
             &store,
             "bk",
             &caches(),
+            &asset_localhost_url,
         )
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
@@ -1209,7 +1345,16 @@ mod tests {
         let store = images(dir.path());
         for format in [BookFormat::Pdf, BookFormat::Cbz, BookFormat::Cbr] {
             let name = format.to_string();
-            let err = chapter_html(format, "/nope", 0, &store, "bk", &caches()).unwrap_err();
+            let err = chapter_html(
+                format,
+                "/nope",
+                0,
+                &store,
+                "bk",
+                &caches(),
+                &asset_localhost_url,
+            )
+            .unwrap_err();
             assert!(
                 err.to_string().contains("not supported"),
                 "unexpected error for {name}: {err}"
