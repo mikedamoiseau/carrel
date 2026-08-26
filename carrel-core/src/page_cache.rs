@@ -340,6 +340,25 @@ fn build_comic_manifest(
 /// Full comic extraction: every page into the cache plus a complete
 /// manifest. Backs [`extract_cbz`]/[`extract_cbr`] and the `ensure_cached`
 /// comic path.
+/// Extract every page of a comic into the cache and write its manifest.
+///
+/// **All or nothing**: a failure part-way through removes whatever was
+/// already written, so this either leaves a complete cache entry or leaves
+/// the cache exactly as it found it. Page blobs are written first and the
+/// manifest last, so without the cleanup a failure on entry 900 of 1000 —
+/// or a full disk, or a failed manifest write after every page landed —
+/// leaves manifest-less bytes behind with nothing accounting for them.
+///
+/// That invariant is what lets [`crate::reader::page_image`] decide whether
+/// to run its caller's eviction hook by looking at this function's result
+/// alone. Without it the caller has to infer "were bytes written?" from
+/// "was the manifest complete beforehand?", and those two come apart on
+/// exactly the failure paths that matter: an archive that never opened
+/// wrote nothing, while one that failed at entry 900 wrote a great deal.
+/// Guessing wrong in one direction leaves the cache over budget; in the
+/// other it hands an unauthenticated LAN client a full-cache eviction walk
+/// per request. Several rounds of the M3 review went back and forth on that
+/// inference before the invariant replaced it.
 fn extract_comic_full(
     storage: &dyn Storage,
     book_id: &str,
@@ -347,13 +366,36 @@ fn extract_comic_full(
     file_path: &str,
     format: &BookFormat,
 ) -> CarrelResult<CacheManifest> {
+    // Before any write: nothing to undo if this is where it fails, which is
+    // the corrupt/unopenable-archive case.
     let names = comic_page_names(format, file_path)?;
     let want: BTreeSet<usize> = (0..names.len()).collect();
-    let total_size =
-        extract_comic_subset(storage, book_hash, format, file_path, &names, &want, |_| {})?;
-    let manifest = build_comic_manifest(book_id, book_hash, format, &names, total_size);
-    write_manifest(storage, book_hash, &manifest)?;
-    Ok(manifest)
+
+    let extracted = (|| {
+        let total_size =
+            extract_comic_subset(storage, book_hash, format, file_path, &names, &want, |_| {})?;
+        let manifest = build_comic_manifest(book_id, book_hash, format, &names, total_size);
+        write_manifest(storage, book_hash, &manifest)?;
+        Ok(manifest)
+    })();
+
+    match extracted {
+        Ok(manifest) => Ok(manifest),
+        Err(e) => {
+            // Best effort: a cleanup that itself fails (the same full disk,
+            // the same unwritable storage) must not replace the real error
+            // with a second one. `run_eviction`'s orphan-prefix pass is the
+            // backstop for that residue.
+            if let Err(cleanup) = evict_book(storage, book_hash) {
+                page_dbg!(
+                    "extract_comic_full: cleanup after failure also failed for {}: {}",
+                    book_hash,
+                    cleanup
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
 pub fn extract_cbz(
@@ -1843,6 +1885,97 @@ mod tests {
         assert_eq!(books[1].page_count, 4);
         assert_eq!(books[2].book_hash, "hash_c");
         assert_eq!(books[2].page_count, 1);
+    }
+
+    /// A `Storage` that starts failing writes after the first `limit` of
+    /// them succeed — the only way to reach a genuinely *partial*
+    /// extraction. A read-only directory fails the very first `put`, which
+    /// leaves nothing written and so cannot tell the cleanup apart from its
+    /// absence.
+    struct FailsAfter {
+        inner: LocalStorage,
+        limit: usize,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Storage for FailsAfter {
+        fn put(&self, key: &str, bytes: &[u8]) -> CarrelResult<()> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.limit {
+                return Err(CarrelError::io("disk full (test)"));
+            }
+            self.inner.put(key, bytes)
+        }
+        fn get(&self, key: &str) -> CarrelResult<Vec<u8>> {
+            self.inner.get(key)
+        }
+        fn exists(&self, key: &str) -> CarrelResult<bool> {
+            self.inner.exists(key)
+        }
+        fn delete(&self, key: &str) -> CarrelResult<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> CarrelResult<Vec<String>> {
+            self.inner.list(prefix)
+        }
+        fn size(&self, key: &str) -> CarrelResult<u64> {
+            self.inner.size(key)
+        }
+        fn local_path(&self, key: &str) -> CarrelResult<std::path::PathBuf> {
+            self.inner.local_path(key)
+        }
+    }
+
+    /// M3 review round 7: `extract_comic_full` is all-or-nothing. A failure
+    /// after it has already written page blobs must leave the cache exactly
+    /// as it found it, not a pile of manifest-less bytes that nothing
+    /// accounts for.
+    ///
+    /// This invariant is load-bearing for `reader::page_image`, which
+    /// decides whether to run its caller's eviction hook from this
+    /// function's result alone. Without it the caller has to guess whether
+    /// bytes were written, and several review rounds showed both guesses are
+    /// wrong: skip the sweep after a real extraction and the cache sits over
+    /// budget; run it after an archive that never opened and a LAN client
+    /// can loop one broken comic into a full-cache walk per request.
+    #[test]
+    fn a_failed_extraction_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FailsAfter {
+            inner: LocalStorage::new(dir.path().join("cache")).unwrap(),
+            // Two pages land, the third write fails: a real partial write.
+            limit: 2,
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let path = dir.path().join("book.cbz");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..5 {
+                zip.start_file(format!("{i:03}.jpg"), options).unwrap();
+                std::io::Write::write_all(&mut zip, b"\xff\xd8\xff\xe0jpeg-ish").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        let result = ensure_cached(
+            &storage,
+            "bk",
+            "hash-partial",
+            path.to_str().unwrap(),
+            &BookFormat::Cbz,
+        );
+        assert!(result.is_err(), "the failing write must fail the extract");
+
+        let leftovers = storage.list(&book_prefix("hash-partial")).unwrap();
+        assert!(
+            leftovers.is_empty(),
+            "a failed extraction must leave nothing behind: {leftovers:?}"
+        );
     }
 
     #[test]

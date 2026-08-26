@@ -354,29 +354,32 @@ pub enum OnMiss {
 /// already satisfied it (none consumed anything they captured), so this is
 /// not a behavior change for comics.
 ///
-/// For comics, fires **at most once**, and exactly when this call performed
-/// a real extraction via `ensure_cached` — not when `ensure_cached`
-/// short-circuited on an already-complete manifest. Whether the page then
-/// read back successfully is deliberately *not* part of the condition (M3
-/// review rounds 4 and 5): `ensure_cached` has no size cap of its own, so
-/// this callback is the only thing bounding what it just wrote against the
-/// caller's budget, and a request that goes on to fail — an out-of-range
-/// index, a failed read-back, a resize error — has still put a whole
-/// archive on disk that something must sweep. So it fires on those paths
-/// too, including ones that return `Err`.
+/// For comics, fires **at most once**, and exactly when this call left new
+/// bytes in the cache: `ensure_cached` returned `Ok` *and* did real work,
+/// rather than short-circuiting on an already-complete manifest.
 ///
-/// An earlier version inferred "a real extraction happened" from "the
-/// post-extraction read succeeded", which is cheaper but wrong in exactly
-/// that direction: it skipped the sweep on every failing path, leaving the
-/// cache over budget until an unrelated request happened to trigger one.
-/// The predicate is now read directly, from
-/// [`page_cache::complete_manifest`] before `ensure_cached` runs — the same
-/// test `ensure_cached` itself uses to decide whether to short-circuit.
+/// Whether the page then read back successfully is deliberately not part of
+/// the condition (M3 review round 4). `ensure_cached` has no size cap of its
+/// own, so this callback is the only thing bounding what it wrote against
+/// the caller's budget, and a request that goes on to fail — an
+/// out-of-range index, a failed read-back, a resize error — has still put a
+/// whole archive on disk. It fires on those paths too, including ones that
+/// return `Err`.
 ///
-/// Gating on a real extraction (rather than firing unconditionally) is what
-/// stops a LAN client — the PIN is optional — from triggering a full-cache
-/// eviction walk in a tight loop by repeatedly requesting an invalid page
-/// index on an already-warm book, where nothing is ever written.
+/// A *failed* `ensure_cached` does not fire it, because that function is
+/// all-or-nothing: a failure part-way through removes what it had written,
+/// so there is nothing to sweep (M3 review round 7). Do not replace that
+/// with an inference here. Earlier rounds tried to derive "were bytes
+/// written?" from "was the manifest complete beforehand?" and got it wrong
+/// in both directions — skipping the sweep after a real extraction left the
+/// cache over budget, and running it after an archive that never opened
+/// handed an unauthenticated LAN client (the PIN is optional) a full-cache
+/// eviction walk per request against one broken comic.
+///
+/// Gating on real work at all — rather than firing whenever this branch is
+/// reached — is what closes that same amplification for a warm book: an
+/// invalid page index on an already-cached comic writes nothing, so it must
+/// sweep nothing.
 ///
 /// Never fires on a cache hit (the hot path — the callback is where a
 /// caller is expected to run eviction, which walks the whole cache and does
@@ -568,25 +571,20 @@ where
         // a genuinely broken archive still errors — from the direct decode
         // below, which fails too.
         //
-        // The eviction hook deliberately does NOT fire here, reversing round
-        // 5's attempt to sweep a partial extraction. `extracted` means "the
-        // manifest was not complete", not "bytes were written", and the two
-        // come apart precisely on this path: `extract_comic_full` calls
-        // `comic_page_names` before writing anything, so a corrupt CBZ or an
-        // unopenable CBR fails having written nothing at all. Firing anyway
-        // hands an unauthenticated LAN client a full-cache eviction walk per
-        // request against one broken comic — the amplification the
-        // `on_extracted` contract above exists to prevent. Telling the two
-        // apart cheaply is not possible here either: `Storage::list` walks
-        // the whole storage root (see `page_cache::pdf_manifest_page_count`),
-        // so probing per error would be worse than the sweep it guards.
+        // No eviction hook here, and after M3 review round 7 that needs no
+        // reasoning about what might be on disk: `ensure_cached` is
+        // all-or-nothing, so a failure leaves the cache exactly as it found
+        // it. Nothing was written, so there is nothing to sweep. Earlier
+        // rounds tried to infer this from whether the manifest had been
+        // complete beforehand and got it wrong in both directions — see that
+        // function's doc comment.
         //
-        // The cost is that a genuinely partial extraction's bytes linger.
-        // They are manifest-less, which is exactly what `run_eviction`'s
-        // orphan-prefix pass reclaims, so the next sweep from any other
-        // request collects them. Self-healing lag beats an abuse amplifier.
+        // Logged at `warn`, matching the PDF arm's identical degrade
+        // (`pdf page cache unavailable…`): a permanently unwritable or full
+        // cache otherwise degrades every comic page request forever with
+        // nothing in the app log, and the user just sees slow pages.
         if let Err(e) = page_cache::ensure_cached(pages, book_id, hash, file_path, &format) {
-            page_cache::page_dbg!("ensure_cached failed, decoding directly: {}", e);
+            log::warn!("comic page cache unavailable for {hash}, decoding directly: {e}");
             return direct_comic_page(
                 format,
                 file_path,
