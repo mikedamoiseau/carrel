@@ -576,13 +576,16 @@ where
         // a genuinely broken archive still errors — from the direct decode
         // below, which fails too.
         //
-        // No eviction hook here, and after M3 review round 7 that needs no
-        // reasoning about what might be on disk: `ensure_cached` is
-        // all-or-nothing, so a failure leaves the cache exactly as it found
-        // it. Nothing was written, so there is nothing to sweep. Earlier
-        // rounds tried to infer this from whether the manifest had been
-        // complete beforehand and got it wrong in both directions — see that
-        // function's doc comment.
+        // No eviction hook here: `ensure_cached` cleans up its own partial
+        // writes, so a failure leaves the cache as it found it and there is
+        // nothing to sweep (M3 review round 7). That cleanup is best effort
+        // — if it fails for the same reason the write did, manifest-less
+        // pages can survive, and nothing else reclaims them (round 8) — but
+        // firing the hook would not help: `collect_cached_books` skips
+        // hashes with no manifest, so an eviction pass would not count those
+        // bytes, let alone free them. Earlier rounds tried to infer all this
+        // from whether the manifest had been complete beforehand and got it
+        // wrong in both directions — see `extract_comic_full`'s doc.
         //
         // Logged at `warn`, matching the PDF arm's identical degrade
         // (`pdf page cache unavailable…`): a permanently unwritable or full

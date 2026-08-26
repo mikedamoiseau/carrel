@@ -101,3 +101,23 @@ them. Widening `evict_orphan_prefixes` to collect page files whose prefix has
 no manifest *and* no writer in flight would close it, but distinguishing
 "abandoned" from "in flight" is what that pass avoids today, and it would need
 an explicit in-flight marker to do safely.
+
+## Still open: `ensure_cached`'s corrupt-manifest branch walks the cache per request (M3 round 9)
+
+`extract_comic_full`'s cleanup is now guarded on a write having landed, so a
+corrupt archive no longer costs a whole-cache walk per request. The sibling
+call one frame up is not guarded: `ensure_cached`'s corrupt/partial-manifest
+branch calls `evict_book` unconditionally and discards the result with
+`let _`. `evict_book` lists the book's prefix, and `LocalStorage::list` walks
+the entire cache root before filtering.
+
+If those deletes keep failing — a read-only cache mount, or a manifest that
+survived a partially-failed `evict_book` — the manifest stays on disk and
+every later request from the same client repeats the full walk. The web
+route's PIN is optional, so that is loopable.
+
+Pre-existing, and untouched by M3. Fixing it means either making
+`evict_book` cheap (a prefix-scoped listing rather than a whole-root walk —
+see `Storage::list`'s implementation, which is the shared root cause of
+several findings in this epic) or not re-attempting eviction for a hash whose
+last attempt failed. The first is the better fix and would help every caller.

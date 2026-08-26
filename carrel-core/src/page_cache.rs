@@ -390,6 +390,13 @@ fn extract_comic_full(
 
     match extracted {
         Ok(manifest) => Ok(manifest),
+        // Nothing landed, so there is nothing of *this* call's to undo. The
+        // deliberate trade (M3 review round 9): this also skips reclaiming
+        // any pre-existing manifest-less residue for the same hash, which a
+        // cleanup here would have swept. Recovering someone else's residue
+        // is not worth one whole-cache walk per failed request on a route an
+        // unauthenticated LAN client can loop — and that residue is already
+        // outside the size budget either way.
         Err(e) if written == 0 => Err(e),
         Err(e) => {
             // Best effort: a cleanup that itself fails (the same full disk,
@@ -419,12 +426,14 @@ fn extract_comic_full(
 }
 
 /// Extract a CBZ into the page cache. See [`extract_comic_full`] for the
-/// all-or-nothing contract: **on failure this removes the book's cached
-/// pages**, including any that were already there before the call, so it is
-/// destructive toward `book_hash`'s prefix rather than merely unsuccessful
-/// (M3 review round 8). Callers that already hold a complete cache entry
-/// should not re-run it speculatively — [`ensure_cached`] short-circuits on
-/// a complete manifest for exactly that reason.
+/// all-or-nothing contract: **a failure that had already written at least
+/// one page removes the book's cached pages**, including any that were
+/// there before the call, so it is destructive toward `book_hash`'s prefix
+/// rather than merely unsuccessful. A failure before the first write — a
+/// corrupt or unopenable archive — leaves the prefix untouched (M3 review
+/// rounds 7 and 8). Callers that already hold a complete cache entry should
+/// not re-run it speculatively — [`ensure_cached`] short-circuits on a
+/// complete manifest for exactly that reason.
 pub fn extract_cbz(
     storage: &dyn Storage,
     book_id: &str,
@@ -1377,16 +1386,6 @@ fn collect_cached_books(storage: &dyn Storage) -> Vec<CacheManifest> {
         .collect()
 }
 
-/// Evict every `page-cache/{hash}/` prefix that has files on disk but no
-/// valid manifest — an orphan. `collect_cached_books` skips these (it only
-/// counts manifested books), so without this pass they would sit outside
-/// the LRU/size/age budgets forever.
-///
-/// This is the backstop for Finding F2b: the PDF text-index background
-/// build (command layer) re-checks the manifest right before writing
-/// `text-index.json` and self-cleans if the book was deleted in that tiny
-/// window, but this sweep covers whatever slips through that race, plus any
-/// other orphaned prefix left by an interrupted write.
 /// Delete only the `text-index.json` for `book_hash`, leaving any page
 /// images and manifest in place. Used to drop an orphaned or
 /// private-mode-forbidden text index without disturbing the rest of the
@@ -1399,6 +1398,24 @@ pub fn evict_text_index(storage: &dyn Storage, book_hash: &str) -> CarrelResult<
     Ok(())
 }
 
+/// Sweep what an orphaned `page-cache/{hash}/` prefix — one with files on
+/// disk but no valid manifest — leaves behind, which is **only** an
+/// orphaned `text-index.json`. Manifest-less *page files* are deliberately
+/// left alone; see the body for why, and
+/// `orphan_sweep_spares_manifestless_page_files` for the test that pins it.
+///
+/// This is the backstop for Finding F2b: the PDF text-index background
+/// build (command layer) re-checks the manifest right before writing
+/// `text-index.json` and self-cleans if the book was deleted in that tiny
+/// window, and this sweep covers whatever slips through that race.
+///
+/// It is **not** a backstop for orphaned page files, and reading it as one
+/// is a mistake this codebase has made repeatedly: `collect_cached_books`
+/// skips manifest-less hashes, so such pages are never counted toward the
+/// size budget and never reclaimed here — they survive until
+/// `clear_cache`. Whoever writes them owns cleaning them up, which is what
+/// [`extract_comic_full`]'s failure path does for comics (M3 review rounds
+/// 7 and 8).
 fn evict_orphan_prefixes(storage: &dyn Storage) -> CarrelResult<()> {
     // A prefix without a valid manifest may be an ACTIVE build in progress:
     // both PDF prewarm and comic extraction write page files (and the
@@ -1461,9 +1478,11 @@ fn book_disk_size_bytes(storage: &dyn Storage, book_hash: &str) -> u64 {
 }
 
 pub fn run_eviction(storage: &dyn Storage, max_size_mb: u64) -> CarrelResult<()> {
-    // Orphan prefixes (no valid manifest) are invisible to `collect_cached_books`
-    // below, so sweep them unconditionally first — not gated by the size/LRU/age
-    // budgets, since an orphan is never counted toward them in the first place.
+    // Sweep orphaned text indexes first — unconditionally, since an orphan is
+    // invisible to `collect_cached_books` below and so is never counted toward
+    // the size/LRU/age budgets in the first place. Note this reclaims only
+    // `text-index.json`, NOT manifest-less page files; see the function's doc
+    // comment.
     evict_orphan_prefixes(storage)?;
 
     let mut books = collect_cached_books(storage);
