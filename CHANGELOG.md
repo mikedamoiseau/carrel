@@ -13,6 +13,29 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   desktop reader has always used instead of reopening and reparsing the whole
   file per request. Noticeable on large or network-mounted books; the desktop
   reader's output is unchanged.
+- **Comic (CBZ/CBR) page turns in the web reader are now served from the disk
+  page cache** instead of decoding the archive on every request. The first
+  page of a comic primes the whole book into the same on-disk cache the
+  desktop reader has always used; every page after that — including flipping
+  back and forth — is a pure cache read with no archive access. Noticeable on
+  large or network-mounted comics; a book without a computed file hash still
+  renders, just without the cache.
+- **PDF page turns in the web reader are now served from the disk page
+  cache**, matching the comic fix above. Each page is cached individually the
+  first time it's rendered — a PDF no longer re-renders with pdfium on every
+  page request once it's been viewed once. A PDF whose pages are already
+  cached now also opens when its source file is unreachable (a disconnected
+  network library), which previously failed at the page-count step. A book
+  read in private mode renders normally but no longer starts a page-cache
+  entry for itself.
+- **The web reader's Contents (table of contents) panel no longer re-opens
+  the book file on every request.** TOC reads for EPUB and MOBI now go
+  through the same `carrel-core` module (`reader::toc`) used for chapter
+  reads, so the LAN reader reads from the same warm archive cache the desktop
+  reader has always used instead of reopening and reparsing the whole file
+  per request. Also fixes the desktop app reporting a generic "Failed to open
+  EPUB archive" error for a corrupt (but present) EPUB's table of contents;
+  it now reports the real, more specific error.
 
 ## [3.1.0] - 2026-08-24
 

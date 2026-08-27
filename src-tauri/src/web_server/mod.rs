@@ -178,6 +178,18 @@ impl WebState {
         Ok(Arc::new(carrel_core::storage::LocalStorage::new(root)?))
     }
 
+    /// Returns a `Storage` handle for the disk page-image cache
+    /// (`carrel_core::page_cache`), rooted at `cache_dir` — the same root
+    /// the desktop shell's `page_cache_storage` helper builds from
+    /// `app_cache_dir()` (`WebState::cache_dir` is cloned from
+    /// `AppState::cache_dir`, itself `app_cache_dir()`; see `lib.rs`), so a
+    /// page cached by one surface is read straight back by the other.
+    pub fn pages_storage(&self) -> CarrelResult<Arc<dyn carrel_core::storage::Storage>> {
+        Ok(Arc::new(carrel_core::storage::LocalStorage::new(
+            self.cache_dir.clone(),
+        )?))
+    }
+
     /// The app-managed covers root, `{data_dir}/covers` — mirrors
     /// `AppState::covers_storage`'s layout. Used by
     /// `api::cover_write_path_is_safe` to confirm a book's (DB-backed, so

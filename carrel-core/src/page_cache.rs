@@ -340,6 +340,23 @@ fn build_comic_manifest(
 /// Full comic extraction: every page into the cache plus a complete
 /// manifest. Backs [`extract_cbz`]/[`extract_cbr`] and the `ensure_cached`
 /// comic path.
+/// **All or nothing**: a failure part-way through removes whatever was
+/// already written, so this either leaves a complete cache entry or leaves
+/// the cache exactly as it found it. Page blobs are written first and the
+/// manifest last, so without the cleanup a failure on entry 900 of 1000 —
+/// or a full disk, or a failed manifest write after every page landed —
+/// leaves manifest-less bytes behind with nothing accounting for them.
+///
+/// That invariant is what lets [`crate::reader::page_image`] decide whether
+/// to run its caller's eviction hook by looking at this function's result
+/// alone. Without it the caller has to infer "were bytes written?" from
+/// "was the manifest complete beforehand?", and those two come apart on
+/// exactly the failure paths that matter: an archive that never opened
+/// wrote nothing, while one that failed at entry 900 wrote a great deal.
+/// Guessing wrong in one direction leaves the cache over budget; in the
+/// other it hands an unauthenticated LAN client a full-cache eviction walk
+/// per request. Several rounds of the M3 review went back and forth on that
+/// inference before the invariant replaced it.
 fn extract_comic_full(
     storage: &dyn Storage,
     book_id: &str,
@@ -347,15 +364,76 @@ fn extract_comic_full(
     file_path: &str,
     format: &BookFormat,
 ) -> CarrelResult<CacheManifest> {
+    // Before any write: nothing to undo if this is where it fails, which is
+    // the corrupt/unopenable-archive case.
     let names = comic_page_names(format, file_path)?;
     let want: BTreeSet<usize> = (0..names.len()).collect();
-    let total_size =
-        extract_comic_subset(storage, book_hash, format, file_path, &names, &want, |_| {})?;
-    let manifest = build_comic_manifest(book_id, book_hash, format, &names, total_size);
-    write_manifest(storage, book_hash, &manifest)?;
-    Ok(manifest)
+
+    // Counted through `extract_comic_subset`'s existing per-page callback,
+    // which fires immediately after each successful `put`. A failure with
+    // this still at zero wrote nothing, and must not pay for a cleanup:
+    // `evict_book` lists the book's prefix, and `LocalStorage::list` walks
+    // the *whole* cache root before filtering. Without this guard a corrupt
+    // comic — or a permanently unwritable cache, where the very first `put`
+    // fails — would walk the entire cache on every request, and the web
+    // route's PIN is optional (M3 review round 8).
+    let mut written = 0usize;
+    let extracted = (|| {
+        let total_size =
+            extract_comic_subset(storage, book_hash, format, file_path, &names, &want, |_| {
+                written += 1
+            })?;
+        let manifest = build_comic_manifest(book_id, book_hash, format, &names, total_size);
+        write_manifest(storage, book_hash, &manifest)?;
+        Ok(manifest)
+    })();
+
+    match extracted {
+        Ok(manifest) => Ok(manifest),
+        // Nothing landed, so there is nothing of *this* call's to undo. The
+        // deliberate trade (M3 review round 9): this also skips reclaiming
+        // any pre-existing manifest-less residue for the same hash, which a
+        // cleanup here would have swept. Recovering someone else's residue
+        // is not worth one whole-cache walk per failed request on a route an
+        // unauthenticated LAN client can loop — and that residue is already
+        // outside the size budget either way.
+        Err(e) if written == 0 => Err(e),
+        Err(e) => {
+            // Best effort: a cleanup that itself fails (the same full disk,
+            // the same unwritable storage) must not replace the real error
+            // with a second one.
+            //
+            // There is no backstop if it does. `run_eviction`'s
+            // `evict_orphan_prefixes` pass deliberately spares manifest-less
+            // page files — it removes only an orphaned `text-index.json`,
+            // because a prefix without a manifest may be an extraction still
+            // in flight — and `collect_cached_books` skips hashes with no
+            // manifest, so those bytes never count toward the size budget
+            // either. They survive until `clear_cache`. That is precisely
+            // the "extraction path's own orphan handling" that pass's
+            // comment defers to, and this is it, so it is worth getting
+            // right rather than relying on a later sweep (M3 review round 8;
+            // earlier rounds asserted a backstop that does not exist).
+            if let Err(cleanup) = evict_book(storage, book_hash) {
+                log::warn!(
+                    "page cache: cleanup after a failed extraction of {book_hash} also failed \
+                     ({cleanup}); manifest-less pages may remain until the cache is cleared"
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
+/// Extract a CBZ into the page cache. See [`extract_comic_full`] for the
+/// all-or-nothing contract: **a failure that had already written at least
+/// one page removes the book's cached pages**, including any that were
+/// there before the call, so it is destructive toward `book_hash`'s prefix
+/// rather than merely unsuccessful. A failure before the first write — a
+/// corrupt or unopenable archive — leaves the prefix untouched (M3 review
+/// rounds 7 and 8). Callers that already hold a complete cache entry should
+/// not re-run it speculatively — [`ensure_cached`] short-circuits on a
+/// complete manifest for exactly that reason.
 pub fn extract_cbz(
     storage: &dyn Storage,
     book_id: &str,
@@ -365,6 +443,8 @@ pub fn extract_cbz(
     extract_comic_full(storage, book_id, book_hash, file_path, &BookFormat::Cbz)
 }
 
+/// Extract a CBR into the page cache. Same all-or-nothing, destructive-on-
+/// failure contract as [`extract_cbz`].
 pub fn extract_cbr(
     storage: &dyn Storage,
     book_id: &str,
@@ -544,6 +624,126 @@ pub fn get_cached_page(
         .map_err(|e| CarrelError::io(format!("Failed to read cached page {page_index}: {e}")))?;
 
     Ok((data, mime_for_page_name(&page_name).to_string()))
+}
+
+/// Bump `book_hash`'s `last_accessed` to now, without touching any cached
+/// page content.
+///
+/// Every `ensure_*` function in this module already does this on its own
+/// cache-hit path. This is for a caller whose cache-hit path reads pages
+/// directly via [`get_cached_page`] instead of going through one of those —
+/// without it, a book read only that way looks, to [`run_eviction`], like
+/// the coldest entry in the whole cache and is first in line for both its
+/// size cap and its 20-book cap, even while it's the one actively being
+/// read. A no-op when there is no manifest to touch; like every other
+/// manifest write in this module, a failure is swallowed rather than
+/// surfaced — the worst case is this read being treated as slightly colder
+/// than it really was, not a failed page request.
+pub fn touch_last_accessed(storage: &dyn Storage, book_hash: &str) {
+    if let Some(mut manifest) = read_manifest(storage, book_hash) {
+        manifest.last_accessed = now_iso();
+        let _ = write_manifest(storage, book_hash, &manifest);
+    }
+}
+
+/// Whether `book_hash`'s cached comic is complete enough to trust without
+/// reopening the source archive: the manifest exists, and its first and
+/// last listed page are both actually on disk. Returns the manifest when
+/// so, `None` otherwise.
+///
+/// This is the exact completeness test [`ensure_cached`] and
+/// [`ensure_comic_fast`] already use to decide "cache hit, skip extraction"
+/// vs. "partial, evict and re-extract" — a sample of two pages, not a full
+/// per-page existence scan (a caller that needs a scan on every book open
+/// would put a whole-cache stat storm on that path; this reuses the same
+/// evidence those two functions already consider sufficient for their own
+/// decisions). `ensure_comic_fast`'s own manifest is the case that makes
+/// the sample matter to a caller outside this module: it writes a
+/// *complete-looking* manifest immediately but extracts only the first page
+/// (plus any priority pages), filling the rest in later via
+/// [`extract_comic_remaining`]. A caller that only checked "does a manifest
+/// exist" would trust that manifest before the background pass finishes,
+/// and report a page count — or serve a read — for pages that are not
+/// actually there yet.
+pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<CacheManifest> {
+    let manifest = read_manifest(storage, book_hash)?;
+    let first_ok = manifest
+        .pages
+        .first()
+        .and_then(|p| storage.exists(&page_key(book_hash, p)).ok())
+        .unwrap_or(false);
+    let last_ok = manifest
+        .pages
+        .last()
+        .and_then(|p| storage.exists(&page_key(book_hash, p)).ok())
+        .unwrap_or(false);
+    if first_ok && last_ok {
+        Some(manifest)
+    } else {
+        None
+    }
+}
+
+/// The page count from `book_hash`'s PDF manifest, when that manifest can
+/// actually back a read — the counterpart of [`complete_manifest`],
+/// deliberately not the same test.
+///
+/// [`complete_manifest`] samples two of a comic's *listed* pages because a
+/// comic manifest makes a claim about what is on disk: `ensure_comic_fast`
+/// writes a complete-looking `pages` list while the extraction is still
+/// running, so trusting it would report a count for pages that are not
+/// there. A PDF manifest makes no such claim — `pages` is empty, filenames
+/// derive from the index, and pages are cached one at a time on demand —
+/// and its `page_count` comes straight from pdfium at
+/// [`ensure_pdf_prewarmed`] time, keyed by content hash, with a failed
+/// prewarm leaving no manifest at all. So the *count* is correct whether or
+/// not a single page is cached.
+///
+/// What this gates on instead is whether answering leads anywhere: at least
+/// one page must be on disk. Both halves of that matter.
+///
+/// Requiring the comic-style first-*and-last* sample would refuse a book
+/// that is merely part-read — PDF pages fill in as they are visited, so a
+/// 300-page book read to page 20 has page 0 and not page 299 — and a book
+/// with 21 perfectly readable cached pages would not open at all once its
+/// source went away, the exact case the cache is for. Requiring *nothing*
+/// is equally wrong: a manifest with zero cached pages is a routine state,
+/// not an edge case, since `commands::prepare_pdf` prewarms zero pages and
+/// a private-mode read caches none at all. Trusting that count would open
+/// a reader in which every single page then fails.
+///
+/// "At least one page" is what separates them.
+///
+/// Answering that cheaply matters, because this runs on book open. Page 0
+/// is the common case — it is where reading a book starts, and where the
+/// desktop's background prerender pass fills in first — so an `exists`
+/// probe answers most calls in one stat. It is not the rule, though: a book
+/// resumed at page 50 is cached from there up, and `prepare_pdf`'s reserved
+/// render targets that resume page rather than page 0, so on such a book
+/// nothing is at index 0 at all. That is what the listing fallback is for,
+/// and why it must not be deleted as redundant. The fallback is worth
+/// confining rather than defaulting to: `Storage::list` filters by prefix
+/// but the local implementation walks the whole storage root to build the
+/// list first, and that root is the entire app cache — exactly the
+/// "whole-cache stat storm on the book-open path" that
+/// [`complete_manifest`]'s doc comment above avoids for comics.
+pub fn pdf_manifest_page_count(storage: &dyn Storage, book_hash: &str) -> Option<u32> {
+    let manifest = read_manifest(storage, book_hash)?;
+    if manifest.format != BookFormat::Pdf || manifest.page_count == 0 {
+        return None;
+    }
+    let any_page_cached = storage
+        .exists(&page_key(book_hash, "000.jpg"))
+        .unwrap_or(false)
+        || storage
+            .list(&book_prefix(book_hash))
+            .map(|keys| keys.iter().any(|k| k.ends_with(".jpg")))
+            .unwrap_or(false);
+    if any_page_cached {
+        Some(manifest.page_count)
+    } else {
+        None
+    }
 }
 
 pub fn ensure_cached(
@@ -1186,16 +1386,6 @@ fn collect_cached_books(storage: &dyn Storage) -> Vec<CacheManifest> {
         .collect()
 }
 
-/// Evict every `page-cache/{hash}/` prefix that has files on disk but no
-/// valid manifest — an orphan. `collect_cached_books` skips these (it only
-/// counts manifested books), so without this pass they would sit outside
-/// the LRU/size/age budgets forever.
-///
-/// This is the backstop for Finding F2b: the PDF text-index background
-/// build (command layer) re-checks the manifest right before writing
-/// `text-index.json` and self-cleans if the book was deleted in that tiny
-/// window, but this sweep covers whatever slips through that race, plus any
-/// other orphaned prefix left by an interrupted write.
 /// Delete only the `text-index.json` for `book_hash`, leaving any page
 /// images and manifest in place. Used to drop an orphaned or
 /// private-mode-forbidden text index without disturbing the rest of the
@@ -1208,6 +1398,24 @@ pub fn evict_text_index(storage: &dyn Storage, book_hash: &str) -> CarrelResult<
     Ok(())
 }
 
+/// Sweep what an orphaned `page-cache/{hash}/` prefix — one with files on
+/// disk but no valid manifest — leaves behind, which is **only** an
+/// orphaned `text-index.json`. Manifest-less *page files* are deliberately
+/// left alone; see the body for why, and
+/// `orphan_sweep_spares_manifestless_page_files` for the test that pins it.
+///
+/// This is the backstop for Finding F2b: the PDF text-index background
+/// build (command layer) re-checks the manifest right before writing
+/// `text-index.json` and self-cleans if the book was deleted in that tiny
+/// window, and this sweep covers whatever slips through that race.
+///
+/// It is **not** a backstop for orphaned page files, and reading it as one
+/// is a mistake this codebase has made repeatedly: `collect_cached_books`
+/// skips manifest-less hashes, so such pages are never counted toward the
+/// size budget and never reclaimed here — they survive until
+/// `clear_cache`. Whoever writes them owns cleaning them up, which is what
+/// [`extract_comic_full`]'s failure path does for comics (M3 review rounds
+/// 7 and 8).
 fn evict_orphan_prefixes(storage: &dyn Storage) -> CarrelResult<()> {
     // A prefix without a valid manifest may be an ACTIVE build in progress:
     // both PDF prewarm and comic extraction write page files (and the
@@ -1270,9 +1478,11 @@ fn book_disk_size_bytes(storage: &dyn Storage, book_hash: &str) -> u64 {
 }
 
 pub fn run_eviction(storage: &dyn Storage, max_size_mb: u64) -> CarrelResult<()> {
-    // Orphan prefixes (no valid manifest) are invisible to `collect_cached_books`
-    // below, so sweep them unconditionally first — not gated by the size/LRU/age
-    // budgets, since an orphan is never counted toward them in the first place.
+    // Sweep orphaned text indexes first — unconditionally, since an orphan is
+    // invisible to `collect_cached_books` below and so is never counted toward
+    // the size/LRU/age budgets in the first place. Note this reclaims only
+    // `text-index.json`, NOT manifest-less page files; see the function's doc
+    // comment.
     evict_orphan_prefixes(storage)?;
 
     let mut books = collect_cached_books(storage);
@@ -1723,6 +1933,146 @@ mod tests {
         assert_eq!(books[1].page_count, 4);
         assert_eq!(books[2].book_hash, "hash_c");
         assert_eq!(books[2].page_count, 1);
+    }
+
+    /// A `Storage` that fails writes after the first `put_limit` succeed and
+    /// counts `list` calls. Both knobs are needed to pin `extract_comic_full`'s
+    /// cleanup: a partial write (some pages down, then a failure) and a
+    /// zero-write failure look identical from the outside — the prefix is
+    /// empty either way — so the difference has to be observed as whether the
+    /// cleanup ran at all, and `list` is what it costs.
+    struct FlakyStorage {
+        inner: LocalStorage,
+        put_limit: usize,
+        writes: std::sync::atomic::AtomicUsize,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyStorage {
+        fn new(root: std::path::PathBuf, put_limit: usize) -> Self {
+            Self {
+                inner: LocalStorage::new(root).unwrap(),
+                put_limit,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn lists(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Storage for FlakyStorage {
+        fn put(&self, key: &str, bytes: &[u8]) -> CarrelResult<()> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.put_limit {
+                return Err(CarrelError::io("disk full (test)"));
+            }
+            self.inner.put(key, bytes)
+        }
+        fn get(&self, key: &str) -> CarrelResult<Vec<u8>> {
+            self.inner.get(key)
+        }
+        fn exists(&self, key: &str) -> CarrelResult<bool> {
+            self.inner.exists(key)
+        }
+        fn delete(&self, key: &str) -> CarrelResult<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> CarrelResult<Vec<String>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+        fn size(&self, key: &str) -> CarrelResult<u64> {
+            self.inner.size(key)
+        }
+        fn local_path(&self, key: &str) -> CarrelResult<std::path::PathBuf> {
+            self.inner.local_path(key)
+        }
+    }
+
+    /// A small, valid multi-page CBZ for the cleanup tests.
+    fn write_cleanup_fixture_cbz(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("book.cbz");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for i in 0..5 {
+            zip.start_file(format!("{i:03}.jpg"), options).unwrap();
+            std::io::Write::write_all(&mut zip, b"\xff\xd8\xff\xe0jpeg-ish").unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    /// M3 review round 8: a failure that wrote nothing must not pay for a
+    /// cleanup. `evict_book` lists the book's prefix, and
+    /// `LocalStorage::list` walks the whole cache root before filtering, so
+    /// cleaning up after a write that never landed would walk the entire
+    /// cache on every request — on a route an unauthenticated LAN client can
+    /// loop.
+    ///
+    /// Observed as the `list` count, because the visible outcome (an empty
+    /// prefix) is the same whether or not the cleanup ran.
+    #[test]
+    fn a_failure_that_wrote_nothing_does_not_walk_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        // put_limit 0: `comic_page_names` still succeeds, so extraction
+        // starts, but the very first page write fails.
+        let storage = FlakyStorage::new(dir.path().join("cache"), 0);
+        let path = write_cleanup_fixture_cbz(dir.path());
+
+        let result = ensure_cached(
+            &storage,
+            "bk",
+            "hash-nowrite",
+            path.to_str().unwrap(),
+            &BookFormat::Cbz,
+        );
+
+        assert!(result.is_err(), "the failing write must fail the extract");
+        assert_eq!(
+            storage.lists(),
+            0,
+            "an extraction that wrote nothing must not list (and so walk) the cache"
+        );
+    }
+
+    /// M3 review round 7: `extract_comic_full` is all-or-nothing. A failure
+    /// after it has already written page blobs must leave the cache exactly
+    /// as it found it, not a pile of manifest-less bytes that nothing
+    /// accounts for.
+    ///
+    /// This invariant is load-bearing for `reader::page_image`, which
+    /// decides whether to run its caller's eviction hook from this
+    /// function's result alone. Without it the caller has to guess whether
+    /// bytes were written, and several review rounds showed both guesses are
+    /// wrong: skip the sweep after a real extraction and the cache sits over
+    /// budget; run it after an archive that never opened and a LAN client
+    /// can loop one broken comic into a full-cache walk per request.
+    #[test]
+    fn a_failed_extraction_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two pages land, the third write fails: a real partial write.
+        let storage = FlakyStorage::new(dir.path().join("cache"), 2);
+        let path = write_cleanup_fixture_cbz(dir.path());
+
+        let result = ensure_cached(
+            &storage,
+            "bk",
+            "hash-partial",
+            path.to_str().unwrap(),
+            &BookFormat::Cbz,
+        );
+        assert!(result.is_err(), "the failing write must fail the extract");
+
+        let leftovers = storage.list(&book_prefix("hash-partial")).unwrap();
+        assert!(
+            leftovers.is_empty(),
+            "a failed extraction must leave nothing behind: {leftovers:?}"
+        );
     }
 
     #[test]

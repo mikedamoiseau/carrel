@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use carrel_core::activity::ActivityEvent;
 use carrel_core::events::{self, CarrelEvent, ImportSource, SyncDirection};
+use carrel_core::storage::Storage;
 
 use crate::cbr;
 use crate::cbz;
@@ -1869,6 +1870,12 @@ pub async fn get_chapter_content(
         images_storage.as_ref(),
         &book_id,
         &state.archive_caches(),
+        // The desktop's inline-image URL policy (M5): Tauri's asset protocol,
+        // which is what the React reader's DOMPurify configuration allows
+        // through and what `tauri.conf.json` scopes to `$APPDATA/**`. Core
+        // used to hard-code this; now it is passed in, so the LAN web server
+        // can pass its own HTTP route instead of unpicking this one.
+        &carrel_core::reader::asset_localhost_url,
     )
 }
 
@@ -2174,44 +2181,7 @@ pub async fn get_toc(
 
     validate_file_exists(&file_path)?;
 
-    match format {
-        BookFormat::Epub => {
-            let mut cache = state.epub_cache.lock()?;
-            ensure_epub_cached(&mut cache, &file_path);
-            let cached = cache
-                .get_mut(&file_path)
-                .ok_or("Failed to open EPUB archive")?;
-            Ok(epub::get_toc_from_cache(cached)?)
-        }
-        #[cfg(feature = "mobi")]
-        BookFormat::Mobi => {
-            // MOBI has no real TOC — synthesize a flat list from the
-            // adapter's chapter list so the Contents sidebar works. Each
-            // entry is a depth-0 leaf (no children).
-            let mut cache = state.mobi_cache.lock()?;
-            ensure_mobi_cached(&mut cache, &file_path)?;
-            let cached = cache
-                .get(&file_path)
-                .ok_or_else(|| CarrelError::internal("Failed to open MOBI book"))?;
-            let chapters = carrel_core::mobi::get_chapter_list_from_cache(cached);
-            Ok(chapters
-                .into_iter()
-                .map(|c| crate::models::TocEntry {
-                    chapter_index: c.index as u32,
-                    label: c.title,
-                    play_order: format!("{}", c.index + 1),
-                    children: Vec::new(),
-                })
-                .collect())
-        }
-        #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => Err(CarrelError::invalid(
-            "MOBI support is not enabled in this build",
-        )),
-        other => Err(CarrelError::invalid(format!(
-            "get_toc is not supported for format {other}"
-        ))),
-    }
+    carrel_core::reader::toc(format, &file_path, &state.archive_caches())
 }
 
 // --- Progress ---
@@ -2231,6 +2201,21 @@ pub async fn get_all_reading_progress(
 ) -> CarrelResult<Vec<ReadingProgress>> {
     let conn = state.active_db()?.get()?;
     Ok(db::get_all_reading_progress(&conn)?)
+}
+
+/// Whether `format` is one of the comic archive formats the comic-specific
+/// commands accept.
+///
+/// Extracted so the commands that *gate* on it cannot drift apart (M3 review
+/// round 2, finding 2): `get_comic_page_bytes` lost its check entirely when
+/// M3 folded its body into `carrel_core::reader` — which accepts PDF too —
+/// and nothing failed, because the check existed only as an inline `match`
+/// arm nobody tested. Callers keep their own error text; only the predicate
+/// is shared. `get_comic_page_count` is not one of them: its `match` is a
+/// per-format dispatch rather than a gate, so it cannot use this and cannot
+/// silently lose an arm either.
+fn is_comic_format(format: &BookFormat) -> bool {
+    matches!(format, BookFormat::Cbz | BookFormat::Cbr)
 }
 
 fn validate_file_exists(file_path: &str) -> CarrelResult<()> {
@@ -2570,6 +2555,27 @@ pub async fn get_comic_page_bytes(
             .ok_or_else(|| CarrelError::not_found(format!("Book '{book_id}' not found")))?
     };
 
+    // `reader::page_image` accepts PDF as well as CBZ/CBR, so it cannot be
+    // this command's format guard (M3 review, finding 1). Without one, a PDF
+    // passed to the *comic* command would reach the PDF arm carrying this
+    // call site's hardcoded `is_private = false` — correct for comics, which
+    // have no private-mode plumbing yet, but it would write rendered pages to
+    // the shared cache during a private session, the exact write
+    // `get_pdf_page_bytes` suppresses. The frontend dispatches on format and
+    // never does this; these are public IPC commands, so the guard the
+    // pre-M3 inline `match` provided has to stay somewhere.
+    //
+    // Above the `cached_only` branch, matching `get_pdf_page_bytes`: the page
+    // cache is keyed by `{hash}/{NNN}` with no format discriminator, so a
+    // probe would otherwise happily return a PDF's cached page through the
+    // comic command (M3 review round 2, finding 1).
+    if !is_comic_format(&book.format) {
+        return Err(CarrelError::invalid(format!(
+            "get_comic_page_bytes is not supported for {:?}",
+            book.format
+        )));
+    }
+
     // A cached_only probe touches ONLY the local page cache — never the source
     // archive — so it must skip resolve_book_path / validate_file_exists, which
     // stat the (possibly network-mounted) file and would defeat the point of a
@@ -2586,6 +2592,12 @@ pub async fn get_comic_page_bytes(
     }
 
     let file_path = state.resolve_book_path(&book)?;
+    // Deliberately kept even though `reader::page_image` runs its own
+    // `ensure_file_exists` on the miss path: this one also rejects symlinks
+    // (traversal defence shared with every other file-backed command) and
+    // attaches the SMB unicode hint, neither of which the module's check
+    // does. The duplicate `metadata()` call on a cache miss is the price;
+    // the archive open that follows dwarfs it (M3 review, finding 3).
     validate_file_exists(&file_path)?;
 
     // Mark a foreground render in flight so a still-running PDF prerender pass
@@ -2601,45 +2613,34 @@ pub async fn get_comic_page_bytes(
     let format = book.format;
     let (bytes, mime) =
         tauri::async_runtime::spawn_blocking(move || -> CarrelResult<(Vec<u8>, String)> {
-            let start = std::time::Instant::now();
-
-            // Cache-first path. Cached pages are full-resolution archive bytes;
-            // run them through the same resize helper the cold path uses so the
-            // wire-level promise (≤ target_width) holds either way.
-            if let Ok(storage) = page_cache_storage(&app) {
-                if let Some(ref book_hash) = book_hash {
-                    if let Ok((data, mime)) =
-                        page_cache::get_cached_page(&storage, book_hash, page_index)
-                    {
-                        let (bytes, out_mime) =
-                            crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
-                        page_cache::page_dbg!(
-                            "bytes cache HIT: page={} size={}KB total={:?}",
-                            page_index,
-                            bytes.len() / 1024,
-                            start.elapsed()
-                        );
-                        return Ok((bytes, out_mime));
-                    }
-                }
-            }
-
-            let (bytes, mime) = match format {
-                BookFormat::Cbz => cbz::get_page_image_bytes(&file_path, page_index, target_width)?,
-                BookFormat::Cbr => cbr::get_page_image_bytes(&file_path, page_index, target_width)?,
-                _ => {
-                    return Err(CarrelError::invalid(format!(
-                        "get_comic_page_bytes is not supported for {format:?}"
-                    )));
-                }
-            };
-            page_cache::page_dbg!(
-                "bytes archive read: page={} size={}KB total={:?}",
+            // An unopenable cache directory must cost the cache, not the
+            // page — `reader::page_image` treats `None` as "no cache",
+            // the same path a book with no hash takes.
+            let pages = page_cache_storage(&app).ok();
+            carrel_core::reader::page_image(
+                format,
+                &file_path,
                 page_index,
-                bytes.len() / 1024,
-                start.elapsed()
-            );
-            Ok((bytes, mime.to_string()))
+                target_width,
+                &book_id,
+                book_hash.as_deref(),
+                pages.as_ref().map(|s| s as &dyn Storage),
+                // `OnMiss::ReadSource` never primes, so a real extraction
+                // never happens here — this never fires. Priming is
+                // `prepare_comic`'s and its background
+                // `extract_comic_remaining` pass's job, not this command's.
+                || {},
+                // Comics do not yet consult private mode (tracked in
+                // docs/backlog/comic-cache-ignores-private-mode.md).
+                false,
+                // Desktop: `prepare_comic` (book-open) and its background
+                // prerender pass own priming. This foreground page read must
+                // only ever read what's already there, or read the one page
+                // it was asked for directly — never prime a whole archive
+                // itself, which would block on a possibly network-mounted
+                // file the background pass is already handling.
+                carrel_core::reader::OnMiss::ReadSource,
+            )
         })
         .await
         .map_err(|e| CarrelError::internal(format!("comic page render task failed: {e}")))??;
@@ -2662,18 +2663,13 @@ async fn serve_cached_only(
 ) -> CarrelResult<tauri::ipc::Response> {
     let rendered =
         tauri::async_runtime::spawn_blocking(move || -> CarrelResult<Option<(Vec<u8>, String)>> {
-            if let Ok(storage) = page_cache_storage(&app) {
-                if let Some(ref hash) = book_hash {
-                    if let Ok((data, mime)) =
-                        page_cache::get_cached_page(&storage, hash, page_index)
-                    {
-                        let (bytes, out_mime) =
-                            crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
-                        return Ok(Some((bytes, out_mime)));
-                    }
-                }
-            }
-            Ok(None)
+            let Ok(storage) = page_cache_storage(&app) else {
+                return Ok(None);
+            };
+            let Some(hash) = book_hash else {
+                return Ok(None);
+            };
+            carrel_core::reader::cached_page(&storage, &hash, page_index, target_width)
         })
         .await
         .map_err(|e| CarrelError::internal(format!("{label} cache probe failed: {e}")))??;
@@ -2854,7 +2850,7 @@ pub async fn prepare_comic(
 
     validate_file_exists(&file_path)?;
 
-    if book.format != BookFormat::Cbz && book.format != BookFormat::Cbr {
+    if !is_comic_format(&book.format) {
         return Err(CarrelError::invalid(
             "prepare_comic only supports CBZ/CBR formats",
         ));
@@ -6699,68 +6695,41 @@ pub async fn get_pdf_page_bytes(
     // including the page the user is actually waiting on).
     let (bytes, out_mime) =
         tauri::async_runtime::spawn_blocking(move || -> CarrelResult<(Vec<u8>, String)> {
-            // Cache-first path. Cached pages live at the canonical render
-            // width; resize on read clamps them to the viewport-derived
-            // target.
-            if let Ok(storage) = page_cache_storage(&app) {
-                if let Some(ref book_hash) = book_hash {
-                    if let Ok((data, mime)) =
-                        page_cache::get_cached_page(&storage, book_hash, page_index)
-                    {
-                        let (bytes, out_mime) =
-                            crate::image_util::maybe_resize_to_jpeg(data, mime, render_width)?;
-                        return Ok((bytes, out_mime));
+            // An unopenable cache directory must cost the cache, not the
+            // page — `reader::page_image` treats `None` as "no cache", the
+            // same path a book with no hash takes.
+            let pages = page_cache_storage(&app).ok();
+            let app_for_evict = app.clone();
+            carrel_core::reader::page_image(
+                BookFormat::Pdf,
+                &file_path,
+                page_index,
+                render_width,
+                &book_id,
+                book_hash.as_deref(),
+                pages.as_ref().map(|s| s as &dyn Storage),
+                // Fires only once a PDF manifest already exists (established
+                // by `prepare_pdf`, since `OnMiss::ReadSource` below never
+                // establishes one itself) — same eviction shape as before:
+                // spawn the sweep onto the blocking pool rather than running
+                // it inline.
+                move || {
+                    if let Ok(evict_storage) = page_cache_storage(&app_for_evict) {
+                        tauri::async_runtime::spawn_blocking(move || {
+                            let _ = page_cache::run_eviction(&evict_storage, max_size_mb);
+                        });
                     }
-                }
-            }
-
-            // Miss path. Use the cached-render code path (canonical 2400 px
-            // render + best-effort disk write) only when a PDF manifest is
-            // already in place — otherwise the higher render cost has no
-            // cache benefit. No manifest → render at viewport width directly,
-            // matching pre-spec behavior.
-            let (bytes, mime) = if let Some(book_hash) = book_hash.clone() {
-                if let Ok(storage) = page_cache_storage(&app) {
-                    let has_pdf_manifest = page_cache::read_manifest(&storage, &book_hash)
-                        .map(|m| m.format == BookFormat::Pdf)
-                        .unwrap_or(false);
-                    if has_pdf_manifest {
-                        let app_for_evict = app.clone();
-                        let on_batch = move || {
-                            if let Ok(evict_storage) = page_cache_storage(&app_for_evict) {
-                                tauri::async_runtime::spawn_blocking(move || {
-                                    let _ = page_cache::run_eviction(&evict_storage, max_size_mb);
-                                });
-                            }
-                        };
-                        let (b, m) = page_cache::get_or_render_pdf_page_with_eviction(
-                            &storage, &book_hash, &file_path, page_index, on_batch,
-                            // Private mode (B-M1, OQ-3/SB-9): skip only the on-disk
-                            // page write; the read/pre-warm path above is untouched.
-                            is_private,
-                        )?;
-                        (b, m.to_string())
-                    } else {
-                        // No PDF manifest — viewport render, no cache.
-                        let (b, m) =
-                            pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
-                        (b, m.to_string())
-                    }
-                } else {
-                    // Storage unavailable — viewport render, no cache.
-                    let (b, m) = pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
-                    (b, m.to_string())
-                }
-            } else {
-                // No file hash — viewport render, no cache.
-                let (b, m) = pdf::get_page_image_bytes(&file_path, page_index, render_width)?;
-                (b, m.to_string())
-            };
-
-            // Cache-miss canonical-render branch produced 2400 px JPEG bytes;
-            // the no-cache fallbacks already match `render_width`.
-            // `maybe_resize_to_jpeg` is a no-op when input == target.
-            crate::image_util::maybe_resize_to_jpeg(bytes, mime, render_width)
+                },
+                // Private mode (B-M1, OQ-3/SB-9): skip only the on-disk page
+                // write once a manifest already exists; the read/pre-warm
+                // path above is untouched.
+                is_private,
+                // Desktop: only `prepare_pdf` (book-open) establishes a PDF
+                // manifest. With none in place yet this page read must
+                // render at the viewport width directly, matching pre-spec
+                // behavior, rather than create one itself.
+                carrel_core::reader::OnMiss::ReadSource,
+            )
         })
         .await
         .map_err(|e| CarrelError::internal(format!("pdf page render task failed: {e}")))??;
@@ -9740,7 +9709,6 @@ mod tests {
 
         delete_book_covers(&storage, "target").unwrap();
 
-        use carrel_core::storage::Storage;
         assert!(storage.list("target/").unwrap().is_empty());
         assert_eq!(storage.list("other/").unwrap().len(), 1);
     }
@@ -9777,6 +9745,25 @@ mod tests {
         assert_eq!(validate_scroll_position(0.0).unwrap(), 0.0);
         assert_eq!(validate_scroll_position(0.5).unwrap(), 0.5);
         assert_eq!(validate_scroll_position(1.0).unwrap(), 1.0);
+    }
+
+    /// M3 review round 2, finding 2. The predicate the comic commands gate
+    /// on had no test, which is how M3 deleted one of its three copies
+    /// without a single failure. PDF is the case that matters: it is the
+    /// one format `carrel_core::reader::page_image` also accepts, so it is
+    /// the one a missing guard lets through.
+    #[test]
+    fn is_comic_format_accepts_only_the_comic_archives() {
+        assert!(is_comic_format(&BookFormat::Cbz));
+        assert!(is_comic_format(&BookFormat::Cbr));
+        assert!(
+            !is_comic_format(&BookFormat::Pdf),
+            "PDF must not pass the comic guard: `reader::page_image` accepts \
+             it, so the comic command's hardcoded is_private=false would \
+             reach the PDF cache-write path"
+        );
+        assert!(!is_comic_format(&BookFormat::Epub));
+        assert!(!is_comic_format(&BookFormat::Mobi));
     }
 
     #[test]
@@ -11348,6 +11335,66 @@ mod tests {
         assert_eq!(
             normalized,
             "<p>Hello</p><img src=\"asset://localhost/{IMAGES}%2Fbk-chapter-read%2F0%2F2fcbc7ca6bddbb6f-img.png\" alt=\"a\">"
+        );
+    }
+
+    /// Characterization: `get_toc` still returns the same fallback TOC (no
+    /// nav/NCX in this fixture, so the spine-derived "Chapter N" labels)
+    /// after routing through `carrel_core::reader::toc` (M4) instead of its
+    /// own local `ensure_epub_cached`.
+    #[tokio::test]
+    async fn get_toc_desktop_output_is_stable() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let epub_path = crate::test_epub::write_epub_with_image_chapter(dir.path(), "toc-read");
+        let mut book = progress_test_book("bk-toc-read", 1);
+        book.file_path = epub_path.to_string_lossy().into_owned();
+        {
+            let conn = state.active_db().unwrap().get().unwrap();
+            db::insert_book(&conn, &book).unwrap();
+        }
+
+        let toc = get_toc("bk-toc-read".to_string(), state.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(toc.len(), 1);
+        assert_eq!(toc[0].label, "Chapter 1");
+        assert_eq!(toc[0].chapter_index, 0);
+    }
+
+    /// M4: before this milestone, `get_toc`'s own `ensure_epub_cached`
+    /// silently discarded the archive-open error (`if let Ok(archive) = …`)
+    /// and reported a generic `CarrelError::internal("Failed to open EPUB
+    /// archive")` for both a missing AND a corrupt file — collapsing every
+    /// failure into the same opaque `Internal` kind regardless of cause.
+    /// Routing through `carrel_core::reader::toc` (which propagates the real
+    /// open error via `?`) now surfaces this corrupt-but-present file's real
+    /// `InvalidInput` kind instead.
+    #[tokio::test]
+    async fn get_toc_desktop_does_not_swallow_a_corrupt_archives_error() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+
+        let epub_path = dir.path().join("corrupt.epub");
+        std::fs::write(&epub_path, b"not a zip file!!").unwrap();
+        let mut book = progress_test_book("bk-toc-corrupt", 1);
+        book.file_path = epub_path.to_string_lossy().into_owned();
+        {
+            let conn = state.active_db().unwrap().get().unwrap();
+            db::insert_book(&conn, &book).unwrap();
+        }
+
+        let err = get_toc("bk-toc-corrupt".to_string(), state.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            "InvalidInput",
+            "corrupt archive must surface its real error kind, not a generic \
+             internal failure: {err}"
         );
     }
 

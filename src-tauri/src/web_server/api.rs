@@ -1072,39 +1072,30 @@ async fn get_chapters(
     let file_path = state
         .resolve_book_path(&book)
         .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
-    let toc = match book.format {
-        BookFormat::Epub => crate::epub::get_toc(&file_path)
-            .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?,
-        #[cfg(feature = "mobi")]
-        BookFormat::Mobi => {
-            // MOBI has no real TOC — mirror the desktop `get_toc` behaviour by
-            // synthesising a flat list from the chapter list.
-            let chapters = carrel_core::mobi::get_chapter_list(&file_path)
-                .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
-            chapters
-                .into_iter()
-                .map(|c| crate::models::TocEntry {
-                    chapter_index: c.index as u32,
-                    label: c.title,
-                    play_order: format!("{}", c.index + 1),
-                    children: Vec::new(),
-                })
-                .collect()
-        }
-        #[cfg(not(feature = "mobi"))]
-        BookFormat::Mobi => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "MOBI support is not enabled in this build".to_string(),
-            ));
-        }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "TOC is only available for EPUB and MOBI books".to_string(),
-            ));
-        }
-    };
+
+    // Reject the unsupported formats here rather than letting the reader
+    // module do it, so each rejection keeps its own client-facing wording —
+    // `book_file_status` would flatten both into the generic "corrupt or
+    // unsupported" body. Mirrors `get_chapter_content`'s guard.
+    #[cfg(not(feature = "mobi"))]
+    if matches!(book.format, BookFormat::Mobi) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MOBI support is not enabled in this build".to_string(),
+        ));
+    }
+    if !matches!(book.format, BookFormat::Epub | BookFormat::Mobi) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "TOC is only available for EPUB and MOBI books".to_string(),
+        ));
+    }
+
+    // Reads through the process-wide archive cache (M4): before this, every
+    // TOC request reopened and reparsed the whole book file, while the
+    // desktop reader had been reading from a warm archive all along.
+    let toc = carrel_core::reader::toc(book.format, &file_path, &state.archives)
+        .map_err(|e| book_file_status(toc_not_found, toc_invalid, e))?;
 
     Ok(Json(serde_json::to_value(toc).unwrap_or_default()))
 }
@@ -1155,11 +1146,14 @@ async fn get_chapter_content(
         images_storage.as_ref(),
         &id,
         &state.archives,
+        // The inline-image URL policy for this surface (M5): a browser cannot
+        // fetch Tauri's `asset://`, so core is handed the HTTP route this
+        // server serves those same extracted files from. Before M5 core
+        // emitted `asset://` here too and this adapter string-scanned it back
+        // apart — a parser undoing a formatter.
+        &|_key, local_path| web_image_url(&id, index, local_path),
     )
     .map_err(|e| book_file_status(chapter_not_found, chapter_invalid, e))?;
-
-    // Rewrite asset:// URLs to HTTP URLs for web serving
-    let html = rewrite_asset_urls_to_http(&html, &id, index);
 
     // R3-1: Sanitize HTML to prevent XSS from malicious book content
     let html = sanitize_chapter_html(&html);
@@ -1237,34 +1231,27 @@ fn sanitize_chapter_html(html: &str) -> String {
         .to_string()
 }
 
-/// Rewrite `asset://localhost/...` image URLs to HTTP `/api/books/{id}/images/{chapter}/{filename}`.
-fn rewrite_asset_urls_to_http(html: &str, book_id: &str, chapter_index: usize) -> String {
-    // The epub module produces URLs like: asset://localhost/{url_encoded_path}
-    // We need to extract the filename and rewrite to our HTTP route.
-    let mut result = html.to_string();
-
-    while let Some(start) = result.find("asset://localhost/") {
-        let rest = &result[start + 18..]; // skip "asset://localhost/"
-        let url_end = rest
-            .find('"')
-            .or_else(|| rest.find('\''))
-            .or_else(|| rest.find(')'))
-            .unwrap_or(rest.len());
-
-        let encoded_path = &rest[..url_end];
-        let decoded = urlencoding::decode(encoded_path).unwrap_or_default();
-        let filename = decoded.rsplit('/').next().unwrap_or("image");
-
-        let new_url = format!("/api/books/{book_id}/images/{chapter_index}/{filename}");
-        result = format!(
-            "{}{}{}",
-            &result[..start],
-            new_url,
-            &result[start + 18 + url_end..]
-        );
-    }
-
-    result
+/// This server's inline-image URL policy (M5), handed to
+/// `carrel_core::reader::chapter_html` so core never has to know which URL
+/// scheme its caller serves.
+///
+/// `local_path` is where core's storage resolved the image's key —
+/// `{data_dir}/images/{book_id}/{chapter}/{filename}` — and only the last
+/// segment goes into the URL, because [`get_epub_image`] re-joins exactly that
+/// onto `{data_dir}/images/{id}/{chapter}/` (guarding it with
+/// [`is_safe_filename`]). The filename is *not* percent-encoded, which is what
+/// the `rewrite_asset_urls_to_http` scanner this replaced produced: it decoded
+/// the path out of core's `asset://` URL and never re-encoded the basename.
+/// Keeping that byte-for-byte matters — the web reader's service worker caches
+/// these URLs, so a changed one is a cache miss on every offline-saved book.
+fn web_image_url(book_id: &str, chapter_index: usize, local_path: &std::path::Path) -> String {
+    let filename = local_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        // Unreachable — every storage key ends in a filename component — but
+        // the scanner this replaced carried the same fallback.
+        .unwrap_or_else(|| "image".to_string());
+    format!("/api/books/{book_id}/images/{chapter_index}/{filename}")
 }
 
 async fn get_epub_image(
@@ -1354,10 +1341,25 @@ async fn get_page_image(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<Response, (StatusCode, String)> {
     let width = parse_width(query.as_deref());
-    let conn = state.conn().map_err(carrel_status)?;
-    let book = db::get_book(&conn, &id)
-        .map_err(carrel_status)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
+    // Scoped so the `PooledConnection` (not `Send`) is dropped before the
+    // `spawn_blocking` hop below — held across that `.await` it would make
+    // this handler's future non-`Send` and axum would refuse to compile it.
+    // The eviction budget is read here too (same connection, same scope) so
+    // there is no second checkout and nothing DB-shaped survives near the
+    // hop: same key, same fallback, same parse as `commands::prepare_comic`,
+    // which is the desktop's resolution of this exact setting.
+    let (book, max_cache_size_mb) = {
+        let conn = state.conn().map_err(carrel_status)?;
+        let book = db::get_book(&conn, &id)
+            .map_err(carrel_status)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
+        let max_cache_size_mb = db::get_setting(&conn, "page_cache_max_size_mb")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(crate::page_cache::DEFAULT_MAX_CACHE_SIZE_MB);
+        (book, max_cache_size_mb)
+    };
 
     let page_not_found = "Page not found in this book";
     let page_invalid =
@@ -1380,21 +1382,85 @@ async fn get_page_image(
     }
 
     match book.format {
+        // Reads through the disk page cache (M2): before this, every PDF
+        // page request re-rendered with pdfium from scratch, while the
+        // desktop reader had been reading from a warm cache all along (once
+        // `commands::prepare_pdf` had run on book-open). This route has no
+        // equivalent open event, so `carrel_core::reader::page_image`'s PDF
+        // arm establishes the same zero-prewarm manifest lazily on its own
+        // first call for a book — see that function's doc comment. Unlike
+        // the comic arm below, a miss renders exactly the one requested
+        // page, not the whole document, so this still runs on the blocking
+        // pool (a pdfium render is CPU-heavy) but for a bounded, single-page
+        // cost rather than a whole-archive one.
         BookFormat::Pdf => {
-            let (bytes, mime) = crate::pdf::get_page_image_bytes(&file_path, index, width)
-                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
-            Ok((
-                [
-                    (header::CONTENT_TYPE, mime.to_string()),
-                    (header::CACHE_CONTROL, page_cache_control.to_string()),
-                ],
-                bytes,
-            )
-                .into_response())
-        }
-        BookFormat::Cbz => {
-            let (bytes, mime) = crate::cbz::get_page_image_bytes(&file_path, index, width)
-                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
+            // An unopenable cache directory must cost the cache, not the
+            // book (M2 review round 3, finding 3): before this route used
+            // the cache it just read the file, and `LocalStorage::new`
+            // fails on an unwritable or missing cache parent. Left as an
+            // error it would also contradict the page-count route below,
+            // which degrades — the book would open and then every page
+            // would fail. `page_image` treats `None` as "no cache", the
+            // same path a book with no hash takes.
+            let pages_storage = match state.pages_storage() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("page cache unavailable for page read, rendering without it: {e}");
+                    None
+                }
+            };
+            let book_id = id.clone();
+            let file_hash = book.file_hash.clone();
+            let is_private = state.is_private();
+            let (bytes, mime) = tokio::task::spawn_blocking(move || {
+                let evict_storage = pages_storage.clone();
+                carrel_core::reader::page_image(
+                    BookFormat::Pdf,
+                    &file_path,
+                    index,
+                    width,
+                    &book_id,
+                    file_hash.as_deref(),
+                    pages_storage.as_deref(),
+                    // Fires when the lazy-write counter crosses a multiple
+                    // of `page_cache::LAZY_EVICTION_BATCH` — a sparser
+                    // cadence than the comic arm's "every priming miss",
+                    // since a PDF page cache fills one page at a time. Same
+                    // budget resolution as the comic arm below: the user's
+                    // `page_cache_max_size_mb` setting, so a lowered budget
+                    // is honored regardless of which format primed the
+                    // cache first.
+                    move || {
+                        let Some(storage) = evict_storage.as_ref() else {
+                            return;
+                        };
+                        if let Err(e) =
+                            crate::page_cache::run_eviction(storage.as_ref(), max_cache_size_mb)
+                        {
+                            log::warn!("pdf page-cache eviction failed: {e}");
+                        }
+                    },
+                    // Private mode: suppress only the page-bytes disk write,
+                    // matching `commands::get_pdf_page_bytes`'s desktop
+                    // behaviour, so a "don't track this session" read
+                    // doesn't persist rendered pages to the shared
+                    // page-cache directory.
+                    is_private,
+                    // The web reader has no book-open event of its own — a
+                    // miss must prime the cache itself, or a book never gets
+                    // cached at all. See `carrel_core::reader::OnMiss`.
+                    carrel_core::reader::OnMiss::Prime,
+                )
+            })
+            .await
+            .map_err(|e| {
+                log::error!("pdf page render task panicked: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            })?
+            .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1404,9 +1470,93 @@ async fn get_page_image(
             )
                 .into_response())
         }
-        BookFormat::Cbr => {
-            let (bytes, mime) = crate::cbr::get_page_image_bytes(&file_path, index, width)
-                .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
+        // Reads through the disk page cache (M1 follow-on): before this, every
+        // page request reopened and reparsed the whole archive, while the
+        // desktop reader had been reading from a warm cache all along.
+        //
+        // A cache miss now extracts the *whole* archive (see
+        // `carrel_core::reader::page_image`'s doc comment for why) —
+        // proportional to the whole book rather than one page, and on this
+        // project's real library that archive can live on a network mount.
+        // Run it on the blocking pool (`spawn_blocking`), the same treatment
+        // `commands::get_comic_page_bytes` gives this exact work on the
+        // desktop side: a handful of concurrent cold opens would otherwise
+        // occupy every Tokio worker and stall the health check and every
+        // unrelated route behind them (M1 review, finding 1). Everything
+        // moved into the closure is owned, not borrowed from `state`/`book`.
+        BookFormat::Cbz | BookFormat::Cbr => {
+            // An unopenable cache directory must cost the cache, not the
+            // book (M2 review round 3, finding 3): before this route used
+            // the cache it just read the file, and `LocalStorage::new`
+            // fails on an unwritable or missing cache parent. Left as an
+            // error it would also contradict the page-count route below,
+            // which degrades — the book would open and then every page
+            // would fail. `page_image` treats `None` as "no cache", the
+            // same path a book with no hash takes.
+            let pages_storage = match state.pages_storage() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("page cache unavailable for page read, rendering without it: {e}");
+                    None
+                }
+            };
+            let format = book.format.clone();
+            let book_id = id.clone();
+            let file_hash = book.file_hash.clone();
+            let (bytes, mime) = tokio::task::spawn_blocking(move || {
+                let evict_storage = pages_storage.clone();
+                carrel_core::reader::page_image(
+                    format,
+                    &file_path,
+                    index,
+                    width,
+                    &book_id,
+                    file_hash.as_deref(),
+                    pages_storage.as_deref(),
+                    // Fires only on the miss that just extracted the whole
+                    // archive (M1 review, finding 2) — `run_eviction` walks
+                    // the entire page cache, so it must never run on the hit
+                    // path that serves nearly every request. The budget is
+                    // the user's `page_cache_max_size_mb` setting, resolved
+                    // above with `DEFAULT_MAX_CACHE_SIZE_MB` only as the
+                    // fallback when it's unset — a lowered budget must be
+                    // honored here too, or the desktop and web halves of one
+                    // install would disagree about the same cache directory
+                    // (M1 review, finding 3). A failed sweep is logged and
+                    // swallowed rather than failing a page request that
+                    // already has its bytes.
+                    move || {
+                        let Some(storage) = evict_storage.as_ref() else {
+                            return;
+                        };
+                        if let Err(e) =
+                            crate::page_cache::run_eviction(storage.as_ref(), max_cache_size_mb)
+                        {
+                            log::warn!("comic page-cache eviction failed: {e}");
+                        }
+                    },
+                    // Comics do not yet consult private mode (tracked in
+                    // `docs/backlog/comic-cache-ignores-private-mode.md`) —
+                    // hardcoded rather than wired to `state.is_private()`
+                    // so fixing that gap later is a deliberate, reviewed
+                    // change, not an accidental side effect of this one.
+                    false,
+                    // The web reader has no book-open event of its own — a
+                    // miss must prime the whole archive itself, or a book
+                    // never gets cached at all. See
+                    // `carrel_core::reader::OnMiss`.
+                    carrel_core::reader::OnMiss::Prime,
+                )
+            })
+            .await
+            .map_err(|e| {
+                log::error!("comic page render task panicked: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            })?
+            .map_err(|e| book_file_status(page_not_found, page_invalid, e))?;
             Ok((
                 [
                     (header::CONTENT_TYPE, mime),
@@ -1427,10 +1577,15 @@ async fn get_page_count(
     State(state): State<WebState>,
     Path(id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
-    let conn = state.conn().map_err(carrel_status)?;
-    let book = db::get_book(&conn, &id)
-        .map_err(carrel_status)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?;
+    // Scoped for the same reason as `get_page_image`: the `PooledConnection`
+    // must be dropped before the `spawn_blocking` hop below, or this
+    // handler's future stops being `Send`.
+    let book = {
+        let conn = state.conn().map_err(carrel_status)?;
+        db::get_book(&conn, &id)
+            .map_err(carrel_status)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Book not found".to_string()))?
+    };
 
     let count_not_found = "Page count not available for this book";
     let count_invalid =
@@ -1440,12 +1595,52 @@ async fn get_page_count(
         .map_err(|e| book_file_status(count_not_found, count_invalid, e))?;
 
     let count = match book.format {
-        BookFormat::Pdf => crate::pdf::get_page_count(&file_path)
-            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
-        BookFormat::Cbz => crate::cbz::get_page_count(&file_path)
-            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
-        BookFormat::Cbr => crate::cbr::get_page_count(&file_path)
-            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?,
+        // Answers from the cache when a complete manifest is already on disk
+        // (M1 review, finding 5) rather than opening the archive on every
+        // call; falls back to the archive otherwise. Blocking pool for the
+        // same reason as the page-image route above (M1 review, finding 1).
+        //
+        // PDF joined this arm in M2 (review finding F3): the page-image
+        // route above now serves cached PDF pages without touching the
+        // source, and the web reader fetches this count *before* its first
+        // page request — so leaving this one always opening the file meant a
+        // fully-cached PDF still could not be opened with its source gone,
+        // which is the case the caching is for.
+        BookFormat::Cbz | BookFormat::Cbr | BookFormat::Pdf => {
+            // A cache directory that cannot even be opened must cost the
+            // cache, not the book (M2 review round 2, finding 1): before
+            // this route consulted the cache at all, it just read the file,
+            // and a `LocalStorage::new` failure — an unwritable or missing
+            // cache parent — would otherwise 500 a count the file itself
+            // can still answer. `page_count` skips the manifest lookup when
+            // handed `None`.
+            let pages_storage = match state.pages_storage() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    log::warn!("page cache unavailable for page count, reading the file: {e}");
+                    None
+                }
+            };
+            let format = book.format.clone();
+            let file_hash = book.file_hash.clone();
+            tokio::task::spawn_blocking(move || {
+                carrel_core::reader::page_count(
+                    format,
+                    &file_path,
+                    file_hash.as_deref(),
+                    pages_storage.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| {
+                log::error!("page-count task panicked: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            })?
+            .map_err(|e| book_file_status(count_not_found, count_invalid, e))?
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -2561,6 +2756,92 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    async fn body_bytes(resp: Response) -> Bytes {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// A one-page CBZ containing a real (decodable) JPEG, so the page-cache
+    /// round trip below is byte-meaningful rather than just "some bytes
+    /// passed through".
+    fn write_cbz(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("page00.jpg", opts).unwrap();
+        let img: image::ImageBuffer<image::Rgb<u8>, _> =
+            image::ImageBuffer::from_pixel(20, 20, image::Rgb([200u8, 30, 30]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&img)
+            .unwrap();
+        std::io::Write::write_all(&mut zip, &jpeg).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// A one-page CBZ whose page is exactly `page_bytes` long (arbitrary
+    /// content — nothing here decodes it, so it need not be a real image).
+    /// Used to make the page cache's disk footprint large enough to trigger
+    /// `run_eviction`'s size cap deterministically in a test.
+    fn write_large_cbz(dir: &std::path::Path, name: &str, page_bytes: usize) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("page00.jpg", opts).unwrap();
+        std::io::Write::write_all(&mut zip, &vec![0xABu8; page_bytes]).unwrap();
+        zip.finish().unwrap();
+        path
+    }
+
+    /// A linked CBZ book row pointing at `path`, seeded into `state`'s DB.
+    fn seed_comic_book(
+        state: &WebState,
+        id: &str,
+        path: &std::path::Path,
+        file_hash: Option<&str>,
+    ) {
+        let book = crate::models::Book {
+            id: id.to_string(),
+            title: "Comic Page Read Test Book".to_string(),
+            author: "Test Author".to_string(),
+            file_path: path.to_string_lossy().into_owned(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: BookFormat::Cbz,
+            file_hash: file_hash.map(|s| s.to_string()),
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        };
+        let conn = state.conn().unwrap();
+        crate::db::insert_book(&conn, &book).unwrap();
+    }
+
+    /// Comic-page tests each need an isolated `cache_dir` — unlike
+    /// `dictionary_test_state`'s shared `std::env::temp_dir()`, the page
+    /// cache is written to, so sharing it across tests risks a book-hash
+    /// collision.
+    fn comic_test_state(dir: &std::path::Path) -> WebState {
+        let mut state = dictionary_test_state(dir.to_path_buf());
+        state.cache_dir = dir.join("cache");
+        state
+    }
+
     /// M1's acceptance criterion: a second chapter request is served from the
     /// cached archive rather than by reopening the book file, which is what
     /// this route did on *every* request before.
@@ -2589,6 +2870,427 @@ mod tests {
                 .expect("second read must be served from the cached archive");
         assert_eq!(body_string(second).await, first);
         assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
+    }
+
+    /// Characterization lock for the web chapter read's inline-image URLs
+    /// across M5's move of the URL policy out of core.
+    ///
+    /// It ships in the same commit as that change, so on its own it is a lock
+    /// going forward rather than evidence the bytes did not move; the evidence
+    /// for that was a byte-for-byte diff of this route's output between the
+    /// two commits, over adversarial filenames (space, `&`, non-ASCII, an
+    /// embedded `%2F`, a `?query`).
+    ///
+    /// Until M5 these URLs were produced by core emitting
+    /// `asset://localhost/<url-encoded absolute path>` and this adapter
+    /// string-scanning it back apart (`rewrite_asset_urls_to_http`); after M5
+    /// this adapter injects the policy and core never sees `asset://` at all.
+    /// The web reader, its service worker, and the offline-save path all
+    /// consume these `/api/books/{id}/images/{chapter}/{filename}` URLs
+    /// directly, so the refactor must not move a byte of this output — hence
+    /// an exact-equality assertion rather than a `contains`.
+    #[tokio::test]
+    async fn web_chapter_output_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_image_chapter(dir.path(), "web-stable");
+        seed_epub_book(&state, "bk-web-stable", &epub);
+
+        let resp = get_chapter_content(
+            State(state.clone()),
+            Path(("bk-web-stable".to_string(), 0usize)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            body_string(resp).await,
+            "<p>Hello</p><img src=\"/api/books/bk-web-stable/images/0/2fcbc7ca6bddbb6f-img.png\" alt=\"a\">"
+        );
+    }
+
+    /// M4's acceptance criterion for the web adapter: a second TOC request is
+    /// served from the cached archive rather than by reopening the book
+    /// file. Before this milestone the route called the path-based
+    /// `epub::get_toc` directly, with no cache at all — every request
+    /// reopened and reparsed the whole file, unlike the desktop reader which
+    /// had read through a warm archive cache all along.
+    ///
+    /// Deleting the file between the two requests is what makes that
+    /// observable — asserting two 200s would pass with the caching removed.
+    #[tokio::test]
+    async fn web_toc_reads_reuse_the_cached_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_image_chapter(dir.path(), "web-toc");
+        seed_epub_book(&state, "bk-web-toc", &epub);
+
+        let first = get_chapters(State(state.clone()), Path("bk-web-toc".to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            first.as_array().map(|a| a.len()),
+            Some(1),
+            "unexpected first body: {first}"
+        );
+        assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
+
+        std::fs::remove_file(&epub).unwrap();
+
+        let second = get_chapters(State(state.clone()), Path("bk-web-toc".to_string()))
+            .await
+            .expect("second read must be served from the cached archive")
+            .0;
+        assert_eq!(second, first);
+        assert_eq!(state.archives.epub.lock().unwrap().len(), 1);
+    }
+
+    /// M1 follow-on's acceptance criterion: a second comic page request is
+    /// served from the disk page cache rather than by reopening the archive,
+    /// which is what this route did on *every* request before.
+    ///
+    /// Deleting the file between the two requests is what makes that
+    /// observable — asserting two 200s would pass with the caching removed.
+    #[tokio::test]
+    async fn web_comic_page_reads_reuse_the_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-comic", &cbz, Some("comic-hash-1"));
+
+        let first = get_page_image(
+            State(state.clone()),
+            Path(("bk-comic".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+        let first_bytes = body_bytes(first).await;
+        assert!(!first_bytes.is_empty());
+
+        std::fs::remove_file(&cbz).unwrap();
+
+        let second = get_page_image(
+            State(state.clone()),
+            Path(("bk-comic".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("second read must be served from the cached page");
+        assert_eq!(body_bytes(second).await, first_bytes);
+    }
+
+    /// A book with no `file_hash` has nothing to key the page cache on — the
+    /// route must still serve it (uncached) rather than erroring.
+    #[tokio::test]
+    async fn web_comic_page_without_hash_still_renders() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-comic-nohash", &cbz, None);
+
+        let resp = get_page_image(
+            State(state.clone()),
+            Path(("bk-comic-nohash".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("a book with no file_hash must still render");
+        assert!(!body_bytes(resp).await.is_empty());
+    }
+
+    /// Trap from the M1 brief: a missing comic file must stay a 404, not
+    /// collapse into the generic 500 `book_file_status` maps unrecognized
+    /// error kinds to (see `carrel_core::reader::page_image`'s
+    /// `ensure_file_exists` guard, added for exactly this).
+    #[tokio::test]
+    async fn web_comic_page_missing_file_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let missing = dir.path().join("nope.cbz");
+        seed_comic_book(&state, "bk-comic-missing", &missing, Some("comic-hash-3"));
+
+        let err = get_page_image(
+            State(state.clone()),
+            Path(("bk-comic-missing".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND, "unexpected status: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn web_comic_page_count_returns_number_of_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-comic-count", &cbz, Some("comic-hash-2"));
+
+        let resp = get_page_count(State(state.clone()), Path("bk-comic-count".to_string()))
+            .await
+            .unwrap();
+        let bytes = body_bytes(resp).await;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["count"], 1);
+    }
+
+    /// M1 review finding 3: the eviction budget passed to `run_eviction`
+    /// must be the user's `page_cache_max_size_mb` setting, not a hardcoded
+    /// default — otherwise a lowered budget is silently ignored whenever
+    /// the web route is what primes the cache, and the desktop and web
+    /// halves of one install disagree about the same directory on disk.
+    ///
+    /// Sets the setting to 1 MB, then primes two ~700 KB comics — together
+    /// over budget, neither alone. If eviction saw the configured 1 MB cap,
+    /// priming the second book must reclaim the first; if it silently used
+    /// `DEFAULT_MAX_CACHE_SIZE_MB` (500 MB) instead, both would still fit
+    /// and neither would ever be evicted.
+    #[tokio::test]
+    async fn web_comic_page_eviction_honors_the_configured_cache_size_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+
+        let cbz_a = write_large_cbz(dir.path(), "comic-a.cbz", 700 * 1024);
+        seed_comic_book(&state, "bk-comic-a", &cbz_a, Some("comic-hash-a"));
+        let cbz_b = write_large_cbz(dir.path(), "comic-b.cbz", 700 * 1024);
+        seed_comic_book(&state, "bk-comic-b", &cbz_b, Some("comic-hash-b"));
+
+        get_page_image(
+            State(state.clone()),
+            Path(("bk-comic-a".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+        get_page_image(
+            State(state.clone()),
+            Path(("bk-comic-b".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+
+        let pages_storage = state.pages_storage().unwrap();
+        let a_present =
+            carrel_core::page_cache::read_manifest(pages_storage.as_ref(), "comic-hash-a")
+                .is_some();
+        let b_present =
+            carrel_core::page_cache::read_manifest(pages_storage.as_ref(), "comic-hash-b")
+                .is_some();
+        assert!(
+            !(a_present && b_present),
+            "at least one book must be evicted once the combined cache exceeds the \
+             configured 1 MB budget; both present means eviction used a larger budget \
+             than what was set"
+        );
+    }
+
+    // ── PDF page reads (M2) ─────────────────────────────────────────────
+
+    /// Point pdfium at the bundled library and return whether it is usable.
+    ///
+    /// Mirrors `carrel_core::pdf::tests::pdfium_available`: the binary is
+    /// downloaded by `scripts/download-pdfium.sh` (and by CI on
+    /// Linux/macOS) into `src-tauri/resources/`, which is gitignored — a
+    /// fresh clone that skipped the script, and the Windows CI job (which
+    /// builds this test binary but has no library at all), skip PDF tests
+    /// rather than fail them.
+    fn pdfium_available() -> bool {
+        let lib_name = if cfg!(target_os = "windows") {
+            "pdfium.dll"
+        } else if cfg!(target_os = "macos") {
+            "libpdfium.dylib"
+        } else {
+            "libpdfium.so"
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(lib_name);
+        if !path.exists() {
+            return false;
+        }
+        carrel_core::pdf::set_pdfium_library_path(Some(path));
+        true
+    }
+
+    /// A minimal one-page, hand-crafted PDF — no PDF-writing crate needed.
+    /// Mirrors `carrel_core::reader::tests::write_pdf`.
+    fn write_pdf(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let content = b"0 0 1 rg 0 0 10 10 re f\n";
+        let bodies: Vec<Vec<u8>> = vec![
+            b"<</Type/Catalog/Pages 2 0 R>>".to_vec(),
+            b"<</Type/Pages/Kids[3 0 R]/Count 1>>".to_vec(),
+            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R/Resources<<>>>>"
+                .to_vec(),
+            format!(
+                "<</Length {}>>stream\n{}\nendstream",
+                content.len(),
+                std::str::from_utf8(content).unwrap()
+            )
+            .into_bytes(),
+        ];
+
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"endobj\n");
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{}\n%%EOF\n",
+                bodies.len() + 1,
+                xref
+            )
+            .as_bytes(),
+        );
+
+        let path = dir.join(name);
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// A linked PDF book row pointing at `path`, seeded into `state`'s DB.
+    fn seed_pdf_book(state: &WebState, id: &str, path: &std::path::Path, file_hash: Option<&str>) {
+        let book = crate::models::Book {
+            id: id.to_string(),
+            title: "PDF Page Read Test Book".to_string(),
+            author: "Test Author".to_string(),
+            file_path: path.to_string_lossy().into_owned(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format: BookFormat::Pdf,
+            file_hash: file_hash.map(|s| s.to_string()),
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        };
+        let conn = state.conn().unwrap();
+        crate::db::insert_book(&conn, &book).unwrap();
+    }
+
+    /// M2's acceptance criterion: a second PDF page request is served from
+    /// the disk page cache rather than by re-rendering with pdfium, which is
+    /// what this route did on *every* request before.
+    ///
+    /// Deleting the file between the two requests is what makes that
+    /// observable — asserting two 200s would pass with the caching removed.
+    #[tokio::test]
+    async fn web_pdf_page_reads_reuse_the_page_cache() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let pdf = write_pdf(dir.path(), "book.pdf");
+        seed_pdf_book(&state, "bk-pdf", &pdf, Some("pdf-hash-1"));
+
+        let first = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+        let first_bytes = body_bytes(first).await;
+        assert!(!first_bytes.is_empty());
+
+        std::fs::remove_file(&pdf).unwrap();
+
+        let second = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("second read must be served from the cached page");
+        assert_eq!(body_bytes(second).await, first_bytes);
+    }
+
+    /// M2's private-mode requirement, proven at the web-route level (not
+    /// just core): with `WebState::private_mode` on, the page still renders,
+    /// but the page BYTES must never reach disk — only `is_private` reaching
+    /// `carrel_core::reader::page_image` unchanged makes that true; a wiring
+    /// bug that dropped or hardcoded the flag would still pass a test that
+    /// only checked the response was 200.
+    #[tokio::test]
+    async fn web_pdf_page_private_mode_does_not_write_page_bytes() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        state
+            .private_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pdf = write_pdf(dir.path(), "book.pdf");
+        seed_pdf_book(&state, "bk-pdf-private", &pdf, Some("pdf-hash-private"));
+
+        let resp = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf-private".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("private mode must still render the page");
+        assert!(!body_bytes(resp).await.is_empty());
+
+        let pages_storage = state.pages_storage().unwrap();
+        let entries = pages_storage.list("page-cache/pdf-hash-private/").unwrap();
+        assert!(
+            !entries.iter().any(|e| e.ends_with(".jpg")),
+            "private mode must not write page bytes to disk: {entries:?}"
+        );
+    }
+
+    /// A PDF with no `file_hash` has nothing to key the page cache on — the
+    /// route must still serve it (uncached) rather than erroring.
+    #[tokio::test]
+    async fn web_pdf_page_without_hash_still_renders() {
+        if !pdfium_available() {
+            eprintln!("skipping: no bundled pdfium library (see scripts/download-pdfium.sh)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let pdf = write_pdf(dir.path(), "book.pdf");
+        seed_pdf_book(&state, "bk-pdf-nohash", &pdf, None);
+
+        let resp = get_page_image(
+            State(state.clone()),
+            Path(("bk-pdf-nohash".to_string(), 0u32)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .expect("a book with no file_hash must still render");
+        assert!(!body_bytes(resp).await.is_empty());
     }
 
     #[tokio::test]
@@ -3517,19 +4219,54 @@ mod tests {
         assert_eq!(parse_width(Some("width=+800")), None);
     }
 
+    /// Successor to the deleted `test_rewrite_asset_urls`: the same
+    /// filename-extraction contract, asserted on the policy that now *produces*
+    /// the URL rather than on the scanner that used to repair it. The path is
+    /// the one core resolves the storage key to; only its last segment reaches
+    /// the URL, because that is what `get_epub_image` re-joins onto
+    /// `{data_dir}/images/{id}/{chapter}/`.
     #[test]
-    fn test_rewrite_asset_urls() {
-        let html = r#"<img src="asset://localhost/%2Ftmp%2Fimages%2Fbook1%2F0%2Fchapter1.jpg" />"#;
-        let result = rewrite_asset_urls_to_http(html, "book1", 0);
-        assert!(result.contains("/api/books/book1/images/0/chapter1.jpg"));
-        assert!(!result.contains("asset://"));
+    fn web_image_url_uses_the_paths_last_segment() {
+        assert_eq!(
+            web_image_url(
+                "book1",
+                0,
+                std::path::Path::new("/tmp/images/book1/0/chapter1.jpg")
+            ),
+            "/api/books/book1/images/0/chapter1.jpg"
+        );
+        assert_eq!(
+            web_image_url(
+                "bk",
+                3,
+                std::path::Path::new("/var/data/images/bk/3/ab12-fig.png")
+            ),
+            "/api/books/bk/images/3/ab12-fig.png"
+        );
     }
 
+    /// Successor to the deleted `test_rewrite_asset_urls_utf8_filename`. The
+    /// old rewriter percent-*decoded* the path it scanned and never re-encoded
+    /// the filename, so a non-ASCII basename landed in the `src` as raw UTF-8.
+    /// Byte-identity with that output is the acceptance criterion for M5, so
+    /// this pins it: no percent-encoding is applied here.
     #[test]
-    fn test_rewrite_asset_urls_no_assets() {
-        let html = "<p>Hello world</p>";
-        let result = rewrite_asset_urls_to_http(html, "book1", 0);
-        assert_eq!(result, html);
+    fn web_image_url_leaves_a_non_ascii_filename_unencoded() {
+        assert_eq!(
+            web_image_url("book1", 0, std::path::Path::new("/tmp/images/图片.jpg")),
+            "/api/books/book1/images/0/图片.jpg"
+        );
+    }
+
+    /// A path with no final component cannot arise — every storage key ends in
+    /// a filename — but the deleted rewriter carried an explicit fallback for
+    /// the degenerate case, so keep one rather than dropping it in passing.
+    #[test]
+    fn web_image_url_falls_back_when_the_path_has_no_filename() {
+        assert_eq!(
+            web_image_url("bk", 2, std::path::Path::new("/")),
+            "/api/books/bk/images/2/image"
+        );
     }
 
     // R2-1: Path traversal prevention
@@ -3575,24 +4312,6 @@ mod tests {
         assert!(sanitized.contains("<h1>"));
         assert!(sanitized.contains("<em>"));
         assert!(sanitized.contains("<img"));
-    }
-
-    // R2-4: URL rewriting with regex handles multiple URLs
-    #[test]
-    fn test_rewrite_asset_urls_multiple_images() {
-        let html = r#"<img src="asset://localhost/a/b/c/img1.jpg"><img src="asset://localhost/x/y/z/img2.png">"#;
-        let result = rewrite_asset_urls_to_http(html, "book1", 3);
-        assert!(result.contains("/api/books/book1/images/3/img1.jpg"));
-        assert!(result.contains("/api/books/book1/images/3/img2.png"));
-        assert!(!result.contains("asset://"));
-    }
-
-    // R2-4: URL rewriting handles UTF-8 filenames
-    #[test]
-    fn test_rewrite_asset_urls_utf8_filename() {
-        let html = r#"<img src="asset://localhost/path/%E5%9B%BE%E7%89%87.jpg">"#;
-        let result = rewrite_asset_urls_to_http(html, "book1", 0);
-        assert!(!result.contains("asset://"));
     }
 
     #[test]

@@ -45,8 +45,9 @@ mod adapter;
 mod ffi;
 
 pub use adapter::{
-    extract_cover, get_chapter_content, get_chapter_content_from_cache, get_chapter_list,
-    get_chapter_list_from_cache, get_chapter_metadata_batch_from_cache, get_chapter_word_counts,
+    extract_cover, get_chapter_content, get_chapter_content_from_cache,
+    get_chapter_content_from_cache_with_url_policy, get_chapter_list, get_chapter_list_from_cache,
+    get_chapter_metadata_batch_from_cache, get_chapter_word_counts,
     get_chapter_word_counts_from_cache, parse_mobi_metadata, CachedMobiBook, MobiMetadata,
 };
 
