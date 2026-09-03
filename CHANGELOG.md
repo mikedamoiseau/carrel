@@ -5,6 +5,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **The OPDS search feed (`/opds/search`) is now paged and conditionally
+  cacheable**, matching the other catalog feeds: results beyond the first 50
+  now require following the feed's `next` link rather than arriving in one
+  unbounded response, and the feed now sends a weak `ETag` and honours
+  `If-None-Match` with a `304 Not Modified`. An absent or empty search term
+  still returns the whole library, just across however many pages that now
+  takes.
+
 ### Fixed
 - **The web reader no longer re-opens the book file on every chapter turn.**
   Chapter reads for EPUB and MOBI now go through one module in `carrel-core`
