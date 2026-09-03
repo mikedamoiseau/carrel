@@ -914,8 +914,11 @@ fn build_book_predicate(query: &BookQuery) -> (String, Vec<Value>) {
 /// second-granularity (or coarser) ties — concurrent imports, unrated books,
 /// never-opened books — and without a unique tiebreaker, offset pagination
 /// can slice a book onto two pages or skip it entirely depending on how ties
-/// happen to resolve between two calls (mirrors the "Fix D" comments on
-/// `list_books_grid` above and on the `api.rs` code this replaces).
+/// happen to resolve between two calls (mirrors the "Fix D" comment on
+/// `list_books_grid` above, and `resolveSeriesNav` in the web UI's `app.js`,
+/// which needed the same tie-break for the same reason). This is the only
+/// remaining home for that rationale on the server side — the `api.rs` sort
+/// block that used to carry it is gone.
 fn book_sort_order_sql(sort: BookSort) -> &'static str {
     match sort {
         BookSort::DateAdded => "b.added_at DESC, b.id",
@@ -952,16 +955,23 @@ fn query_books_generic<T>(
 
     let order_sql = book_sort_order_sql(query.sort);
     let mut page_params = where_params;
+    // Saturate rather than cast: `usize as i64` WRAPS on a value above
+    // i64::MAX, and a negative OFFSET is silently clamped to 0 by SQLite, so
+    // a wrapped offset would return the first page instead of the empty one
+    // the caller asked for. Saturating to i64::MAX keeps "past the end"
+    // meaning past the end. (A saturated LIMIT is harmless either way — both
+    // i64::MAX and the true value return every remaining row.)
+    let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
     let limit_sql = match query.limit {
         Some(limit) => {
-            page_params.push(Value::Integer(limit as i64));
-            page_params.push(Value::Integer(query.offset as i64));
+            page_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+            page_params.push(Value::Integer(offset));
             "LIMIT ? OFFSET ?"
         }
         None => {
             // SQLite treats a negative LIMIT as "no limit", which lets
             // OFFSET keep working with no `limit` given.
-            page_params.push(Value::Integer(query.offset as i64));
+            page_params.push(Value::Integer(offset));
             "LIMIT -1 OFFSET ?"
         }
     };
@@ -7053,6 +7063,30 @@ mod tests {
         let mut all: Vec<&str> = ids(&page1.items);
         all.extend(ids(&page2.items));
         assert_eq!(all, vec!["b1", "a1", "a2", "a3", "b2"]);
+    }
+
+    /// `usize as i64` wraps above `i64::MAX`, and SQLite silently clamps a
+    /// negative OFFSET to zero — so without the saturating conversion an
+    /// offset far past the end returns the *first* page instead of nothing.
+    #[test]
+    fn query_books_grid_offset_above_i64_max_returns_empty_not_the_first_page() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                limit: Some(2),
+                offset: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            page.items.is_empty(),
+            "offset past the end must return nothing, not wrap to page one"
+        );
+        assert_eq!(page.total, 5, "total still counts the whole filtered set");
     }
 
     #[test]

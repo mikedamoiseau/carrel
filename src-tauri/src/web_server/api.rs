@@ -704,14 +704,24 @@ async fn list_books(
         want_to_read: params.want_to_read.as_deref() == Some("true"),
         sort,
         limit: params.limit,
-        offset: params.offset.unwrap_or(0),
+        // Item 14: `offset` has only ever meant anything alongside `limit`.
+        // The pre-pagination response read `offset` solely inside the
+        // paginated branch, so `?offset=` on its own was a no-op — and it
+        // stays one. Forwarding it unconditionally would silently drop rows
+        // from an unpaginated listing, which no in-repo caller sends but any
+        // LAN client could.
+        offset: match params.limit {
+            Some(_) => params.offset.unwrap_or(0),
+            None => 0,
+        },
     };
 
     let page = db::query_books_grid(&conn, &query).map_err(carrel_status)?;
     let books: Vec<PublicBookGridItem> = page.items.into_iter().map(Into::into).collect();
 
-    // Item 14: no `limit` means no behavior change at all — a bare array
-    // with no `x-total-count` header, exactly as before pagination existed.
+    // Item 14: no `limit` means a bare array with no `x-total-count` header,
+    // exactly as before pagination existed. (`offset` is neutralised above in
+    // that case, so the body is the whole filtered list too.)
     match params.limit {
         Some(_) => Ok((
             [(
@@ -4647,6 +4657,101 @@ mod tests {
         assert_eq!(
             total_header, "2",
             "x-total-count must be the filtered total, not the page length (1) or table size (5)"
+        );
+    }
+
+    /// The pre-pagination endpoint read `offset` only inside its paginated
+    /// branch, so `?offset=` with no `limit` returned the whole list. Moving
+    /// the paging into SQL made it easy to forward `offset` unconditionally,
+    /// which would silently drop rows from an unpaginated listing — invisible
+    /// in-repo, since the web UI always sends the pair, but a wire-contract
+    /// change for any other LAN client.
+    #[tokio::test]
+    async fn list_books_offset_without_limit_is_a_no_op() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.offset = Some(2);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("x-total-count").is_none(),
+            "no limit must still mean no x-total-count header"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["b1", "a1", "a2", "a3", "b2"],
+            "an offset with no limit must drop nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_non_zero_offset_shifts_the_window() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(2);
+        query.offset = Some(2);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // Default order is b1, a1, a2, a3, b2 — so skipping two lands on a2.
+        assert_eq!(
+            ids_from(&json),
+            vec!["a2", "a3"],
+            "offset must shift the window, not just cap its length"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_limit_zero_returns_empty_page_with_full_total() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(0);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let total = resp
+            .headers()
+            .get("x-total-count")
+            .expect("limit present must set x-total-count")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(total, "5", "limit=0 still reports the full filtered total");
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            json.as_array().unwrap().is_empty(),
+            "limit=0 yields no rows"
+        );
+    }
+
+    /// `usize as i64` wraps above `i64::MAX`, and SQLite silently clamps a
+    /// negative OFFSET to zero — so an offset far past the end would have
+    /// returned the *first* page rather than an empty one. The old Rust path
+    /// clamped with `offset.min(total)` and returned nothing.
+    #[tokio::test]
+    async fn list_books_offset_beyond_i64_returns_empty_not_the_first_page() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(2);
+        query.offset = Some(usize::MAX);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            json.as_array().unwrap().is_empty(),
+            "an offset past the end must return nothing, not wrap to page one"
         );
     }
 
