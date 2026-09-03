@@ -686,105 +686,52 @@ async fn list_books(
     Query(params): Query<BookQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
-    let books = db::list_books_grid(&conn).map_err(carrel_status)?;
 
-    let books = match params.series {
-        Some(ref s) if !s.is_empty() => books
-            .into_iter()
-            .filter(|b| b.series.as_deref() == Some(s.as_str()))
-            .collect(),
-        _ => books,
+    // `sort` is a caller-supplied string; anything unrecognised falls back to
+    // the default (date added desc) rather than 400ing — carrel_core takes a
+    // closed enum so no caller-supplied string ever reaches the SQL.
+    let sort = match params.sort.as_deref() {
+        Some("title") => db::BookSort::Title,
+        Some("author") => db::BookSort::Author,
+        Some("rating") => db::BookSort::Rating,
+        Some("last_read") => db::BookSort::LastRead,
+        _ => db::BookSort::DateAdded,
     };
 
-    let books = match params.q {
-        Some(ref q) if !q.is_empty() => {
-            let q_lower = q.to_lowercase();
-            books
-                .into_iter()
-                .filter(|b| {
-                    b.title.to_lowercase().contains(&q_lower)
-                        || b.author.to_lowercase().contains(&q_lower)
-                })
-                .collect()
-        }
-        _ => books,
+    let query = db::BookQuery {
+        q: params.q,
+        series: params.series,
+        want_to_read: params.want_to_read.as_deref() == Some("true"),
+        sort,
+        limit: params.limit,
+        // Item 14: `offset` has only ever meant anything alongside `limit`.
+        // The pre-pagination response read `offset` solely inside the
+        // paginated branch, so `?offset=` on its own was a no-op — and it
+        // stays one. Forwarding it unconditionally would silently drop rows
+        // from an unpaginated listing, which no in-repo caller sends but any
+        // LAN client could.
+        offset: match params.limit {
+            Some(_) => params.offset.unwrap_or(0),
+            None => 0,
+        },
     };
 
-    let books = match params.want_to_read.as_deref() {
-        Some("true") => books.into_iter().filter(|b| b.want_to_read).collect(),
-        _ => books,
-    };
+    let page = db::query_books_grid(&conn, &query).map_err(carrel_status)?;
+    let books: Vec<PublicBookGridItem> = page.items.into_iter().map(Into::into).collect();
 
-    // Sort
-    // Fix D: every branch falls back to `id` on equality — ties (identical
-    // title/author/rating/last-read, or no reading progress at all) would
-    // otherwise sort in whatever order the underlying Vec happened to be in,
-    // which isn't stable across requests. That breaks offset pagination:
-    // the same book could land on two pages or be skipped depending on how
-    // ties resolved between two calls. `id` is unique, so this gives every
-    // sort a total, deterministic order (mirrors resolveSeriesNav in
-    // app.js, which needed the same fix for the same reason).
-    let mut books = books;
-    match params.sort.as_deref() {
-        Some("title") => books.sort_by(|a, b| {
-            a.title
-                .to_lowercase()
-                .cmp(&b.title.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
-        }),
-        Some("author") => books.sort_by(|a, b| {
-            a.author
-                .to_lowercase()
-                .cmp(&b.author.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
-        }),
-        Some("rating") => books.sort_by(|a, b| {
-            b.rating
-                .unwrap_or(0.0)
-                .partial_cmp(&a.rating.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
-        }),
-        Some("last_read") => {
-            // Need reading progress for last_read sort
-            let progress_map: std::collections::HashMap<String, i64> =
-                db::get_all_reading_progress(&conn)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| (p.book_id, p.last_read_at))
-                    .collect();
-            books.sort_by(|a, b| {
-                let la = progress_map.get(&a.id).copied().unwrap_or(0);
-                let lb = progress_map.get(&b.id).copied().unwrap_or(0);
-                lb.cmp(&la).then_with(|| a.id.cmp(&b.id))
-            });
-        }
-        _ => {} // default: date_added DESC, id from SQL
-    }
-
-    // Item 14: pagination is applied strictly after filter+sort, so it's
-    // purely a slice of the same result the pre-pagination endpoint would
-    // have returned — no `limit` means no behavior change at all.
+    // Item 14: no `limit` means a bare array with no `x-total-count` header,
+    // exactly as before pagination existed. (`offset` is neutralised above in
+    // that case, so the body is the whole filtered list too.)
     match params.limit {
-        Some(limit) => {
-            let total = books.len();
-            let offset = params.offset.unwrap_or(0).min(total);
-            let end = offset.saturating_add(limit).min(total);
-            let page: Vec<PublicBookGridItem> =
-                books[offset..end].iter().cloned().map(Into::into).collect();
-            Ok((
-                [(
-                    axum::http::HeaderName::from_static("x-total-count"),
-                    total.to_string(),
-                )],
-                Json(page),
-            )
-                .into_response())
-        }
-        None => {
-            let books: Vec<PublicBookGridItem> = books.into_iter().map(Into::into).collect();
-            Ok(Json(books).into_response())
-        }
+        Some(_) => Ok((
+            [(
+                axum::http::HeaderName::from_static("x-total-count"),
+                page.total.to_string(),
+            )],
+            Json(books),
+        )
+            .into_response()),
+        None => Ok(Json(books).into_response()),
     }
 }
 
@@ -2202,12 +2149,27 @@ async fn list_collections(
     Ok(Json(result))
 }
 
+#[derive(serde::Deserialize)]
+struct CollectionBooksQuery {
+    q: Option<String>,
+    /// Presence-only, enabled by the literal `"true"` alone — same convention
+    /// as `BookQuery::want_to_read` above (see its doc comment for why this
+    /// is a lenient `Option<String>` rather than a `bool`).
+    want_to_read: Option<String>,
+}
+
 async fn get_collection_books(
     State(state): State<WebState>,
     Path(id): Path<String>,
+    Query(params): Query<CollectionBooksQuery>,
 ) -> Result<Json<Vec<PublicBookGridItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
-    let books = db::get_books_in_collection_grid(&conn, &id).map_err(carrel_status)?;
+    let query = db::BookQuery {
+        q: params.q,
+        want_to_read: params.want_to_read.as_deref() == Some("true"),
+        ..Default::default()
+    };
+    let books = db::query_books_in_collection_grid(&conn, &id, &query).map_err(carrel_status)?;
     Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
@@ -4335,6 +4297,752 @@ mod tests {
         let query: BookQuery = serde_json::from_str("{}").expect("should parse empty");
         assert_eq!(query.q, None);
         assert_eq!(query.series, None);
+    }
+
+    // --- M2: list_books adopts carrel_core::db::query_books_grid ----------
+    //
+    // These are characterization tests: `list_books` must return exactly
+    // what it returned before the SQL swap. The fixture mirrors
+    // carrel-core's `seed_query_fixture` (same ids, same expected orders) so
+    // the already-verified sort/fold expectations can be reused directly.
+
+    fn list_books_test_state() -> WebState {
+        dictionary_test_state(std::env::temp_dir())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_list_books_book(
+        state: &WebState,
+        id: &str,
+        title: &str,
+        author: &str,
+        added_at: i64,
+        series: Option<&str>,
+        rating: Option<f64>,
+        want_to_read: bool,
+    ) {
+        let book = crate::models::Book {
+            id: id.to_string(),
+            title: title.to_string(),
+            author: author.to_string(),
+            file_path: format!("/tmp/{id}.epub"),
+            cover_path: None,
+            total_chapters: 100,
+            added_at,
+            format: BookFormat::Epub,
+            file_hash: None,
+            description: None,
+            genres: None,
+            rating,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: series.map(str::to_string),
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read,
+        };
+        let conn = state.conn().unwrap();
+        crate::db::insert_book(&conn, &book).unwrap();
+    }
+
+    fn seed_list_books_progress(state: &WebState, book_id: &str, last_read_at: i64) {
+        let conn = state.conn().unwrap();
+        crate::db::upsert_reading_progress(
+            &conn,
+            &crate::models::ReadingProgress {
+                book_id: book_id.to_string(),
+                chapter_index: 1,
+                scroll_position: 0.0,
+                last_read_at,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Mirrors `carrel_core::db`'s `seed_query_fixture`: non-ASCII
+    /// titles/authors (the M1 case-folding trap), a three-way `added_at` tie
+    /// (a1/a2/a3), NULL rating (a1, a3) and NULL series (a1, b1), a mix of
+    /// `want_to_read` (a2, b2), and reading progress on (a2, a3, b2) but not
+    /// (a1, b1).
+    fn seed_list_books_fixture(state: &WebState) {
+        seed_list_books_book(
+            state,
+            "a1",
+            "Éducation sentimentale",
+            "Gustave Flaubert",
+            100,
+            None,
+            None,
+            false,
+        );
+        seed_list_books_book(
+            state,
+            "a2",
+            "Der Steppenwolf",
+            "Hermann Süskind",
+            100,
+            Some("Classics"),
+            Some(4.5),
+            true,
+        );
+        seed_list_books_book(
+            state,
+            "a3",
+            "Das Parfum",
+            "Patrick Ünsal",
+            100,
+            Some("Classics"),
+            None,
+            false,
+        );
+        seed_list_books_book(
+            state,
+            "b1",
+            "A Random Book",
+            "John Doe",
+            300,
+            None,
+            Some(5.0),
+            false,
+        );
+        seed_list_books_book(
+            state,
+            "b2",
+            "Another One",
+            "Jane Roe",
+            50,
+            Some("Other"),
+            Some(3.0),
+            true,
+        );
+
+        seed_list_books_progress(state, "a2", 500);
+        seed_list_books_progress(state, "a3", 900);
+        seed_list_books_progress(state, "b2", 200);
+    }
+
+    fn no_filter_query() -> BookQuery {
+        BookQuery {
+            q: None,
+            series: None,
+            sort: None,
+            limit: None,
+            offset: None,
+            want_to_read: None,
+        }
+    }
+
+    fn ids_from(json: &serde_json::Value) -> Vec<String> {
+        json.as_array()
+            .expect("body must be a JSON array")
+            .iter()
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_books_default_sort_is_date_added_desc_then_id() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let resp = list_books(State(state.clone()), Query(no_filter_query()))
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("x-total-count").is_none(),
+            "no limit must mean no x-total-count header"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["b1", "a1", "a2", "a3", "b2"]);
+    }
+
+    #[tokio::test]
+    async fn list_books_unrecognised_sort_falls_back_to_default() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.sort = Some("not-a-real-sort".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["b1", "a1", "a2", "a3", "b2"],
+            "an unrecognised sort string must not 400 and must not change the order"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_title_sort() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.sort = Some("title".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["b1", "b2", "a3", "a2", "a1"]);
+    }
+
+    #[tokio::test]
+    async fn list_books_author_sort() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.sort = Some("author".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["a1", "a2", "b2", "b1", "a3"]);
+    }
+
+    #[tokio::test]
+    async fn list_books_rating_sort_treats_null_as_zero() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.sort = Some("rating".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["b1", "a2", "b2", "a1", "a3"]);
+    }
+
+    #[tokio::test]
+    async fn list_books_last_read_sort_uses_reading_progress() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.sort = Some("last_read".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["a3", "a2", "b2", "a1", "b1"]);
+    }
+
+    #[tokio::test]
+    async fn list_books_q_matches_title_and_author_case_insensitively() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.q = Some("STEPPENWOLF".to_string()); // matches a2's title
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["a2"]);
+
+        let mut query = no_filter_query();
+        query.q = Some("jane roe".to_string()); // matches b2's author
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["b2"]);
+    }
+
+    #[tokio::test]
+    async fn list_books_q_matching_nothing_returns_empty() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.q = Some("nonexistent needle".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    /// The M1 case-folding trap, at the API layer: SQLite's built-in
+    /// `LOWER()`/`LIKE` are ASCII-only, so a naive translation would silently
+    /// stop matching accented titles. A plain-ASCII needle must NOT match
+    /// the accented title either — Rust's `to_lowercase()` doesn't fold
+    /// accents away, so "education" is not a substring of "éducation...".
+    #[tokio::test]
+    async fn list_books_q_handles_non_ascii_case_folding() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.q = Some("éducation".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["a1"]);
+
+        let mut query = no_filter_query();
+        query.q = Some("education".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_books_series_filter_excludes_null_series() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.series = Some("Classics".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["a2", "a3"],
+            "a1 and b1 have NULL series and must never match"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_want_to_read_is_true_literal_only() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.want_to_read = Some("true".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["a2", "b2"]);
+
+        let mut query = no_filter_query();
+        query.want_to_read = Some("1".to_string());
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            ids_from(&json).len(),
+            5,
+            "only the literal 'true' enables the filter — '1' must leave it off"
+        );
+
+        let query = no_filter_query(); // absent
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(ids_from(&json).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn list_books_limit_offset_pages_and_reports_filtered_total() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.want_to_read = Some("true".to_string()); // total 2, not 5
+        query.limit = Some(1);
+        query.offset = Some(0);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let total_header = resp
+            .headers()
+            .get("x-total-count")
+            .expect("limit present must set x-total-count")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1, "page is capped by limit");
+        assert_eq!(
+            total_header, "2",
+            "x-total-count must be the filtered total, not the page length (1) or table size (5)"
+        );
+    }
+
+    /// The pre-pagination endpoint read `offset` only inside its paginated
+    /// branch, so `?offset=` with no `limit` returned the whole list. Moving
+    /// the paging into SQL made it easy to forward `offset` unconditionally,
+    /// which would silently drop rows from an unpaginated listing — invisible
+    /// in-repo, since the web UI always sends the pair, but a wire-contract
+    /// change for any other LAN client.
+    #[tokio::test]
+    async fn list_books_offset_without_limit_is_a_no_op() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.offset = Some(2);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        assert!(
+            resp.headers().get("x-total-count").is_none(),
+            "no limit must still mean no x-total-count header"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["b1", "a1", "a2", "a3", "b2"],
+            "an offset with no limit must drop nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_non_zero_offset_shifts_the_window() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(2);
+        query.offset = Some(2);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        // Default order is b1, a1, a2, a3, b2 — so skipping two lands on a2.
+        assert_eq!(
+            ids_from(&json),
+            vec!["a2", "a3"],
+            "offset must shift the window, not just cap its length"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_limit_zero_returns_empty_page_with_full_total() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(0);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let total = resp
+            .headers()
+            .get("x-total-count")
+            .expect("limit present must set x-total-count")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(total, "5", "limit=0 still reports the full filtered total");
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            json.as_array().unwrap().is_empty(),
+            "limit=0 yields no rows"
+        );
+    }
+
+    /// `usize as i64` wraps above `i64::MAX`, and SQLite silently clamps a
+    /// negative OFFSET to zero — so an offset far past the end would have
+    /// returned the *first* page rather than an empty one. The old Rust path
+    /// clamped with `offset.min(total)` and returned nothing.
+    #[tokio::test]
+    async fn list_books_offset_beyond_i64_returns_empty_not_the_first_page() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(2);
+        query.offset = Some(usize::MAX);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            json.as_array().unwrap().is_empty(),
+            "an offset past the end must return nothing, not wrap to page one"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_books_offset_past_end_returns_empty_array_not_error() {
+        let state = list_books_test_state();
+        seed_list_books_fixture(&state);
+
+        let mut query = no_filter_query();
+        query.limit = Some(10);
+        query.offset = Some(999);
+        let resp = list_books(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("x-total-count")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "5"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    // --- M4: get_collection_books filters server-side --------------------
+
+    fn seed_collection(state: &WebState, id: &str, r#type: crate::models::CollectionType) {
+        let conn = state.conn().unwrap();
+        db::insert_collection(
+            &conn,
+            &crate::models::Collection {
+                id: id.to_string(),
+                name: "Test collection".to_string(),
+                r#type,
+                icon: None,
+                color: None,
+                created_at: 1,
+                updated_at: 1,
+                rules: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn add_to_collection(state: &WebState, book_id: &str, collection_id: &str) {
+        let conn = state.conn().unwrap();
+        db::add_book_to_collection(&conn, book_id, collection_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_filters_by_q_matching_title() {
+        let state = list_books_test_state();
+        seed_collection(&state, "coll-fox", crate::models::CollectionType::Manual);
+        seed_list_books_book(&state, "fox", "Red Fox", "Bob", 100, None, None, false);
+        seed_list_books_book(
+            &state,
+            "whale",
+            "Blue Whale",
+            "Alice",
+            200,
+            None,
+            None,
+            false,
+        );
+        add_to_collection(&state, "fox", "coll-fox");
+        add_to_collection(&state, "whale", "coll-fox");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-fox".to_string()),
+            Query(CollectionBooksQuery {
+                q: Some("fox".to_string()),
+                want_to_read: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["fox"],
+            "server-side q must match the title and exclude the non-matching member"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_want_to_read_true_literal_filters() {
+        let state = list_books_test_state();
+        seed_collection(&state, "coll-want", crate::models::CollectionType::Manual);
+        seed_list_books_book(&state, "wanted", "Wanted", "Author", 100, None, None, true);
+        seed_list_books_book(
+            &state,
+            "not-wanted",
+            "Not Wanted",
+            "Author",
+            200,
+            None,
+            None,
+            false,
+        );
+        add_to_collection(&state, "wanted", "coll-want");
+        add_to_collection(&state, "not-wanted", "coll-want");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-want".to_string()),
+            Query(CollectionBooksQuery {
+                q: None,
+                want_to_read: Some("true".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["wanted"]);
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_want_to_read_non_true_value_is_lenient() {
+        // Item-14/M3 convention: only the literal "true" enables the filter.
+        // A malformed/other value (e.g. "1", which a naive `bool` field would
+        // 400 on) must be treated the same as absent — no filter, not an error.
+        let state = list_books_test_state();
+        seed_collection(
+            &state,
+            "coll-lenient",
+            crate::models::CollectionType::Manual,
+        );
+        seed_list_books_book(
+            &state, "l-wanted", "Wanted", "Author", 100, None, None, true,
+        );
+        seed_list_books_book(
+            &state,
+            "l-not-wanted",
+            "Not Wanted",
+            "Author",
+            200,
+            None,
+            None,
+            false,
+        );
+        add_to_collection(&state, "l-wanted", "coll-lenient");
+        add_to_collection(&state, "l-not-wanted", "coll-lenient");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-lenient".to_string()),
+            Query(CollectionBooksQuery {
+                q: None,
+                want_to_read: Some("1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        let mut got = ids_from(&json);
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["l-not-wanted", "l-wanted"],
+            "\"1\" is not the literal \"true\" — it must not enable the filter, and must not 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_absent_params_return_whole_collection() {
+        let state = list_books_test_state();
+        seed_collection(&state, "coll-absent", crate::models::CollectionType::Manual);
+        seed_list_books_book(&state, "abs-a", "A", "Author", 100, None, None, false);
+        seed_list_books_book(&state, "abs-b", "B", "Author", 200, None, None, false);
+        add_to_collection(&state, "abs-a", "coll-absent");
+        add_to_collection(&state, "abs-b", "coll-absent");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-absent".to_string()),
+            Query(CollectionBooksQuery {
+                q: None,
+                want_to_read: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        // Ids, not just a count: `len() == 2` is satisfied by any
+        // implementation that ignores the params, including one that returns
+        // the whole library rather than the collection. Sorted, because a
+        // manual collection orders by `bc.added_at DESC` with no `id`
+        // tie-break and these two are added within the same second — the
+        // membership order itself is pinned by the dedicated core test.
+        let mut got = ids_from(&json);
+        got.sort();
+        assert_eq!(got, vec!["abs-a", "abs-b"]);
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_automated_rule_and_q_both_apply() {
+        let state = list_books_test_state();
+        let conn = state.conn().unwrap();
+        db::insert_collection(
+            &conn,
+            &crate::models::Collection {
+                id: "coll-auto".to_string(),
+                name: "Automated".to_string(),
+                r#type: crate::models::CollectionType::Automated,
+                icon: None,
+                color: None,
+                created_at: 1,
+                updated_at: 1,
+                rules: vec![crate::models::CollectionRule {
+                    id: "rule-1".to_string(),
+                    collection_id: "coll-auto".to_string(),
+                    field: "series".to_string(),
+                    operator: "equals".to_string(),
+                    value: "SciFi".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+        drop(conn);
+        seed_list_books_book(
+            &state,
+            "auto-a",
+            "Star Voyager",
+            "Nova",
+            100,
+            Some("SciFi"),
+            None,
+            false,
+        );
+        seed_list_books_book(
+            &state,
+            "auto-b",
+            "Star Kingdom",
+            "Nova",
+            100,
+            Some("Fantasy"),
+            None,
+            false,
+        );
+        // Matches the rule but not q — proves q still filters within a
+        // rule-matched set, not just that the rule alone decided the outcome.
+        seed_list_books_book(
+            &state,
+            "auto-c",
+            "Ocean Deep",
+            "Nova",
+            100,
+            Some("SciFi"),
+            None,
+            false,
+        );
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-auto".to_string()),
+            Query(CollectionBooksQuery {
+                q: Some("star".to_string()),
+                want_to_read: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["auto-a"],
+            "the automated collection's rule and the q predicate must both apply"
+        );
     }
 
     #[test]

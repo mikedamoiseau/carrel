@@ -311,6 +311,13 @@ async fn root_catalog() -> Response {
 
 #[derive(serde::Deserialize)]
 struct PaginationQuery {
+    /// Note the divergence from `SearchQuery::page`, which is a lenient
+    /// `String`: a malformed `?page=abc` still rejects this feed outright.
+    /// Left as it is deliberately — changing it is a behaviour change to a
+    /// handler the milestone that made search lenient did not touch — but it
+    /// is the weaker of the two conventions, and the note in `docs/backlog/`
+    /// on these handlers records it alongside the other reasons to revisit
+    /// them together.
     page: Option<usize>,
 }
 
@@ -464,47 +471,117 @@ async fn collection_feed(
 #[derive(serde::Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+    /// Lenient by design, and typed `String` rather than `usize` for the
+    /// reason `api.rs`'s `BookQuery` documents on its own presence-only
+    /// field: axum's `Query` extraction is all-or-nothing, so a `usize` here
+    /// would reject the entire request — 400, no feed — on a malformed or
+    /// empty value (`page=`, `page=abc`) that a proxy or an OPDS client might
+    /// append. Before this parameter existed such a value was simply ignored
+    /// and the feed served, and it still is. Read it through
+    /// [`SearchQuery::page`], never directly.
+    page: Option<String>,
+}
+
+impl SearchQuery {
+    /// The requested page, or 0 for anything that is not a page number.
+    fn page(&self) -> usize {
+        self.page
+            .as_deref()
+            .and_then(|p| p.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
 }
 
 async fn search_books(
     State(state): State<WebState>,
     Query(params): Query<SearchQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
-    let books = db::list_books(&conn).map_err(carrel_status)?;
+    let page = params.page();
+    let search_term = params.q.unwrap_or_default();
 
-    let filtered: Vec<Book> = match params.q {
-        Some(ref q) if !q.is_empty() => {
-            let q_lower = q.to_lowercase();
-            books
-                .into_iter()
-                .filter(|b| {
-                    b.title.to_lowercase().contains(&q_lower)
-                        || b.author.to_lowercase().contains(&q_lower)
-                })
-                .collect()
-        }
-        _ => books,
+    // Filter and sort in SQL; page in Rust. `limit`/`offset` deliberately go
+    // unused here, because the ETag below covers the whole *filtered* set and
+    // therefore needs the complete matching list before it can be sliced.
+    //
+    // That whole-set tag is a consistency choice, not a correctness one, and
+    // it is worth being precise about which: a per-page tag would also be
+    // correct, since it hashes the ids actually rendered and a deletion on an
+    // earlier page changes which ids those are. What the shared tag buys is
+    // what `all_books` documents — uniform invalidation, so one library
+    // change invalidates every page URL at once. Matching the other three
+    // feeds is the reason to keep it; the cost is fetching every matching row
+    // to render fifty. See the note in `docs/backlog/` on these handlers for
+    // the SQL-paging alternative.
+    let query = db::BookQuery {
+        q: Some(search_term.clone()),
+        series: None,
+        want_to_read: false,
+        sort: db::BookSort::default(),
+        limit: None,
+        offset: 0,
     };
+    let books = db::query_books(&conn, &query).map_err(carrel_status)?.items;
+    let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
-    let entries: String = filtered
+    let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
+    let etag = feed_etag("urn:carrel:search", &rendered_ids, &pairs);
+    if if_none_match_matches(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
+    // Saturating, not `*`: `page` comes off the wire, so a large-but-parseable
+    // value reaches here. `page * OPDS_PAGE_SIZE` panics in debug and wraps in
+    // release, and a wrapped `start + OPDS_PAGE_SIZE` would then read as
+    // "there is a next page" and emit a `next` link back to page 0.
+    let start = page.saturating_mul(OPDS_PAGE_SIZE);
+    let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
+
+    let entries: String = page_books
         .iter()
-        .map(book_to_entry)
+        .map(|b| book_to_entry(b))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let search_term = params.q.as_deref().unwrap_or("");
+    let encoded_term = urlencoding::encode(&search_term);
+    let has_next = start.saturating_add(OPDS_PAGE_SIZE) < books.len();
+    // `&amp;` (not a raw `&`): these hrefs sit inside a double-quoted XML
+    // attribute, and an unescaped `&` starts an entity reference — the same
+    // reason `opensearch_descriptor`'s template runs through `xml_escape`.
+    let next_href = if has_next {
+        Some(format!(
+            "/opds/search?q={}&amp;page={}",
+            encoded_term,
+            page + 1
+        ))
+    } else {
+        None
+    };
+    let self_href = if page > 0 {
+        format!("/opds/search?q={}&amp;page={page}", encoded_term)
+    } else {
+        format!("/opds/search?q={}", encoded_term)
+    };
+
     let xml = wrap_feed(
-        &format!("Search: {}", xml_escape(search_term)),
+        &format!("Search: {}", xml_escape(&search_term)),
         "urn:carrel:search",
         &entries,
-        &format!("/opds/search?q={}", urlencoding::encode(search_term)),
+        &self_href,
         ATOM_ACQ_TYPE,
-        None,
-        None,
+        next_href.as_deref(),
+        max_updated(&rendered_ids, &pairs),
     );
 
-    Ok(([(header::CONTENT_TYPE, ATOM_ACQ_TYPE)], xml).into_response())
+    Ok((
+        [
+            (header::CONTENT_TYPE, ATOM_ACQ_TYPE.to_string()),
+            (header::ETAG, etag),
+        ],
+        xml,
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -1100,27 +1177,482 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_and_root_have_no_etag() {
-        let state = seeded_state(&[("b1", 100)]);
-
-        let resp = search_books(
-            AxumState(state.clone()),
-            AxumQuery(SearchQuery {
-                q: Some("Book".to_string()),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(
-            response_etag(&resp).is_none(),
-            "/search is out of ETag scope"
-        );
-
+    async fn root_has_no_etag() {
         let resp = root_catalog().await;
         assert!(
             response_etag(&resp).is_none(),
             "root catalog is out of ETag scope"
         );
+    }
+
+    fn search_query(q: Option<&str>, page: Option<usize>) -> SearchQuery {
+        SearchQuery {
+            q: q.map(str::to_string),
+            page: page.map(|p| p.to_string()),
+        }
+    }
+
+    async fn call_search(state: &WebState, q: Option<&str>, page: Option<usize>) -> Response {
+        search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(q, page)),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn seeded_state_with_books(books: Vec<Book>) -> WebState {
+        let pool = crate::db::create_pool(&PathBuf::from(":memory:")).expect("in-memory DB");
+        {
+            let conn = pool.get().unwrap();
+            for book in &books {
+                crate::db::insert_book(&conn, book).unwrap();
+            }
+        }
+        WebState {
+            archives: carrel_core::reader::ArchiveCaches::with_capacity(2),
+            pool: Arc::new(Mutex::new(pool)),
+            data_dir: PathBuf::from("/tmp"),
+            cache_dir: std::env::temp_dir(),
+            pin_hash: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
+            active_profile_name: Arc::new(Mutex::new("default".to_string())),
+            unlocked_profiles: Arc::new(Mutex::new(std::collections::HashSet::from([
+                "default".to_string()
+            ]))),
+            private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            profile_host: None,
+            dictionary_pool: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn search_test_book(id: &str, title: &str, author: &str, added_at: i64) -> Book {
+        let mut book = etag_test_book(id, added_at);
+        book.title = title.to_string();
+        book.author = author.to_string();
+        book
+    }
+
+    /// A filter that would pass with the feature deleted proves nothing, so
+    /// every fixture here mixes matching and non-matching books.
+    fn search_fixture() -> Vec<Book> {
+        vec![
+            search_test_book("t1", "The Great Gatsby", "F. Scott Fitzgerald", 100),
+            search_test_book("a1", "Moby Dick", "Herman Melville", 200),
+            search_test_book("none1", "Unrelated Tome", "Someone Else", 300),
+        ]
+    }
+
+    #[tokio::test]
+    async fn search_matches_title_and_excludes_non_matches() {
+        let state = seeded_state_with_books(search_fixture());
+        let xml = body_string(call_search(&state, Some("Gatsby"), None).await).await;
+        assert!(xml.contains("urn:carrel:t1"));
+        assert!(!xml.contains("urn:carrel:a1"));
+        assert!(!xml.contains("urn:carrel:none1"));
+    }
+
+    #[tokio::test]
+    async fn search_matches_author_and_excludes_non_matches() {
+        let state = seeded_state_with_books(search_fixture());
+        let xml = body_string(call_search(&state, Some("Melville"), None).await).await;
+        assert!(xml.contains("urn:carrel:a1"));
+        assert!(!xml.contains("urn:carrel:t1"));
+        assert!(!xml.contains("urn:carrel:none1"));
+    }
+
+    #[tokio::test]
+    async fn search_folds_unicode_case_via_carrel_lower() {
+        // SQLite's built-in LOWER() is ASCII-only, so a query that only
+        // worked via `carrel_lower` (Unicode-aware) pins the module's whole
+        // reason for existing — `LOWER('É')` stays `'É'` and would not match
+        // a lowercase query.
+        let books = vec![
+            search_test_book("u1", "Éducation sentimentale", "Gustave Flaubert", 100),
+            search_test_book("u2", "Der Steppenwolf", "Hermann Süskind", 200),
+        ];
+        let state = seeded_state_with_books(books);
+        let xml = body_string(call_search(&state, Some("éducation"), None).await).await;
+        assert!(xml.contains("urn:carrel:u1"));
+        assert!(!xml.contains("urn:carrel:u2"));
+    }
+
+    #[tokio::test]
+    async fn search_absent_or_empty_q_returns_whole_library() {
+        let state = seeded_state_with_books(search_fixture());
+
+        let xml_absent = body_string(call_search(&state, None, None).await).await;
+        for id in ["t1", "a1", "none1"] {
+            assert!(
+                xml_absent.contains(&format!("urn:carrel:{id}")),
+                "absent q must return the whole library, missing {id}"
+            );
+        }
+
+        let xml_empty = body_string(call_search(&state, Some(""), None).await).await;
+        for id in ["t1", "a1", "none1"] {
+            assert!(
+                xml_empty.contains(&format!("urn:carrel:{id}")),
+                "empty q must return the whole library, missing {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_sets_etag_and_returns_304_on_match() {
+        let state = seeded_state_with_books(search_fixture());
+
+        let resp = call_search(&state, Some("Gatsby"), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = response_etag(&resp).expect("200 must carry ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        let resp = search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(Some("Gatsby"), None)),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response_etag(&resp).as_deref(), Some(etag.as_str()));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "304 must have empty body");
+    }
+
+    #[tokio::test]
+    async fn search_etag_changes_when_matching_set_changes() {
+        let state = seeded_state_with_books(search_fixture());
+
+        let resp = call_search(&state, Some("Gatsby"), None).await;
+        let etag = response_etag(&resp).unwrap();
+
+        // Add a second book that also matches the same search term — the
+        // filtered set this feed's ETag covers has changed even though
+        // neither existing row's own timestamp did.
+        crate::db::insert_book(
+            &state.conn().unwrap(),
+            &search_test_book("t2", "Gatsby Revisited", "Someone New", 400),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.parse().unwrap());
+        let resp = search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(Some("Gatsby"), None)),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "stale tag must re-send");
+        assert_ne!(response_etag(&resp).unwrap(), etag);
+    }
+
+    /// How `page` deserializes is only reachable through the extractor, and
+    /// every other test here hand-builds `SearchQuery`, so this is the one
+    /// place the wire behaviour of the new parameter is pinned.
+    ///
+    /// Before this milestone `SearchQuery` had no `page` field at all, so
+    /// axum ignored a stray `page=` entirely and the feed served 200. A bare
+    /// `Option<usize>` would instead reject the whole request, which is the
+    /// trap `api.rs`'s `BookQuery` documents on its `want_to_read` field:
+    /// axum's `Query` extraction is all-or-nothing, so one malformed value a
+    /// proxy or client appended takes the catalog down with it.
+    ///
+    /// One case this does *not* rescue, pinned below so nobody assumes
+    /// otherwise: a **repeated** `?page=1&page=2` is still rejected, because
+    /// serde's derive reports a duplicate field before any of this runs. That
+    /// matches how a repeated `?q=` has always behaved here, so the endpoint
+    /// has never tolerated duplicated parameters — widening `page` alone
+    /// would only make the two inconsistent.
+    #[test]
+    fn search_query_tolerates_a_malformed_page() {
+        use axum::extract::Query as AxumQ;
+
+        for (uri, expected) in [
+            ("/opds/search?q=x", None),
+            ("/opds/search?q=x&page=2", Some(2)),
+            // Each of these would 400 the whole feed with a bare Option<usize>.
+            ("/opds/search?q=x&page=", None),
+            ("/opds/search?q=x&page=abc", None),
+            ("/opds/search?q=x&page=-1", None),
+        ] {
+            let parsed: AxumQ<SearchQuery> = AxumQ::try_from_uri(&uri.parse().unwrap())
+                .unwrap_or_else(|e| panic!("{uri} must not be rejected: {e:?}"));
+            assert_eq!(parsed.0.q.as_deref(), Some("x"), "{uri}");
+            assert_eq!(parsed.0.page(), expected.unwrap_or(0), "{uri}");
+        }
+
+        // A repeated parameter is still rejected — serde's derive reports the
+        // duplicate field before the lenient parse gets a look in. Pinned
+        // because the field's doc comment claims leniency, and this is the
+        // edge that claim does not cover. A repeated `q` behaves the same way
+        // and always has, so the endpoint is at least consistent.
+        for uri in ["/opds/search?q=x&page=1&page=2", "/opds/search?q=x&q=y"] {
+            let parsed: Result<AxumQ<SearchQuery>, _> = AxumQ::try_from_uri(&uri.parse().unwrap());
+            assert!(parsed.is_err(), "{uri} is expected to be rejected");
+        }
+    }
+
+    /// The design decision behind this feed's ETag is that the tag covers the
+    /// whole *filtered* set — not the whole library, and not the page. Both
+    /// wrong implementations pass `search_etag_changes_when_matching_set_changes`,
+    /// because adding a matching book changes all three. These two assertions
+    /// are what actually separate them:
+    ///   * a non-matching book changing must NOT move the tag (rules out
+    ///     hashing every pair in the library), and
+    ///   * two pages of one search must share a tag (rules out a per-page
+    ///     tag, which would serve a stale page 2 after a deletion on page 1).
+    #[tokio::test]
+    async fn search_etag_covers_the_filtered_set_not_the_library_or_the_page() {
+        let mut books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        books.push(search_test_book("other", "Unrelated", "Nobody", 900));
+        let state = seeded_state_with_books(books);
+
+        let page0 = call_search(&state, Some("Matched"), None).await;
+        let tag0 = response_etag(&page0).expect("search must set an ETag");
+        let page1 = call_search(&state, Some("Matched"), Some(1)).await;
+        let tag1 = response_etag(&page1).expect("search must set an ETag");
+        assert_eq!(
+            tag0, tag1,
+            "one search's pages must share a tag — a per-page tag cannot see a \
+             shift caused by a deletion on an earlier page"
+        );
+
+        // Touch only the book that does not match the term.
+        {
+            let conn = state.conn().unwrap();
+            carrel_core::db::set_want_to_read(&conn, "other", true).unwrap();
+        }
+        let after = call_search(&state, Some("Matched"), None).await;
+        assert_eq!(
+            response_etag(&after).as_deref(),
+            Some(tag0.as_str()),
+            "a change to a book outside the filtered set must not move the tag"
+        );
+
+        // ...but editing a book that IS in the set must move it. Without this
+        // the whole suite passes against a tag that ignores `pairs` and hashes
+        // only the id list, which would serve a stale feed forever after an
+        // in-place title edit.
+        {
+            let conn = state.conn().unwrap();
+            carrel_core::db::set_want_to_read(&conn, "m00", true).unwrap();
+        }
+        let edited = call_search(&state, Some("Matched"), None).await;
+        assert_ne!(
+            response_etag(&edited).as_deref(),
+            Some(tag0.as_str()),
+            "editing a book inside the filtered set must move the tag"
+        );
+    }
+
+    /// `page` is caller-supplied and parsed leniently, so a value large
+    /// enough to overflow `page * OPDS_PAGE_SIZE` is reachable from the wire.
+    /// Unsaturated that multiply panics in debug — a 500 with no
+    /// `CatchPanicLayer` in front of it — and wraps in release, where
+    /// `start + OPDS_PAGE_SIZE` then wraps back near zero and advertises a
+    /// `next` link to page 0. Neither shows up in the other paging tests.
+    #[tokio::test]
+    async fn search_page_at_usize_max_is_empty_and_does_not_link_onward() {
+        let books: Vec<Book> = (0..3)
+            .map(|i| search_test_book(&format!("m{i}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let xml = body_string(call_search(&state, Some("Matched"), Some(usize::MAX)).await).await;
+        assert!(!xml.contains("<entry>"), "must be empty: {xml}");
+        assert!(
+            !xml.contains(r#"rel="next""#),
+            "must not link onward: {xml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page_beyond_the_last_is_an_empty_feed_with_no_next() {
+        let books: Vec<Book> = (0..3)
+            .map(|i| search_test_book(&format!("m{i}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let xml = body_string(call_search(&state, Some("Matched"), Some(5)).await).await;
+        assert!(
+            !xml.contains("<entry>"),
+            "page past the end must be empty: {xml}"
+        );
+        assert!(
+            !xml.contains(r#"rel="next""#),
+            "no next past the end: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<link rel="self" href="/opds/search?q=Matched&amp;page=5""#),
+            "self href must still name the requested page: {xml}"
+        );
+    }
+
+    /// The boundary `has_next` gets wrong if it is written `<=` rather than
+    /// `<`: exactly one full page and nothing after it must not advertise a
+    /// next link to an empty page. The 51-book test cannot catch that.
+    #[tokio::test]
+    async fn search_exactly_one_full_page_has_no_next_link() {
+        let books: Vec<Book> = (0..OPDS_PAGE_SIZE)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let xml = body_string(call_search(&state, Some("Matched"), None).await).await;
+        assert_eq!(
+            xml.matches("<entry>").count(),
+            OPDS_PAGE_SIZE,
+            "the page should be full"
+        );
+        assert!(
+            !xml.contains(r#"rel="next""#),
+            "exactly one full page must not link to an empty next page: {xml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_self_href_omits_page_at_page_zero() {
+        let state = seeded_state_with_books(search_fixture());
+        let xml = body_string(call_search(&state, Some("Gatsby"), None).await).await;
+        assert!(
+            xml.contains(r#"<link rel="self" href="/opds/search?q=Gatsby" type=""#),
+            "self href must omit page at page 0, got: {xml}"
+        );
+        assert!(!xml.contains("q=Gatsby&amp;page=0"));
+    }
+
+    /// The paged hrefs carry two query params, so they contain a literal `&`
+    /// inside a double-quoted XML attribute — and `wrap_feed` interpolates
+    /// `self_href`/`next_href` raw, with no escaping of its own. A raw `&`
+    /// there opens an entity reference that never terminates, which every
+    /// `contains(...)` assertion in this module would happily pass.
+    ///
+    /// Note that merely reading the events is *not* enough: quick-xml's
+    /// reader tolerates an unescaped `&` in an attribute value and only
+    /// reports it when the value is normalized. Verified by dropping the
+    /// escape and watching an event-only version of this test still pass. So
+    /// normalize every attribute — that is what makes this discriminating.
+    #[tokio::test]
+    async fn search_paged_feed_attributes_normalize_cleanly() {
+        use quick_xml::events::Event;
+
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        for page in [None, Some(1)] {
+            let xml = body_string(call_search(&state, Some("Matched"), page).await).await;
+            let mut reader = quick_xml::Reader::from_str(&xml);
+            let mut checked = 0usize;
+            loop {
+                match reader.read_event() {
+                    Ok(Event::Eof) => break,
+                    Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                        for attr in e.attributes() {
+                            let attr = attr.unwrap_or_else(|err| {
+                                panic!("page {page:?}: bad attribute: {err}")
+                            });
+                            attr.normalized_value(quick_xml::XmlVersion::Explicit1_0)
+                                .unwrap_or_else(|err| {
+                                    panic!(
+                                        "page {page:?}: attribute {:?} does not normalize: {err}\n{xml}",
+                                        String::from_utf8_lossy(attr.key.as_ref())
+                                    )
+                                });
+                            checked += 1;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("page {page:?} produced ill-formed XML: {e}\n{xml}"),
+                }
+            }
+            assert!(checked > 0, "page {page:?}: parsed no attributes at all");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_next_link_present_on_full_page_absent_on_last() {
+        // 51 matching books: page 0 is full (50) and has a next link; page 1
+        // (the last, 1 book) has none.
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let xml_first = body_string(call_search(&state, Some("Matched"), None).await).await;
+        assert!(
+            xml_first.contains(r#"<link rel="next" href="/opds/search?q=Matched&amp;page=1""#),
+            "full page must carry a next link, got: {xml_first}"
+        );
+
+        let xml_last = body_string(call_search(&state, Some("Matched"), Some(1)).await).await;
+        assert!(
+            !xml_last.contains(r#"rel="next""#),
+            "last page must have no next link, got: {xml_last}"
+        );
+    }
+
+    /// Behaviour change 1: `db::list_books`'s old `added_at DESC` order had
+    /// no tie-break; `BookSort::DateAdded` appends `id`. Several books
+    /// sharing one `added_at` must therefore now get a stable order that
+    /// neither repeats nor skips a book across pages.
+    #[tokio::test]
+    async fn search_paging_over_tied_added_at_is_stable_no_repeat_no_skip() {
+        // 51 matching books, ALL sharing the same added_at — without the
+        // `id` tie-break this order (and therefore the paging split) would
+        // be undefined between calls. Inserted in DESCENDING id order
+        // (deliberately the opposite of the expected ascending-id result) so
+        // this discriminates against a query that just falls back to
+        // insertion/rowid order rather than actually sorting by id: with no
+        // tie-break, page 0 would come back highest-id-first (m50..m01) and
+        // every assertion below would fail.
+        let books: Vec<Book> = (0..51)
+            .rev()
+            .map(|i| search_test_book(&format!("m{i:02}"), "Tied Title", "Author", 1000))
+            .collect();
+        let expected_order: Vec<String> = {
+            let mut ids: Vec<String> = (0..51).map(|i| format!("m{i:02}")).collect();
+            ids.sort();
+            ids
+        };
+        let state = seeded_state_with_books(books);
+
+        let xml_p0 = body_string(call_search(&state, Some("Tied"), None).await).await;
+        let xml_p1 = body_string(call_search(&state, Some("Tied"), Some(1)).await).await;
+
+        let page0_ids = &expected_order[0..50];
+        let page1_ids = &expected_order[50..51];
+        for id in page0_ids {
+            assert!(
+                xml_p0.contains(&format!("urn:carrel:{id}")),
+                "page 0 missing {id}"
+            );
+            assert!(
+                !xml_p1.contains(&format!("urn:carrel:{id}")),
+                "page 1 must not repeat {id}"
+            );
+        }
+        for id in page1_ids {
+            assert!(
+                xml_p1.contains(&format!("urn:carrel:{id}")),
+                "page 1 missing {id}"
+            );
+            assert!(
+                !xml_p0.contains(&format!("urn:carrel:{id}")),
+                "page 0 must not have {id} — no book may be skipped or duplicated"
+            );
+        }
     }
 
     #[tokio::test]

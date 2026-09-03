@@ -108,7 +108,7 @@ Bodies and responses are **camelCase** (matching the `Highlight` model's seriali
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/collections` | List all collections |
-| GET | `/api/collections/:id/books` | Books in a collection |
+| GET | `/api/collections/:id/books` | Books in a collection. Supports `?q=` (matches title or author, case/accent-insensitive) and `?want_to_read=true` (presence-only, same convention as `/api/books`), applied server-side for both manual and automated collections. Unpaginated, and ordering is unaffected by these filters — a manual collection stays ordered by when each book was added to it. |
 
 ### Profiles
 
@@ -157,7 +157,7 @@ Compatible with KOReader, Calibre, Moon+ Reader, and other OPDS clients.
 | GET `/opds/all` | All books (paginated, 50 per page, `?page=N`) |
 | GET `/opds/new` | 25 most recently added books |
 | GET `/opds/collections/:id` | Books in a collection |
-| GET `/opds/search?q=term` | Search by title or author |
+| GET `/opds/search?q=term` | Search by title or author (paginated, 50 per page, `?page=N`; an invalid `page` is ignored rather than rejected) |
 
 OPDS feeds use Atom XML. Pagination uses `rel="next"` links.
 

@@ -5,7 +5,32 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
+  in SQL for both manual and automated (rule-based) collections. The web UI's
+  collection view uses them, so searching or filtering inside a collection now
+  transfers only the matching books rather than the whole collection and
+  filtering it in the browser. Results and ordering are unchanged — a manual
+  collection stays in the order books were added to it — and the endpoint
+  remains unpaginated.
+- **The OPDS search feed (`/opds/search`) is now paged and conditionally
+  cacheable**, matching the other catalog feeds: results beyond the first 50
+  now require following the feed's `next` link rather than arriving in one
+  unbounded response, and the feed now sends a weak `ETag` and honours
+  `If-None-Match` with a `304 Not Modified`. An absent or empty search term
+  still returns the whole library, just across however many pages that now
+  takes.
+
 ### Fixed
+- **An automated collection that mixed a tag rule with a metadata rule showed
+  the wrong books.** A rule set like "series is Dune" plus "tag contains
+  scifi" compared each rule's value against the other rule's field, so the
+  collection could come out empty or list books matching neither rule. It
+  needed the two rule kinds in that order, which is why most automated
+  collections were unaffected. The rule builder's live preview count was wrong
+  in the same way, so it agreed with the faulty collection rather than
+  revealing it. Existing collections need no action — the rules were always
+  stored correctly, only the query built from them was wrong.
 - **The web reader no longer re-opens the book file on every chapter turn.**
   Chapter reads for EPUB and MOBI now go through one module in `carrel-core`
   (`reader::chapter_html`) that both the desktop app and the embedded web

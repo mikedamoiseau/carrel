@@ -92,7 +92,7 @@ is a "function not found" error.
 
 | Permission | Functions | Consent shows as |
 |-----------|-----------|------------------|
-| `read:library` | `get_book(id)` → book map or `()`; `find_books(query)` → array (max 50) | Read your book metadata |
+| `read:library` | `get_book(id)` → book map or `()`; `find_books(query)` → array (max 50, newest first, ties broken by book id) | Read your book metadata |
 | `read:highlights` | `get_highlights(book_id)` → array of highlight maps | Read your highlights and notes |
 | `write:tags` | `add_tag(book_id, tag)`; `remove_tag(book_id, tag)` | Add and remove book tags |
 | `write:files` | `write_file(rel, text)`; `append_file(rel, text)` — relative to a folder you pick at enable time | Write files to a folder you choose |

@@ -1,5 +1,7 @@
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::Value;
 use rusqlite::{params, Connection, Result};
 use std::path::Path;
 use std::time::Duration;
@@ -784,6 +786,337 @@ pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_to_grid_item)?;
+    rows.collect()
+}
+
+// --- Query module: filter/sort/page a library in one place -----------------
+//
+// The predicate "case-insensitively match title or author" used to be written
+// out separately for the web API, the OPDS feed, the plugin host, and the web
+// UI's collection view, and every server-side copy loaded the whole `books`
+// table to filter it in the host language. `query_books_grid`/`query_books`
+// compile the same filter+sort+page request to SQL instead, so it runs once,
+// in the database, regardless of caller.
+//
+// Callers: `api.rs::list_books`, `opds_feed.rs::search_books`,
+// `plugins/runtime.rs`'s `find_books`, and — through
+// `query_books_in_collection_grid` below — `api.rs::get_collection_books`.
+//
+// No server-side copy remains. Three client-side ones do, all in the React
+// desktop app and none of them reachable from here: `Library.tsx` filters an
+// already-loaded grid and derives tag facet counts from the result, which is
+// why it was left alone deliberately; `BookPickerModal.tsx` filters a list the
+// modal was handed; and `lib/utils.ts`'s `filterBooks` is imported by nothing
+// but its own test.
+
+/// Sort order for [`query_books_grid`]/[`query_books`]. A closed enum (not a
+/// caller-supplied string) so the `ORDER BY` fragment is always chosen from a
+/// fixed, safe set — never built from user input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BookSort {
+    #[default]
+    DateAdded,
+    Title,
+    Author,
+    Rating,
+    LastRead,
+}
+
+/// Filter/sort/page parameters shared by [`query_books_grid`] and
+/// [`query_books`]. An empty string in `q` or `series` is equivalent to
+/// `None` — both mean "no filter".
+#[derive(Debug, Clone, Default)]
+pub struct BookQuery {
+    pub q: Option<String>,
+    pub series: Option<String>,
+    pub want_to_read: bool,
+    pub sort: BookSort,
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+/// One page of results plus the total row count after filtering (before
+/// `limit`/`offset` are applied).
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+}
+
+/// Registers the `carrel_lower(text)` scalar UDF used by the `q`/sort
+/// machinery below. SQLite's built-in `LOWER()` and `LIKE` are ASCII-only,
+/// so `LOWER('É')` stays `'É'` — a naive translation of the Rust predicate
+/// this replaces (`str::to_lowercase().contains(...)`, which *is*
+/// Unicode-aware) would silently stop matching accented titles/authors.
+/// `carrel_lower` calls Rust's `to_lowercase()` instead, so the two agree.
+///
+/// Registered here, on the `&Connection` the query actually runs on, rather
+/// than in `create_pool` or `init_db` — there are two connection-creation
+/// paths plus direct `Connection::open`/`open_in_memory` calls in tests, and
+/// registering at the use site means the function is present by
+/// construction rather than by remembering to wire it up everywhere a
+/// connection is made. Re-registering on every query is safe — SQLite
+/// replaces the definition in place — and costs one closure box per call,
+/// which is nothing beside the query it precedes. (rusqlite documents only
+/// that a registration lasts until the connection closes or `remove_function`
+/// is called; it says nothing about replacement being free, so don't claim it
+/// is.)
+fn register_carrel_lower(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "carrel_lower",
+        1,
+        FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let text: String = ctx.get(0)?;
+            Ok(text.to_lowercase())
+        },
+    )
+}
+
+/// Builds the `WHERE` fragment and its bound parameters shared by
+/// `query_books_grid` and `query_books`. `q` and `series` are always bound
+/// parameters, never interpolated — only the fixed set of column/operator
+/// fragments chosen here ever becomes part of the SQL text.
+///
+/// `q` matches title-or-author via SQLite's `instr()` rather than `LIKE`, so
+/// a `q` containing `%` or `_` is treated as a literal substring — exactly
+/// like Rust's `str::contains`, with no LIKE wildcard escaping needed.
+/// `series` is exact equality; SQL equality against a NULL column evaluates
+/// to NULL (falsy), so a book with no series never matches a non-empty
+/// filter without any special-casing.
+fn build_book_predicate(query: &BookQuery) -> (Vec<String>, Vec<Value>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if let Some(needle) = query.q.as_deref().filter(|s| !s.is_empty()) {
+        clauses.push(
+            "(instr(carrel_lower(b.title), carrel_lower(?)) > 0 \
+              OR instr(carrel_lower(b.author), carrel_lower(?)) > 0)"
+                .to_string(),
+        );
+        params.push(Value::Text(needle.to_string()));
+        params.push(Value::Text(needle.to_string()));
+    }
+
+    if let Some(series) = query.series.as_deref().filter(|s| !s.is_empty()) {
+        clauses.push("b.series = ?".to_string());
+        params.push(Value::Text(series.to_string()));
+    }
+
+    if query.want_to_read {
+        // `!= 0`, not `= 1`, so this agrees with `row_to_grid_item`/`row_to_book`,
+        // which map any non-zero value to `true`. A `= 1` predicate would hide a
+        // row that the same query's own mapper would report as wanted.
+        clauses.push("b.want_to_read != 0".to_string());
+    }
+
+    (clauses, params)
+}
+
+/// `WHERE ...` for a clause list, or an empty string for none. Kept separate
+/// from [`build_book_predicate`] so a caller that has to AND these onto a
+/// `WHERE` it already built can take the clauses and join them itself, rather
+/// than stripping the keyword back off an assembled string — that string
+/// surgery silently produced *no filter at all* if the shape ever changed.
+fn where_clause(clauses: &[String]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    }
+}
+
+/// `ORDER BY` fragment for each [`BookSort`] variant, `id` appended as a
+/// final tie-break in every case. `added_at`/rating/last-read all have
+/// second-granularity (or coarser) ties — concurrent imports, unrated books,
+/// never-opened books — and without a unique tiebreaker, offset pagination
+/// can slice a book onto two pages or skip it entirely depending on how ties
+/// happen to resolve between two calls (mirrors the "Fix D" comment on
+/// `list_books_grid` above, and `resolveSeriesNav` in the web UI's `app.js`,
+/// which appends the same tie-break to make its own ordering total, though
+/// for stable row order rather than for paging). This is the only
+/// remaining home for that rationale on the server side — the `api.rs` sort
+/// block that used to carry it is gone.
+fn book_sort_order_sql(sort: BookSort) -> &'static str {
+    match sort {
+        BookSort::DateAdded => "b.added_at DESC, b.id",
+        BookSort::Title => "carrel_lower(b.title) ASC, b.id",
+        BookSort::Author => "carrel_lower(b.author) ASC, b.id",
+        BookSort::Rating => "COALESCE(b.rating, 0) DESC, b.id",
+        BookSort::LastRead => "COALESCE(rp.last_read_at, 0) DESC, b.id",
+    }
+}
+
+/// Shared implementation behind `query_books_grid` and `query_books`: builds
+/// one dynamic SQL query from `q` (predicate, sort, `LIMIT`/`OFFSET`) and maps
+/// rows with whichever mapper/column list the caller wants. The `LEFT JOIN`
+/// to `reading_progress` is always present (needed for `BookSort::LastRead`)
+/// but never changes row cardinality — `reading_progress.book_id` is a
+/// primary key, so each book joins at most one progress row.
+fn query_books_generic<T>(
+    conn: &Connection,
+    query: &BookQuery,
+    columns: &str,
+    row_mapper: fn(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Result<Page<T>> {
+    register_carrel_lower(conn)?;
+
+    let (predicate_clauses, where_params) = build_book_predicate(query);
+    let where_sql = where_clause(&predicate_clauses);
+    let from_join = "FROM books b LEFT JOIN reading_progress rp ON rp.book_id = b.id";
+
+    // An unpaginated query from the start already returns every matching row,
+    // so its own row count *is* the total and a second scan would just compute
+    // it again. That is not hypothetical: `opds_feed::search_books` asks for
+    // the whole filtered set and discards `total` entirely, and every request
+    // was paying for a duplicate filtered scan — with the `carrel_lower` UDF
+    // called per row — to produce a number nobody read.
+    //
+    // The shortcut needs `offset == 0` as well as no `limit`. With an offset
+    // the returned rows are only the tail, and an offset past the end returns
+    // nothing at all, which would report a total of zero for a non-empty set.
+    let counted_total: Option<i64> = if query.limit.is_none() && query.offset == 0 {
+        None
+    } else {
+        let count_sql = format!("SELECT COUNT(*) {from_join} {where_sql}");
+        Some(conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(where_params.iter()),
+            |row| row.get(0),
+        )?)
+    };
+
+    let order_sql = book_sort_order_sql(query.sort);
+    let mut page_params = where_params;
+    // Saturate rather than cast: `usize as i64` WRAPS on a value above
+    // i64::MAX, and a negative OFFSET is silently clamped to 0 by SQLite, so
+    // a wrapped offset would return the first page instead of the empty one
+    // the caller asked for. Saturating to i64::MAX keeps "past the end"
+    // meaning past the end. (A saturated LIMIT is harmless either way — both
+    // i64::MAX and the true value return every remaining row.)
+    let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
+    let limit_sql = match query.limit {
+        Some(limit) => {
+            page_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+            page_params.push(Value::Integer(offset));
+            "LIMIT ? OFFSET ?"
+        }
+        None => {
+            // SQLite treats a negative LIMIT as "no limit", which lets
+            // OFFSET keep working with no `limit` given.
+            page_params.push(Value::Integer(offset));
+            "LIMIT -1 OFFSET ?"
+        }
+    };
+
+    let sql = format!("SELECT {columns} {from_join} {where_sql} ORDER BY {order_sql} {limit_sql}");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(page_params.iter()), row_mapper)?;
+    let items = rows.collect::<Result<Vec<T>>>()?;
+
+    let total = match counted_total {
+        Some(total) => total as usize,
+        None => items.len(),
+    };
+    Ok(Page { items, total })
+}
+
+/// Grid-projection counterpart of [`query_books`] — filters, sorts, and
+/// pages the `books` table in SQL and returns [`BookGridItem`] rows plus the
+/// filtered total. See the module comment above for why this exists.
+pub fn query_books_grid(conn: &Connection, query: &BookQuery) -> Result<Page<BookGridItem>> {
+    query_books_generic(conn, query, GRID_COLUMNS_B, row_to_grid_item)
+}
+
+/// Full-`Book`-projection counterpart of [`query_books_grid`] — same filter,
+/// sort, and paging semantics, for callers that need the full record.
+pub fn query_books(conn: &Connection, query: &BookQuery) -> Result<Page<Book>> {
+    query_books_generic(conn, query, BOOK_COLUMNS_B, row_to_book)
+}
+
+/// [`get_books_in_collection_grid`] with `query`'s `q`/`series`/`want_to_read`
+/// predicate ANDed into whichever branch (manual membership, or an
+/// automated collection's rule query) that function already uses — the same
+/// `build_book_predicate` every other query-module entry point shares,
+/// rather than a second copy of it.
+///
+/// `query.sort`, `query.limit` and `query.offset` are deliberately **not**
+/// honoured: a manual collection orders by `bc.added_at DESC` (the order
+/// books were added to the collection), which `BookSort` cannot express —
+/// running it through `book_sort_order_sql` would silently reorder every
+/// manual collection. So both branches keep their existing `ORDER BY`
+/// byte-for-byte, and this returns a plain `Vec` rather than a `Page`: there
+/// is no paging here to report a total for. Collections are deliberately
+/// unpaginated (see `app.js`'s `loadBooks`, which cites the same decision).
+pub fn query_books_in_collection_grid(
+    conn: &Connection,
+    collection_id: &str,
+    query: &BookQuery,
+) -> Result<Vec<BookGridItem>> {
+    register_carrel_lower(conn)?;
+
+    let mut type_stmt = conn.prepare("SELECT type FROM collections WHERE id = ?1")?;
+    let coll_type: String = type_stmt.query_row(params![collection_id], |row| row.get(0))?;
+
+    // Clauses, not an assembled `WHERE` — each branch below already has a
+    // `WHERE` of its own (or, for a rule-less automated collection, none) and
+    // needs to AND onto it.
+    let (predicate_clauses, predicate_params) = build_book_predicate(query);
+    let predicate_and = if predicate_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", predicate_clauses.join(" AND "))
+    };
+
+    if coll_type == "manual" {
+        let sql = format!(
+            "SELECT {cols} FROM books b JOIN book_collections bc ON bc.book_id = b.id \
+             WHERE bc.collection_id = ?{predicate_and} ORDER BY bc.added_at DESC",
+            cols = GRID_COLUMNS_B
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound_params: Vec<Value> = vec![Value::Text(collection_id.to_string())];
+        bound_params.extend(predicate_params);
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(bound_params.iter()),
+            row_to_grid_item,
+        )?;
+        return rows.collect();
+    }
+
+    let rules = get_collection_rules(conn, collection_id)?;
+    let (joins, where_str, rule_params) = build_rule_query(&rules);
+
+    // A rule-less automated collection has no `WHERE` of its own, so the
+    // predicate becomes the whole clause; otherwise it is ANDed on.
+    let combined_where = if where_str.is_empty() {
+        where_clause(&predicate_clauses)
+    } else {
+        format!("{where_str}{predicate_and}")
+    };
+
+    let sql = format!(
+        "SELECT DISTINCT {cols}
+         FROM books b
+         {joins}
+         {combined_where}
+         ORDER BY b.added_at DESC",
+        cols = GRID_COLUMNS_B
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    // Positional parameters, in SQL text order: `build_rule_query` returns its
+    // own params joins-first then wheres (it emits some rules into `joins`
+    // and others into `where_str`, and every join placeholder precedes every
+    // where placeholder), and this function's own predicate placeholders are
+    // textually last — they sit at the end of `combined_where`, which follows
+    // `{joins}`. So rule params first, predicate params second.
+    let mut bound_params: Vec<Value> = rule_params.into_iter().map(Value::Text).collect();
+    bound_params.extend(predicate_params);
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(bound_params.iter()),
+        row_to_grid_item,
+    )?;
     rows.collect()
 }
 
@@ -2462,7 +2795,15 @@ pub fn get_books_in_collection_grid(
 fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
     let mut join_clauses: Vec<String> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
-    let mut param_values: Vec<String> = Vec::new();
+    // Two lists, concatenated joins-first at the end. Bound parameters are
+    // positional and this function emits `{joins} {where_str}`, so every
+    // placeholder inside a JOIN precedes every placeholder inside the WHERE.
+    // One flat list pushed in *rule* order does not respect that: a `tag` rule
+    // is the only kind that puts a parameter in a JOIN, so a field rule
+    // followed by a tag rule used to bind each one's value to the other's
+    // comparison — silently returning the wrong books.
+    let mut join_params: Vec<String> = Vec::new();
+    let mut where_params: Vec<String> = Vec::new();
     let mut rp_idx: u32 = 0;
     let mut tag_idx: u32 = 0;
 
@@ -2470,49 +2811,49 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
         match (rule.field.as_str(), rule.operator.as_str()) {
             ("author", "contains") => {
                 where_clauses.push("b.author LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("author", "equals") => {
                 where_clauses.push("b.author = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("filename", "contains") => {
                 where_clauses.push("b.title LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("series", "contains") => {
                 where_clauses.push("b.series LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("series", "equals") => {
                 where_clauses.push("b.series = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("language", "equals") => {
                 where_clauses.push("b.language = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("language", "contains") => {
                 where_clauses.push("b.language LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("publisher", "contains") => {
                 where_clauses.push("b.publisher LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("description", "contains") => {
                 where_clauses.push("b.description LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("format", "equals") => {
                 where_clauses.push("b.format = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("date_added", "last_n_days") => {
                 where_clauses.push(
                     "b.added_at > (strftime('%s', 'now') - CAST(? AS INTEGER) * 86400)".to_string(),
                 );
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("tag", "contains") => {
                 tag_idx += 1;
@@ -2522,7 +2863,7 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
                     "JOIN book_tags {bt} ON {bt}.book_id = b.id \
                      JOIN tags {tt} ON {tt}.id = {bt}.tag_id AND {tt}.name LIKE ?"
                 ));
-                param_values.push(format!("%{}%", rule.value));
+                join_params.push(format!("%{}%", rule.value));
             }
             ("tag", "equals") => {
                 tag_idx += 1;
@@ -2532,7 +2873,7 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
                     "JOIN book_tags {bt} ON {bt}.book_id = b.id \
                      JOIN tags {tt} ON {tt}.id = {bt}.tag_id AND {tt}.name = ?"
                 ));
-                param_values.push(rule.value.clone());
+                join_params.push(rule.value.clone());
             }
             ("reading_progress", "equals") => {
                 rp_idx += 1;
@@ -2571,6 +2912,12 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
     } else {
         format!("WHERE {}", where_clauses.join(" AND "))
     };
+
+    // Joins first, matching the order their placeholders appear in the SQL the
+    // callers assemble. Callers bind this vector positionally and unchanged,
+    // so the ordering contract lives here rather than in each of them.
+    let mut param_values = join_params;
+    param_values.extend(where_params);
 
     (joins, where_str, param_values)
 }
@@ -6415,6 +6762,1203 @@ mod tests {
             row.book_title.as_deref(),
             Some("Test Book"),
             "title snapshot survives book deletion"
+        );
+    }
+
+    // --- M1: query_books / query_books_grid --------------------------------
+
+    /// Builds one fixture book for the query-module tests, overriding only
+    /// what each row needs on top of `sample_book`. `file_path` is derived
+    /// from `id` because `sample_book` hard-codes a single path and the
+    /// `books.file_path` column is UNIQUE.
+    fn qbook(
+        id: &str,
+        title: &str,
+        author: &str,
+        added_at: i64,
+        series: Option<&str>,
+        rating: Option<f64>,
+        want_to_read: bool,
+    ) -> Book {
+        Book {
+            file_path: format!("/tmp/{id}.epub"),
+            title: title.to_string(),
+            author: author.to_string(),
+            added_at,
+            series: series.map(str::to_string),
+            rating,
+            want_to_read,
+            ..sample_book(id)
+        }
+    }
+
+    /// Seeds the fixture shared by every `query_books`/`query_books_grid`
+    /// test: non-ASCII titles/authors, a three-way `added_at` tie (a1/a2/a3),
+    /// NULL rating (a1, a3) and NULL series (a1, b1), a mix of
+    /// `want_to_read` (a2, b2), and books with (a2, a3, b2) and without
+    /// (a1, b1) a `reading_progress` row.
+    fn seed_query_fixture(conn: &Connection) {
+        insert_book(
+            conn,
+            &qbook(
+                "a1",
+                "Éducation sentimentale",
+                "Gustave Flaubert",
+                100,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        insert_book(
+            conn,
+            &qbook(
+                "a2",
+                "Der Steppenwolf",
+                "Hermann Süskind",
+                100,
+                Some("Classics"),
+                Some(4.5),
+                true,
+            ),
+        )
+        .unwrap();
+        insert_book(
+            conn,
+            &qbook(
+                "a3",
+                "Das Parfum",
+                "Patrick Ünsal",
+                100,
+                Some("Classics"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        insert_book(
+            conn,
+            &qbook(
+                "b1",
+                "A Random Book",
+                "John Doe",
+                300,
+                None,
+                Some(5.0),
+                false,
+            ),
+        )
+        .unwrap();
+        insert_book(
+            conn,
+            &qbook(
+                "b2",
+                "Another One",
+                "Jane Roe",
+                50,
+                Some("Other"),
+                Some(3.0),
+                true,
+            ),
+        )
+        .unwrap();
+
+        // Reading progress: a2, a3, b2 have it; a1, b1 don't.
+        for (book_id, last_read_at) in [("a2", 500), ("a3", 900), ("b2", 200)] {
+            upsert_reading_progress(
+                conn,
+                &ReadingProgress {
+                    book_id: book_id.to_string(),
+                    chapter_index: 1,
+                    scroll_position: 0.0,
+                    last_read_at,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    fn ids(items: &[BookGridItem]) -> Vec<&str> {
+        items.iter().map(|b| b.id.as_str()).collect()
+    }
+
+    #[test]
+    fn query_books_grid_default_sort_is_date_added_desc_then_id() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(&conn, &BookQuery::default()).unwrap();
+
+        assert_eq!(page.total, 5);
+        assert_eq!(ids(&page.items), vec!["b1", "a1", "a2", "a3", "b2"]);
+    }
+
+    #[test]
+    fn query_books_grid_q_matches_unicode_case_insensitively() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        // Accented, lowercase needle: must match "Éducation sentimentale".
+        // A naive translation using SQLite's ASCII-only LOWER()/LIKE would
+        // fail here because LOWER('É') stays 'É', not 'é'.
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                q: Some("éducation".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&page.items), vec!["a1"]);
+        assert_eq!(page.total, 1);
+
+        // Plain-ASCII needle must NOT match — Rust's `.to_lowercase()` does
+        // not fold accents away, so "education" is not a substring of
+        // "éducation sentimentale".
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                q: Some("education".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 0);
+        assert!(page.items.is_empty());
+
+        // Author-side match, same accent-folding trap: "Süskind" / "Ünsal".
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                q: Some("süskind".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&page.items), vec!["a2"]);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                q: Some("ünsal".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&page.items), vec!["a3"]);
+    }
+
+    #[test]
+    fn query_books_grid_empty_q_and_series_mean_no_filter() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                q: Some(String::new()),
+                series: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 5);
+    }
+
+    #[test]
+    fn query_books_grid_series_filter_excludes_null_series() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                series: Some("Classics".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(ids(&page.items), vec!["a2", "a3"]);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                series: Some("Nonexistent".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 0);
+    }
+
+    #[test]
+    fn query_books_grid_want_to_read_filter() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(ids(&page.items), vec!["a2", "b2"]);
+    }
+
+    #[test]
+    fn query_books_grid_title_sort_orders_by_title_ascending() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Title,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&page.items),
+            vec!["b1", "b2", "a3", "a2", "a1"],
+            "lowercased title ascending: 'a random book' < 'another one' < \
+             'das parfum' < 'der steppenwolf' < 'éducation sentimentale'"
+        );
+    }
+
+    #[test]
+    fn query_books_grid_author_sort_orders_by_author_ascending() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Author,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // authors lowercased ascending: "gustave flaubert" (a1) <
+        // "hermann süskind" (a2) < "jane roe" (b2) < "john doe" (b1) <
+        // "patrick ünsal" (a3)
+        assert_eq!(ids(&page.items), vec!["a1", "a2", "b2", "b1", "a3"]);
+        // NOTE: this fixture's five authors differ at their first letter
+        // (g/h/j/j/p), so it pins the column and the direction but says
+        // nothing about case folding — the folding tests below do that.
+    }
+
+    /// Rows whose sort order *flips* depending on how the sort key is folded.
+    /// The point of the fixture is that a wrong folding cannot produce the
+    /// expected order by accident:
+    ///
+    /// | pair            | Rust `to_lowercase` | SQLite ASCII `LOWER()` | no folding |
+    /// |-----------------|---------------------|------------------------|------------|
+    /// | `Émile`/`école` | `école` first       | `Émile` first          | `Émile` first |
+    /// | `zebra`/`Zulu`  | `zebra` first       | `zebra` first          | `Zulu` first  |
+    ///
+    /// The first pair discriminates Unicode folding from SQLite's ASCII-only
+    /// `LOWER()` (which leaves `É` = U+00C9 alone, and U+00C9 sorts before
+    /// the U+00E9 that `école` already carries). The second discriminates
+    /// folding from no folding at all (`Z` = 0x5A sorts before `z` = 0x7A).
+    /// Together they fail against every wrong implementation of the sort key:
+    ///
+    /// | sort key            | resulting order          |
+    /// |---------------------|--------------------------|
+    /// | `carrel_lower`      | `f3, f4, f2, f1` (right) |
+    /// | ASCII `LOWER()`     | `f3, f4, f1, f2`         |
+    /// | raw column, no fold | `f4, f3, f1, f2`         |
+    ///
+    /// Both accented words lead with the byte 0xC3, which sorts after every
+    /// ASCII letter, so the two pairs never interleave.
+    fn seed_folding_fixture(conn: &Connection, on_author: bool) {
+        for (id, text) in [
+            ("f1", "Émile"),
+            ("f2", "école"),
+            ("f3", "zebra"),
+            ("f4", "Zulu"),
+        ] {
+            let (title, author) = if on_author {
+                ("Placeholder Title", text)
+            } else {
+                (text, "Placeholder Author")
+            };
+            insert_book(conn, &qbook(id, title, author, 100, None, None, false)).unwrap();
+        }
+    }
+
+    #[test]
+    fn query_books_grid_title_sort_folds_case_the_way_rust_does() {
+        let (_dir, conn) = setup();
+        seed_folding_fixture(&conn, false);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Title,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&page.items),
+            vec!["f3", "f4", "f2", "f1"],
+            "zebra < Zulu < école < Émile once folded the way Rust's to_lowercase() folds; SQLite's ASCII-only LOWER() would swap the last two, and no folding at all would also put Zulu first"
+        );
+    }
+
+    #[test]
+    fn query_books_grid_author_sort_folds_case_the_way_rust_does() {
+        let (_dir, conn) = setup();
+        seed_folding_fixture(&conn, true);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Author,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&page.items), vec!["f3", "f4", "f2", "f1"]);
+    }
+
+    #[test]
+    fn query_books_grid_rating_sort_treats_null_as_zero() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Rating,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // b1=5.0, a2=4.5, b2=3.0, then NULL-as-0 group (a1, a3) tie-broken by id.
+        assert_eq!(ids(&page.items), vec!["b1", "a2", "b2", "a1", "a3"]);
+    }
+
+    #[test]
+    fn query_books_grid_last_read_sort_uses_left_join() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::LastRead,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // a3=900, a2=500, b2=200, then no-progress group (a1, b1) treated as
+        // 0, tie-broken by id.
+        assert_eq!(ids(&page.items), vec!["a3", "a2", "b2", "a1", "b1"]);
+    }
+
+    #[test]
+    fn query_books_grid_limit_offset_pages_a_tie_without_gap_or_overlap() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        // Default sort ties a1/a2/a3 at added_at=100; a limit of 3 splits
+        // that tie group across the first and second page.
+        let page1 = query_books_grid(
+            &conn,
+            &BookQuery {
+                limit: Some(3),
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page2 = query_books_grid(
+            &conn,
+            &BookQuery {
+                limit: Some(3),
+                offset: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(page1.total, 5);
+        assert_eq!(page2.total, 5);
+        assert_eq!(ids(&page1.items), vec!["b1", "a1", "a2"]);
+        assert_eq!(ids(&page2.items), vec!["a3", "b2"]);
+
+        let mut all: Vec<&str> = ids(&page1.items);
+        all.extend(ids(&page2.items));
+        assert_eq!(all, vec!["b1", "a1", "a2", "a3", "b2"]);
+    }
+
+    /// `usize as i64` wraps above `i64::MAX`, and SQLite silently clamps a
+    /// negative OFFSET to zero — so without the saturating conversion an
+    /// offset far past the end returns the *first* page instead of nothing.
+    #[test]
+    fn query_books_grid_offset_above_i64_max_returns_empty_not_the_first_page() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                limit: Some(2),
+                offset: usize::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            page.items.is_empty(),
+            "offset past the end must return nothing, not wrap to page one"
+        );
+        assert_eq!(page.total, 5, "total still counts the whole filtered set");
+    }
+
+    /// An unpaginated query skips the `COUNT(*)` and reports `items.len()`
+    /// instead. That is only exact while `offset == 0`, so both halves are
+    /// pinned here: the shortcut must still report the *filtered* count rather
+    /// than the table size, and an offset past the end must not report zero
+    /// for a non-empty set.
+    #[test]
+    fn query_books_grid_total_is_exact_whether_or_not_the_count_is_skipped() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        // No limit, no offset — the skipped-count path. Two of five are wanted.
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(
+            page.total, 2,
+            "skipping the COUNT must still report the filtered count, not the table size"
+        );
+
+        // No limit but a non-zero offset — the count must still run, or the
+        // tail's length would be mistaken for the whole.
+        let tail = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tail.items.len(), 1, "one row of the two is skipped");
+        assert_eq!(tail.total, 2, "total is the filtered set, not the tail");
+
+        // An offset past the end returns nothing but still knows the total.
+        let past = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                offset: 99,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(past.items.is_empty());
+        assert_eq!(
+            past.total, 2,
+            "an empty tail must not report a total of zero"
+        );
+    }
+
+    #[test]
+    fn query_books_grid_total_reflects_filtered_count_not_page_or_table_size() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                limit: Some(1),
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(page.items.len(), 1, "page is capped by limit");
+        assert_eq!(
+            page.total, 2,
+            "total counts all want_to_read matches, not the page (1) or the full table (5)"
+        );
+    }
+
+    #[test]
+    fn query_books_agrees_with_query_books_grid_on_ids_and_order() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        let query = BookQuery {
+            sort: BookSort::LastRead,
+            ..Default::default()
+        };
+        let grid_page = query_books_grid(&conn, &query).unwrap();
+        let full_page = query_books(&conn, &query).unwrap();
+
+        assert_eq!(full_page.total, grid_page.total);
+        let grid_ids: Vec<&str> = grid_page.items.iter().map(|b| b.id.as_str()).collect();
+        let full_ids: Vec<&str> = full_page.items.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(full_ids, grid_ids);
+
+        // The two projections run the same query and differ only in their
+        // column list and row mapper, so agreeing on ids is a weak claim on
+        // its own. What it can still catch is BOOK_COLUMNS_B drifting out of
+        // step with `row_to_book` — the LEFT JOIN means a stray `SELECT *`
+        // or a missing alias would either fail to map or map the wrong
+        // column. Read a field only the full projection carries to pin that.
+        for book in &full_page.items {
+            assert_eq!(
+                book.file_path,
+                format!("/tmp/{}.epub", book.id),
+                "full projection mapped file_path onto the wrong row"
+            );
+        }
+        let wanted: Vec<bool> = full_page.items.iter().map(|b| b.want_to_read).collect();
+        let grid_wanted: Vec<bool> = grid_page.items.iter().map(|b| b.want_to_read).collect();
+        assert_eq!(wanted, grid_wanted, "projections disagree on want_to_read");
+    }
+
+    #[test]
+    fn query_books_grid_works_on_bare_in_memory_connection_with_no_pool_or_helper() {
+        // Proves the `carrel_lower` UDF is registered by `query_books_grid`
+        // itself, on the connection it's given, rather than by any pool or
+        // init-time wiring — this uses neither `create_pool` nor the
+        // `init_db`/`setup` test helper, only a bare in-memory connection
+        // with the schema applied directly.
+        let conn = Connection::open_in_memory().unwrap();
+        run_schema(&conn).unwrap();
+
+        insert_book(
+            &conn,
+            &qbook(
+                "x1",
+                "Éducation sentimentale",
+                "Gustave Flaubert",
+                1,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                q: Some("éducation".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(ids(&page.items), vec!["x1"]);
+    }
+
+    // --- M6: build_rule_query parameter ordering ----------------------------
+
+    /// Three books that tell a correct `[series equals "Dune", tag contains
+    /// "scifi"]` match apart from a mis-bound one: `{prefix}-both` matches both
+    /// rules, `{prefix}-series` only the series, `{prefix}-tag` only the tag.
+    /// Swap the two parameters and the rules become `series = "%scifi%"` and
+    /// `tag LIKE "Dune"`, which none of the three satisfies.
+    fn seed_rule_order_fixture(conn: &Connection, prefix: &str) {
+        get_or_create_tag(conn, "tag-scifi", "scifi").unwrap();
+
+        let both = format!("{prefix}-both");
+        insert_book(
+            conn,
+            &qbook(&both, "Dune", "Herbert", 100, Some("Dune"), None, false),
+        )
+        .unwrap();
+        add_tag_to_book(conn, &both, "tag-scifi").unwrap();
+
+        // Right series, no tag.
+        insert_book(
+            conn,
+            &qbook(
+                &format!("{prefix}-series"),
+                "Messiah",
+                "Herbert",
+                100,
+                Some("Dune"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        // Right tag, wrong series.
+        let tag_only = format!("{prefix}-tag");
+        insert_book(
+            conn,
+            &qbook(
+                &tag_only,
+                "Neuromancer",
+                "Gibson",
+                100,
+                Some("Sprawl"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_tag_to_book(conn, &tag_only, "tag-scifi").unwrap();
+    }
+
+    /// `build_rule_query` emits `{joins} {where_str}`, so every placeholder in
+    /// a JOIN precedes every placeholder in the WHERE. Its parameters have to
+    /// be returned in that same order, because bound parameters are
+    /// positional — and a `tag` rule is the one kind that puts a parameter in
+    /// a JOIN.
+    ///
+    /// A field rule followed by a tag rule therefore used to bind the field's
+    /// value to the tag's `LIKE` and the tag's to the field's comparison:
+    /// `[series equals "Dune", tag contains "scifi"]` ran
+    /// `tt1.name LIKE 'Dune'` and `b.series = '%scifi%'`, matching nothing.
+    /// Wrong books, no error. The fixture below distinguishes all three
+    /// outcomes — correct, swapped, and rule-only — so it cannot pass by
+    /// accident.
+    #[test]
+    fn automated_collection_binds_join_and_where_params_in_sql_order() {
+        let (_dir, conn) = setup();
+        seed_rule_order_fixture(&conn, "r");
+
+        // The field rule comes first, which is what triggers the mis-binding:
+        // its param was pushed before the tag's, but its placeholder comes
+        // after the tag's in the generated SQL.
+        let mut coll = make_collection("coll-order", "Ordered", CollectionType::Automated);
+        coll.rules = vec![
+            make_rule("coll-order", "series", "equals", "Dune"),
+            make_rule("coll-order", "tag", "contains", "scifi"),
+        ];
+        insert_collection(&conn, &coll).unwrap();
+
+        let via_old = get_books_in_collection_grid(&conn, "coll-order").unwrap();
+        assert_eq!(
+            ids(&via_old),
+            vec!["r-both"],
+            "only the book matching both rules belongs in the collection"
+        );
+
+        let via_new =
+            query_books_in_collection_grid(&conn, "coll-order", &BookQuery::default()).unwrap();
+        assert_eq!(
+            ids(&via_new),
+            vec!["r-both"],
+            "the query-module path must agree"
+        );
+
+        // Same rules, tag first. This order was always bound correctly, so it
+        // pins that the fix did not break the case that already worked.
+        let mut flipped = make_collection("coll-flip", "Flipped", CollectionType::Automated);
+        flipped.rules = vec![
+            make_rule("coll-flip", "tag", "contains", "scifi"),
+            make_rule("coll-flip", "series", "equals", "Dune"),
+        ];
+        insert_collection(&conn, &flipped).unwrap();
+        assert_eq!(
+            ids(&get_books_in_collection_grid(&conn, "coll-flip").unwrap()),
+            vec!["r-both"],
+            "tag-first ordering must keep working"
+        );
+    }
+
+    /// `preview_collection_rules` is one of `build_rule_query`'s four callers,
+    /// and the reason the mis-binding was easy to miss: the count the rule
+    /// builder shows while you are editing rules was wrong in exactly the same
+    /// way as the collection it would go on to produce, so the preview agreed
+    /// with the bug instead of exposing it.
+    #[test]
+    fn preview_collection_rules_counts_join_and_where_rules_together() {
+        let (_dir, conn) = setup();
+        seed_rule_order_fixture(&conn, "p");
+
+        let field_first = vec![
+            crate::models::NewRuleInput {
+                field: "series".to_string(),
+                operator: "equals".to_string(),
+                value: "Dune".to_string(),
+            },
+            crate::models::NewRuleInput {
+                field: "tag".to_string(),
+                operator: "contains".to_string(),
+                value: "scifi".to_string(),
+            },
+        ];
+        assert_eq!(
+            preview_collection_rules(&conn, &field_first).unwrap(),
+            1,
+            "one of the three books matches both rules"
+        );
+    }
+
+    // --- M4: query_books_in_collection_grid ---------------------------------
+
+    fn make_collection(id: &str, name: &str, r#type: CollectionType) -> Collection {
+        Collection {
+            id: id.to_string(),
+            name: name.to_string(),
+            r#type,
+            icon: None,
+            color: None,
+            created_at: 1,
+            updated_at: 1,
+            rules: Vec::new(),
+        }
+    }
+
+    fn make_rule(collection_id: &str, field: &str, operator: &str, value: &str) -> CollectionRule {
+        CollectionRule {
+            id: format!("rule-{collection_id}-{field}"),
+            collection_id: collection_id.to_string(),
+            field: field.to_string(),
+            operator: operator.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// Inserts a `book_collections` row with an explicit `added_at`, bypassing
+    /// `add_book_to_collection`'s `unixepoch()` — tests need to control
+    /// membership order independently of `books.added_at` and of wall-clock
+    /// time.
+    fn add_to_collection_at(conn: &Connection, book_id: &str, collection_id: &str, added_at: i64) {
+        conn.execute(
+            "INSERT INTO book_collections (book_id, collection_id, added_at) VALUES (?1, ?2, ?3)",
+            params![book_id, collection_id, added_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_manual_q_matches_title() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-m1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("m-fox", "Red Fox", "Bob Writer", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "m-whale",
+                "Blue Whale",
+                "Alice Author",
+                200,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "m-fox", "coll-m1", 100);
+        add_to_collection_at(&conn, "m-whale", "coll-m1", 200);
+
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-m1",
+            &BookQuery {
+                q: Some("fox".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids(&page),
+            vec!["m-fox"],
+            "q must match the title and exclude the non-matching member"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_manual_q_matches_author() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-m2", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("m-fox2", "Red Fox", "Bob Writer", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "m-whale2",
+                "Blue Whale",
+                "Alice Author",
+                200,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "m-fox2", "coll-m2", 100);
+        add_to_collection_at(&conn, "m-whale2", "coll-m2", 200);
+
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-m2",
+            &BookQuery {
+                q: Some("alice".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids(&page),
+            vec!["m-whale2"],
+            "q must match the author and exclude the non-matching member"
+        );
+    }
+
+    /// The one genuinely new combining branch: an automated collection with
+    /// *no* rules has no `WHERE` of its own, so the predicate becomes the
+    /// whole clause instead of being ANDed onto one. Every other automated
+    /// test attaches a rule, so nothing else exercises this path.
+    #[test]
+    fn query_books_in_collection_grid_automated_without_rules_still_applies_q() {
+        let (_dir, conn) = setup();
+        let coll = make_collection("coll-a0", "No rules", CollectionType::Automated);
+        insert_collection(&conn, &coll).unwrap();
+        insert_book(
+            &conn,
+            &qbook("nr-a", "Star Voyager", "Nova", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("nr-b", "Ocean Deep", "Nova", 100, None, None, false),
+        )
+        .unwrap();
+
+        // A rule-less automated collection matches the whole library, so the
+        // `q` is the only thing narrowing this.
+        let items = query_books_in_collection_grid(
+            &conn,
+            "coll-a0",
+            &BookQuery {
+                q: Some("voyager".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&items), vec!["nr-a"]);
+
+        let all = query_books_in_collection_grid(&conn, "coll-a0", &BookQuery::default()).unwrap();
+        assert_eq!(all.len(), 2, "no rules and no q matches the whole library");
+    }
+
+    /// `q` goes through `instr()`, not `LIKE`, so SQL wildcards in a search
+    /// term are literal — the same guarantee `query_books_grid` has, asserted
+    /// again at this seam because this is where a future edit might reach for
+    /// `LIKE` to compose with `build_rule_query`'s own `LIKE` clauses.
+    #[test]
+    fn query_books_in_collection_grid_treats_sql_wildcards_as_literal() {
+        let (_dir, conn) = setup();
+        let coll = make_collection("coll-w", "Wild", CollectionType::Manual);
+        insert_collection(&conn, &coll).unwrap();
+        for (id, title) in [("w-a", "100% Cotton"), ("w-b", "Anything At All")] {
+            insert_book(&conn, &qbook(id, title, "Author", 100, None, None, false)).unwrap();
+            add_book_to_collection(&conn, id, "coll-w").unwrap();
+        }
+
+        // Under LIKE, "100%" would match both rows; as a literal it matches one.
+        let items = query_books_in_collection_grid(
+            &conn,
+            "coll-w",
+            &BookQuery {
+                q: Some("100%".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&items), vec!["w-a"]);
+
+        // `_` is a single-character LIKE wildcard; literally, it matches nothing.
+        let none = query_books_in_collection_grid(
+            &conn,
+            "coll-w",
+            &BookQuery {
+                q: Some("1_0".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(none.is_empty(), "underscore must not act as a wildcard");
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_automated_rule_and_q_both_apply() {
+        let (_dir, conn) = setup();
+        let mut coll = make_collection("coll-a1", "Automated", CollectionType::Automated);
+        coll.rules = vec![make_rule("coll-a1", "series", "equals", "SciFi")];
+        insert_collection(&conn, &coll).unwrap();
+
+        // Matches rule AND q.
+        insert_book(
+            &conn,
+            &qbook(
+                "auto-a",
+                "Star Voyager",
+                "Nova",
+                100,
+                Some("SciFi"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        // Matches rule but not q.
+        insert_book(
+            &conn,
+            &qbook(
+                "auto-b",
+                "Ocean Deep",
+                "Nova",
+                100,
+                Some("SciFi"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        // Matches q but not rule (wrong series).
+        insert_book(
+            &conn,
+            &qbook(
+                "auto-c",
+                "Star Kingdom",
+                "Nova",
+                100,
+                Some("Fantasy"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-a1",
+            &BookQuery {
+                q: Some("star".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids(&page),
+            vec!["auto-a"],
+            "the rule and the q predicate must both apply (AND), not either alone"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_want_to_read_filter() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-w1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("w-yes", "Wanted", "Author", 100, None, None, true),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("w-no", "Not Wanted", "Author", 100, None, None, false),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "w-yes", "coll-w1", 100);
+        add_to_collection_at(&conn, "w-no", "coll-w1", 200);
+
+        let wanted_only = query_books_in_collection_grid(
+            &conn,
+            "coll-w1",
+            &BookQuery {
+                want_to_read: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&wanted_only), vec!["w-yes"]);
+
+        let all = query_books_in_collection_grid(&conn, "coll-w1", &BookQuery::default()).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "want_to_read: false (the default) must not filter anything out"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_non_ascii_q_folds_case() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-u1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "u-edu",
+                "Éducation sentimentale",
+                "Gustave Flaubert",
+                100,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "u-other",
+                "Something Else",
+                "Someone",
+                200,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "u-edu", "coll-u1", 100);
+        add_to_collection_at(&conn, "u-other", "coll-u1", 200);
+
+        // A naive ASCII-only LOWER()/LIKE would fail to match this — see
+        // `register_carrel_lower`'s doc comment.
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-u1",
+            &BookQuery {
+                q: Some("éducation".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ids(&page), vec!["u-edu"]);
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_empty_and_absent_q_return_whole_collection() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-e1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("e-a", "A Book", "Author", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("e-b", "B Book", "Author", 200, None, None, false),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "e-a", "coll-e1", 100);
+        add_to_collection_at(&conn, "e-b", "coll-e1", 200);
+
+        let absent =
+            query_books_in_collection_grid(&conn, "coll-e1", &BookQuery::default()).unwrap();
+        assert_eq!(absent.len(), 2);
+
+        let empty = query_books_in_collection_grid(
+            &conn,
+            "coll-e1",
+            &BookQuery {
+                q: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.len(), 2);
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_manual_membership_order_survives_filtering() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-o1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        // `books.added_at` order is the reverse of `book_collections.added_at`
+        // order, so the two orderings are distinguishable: if the function
+        // ever switched to `book_sort_order_sql`'s date-added ordering (or
+        // any b.added_at-based order), this would catch it.
+        insert_book(
+            &conn,
+            &qbook("ord-x", "Same Title", "Author", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("ord-y", "Same Title", "Author", 500, None, None, false),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "ord-x", "coll-o1", 900); // added to collection most recently
+        add_to_collection_at(&conn, "ord-y", "coll-o1", 200); // added to collection long ago
+
+        let unfiltered =
+            query_books_in_collection_grid(&conn, "coll-o1", &BookQuery::default()).unwrap();
+        assert_eq!(
+            ids(&unfiltered),
+            vec!["ord-x", "ord-y"],
+            "membership order (bc.added_at DESC) must win over books.added_at order"
+        );
+
+        let filtered = query_books_in_collection_grid(
+            &conn,
+            "coll-o1",
+            &BookQuery {
+                q: Some("same title".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&filtered),
+            vec!["ord-x", "ord-y"],
+            "filtering must not disturb the membership order"
         );
     }
 }
