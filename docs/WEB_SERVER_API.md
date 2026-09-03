@@ -157,7 +157,7 @@ Compatible with KOReader, Calibre, Moon+ Reader, and other OPDS clients.
 | GET `/opds/all` | All books (paginated, 50 per page, `?page=N`) |
 | GET `/opds/new` | 25 most recently added books |
 | GET `/opds/collections/:id` | Books in a collection |
-| GET `/opds/search?q=term` | Search by title or author |
+| GET `/opds/search?q=term` | Search by title or author (paginated, 50 per page, `?page=N`) |
 
 OPDS feeds use Atom XML. Pagination uses `rel="next"` links.
 
