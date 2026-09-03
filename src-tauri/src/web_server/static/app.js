@@ -2510,6 +2510,25 @@
     // M4: `q`/`want_to_read` now filter server-side for a collection too (see
     // the `loadBooks` url-building above), so `books` here is already the
     // filtered set — no client-side re-filtering needed.
+    //
+    // Two things the deleted client-side filters used to arrange, recorded
+    // here because they are no longer self-evident:
+    //
+    // 1. They ran *after* the Finding-C empty-heal check above, so a
+    //    collection filtered down to nothing never reached it. Now the server
+    //    filters, so `books.length === 0` can mean "filtered out" as well as
+    //    "collection is gone", and a no-match search does reach the check.
+    //    That is safe — `activeFilterEntityMissing()` asks whether the
+    //    collection still exists, not whether anything matched, so a real
+    //    collection renders its empty grid with the filter pill intact — but
+    //    it costs one extra `/api/collections` round-trip per no-match query.
+    //
+    // 2. The search path returned early rather than falling through, partly
+    //    to skip `setupInfiniteScroll()`. Falling through now calls it, which
+    //    is inert: `resetLibraryPagination()` leaves `libraryTotal === null`
+    //    for an unpaginated collection and `setupInfiniteScroll` returns
+    //    immediately on that. The collection-without-a-query path already
+    //    made the same no-op call before this change.
 
     // Item 5: shelves only appear on the unfiltered "home" view — any active
     // search/series/collection filter (or an empty library) falls back to

@@ -4927,9 +4927,11 @@ mod tests {
         .unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        let mut got = ids_from(&json);
+        got.sort();
         assert_eq!(
-            ids_from(&json).len(),
-            2,
+            got,
+            vec!["l-not-wanted", "l-wanted"],
             "\"1\" is not the literal \"true\" — it must not enable the filter, and must not 400"
         );
     }
@@ -4955,7 +4957,15 @@ mod tests {
         .unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
-        assert_eq!(ids_from(&json).len(), 2);
+        // Ids, not just a count: `len() == 2` is satisfied by any
+        // implementation that ignores the params, including one that returns
+        // the whole library rather than the collection. Sorted, because a
+        // manual collection orders by `bc.added_at DESC` with no `id`
+        // tie-break and these two are added within the same second — the
+        // membership order itself is pinned by the dedicated core test.
+        let mut got = ids_from(&json);
+        got.sort();
+        assert_eq!(got, vec!["abs-a", "abs-b"]);
     }
 
     #[tokio::test]

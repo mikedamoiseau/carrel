@@ -874,7 +874,7 @@ fn register_carrel_lower(conn: &Connection) -> Result<()> {
 /// `series` is exact equality; SQL equality against a NULL column evaluates
 /// to NULL (falsy), so a book with no series never matches a non-empty
 /// filter without any special-casing.
-fn build_book_predicate(query: &BookQuery) -> (String, Vec<Value>) {
+fn build_book_predicate(query: &BookQuery) -> (Vec<String>, Vec<Value>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
 
@@ -900,13 +900,20 @@ fn build_book_predicate(query: &BookQuery) -> (String, Vec<Value>) {
         clauses.push("b.want_to_read != 0".to_string());
     }
 
-    let where_sql = if clauses.is_empty() {
+    (clauses, params)
+}
+
+/// `WHERE ...` for a clause list, or an empty string for none. Kept separate
+/// from [`build_book_predicate`] so a caller that has to AND these onto a
+/// `WHERE` it already built can take the clauses and join them itself, rather
+/// than stripping the keyword back off an assembled string — that string
+/// surgery silently produced *no filter at all* if the shape ever changed.
+fn where_clause(clauses: &[String]) -> String {
+    if clauses.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", clauses.join(" AND "))
-    };
-
-    (where_sql, params)
+    }
 }
 
 /// `ORDER BY` fragment for each [`BookSort`] variant, `id` appended as a
@@ -944,7 +951,8 @@ fn query_books_generic<T>(
 ) -> Result<Page<T>> {
     register_carrel_lower(conn)?;
 
-    let (where_sql, where_params) = build_book_predicate(query);
+    let (predicate_clauses, where_params) = build_book_predicate(query);
+    let where_sql = where_clause(&predicate_clauses);
     let from_join = "FROM books b LEFT JOIN reading_progress rp ON rp.book_id = b.id";
 
     let count_sql = format!("SELECT COUNT(*) {from_join} {where_sql}");
@@ -1025,14 +1033,15 @@ pub fn query_books_in_collection_grid(
     let mut type_stmt = conn.prepare("SELECT type FROM collections WHERE id = ?1")?;
     let coll_type: String = type_stmt.query_row(params![collection_id], |row| row.get(0))?;
 
-    let (predicate_sql, predicate_params) = build_book_predicate(query);
-    // `build_book_predicate` returns "" or "WHERE ...". Strip the keyword so
-    // the clause can be ANDed onto whatever WHERE each branch below already
-    // has (which may itself be empty for a rule-less automated collection).
-    let predicate_and = predicate_sql
-        .strip_prefix("WHERE ")
-        .map(|clause| format!(" AND {clause}"))
-        .unwrap_or_default();
+    // Clauses, not an assembled `WHERE` — each branch below already has a
+    // `WHERE` of its own (or, for a rule-less automated collection, none) and
+    // needs to AND onto it.
+    let (predicate_clauses, predicate_params) = build_book_predicate(query);
+    let predicate_and = if predicate_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" AND {}", predicate_clauses.join(" AND "))
+    };
 
     if coll_type == "manual" {
         let sql = format!(
@@ -1053,12 +1062,10 @@ pub fn query_books_in_collection_grid(
     let rules = get_collection_rules(conn, collection_id)?;
     let (joins, where_str, rule_params) = build_rule_query(&rules);
 
-    // `where_str` is "" or "WHERE ...", same shape as `predicate_sql` — a
-    // rule-less automated collection combines with a non-empty `q` the same
-    // way an empty predicate combines with rules, by just taking whichever
-    // side is non-empty.
+    // A rule-less automated collection has no `WHERE` of its own, so the
+    // predicate becomes the whole clause; otherwise it is ANDed on.
     let combined_where = if where_str.is_empty() {
-        predicate_sql
+        where_clause(&predicate_clauses)
     } else {
         format!("{where_str}{predicate_and}")
     };
@@ -1073,9 +1080,18 @@ pub fn query_books_in_collection_grid(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    // Positional parameters: `rule_params` come from `joins`/`where_str`,
-    // which precede `predicate_and` in the SQL text above, so they must be
-    // bound in that same order — rule params first, predicate params last.
+    // Positional parameters: the predicate's placeholders are always textually
+    // last (they sit at the end of `combined_where`, which follows `{joins}`),
+    // so binding the predicate's params last is correct.
+    //
+    // What is *not* correct, and is inherited rather than introduced here:
+    // `build_rule_query` returns one flat `param_values` in rule order while
+    // emitting some rules into `joins` and others into `where_str`, and every
+    // join placeholder precedes every where placeholder in the SQL text. Rules
+    // like `[series equals X, tag contains Y]` therefore bind X to the tag's
+    // `LIKE` and Y to `b.series`. `get_books_in_collection_grid` and
+    // `preview_collection_rules` have always done this; see the note in
+    // `docs/backlog/` on automated collections.
     let mut bound_params: Vec<Value> = rule_params.into_iter().map(Value::Text).collect();
     bound_params.extend(predicate_params);
     let rows = stmt.query_map(
@@ -7396,6 +7412,82 @@ mod tests {
             vec!["m-whale2"],
             "q must match the author and exclude the non-matching member"
         );
+    }
+
+    /// The one genuinely new combining branch: an automated collection with
+    /// *no* rules has no `WHERE` of its own, so the predicate becomes the
+    /// whole clause instead of being ANDed onto one. Every other automated
+    /// test attaches a rule, so nothing else exercises this path.
+    #[test]
+    fn query_books_in_collection_grid_automated_without_rules_still_applies_q() {
+        let (_dir, conn) = setup();
+        let coll = make_collection("coll-a0", "No rules", CollectionType::Automated);
+        insert_collection(&conn, &coll).unwrap();
+        insert_book(
+            &conn,
+            &qbook("nr-a", "Star Voyager", "Nova", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("nr-b", "Ocean Deep", "Nova", 100, None, None, false),
+        )
+        .unwrap();
+
+        // A rule-less automated collection matches the whole library, so the
+        // `q` is the only thing narrowing this.
+        let items = query_books_in_collection_grid(
+            &conn,
+            "coll-a0",
+            &BookQuery {
+                q: Some("voyager".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&items), vec!["nr-a"]);
+
+        let all = query_books_in_collection_grid(&conn, "coll-a0", &BookQuery::default()).unwrap();
+        assert_eq!(all.len(), 2, "no rules and no q matches the whole library");
+    }
+
+    /// `q` goes through `instr()`, not `LIKE`, so SQL wildcards in a search
+    /// term are literal — the same guarantee `query_books_grid` has, asserted
+    /// again at this seam because this is where a future edit might reach for
+    /// `LIKE` to compose with `build_rule_query`'s own `LIKE` clauses.
+    #[test]
+    fn query_books_in_collection_grid_treats_sql_wildcards_as_literal() {
+        let (_dir, conn) = setup();
+        let coll = make_collection("coll-w", "Wild", CollectionType::Manual);
+        insert_collection(&conn, &coll).unwrap();
+        for (id, title) in [("w-a", "100% Cotton"), ("w-b", "Anything At All")] {
+            insert_book(&conn, &qbook(id, title, "Author", 100, None, None, false)).unwrap();
+            add_book_to_collection(&conn, id, "coll-w").unwrap();
+        }
+
+        // Under LIKE, "100%" would match both rows; as a literal it matches one.
+        let items = query_books_in_collection_grid(
+            &conn,
+            "coll-w",
+            &BookQuery {
+                q: Some("100%".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&items), vec!["w-a"]);
+
+        // `_` is a single-character LIKE wildcard; literally, it matches nothing.
+        let none = query_books_in_collection_grid(
+            &conn,
+            "coll-w",
+            &BookQuery {
+                q: Some("1_0".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(none.is_empty(), "underscore must not act as a wildcard");
     }
 
     #[test]
