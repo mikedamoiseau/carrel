@@ -1105,18 +1105,12 @@ pub fn query_books_in_collection_grid(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    // Positional parameters: the predicate's placeholders are always textually
-    // last (they sit at the end of `combined_where`, which follows `{joins}`),
-    // so binding the predicate's params last is correct.
-    //
-    // What is *not* correct, and is inherited rather than introduced here:
-    // `build_rule_query` returns one flat `param_values` in rule order while
-    // emitting some rules into `joins` and others into `where_str`, and every
-    // join placeholder precedes every where placeholder in the SQL text. Rules
-    // like `[series equals X, tag contains Y]` therefore bind X to the tag's
-    // `LIKE` and Y to `b.series`. `get_books_in_collection_grid` and
-    // `preview_collection_rules` have always done this; see the note in
-    // `docs/backlog/` on automated collections.
+    // Positional parameters, in SQL text order: `build_rule_query` returns its
+    // own params joins-first then wheres (it emits some rules into `joins`
+    // and others into `where_str`, and every join placeholder precedes every
+    // where placeholder), and this function's own predicate placeholders are
+    // textually last — they sit at the end of `combined_where`, which follows
+    // `{joins}`. So rule params first, predicate params second.
     let mut bound_params: Vec<Value> = rule_params.into_iter().map(Value::Text).collect();
     bound_params.extend(predicate_params);
     let rows = stmt.query_map(
@@ -2801,7 +2795,15 @@ pub fn get_books_in_collection_grid(
 fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
     let mut join_clauses: Vec<String> = Vec::new();
     let mut where_clauses: Vec<String> = Vec::new();
-    let mut param_values: Vec<String> = Vec::new();
+    // Two lists, concatenated joins-first at the end. Bound parameters are
+    // positional and this function emits `{joins} {where_str}`, so every
+    // placeholder inside a JOIN precedes every placeholder inside the WHERE.
+    // One flat list pushed in *rule* order does not respect that: a `tag` rule
+    // is the only kind that puts a parameter in a JOIN, so a field rule
+    // followed by a tag rule used to bind each one's value to the other's
+    // comparison — silently returning the wrong books.
+    let mut join_params: Vec<String> = Vec::new();
+    let mut where_params: Vec<String> = Vec::new();
     let mut rp_idx: u32 = 0;
     let mut tag_idx: u32 = 0;
 
@@ -2809,49 +2811,49 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
         match (rule.field.as_str(), rule.operator.as_str()) {
             ("author", "contains") => {
                 where_clauses.push("b.author LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("author", "equals") => {
                 where_clauses.push("b.author = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("filename", "contains") => {
                 where_clauses.push("b.title LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("series", "contains") => {
                 where_clauses.push("b.series LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("series", "equals") => {
                 where_clauses.push("b.series = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("language", "equals") => {
                 where_clauses.push("b.language = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("language", "contains") => {
                 where_clauses.push("b.language LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("publisher", "contains") => {
                 where_clauses.push("b.publisher LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("description", "contains") => {
                 where_clauses.push("b.description LIKE ?".to_string());
-                param_values.push(format!("%{}%", rule.value));
+                where_params.push(format!("%{}%", rule.value));
             }
             ("format", "equals") => {
                 where_clauses.push("b.format = ?".to_string());
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("date_added", "last_n_days") => {
                 where_clauses.push(
                     "b.added_at > (strftime('%s', 'now') - CAST(? AS INTEGER) * 86400)".to_string(),
                 );
-                param_values.push(rule.value.clone());
+                where_params.push(rule.value.clone());
             }
             ("tag", "contains") => {
                 tag_idx += 1;
@@ -2861,7 +2863,7 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
                     "JOIN book_tags {bt} ON {bt}.book_id = b.id \
                      JOIN tags {tt} ON {tt}.id = {bt}.tag_id AND {tt}.name LIKE ?"
                 ));
-                param_values.push(format!("%{}%", rule.value));
+                join_params.push(format!("%{}%", rule.value));
             }
             ("tag", "equals") => {
                 tag_idx += 1;
@@ -2871,7 +2873,7 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
                     "JOIN book_tags {bt} ON {bt}.book_id = b.id \
                      JOIN tags {tt} ON {tt}.id = {bt}.tag_id AND {tt}.name = ?"
                 ));
-                param_values.push(rule.value.clone());
+                join_params.push(rule.value.clone());
             }
             ("reading_progress", "equals") => {
                 rp_idx += 1;
@@ -2910,6 +2912,12 @@ fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
     } else {
         format!("WHERE {}", where_clauses.join(" AND "))
     };
+
+    // Joins first, matching the order their placeholders appear in the SQL the
+    // callers assemble. Callers bind this vector positionally and unchanged,
+    // so the ordering contract lives here rather than in each of them.
+    let mut param_values = join_params;
+    param_values.extend(where_params);
 
     (joins, where_str, param_values)
 }
@@ -7364,6 +7372,144 @@ mod tests {
 
         assert_eq!(page.total, 1);
         assert_eq!(ids(&page.items), vec!["x1"]);
+    }
+
+    // --- M6: build_rule_query parameter ordering ----------------------------
+
+    /// Three books that tell a correct `[series equals "Dune", tag contains
+    /// "scifi"]` match apart from a mis-bound one: `{prefix}-both` matches both
+    /// rules, `{prefix}-series` only the series, `{prefix}-tag` only the tag.
+    /// Swap the two parameters and the rules become `series = "%scifi%"` and
+    /// `tag LIKE "Dune"`, which none of the three satisfies.
+    fn seed_rule_order_fixture(conn: &Connection, prefix: &str) {
+        get_or_create_tag(conn, "tag-scifi", "scifi").unwrap();
+
+        let both = format!("{prefix}-both");
+        insert_book(
+            conn,
+            &qbook(&both, "Dune", "Herbert", 100, Some("Dune"), None, false),
+        )
+        .unwrap();
+        add_tag_to_book(conn, &both, "tag-scifi").unwrap();
+
+        // Right series, no tag.
+        insert_book(
+            conn,
+            &qbook(
+                &format!("{prefix}-series"),
+                "Messiah",
+                "Herbert",
+                100,
+                Some("Dune"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        // Right tag, wrong series.
+        let tag_only = format!("{prefix}-tag");
+        insert_book(
+            conn,
+            &qbook(
+                &tag_only,
+                "Neuromancer",
+                "Gibson",
+                100,
+                Some("Sprawl"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_tag_to_book(conn, &tag_only, "tag-scifi").unwrap();
+    }
+
+    /// `build_rule_query` emits `{joins} {where_str}`, so every placeholder in
+    /// a JOIN precedes every placeholder in the WHERE. Its parameters have to
+    /// be returned in that same order, because bound parameters are
+    /// positional — and a `tag` rule is the one kind that puts a parameter in
+    /// a JOIN.
+    ///
+    /// A field rule followed by a tag rule therefore used to bind the field's
+    /// value to the tag's `LIKE` and the tag's to the field's comparison:
+    /// `[series equals "Dune", tag contains "scifi"]` ran
+    /// `tt1.name LIKE 'Dune'` and `b.series = '%scifi%'`, matching nothing.
+    /// Wrong books, no error. The fixture below distinguishes all three
+    /// outcomes — correct, swapped, and rule-only — so it cannot pass by
+    /// accident.
+    #[test]
+    fn automated_collection_binds_join_and_where_params_in_sql_order() {
+        let (_dir, conn) = setup();
+        seed_rule_order_fixture(&conn, "r");
+
+        // The field rule comes first, which is what triggers the mis-binding:
+        // its param was pushed before the tag's, but its placeholder comes
+        // after the tag's in the generated SQL.
+        let mut coll = make_collection("coll-order", "Ordered", CollectionType::Automated);
+        coll.rules = vec![
+            make_rule("coll-order", "series", "equals", "Dune"),
+            make_rule("coll-order", "tag", "contains", "scifi"),
+        ];
+        insert_collection(&conn, &coll).unwrap();
+
+        let via_old = get_books_in_collection_grid(&conn, "coll-order").unwrap();
+        assert_eq!(
+            ids(&via_old),
+            vec!["r-both"],
+            "only the book matching both rules belongs in the collection"
+        );
+
+        let via_new =
+            query_books_in_collection_grid(&conn, "coll-order", &BookQuery::default()).unwrap();
+        assert_eq!(
+            ids(&via_new),
+            vec!["r-both"],
+            "the query-module path must agree"
+        );
+
+        // Same rules, tag first. This order was always bound correctly, so it
+        // pins that the fix did not break the case that already worked.
+        let mut flipped = make_collection("coll-flip", "Flipped", CollectionType::Automated);
+        flipped.rules = vec![
+            make_rule("coll-flip", "tag", "contains", "scifi"),
+            make_rule("coll-flip", "series", "equals", "Dune"),
+        ];
+        insert_collection(&conn, &flipped).unwrap();
+        assert_eq!(
+            ids(&get_books_in_collection_grid(&conn, "coll-flip").unwrap()),
+            vec!["r-both"],
+            "tag-first ordering must keep working"
+        );
+    }
+
+    /// `preview_collection_rules` is one of `build_rule_query`'s four callers,
+    /// and the reason the mis-binding was easy to miss: the count the rule
+    /// builder shows while you are editing rules was wrong in exactly the same
+    /// way as the collection it would go on to produce, so the preview agreed
+    /// with the bug instead of exposing it.
+    #[test]
+    fn preview_collection_rules_counts_join_and_where_rules_together() {
+        let (_dir, conn) = setup();
+        seed_rule_order_fixture(&conn, "p");
+
+        let field_first = vec![
+            crate::models::NewRuleInput {
+                field: "series".to_string(),
+                operator: "equals".to_string(),
+                value: "Dune".to_string(),
+            },
+            crate::models::NewRuleInput {
+                field: "tag".to_string(),
+                operator: "contains".to_string(),
+                value: "scifi".to_string(),
+            },
+        ];
+        assert_eq!(
+            preview_collection_rules(&conn, &field_first).unwrap(),
+            1,
+            "one of the three books matches both rules"
+        );
     }
 
     // --- M4: query_books_in_collection_grid ---------------------------------

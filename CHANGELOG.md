@@ -22,6 +22,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   takes.
 
 ### Fixed
+- **An automated collection that mixed a tag rule with a metadata rule showed
+  the wrong books.** A rule set like "series is Dune" plus "tag contains
+  scifi" compared each rule's value against the other rule's field, so the
+  collection could come out empty or list books matching neither rule. It
+  needed the two rule kinds in that order, which is why most automated
+  collections were unaffected. The rule builder's live preview count was wrong
+  in the same way, so it agreed with the faulty collection rather than
+  revealing it. Existing collections need no action — the rules were always
+  stored correctly, only the query built from them was wrong.
 - **The web reader no longer re-opens the book file on every chapter turn.**
   Chapter reads for EPUB and MOBI now go through one module in `carrel-core`
   (`reader::chapter_html`) that both the desktop app and the embedded web
