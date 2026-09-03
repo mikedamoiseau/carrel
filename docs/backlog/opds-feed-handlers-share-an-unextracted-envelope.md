@@ -52,3 +52,37 @@ join, so they want checking too rather than assuming.
 characters, so `?q=%01` puts a raw control byte inside `<title>Search: …</title>`
 and the feed is not well-formed XML. Unchanged by milestone 3 — the same was
 true before it — but a strict OPDS client would reject the response.
+
+## Added after the round-2 review of the same milestone
+
+Three more reasons these handlers want looking at together.
+
+**`all_books` has the same paging overflow `search_books` just fixed.**
+`start = page * OPDS_PAGE_SIZE` at `opds_feed.rs:335` and
+`start + OPDS_PAGE_SIZE` at `:344` are unsaturated, and `page` comes off the
+wire. A large-but-parseable `?page=` panics in debug — a 500, with no
+`CatchPanicLayer` in front of the web server — and wraps in release, where the
+wrapped sum reads as "there is a next page" and emits a `rel="next"` link back
+to page 0. `search_books` now uses `saturating_mul`/`saturating_add` and has a
+test at `usize::MAX`; `all_books` was left alone as out of scope.
+
+**The two feeds disagree on how strict a `page` is.** `SearchQuery::page` is a
+lenient `String`, because a strictly-typed optional param turns one malformed
+value a proxy appended into a dead endpoint — the reasoning `api.rs`'s
+`BookQuery` documents on `want_to_read`. `PaginationQuery::page` is still
+`Option<usize>`, so `/opds/all?page=abc` returns 400 where
+`/opds/search?q=x&page=abc` now serves page 0. The lenient one is the better
+convention and the strict one guards the feed clients actually walk, so this
+is the wrong way round. Neither tolerates a *repeated* `?page=1&page=2`, since
+serde's derive rejects the duplicate field first; that is at least consistent
+with how a repeated `?q=` has always behaved.
+
+**SQL paging is available if the whole-set ETag is given up.** The reason
+`search_books` fetches every matching row to render fifty is that its tag
+covers the whole filtered set, so it needs the complete id list. A per-page tag
+would also be *correct* — it hashes the ids actually rendered, and a deletion
+on an earlier page changes which ids those are — so `LIMIT`/`OFFSET` paging
+via `db::query_books`'s existing `limit`/`offset` is on the table. What would
+be lost is what `all_books:325-327` documents: uniform invalidation, one
+library change invalidating every page URL at once. Worth deciding once, for
+all four feeds, rather than per handler.

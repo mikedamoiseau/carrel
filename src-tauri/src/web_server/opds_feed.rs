@@ -311,6 +311,13 @@ async fn root_catalog() -> Response {
 
 #[derive(serde::Deserialize)]
 struct PaginationQuery {
+    /// Note the divergence from `SearchQuery::page`, which is a lenient
+    /// `String`: a malformed `?page=abc` still rejects this feed outright.
+    /// Left as it is deliberately — changing it is a behaviour change to a
+    /// handler the milestone that made search lenient did not touch — but it
+    /// is the weaker of the two conventions, and the note in `docs/backlog/`
+    /// on these handlers records it alongside the other reasons to revisit
+    /// them together.
     page: Option<usize>,
 }
 
@@ -495,10 +502,18 @@ async fn search_books(
     let search_term = params.q.unwrap_or_default();
 
     // Filter and sort in SQL; page in Rust. `limit`/`offset` deliberately go
-    // unused here: the ETag below is over the whole *filtered* set (matches
-    // `all_books`'s rationale for `db::list_books` — a per-page tag can't
-    // detect a shift caused by a deletion on an earlier page), so the
-    // complete matching list has to be fetched before it can be sliced.
+    // unused here, because the ETag below covers the whole *filtered* set and
+    // therefore needs the complete matching list before it can be sliced.
+    //
+    // That whole-set tag is a consistency choice, not a correctness one, and
+    // it is worth being precise about which: a per-page tag would also be
+    // correct, since it hashes the ids actually rendered and a deletion on an
+    // earlier page changes which ids those are. What the shared tag buys is
+    // what `all_books` documents — uniform invalidation, so one library
+    // change invalidates every page URL at once. Matching the other three
+    // feeds is the reason to keep it; the cost is fetching every matching row
+    // to render fifty. See the note in `docs/backlog/` on these handlers for
+    // the SQL-paging alternative.
     let query = db::BookQuery {
         q: Some(search_term.clone()),
         series: None,
@@ -516,7 +531,11 @@ async fn search_books(
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
 
-    let start = page * OPDS_PAGE_SIZE;
+    // Saturating, not `*`: `page` comes off the wire, so a large-but-parseable
+    // value reaches here. `page * OPDS_PAGE_SIZE` panics in debug and wraps in
+    // release, and a wrapped `start + OPDS_PAGE_SIZE` would then read as
+    // "there is a next page" and emit a `next` link back to page 0.
+    let start = page.saturating_mul(OPDS_PAGE_SIZE);
     let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
 
     let entries: String = page_books
@@ -526,7 +545,7 @@ async fn search_books(
         .join("\n");
 
     let encoded_term = urlencoding::encode(&search_term);
-    let has_next = start + OPDS_PAGE_SIZE < books.len();
+    let has_next = start.saturating_add(OPDS_PAGE_SIZE) < books.len();
     // `&amp;` (not a raw `&`): these hrefs sit inside a double-quoted XML
     // attribute, and an unescaped `&` starts an entity reference — the same
     // reason `opensearch_descriptor`'s template runs through `xml_escape`.
@@ -1345,6 +1364,13 @@ mod tests {
     /// trap `api.rs`'s `BookQuery` documents on its `want_to_read` field:
     /// axum's `Query` extraction is all-or-nothing, so one malformed value a
     /// proxy or client appended takes the catalog down with it.
+    ///
+    /// One case this does *not* rescue, pinned below so nobody assumes
+    /// otherwise: a **repeated** `?page=1&page=2` is still rejected, because
+    /// serde's derive reports a duplicate field before any of this runs. That
+    /// matches how a repeated `?q=` has always behaved here, so the endpoint
+    /// has never tolerated duplicated parameters — widening `page` alone
+    /// would only make the two inconsistent.
     #[test]
     fn search_query_tolerates_a_malformed_page() {
         use axum::extract::Query as AxumQ;
@@ -1361,6 +1387,16 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{uri} must not be rejected: {e:?}"));
             assert_eq!(parsed.0.q.as_deref(), Some("x"), "{uri}");
             assert_eq!(parsed.0.page(), expected.unwrap_or(0), "{uri}");
+        }
+
+        // A repeated parameter is still rejected — serde's derive reports the
+        // duplicate field before the lenient parse gets a look in. Pinned
+        // because the field's doc comment claims leniency, and this is the
+        // edge that claim does not cover. A repeated `q` behaves the same way
+        // and always has, so the endpoint is at least consistent.
+        for uri in ["/opds/search?q=x&page=1&page=2", "/opds/search?q=x&q=y"] {
+            let parsed: Result<AxumQ<SearchQuery>, _> = AxumQ::try_from_uri(&uri.parse().unwrap());
+            assert!(parsed.is_err(), "{uri} is expected to be rejected");
         }
     }
 
@@ -1401,6 +1437,42 @@ mod tests {
             response_etag(&after).as_deref(),
             Some(tag0.as_str()),
             "a change to a book outside the filtered set must not move the tag"
+        );
+
+        // ...but editing a book that IS in the set must move it. Without this
+        // the whole suite passes against a tag that ignores `pairs` and hashes
+        // only the id list, which would serve a stale feed forever after an
+        // in-place title edit.
+        {
+            let conn = state.conn().unwrap();
+            carrel_core::db::set_want_to_read(&conn, "m00", true).unwrap();
+        }
+        let edited = call_search(&state, Some("Matched"), None).await;
+        assert_ne!(
+            response_etag(&edited).as_deref(),
+            Some(tag0.as_str()),
+            "editing a book inside the filtered set must move the tag"
+        );
+    }
+
+    /// `page` is caller-supplied and parsed leniently, so a value large
+    /// enough to overflow `page * OPDS_PAGE_SIZE` is reachable from the wire.
+    /// Unsaturated that multiply panics in debug — a 500 with no
+    /// `CatchPanicLayer` in front of it — and wraps in release, where
+    /// `start + OPDS_PAGE_SIZE` then wraps back near zero and advertises a
+    /// `next` link to page 0. Neither shows up in the other paging tests.
+    #[tokio::test]
+    async fn search_page_at_usize_max_is_empty_and_does_not_link_onward() {
+        let books: Vec<Book> = (0..3)
+            .map(|i| search_test_book(&format!("m{i}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let xml = body_string(call_search(&state, Some("Matched"), Some(usize::MAX)).await).await;
+        assert!(!xml.contains("<entry>"), "must be empty: {xml}");
+        assert!(
+            !xml.contains(r#"rel="next""#),
+            "must not link onward: {xml}"
         );
     }
 
