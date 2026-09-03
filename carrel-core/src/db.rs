@@ -791,12 +791,13 @@ pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
 
 // --- Query module: filter/sort/page a library in one place -----------------
 //
-// The predicate "case-insensitively match title or author" used to be
-// written out separately for the desktop app, the web API, and the OPDS
-// feed, each loading the whole `books` table and filtering in the host
+// The predicate "case-insensitively match title or author" is written out
+// separately for the desktop app, the web API, and the OPDS feed, and every
+// server-side copy loads the whole `books` table and filters in the host
 // language. `query_books_grid`/`query_books` compile the same filter+sort+
 // page request to SQL instead, so it runs once, in the database, regardless
-// of caller.
+// of caller. Those callers adopt it in the milestones that follow; as of
+// this commit nothing calls it yet.
 
 /// Sort order for [`query_books_grid`]/[`query_books`]. A closed enum (not a
 /// caller-supplied string) so the `ORDER BY` fragment is always chosen from a
@@ -844,9 +845,12 @@ pub struct Page<T> {
 /// paths plus direct `Connection::open`/`open_in_memory` calls in tests, and
 /// registering at the use site means the function is present by
 /// construction rather than by remembering to wire it up everywhere a
-/// connection is made. `create_scalar_function` replacing an existing
-/// registration is a documented no-op-if-unchanged, so calling this on every
-/// query is cheap and safe.
+/// connection is made. Re-registering on every query is safe — SQLite
+/// replaces the definition in place — and costs one closure box per call,
+/// which is nothing beside the query it precedes. (rusqlite documents only
+/// that a registration lasts until the connection closes or `remove_function`
+/// is called; it says nothing about replacement being free, so don't claim it
+/// is.)
 fn register_carrel_lower(conn: &Connection) -> Result<()> {
     conn.create_scalar_function(
         "carrel_lower",
@@ -870,11 +874,11 @@ fn register_carrel_lower(conn: &Connection) -> Result<()> {
 /// `series` is exact equality; SQL equality against a NULL column evaluates
 /// to NULL (falsy), so a book with no series never matches a non-empty
 /// filter without any special-casing.
-fn build_book_predicate(q: &BookQuery) -> (String, Vec<Value>) {
+fn build_book_predicate(query: &BookQuery) -> (String, Vec<Value>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Value> = Vec::new();
 
-    if let Some(needle) = q.q.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(needle) = query.q.as_deref().filter(|s| !s.is_empty()) {
         clauses.push(
             "(instr(carrel_lower(b.title), carrel_lower(?)) > 0 \
               OR instr(carrel_lower(b.author), carrel_lower(?)) > 0)"
@@ -884,12 +888,12 @@ fn build_book_predicate(q: &BookQuery) -> (String, Vec<Value>) {
         params.push(Value::Text(needle.to_string()));
     }
 
-    if let Some(series) = q.series.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(series) = query.series.as_deref().filter(|s| !s.is_empty()) {
         clauses.push("b.series = ?".to_string());
         params.push(Value::Text(series.to_string()));
     }
 
-    if q.want_to_read {
+    if query.want_to_read {
         // `!= 0`, not `= 1`, so this agrees with `row_to_grid_item`/`row_to_book`,
         // which map any non-zero value to `true`. A `= 1` predicate would hide a
         // row that the same query's own mapper would report as wanted.
@@ -930,13 +934,13 @@ fn book_sort_order_sql(sort: BookSort) -> &'static str {
 /// primary key, so each book joins at most one progress row.
 fn query_books_generic<T>(
     conn: &Connection,
-    q: &BookQuery,
+    query: &BookQuery,
     columns: &str,
     row_mapper: fn(&rusqlite::Row) -> rusqlite::Result<T>,
 ) -> Result<Page<T>> {
     register_carrel_lower(conn)?;
 
-    let (where_sql, where_params) = build_book_predicate(q);
+    let (where_sql, where_params) = build_book_predicate(query);
     let from_join = "FROM books b LEFT JOIN reading_progress rp ON rp.book_id = b.id";
 
     let count_sql = format!("SELECT COUNT(*) {from_join} {where_sql}");
@@ -946,18 +950,18 @@ fn query_books_generic<T>(
         |row| row.get(0),
     )?;
 
-    let order_sql = book_sort_order_sql(q.sort);
+    let order_sql = book_sort_order_sql(query.sort);
     let mut page_params = where_params;
-    let limit_sql = match q.limit {
+    let limit_sql = match query.limit {
         Some(limit) => {
             page_params.push(Value::Integer(limit as i64));
-            page_params.push(Value::Integer(q.offset as i64));
+            page_params.push(Value::Integer(query.offset as i64));
             "LIMIT ? OFFSET ?"
         }
         None => {
             // SQLite treats a negative LIMIT as "no limit", which lets
             // OFFSET keep working with no `limit` given.
-            page_params.push(Value::Integer(q.offset as i64));
+            page_params.push(Value::Integer(query.offset as i64));
             "LIMIT -1 OFFSET ?"
         }
     };
@@ -976,14 +980,14 @@ fn query_books_generic<T>(
 /// Grid-projection counterpart of [`query_books`] — filters, sorts, and
 /// pages the `books` table in SQL and returns [`BookGridItem`] rows plus the
 /// filtered total. See the module comment above for why this exists.
-pub fn query_books_grid(conn: &Connection, q: &BookQuery) -> Result<Page<BookGridItem>> {
-    query_books_generic(conn, q, GRID_COLUMNS_B, row_to_grid_item)
+pub fn query_books_grid(conn: &Connection, query: &BookQuery) -> Result<Page<BookGridItem>> {
+    query_books_generic(conn, query, GRID_COLUMNS_B, row_to_grid_item)
 }
 
 /// Full-`Book`-projection counterpart of [`query_books_grid`] — same filter,
 /// sort, and paging semantics, for callers that need the full record.
-pub fn query_books(conn: &Connection, q: &BookQuery) -> Result<Page<Book>> {
-    query_books_generic(conn, q, BOOK_COLUMNS_B, row_to_book)
+pub fn query_books(conn: &Connection, query: &BookQuery) -> Result<Page<Book>> {
+    query_books_generic(conn, query, BOOK_COLUMNS_B, row_to_book)
 }
 
 pub fn update_book(conn: &Connection, book: &Book) -> Result<()> {
@@ -6863,7 +6867,7 @@ mod tests {
     }
 
     #[test]
-    fn query_books_grid_title_sort_is_unicode_aware() {
+    fn query_books_grid_title_sort_orders_by_title_ascending() {
         let (_dir, conn) = setup();
         seed_query_fixture(&conn);
 
@@ -6884,7 +6888,7 @@ mod tests {
     }
 
     #[test]
-    fn query_books_grid_author_sort() {
+    fn query_books_grid_author_sort_orders_by_author_ascending() {
         let (_dir, conn) = setup();
         seed_query_fixture(&conn);
 
@@ -6900,10 +6904,88 @@ mod tests {
         // "hermann süskind" (a2) < "jane roe" (b2) < "john doe" (b1) <
         // "patrick ünsal" (a3)
         assert_eq!(ids(&page.items), vec!["a1", "a2", "b2", "b1", "a3"]);
+        // NOTE: this fixture's five authors differ at their first letter
+        // (g/h/j/j/p), so it pins the column and the direction but says
+        // nothing about case folding — the folding tests below do that.
+    }
+
+    /// Rows whose sort order *flips* depending on how the sort key is folded.
+    /// The point of the fixture is that a wrong folding cannot produce the
+    /// expected order by accident:
+    ///
+    /// | pair            | Rust `to_lowercase` | SQLite ASCII `LOWER()` | no folding |
+    /// |-----------------|---------------------|------------------------|------------|
+    /// | `Émile`/`école` | `école` first       | `Émile` first          | `Émile` first |
+    /// | `zebra`/`Zulu`  | `zebra` first       | `zebra` first          | `Zulu` first  |
+    ///
+    /// The first pair discriminates Unicode folding from SQLite's ASCII-only
+    /// `LOWER()` (which leaves `É` = U+00C9 alone, and U+00C9 sorts before
+    /// the U+00E9 that `école` already carries). The second discriminates
+    /// folding from no folding at all (`Z` = 0x5A sorts before `z` = 0x7A).
+    /// Together they fail against every wrong implementation of the sort key:
+    ///
+    /// | sort key            | resulting order          |
+    /// |---------------------|--------------------------|
+    /// | `carrel_lower`      | `f3, f4, f2, f1` (right) |
+    /// | ASCII `LOWER()`     | `f3, f4, f1, f2`         |
+    /// | raw column, no fold | `f4, f3, f1, f2`         |
+    ///
+    /// Both accented words lead with the byte 0xC3, which sorts after every
+    /// ASCII letter, so the two pairs never interleave.
+    fn seed_folding_fixture(conn: &Connection, on_author: bool) {
+        for (id, text) in [
+            ("f1", "Émile"),
+            ("f2", "école"),
+            ("f3", "zebra"),
+            ("f4", "Zulu"),
+        ] {
+            let (title, author) = if on_author {
+                ("Placeholder Title", text)
+            } else {
+                (text, "Placeholder Author")
+            };
+            insert_book(conn, &qbook(id, title, author, 100, None, None, false)).unwrap();
+        }
     }
 
     #[test]
-    fn query_books_grid_rating_sort_nulls_last() {
+    fn query_books_grid_title_sort_folds_case_the_way_rust_does() {
+        let (_dir, conn) = setup();
+        seed_folding_fixture(&conn, false);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Title,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&page.items),
+            vec!["f3", "f4", "f2", "f1"],
+            "zebra < Zulu < école < Émile once folded the way Rust's to_lowercase() folds; SQLite's ASCII-only LOWER() would swap the last two, and no folding at all would also put Zulu first"
+        );
+    }
+
+    #[test]
+    fn query_books_grid_author_sort_folds_case_the_way_rust_does() {
+        let (_dir, conn) = setup();
+        seed_folding_fixture(&conn, true);
+
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                sort: BookSort::Author,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&page.items), vec!["f3", "f4", "f2", "f1"]);
+    }
+
+    #[test]
+    fn query_books_grid_rating_sort_treats_null_as_zero() {
         let (_dir, conn) = setup();
         seed_query_fixture(&conn);
 
@@ -7012,6 +7094,23 @@ mod tests {
         let grid_ids: Vec<&str> = grid_page.items.iter().map(|b| b.id.as_str()).collect();
         let full_ids: Vec<&str> = full_page.items.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(full_ids, grid_ids);
+
+        // The two projections run the same query and differ only in their
+        // column list and row mapper, so agreeing on ids is a weak claim on
+        // its own. What it can still catch is BOOK_COLUMNS_B drifting out of
+        // step with `row_to_book` — the LEFT JOIN means a stray `SELECT *`
+        // or a missing alias would either fail to map or map the wrong
+        // column. Read a field only the full projection carries to pin that.
+        for book in &full_page.items {
+            assert_eq!(
+                book.file_path,
+                format!("/tmp/{}.epub", book.id),
+                "full projection mapped file_path onto the wrong row"
+            );
+        }
+        let wanted: Vec<bool> = full_page.items.iter().map(|b| b.want_to_read).collect();
+        let grid_wanted: Vec<bool> = grid_page.items.iter().map(|b| b.want_to_read).collect();
+        assert_eq!(wanted, grid_wanted, "projections disagree on want_to_read");
     }
 
     #[test]
