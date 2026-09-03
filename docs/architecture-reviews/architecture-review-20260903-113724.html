@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Architecture review — Carrel</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .seam { stroke-dasharray: 4 4; }
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); }
+      .lbl { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+      .mermaid { font-size: 13px; }
+    </style>
+  </head>
+  <body class="bg-stone-50 text-slate-900 font-sans antialiased">
+    <main class="max-w-5xl mx-auto px-6 py-12 space-y-12">
+
+      <header class="space-y-6">
+        <div class="flex items-baseline justify-between flex-wrap gap-3">
+          <h1 class="font-serif text-4xl tracking-tight">Architecture review — Carrel</h1>
+          <p class="font-mono text-xs text-slate-500">2026-09-03</p>
+        </div>
+
+        <div class="grid sm:grid-cols-4 gap-3 text-sm">
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <div class="lbl text-slate-400">IPC commands</div>
+            <div class="font-mono text-2xl">156</div>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <div class="lbl text-slate-400">HTTP routes</div>
+            <div class="font-mono text-2xl">51</div>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <div class="lbl text-slate-400">commands.rs</div>
+            <div class="font-mono text-2xl">13,039</div>
+          </div>
+          <div class="rounded border border-slate-200 bg-white p-3">
+            <div class="lbl text-slate-400">app.js exports</div>
+            <div class="font-mono text-2xl text-red-600">0</div>
+          </div>
+        </div>
+
+        <div class="rounded border border-slate-200 bg-white p-4 text-sm space-y-2">
+          <div class="lbl text-slate-400">Legend</div>
+          <div class="flex flex-wrap gap-5 items-center text-slate-600">
+            <span class="flex items-center gap-2"><span class="inline-block w-6 h-4 border border-slate-400"></span> module</span>
+            <span class="flex items-center gap-2"><svg width="28" height="6"><line x1="0" y1="3" x2="28" y2="3" class="seam" stroke="#64748b" stroke-width="2"/></svg> seam</span>
+            <span class="flex items-center gap-2"><svg width="28" height="6"><line x1="0" y1="3" x2="28" y2="3" stroke="#dc2626" stroke-width="2"/></svg> leakage</span>
+            <span class="flex items-center gap-2"><span class="inline-block w-6 h-4 deep"></span> deep module</span>
+          </div>
+        </div>
+
+        <p class="text-sm text-slate-600 border-l-2 border-emerald-500 pl-3">
+          Scope: <code class="font-mono text-xs">carrel_core::reader</code> and the chapter/page read path are excluded —
+          deepened across five milestones in PR #141, merged 2026-08-27. Three explorations ran over the IPC adapter and
+          data layer, the LAN web server, and both user interfaces. Every claim below carries file:line evidence; the
+          load-bearing ones were re-verified against the source before publishing.
+        </p>
+      </header>
+
+      <section id="candidates" class="space-y-10">
+
+        <!-- ============ 1 ============ -->
+        <article id="c1" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">1. Give "filter and sort a library" a home</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>src-tauri/src/web_server/api.rs:684–793</div>
+            <div>src-tauri/src/web_server/opds_feed.rs:469–488</div>
+            <div>src/screens/Library.tsx:571–598</div>
+            <div>src-tauri/src/web_server/static/app.js:2507–2523</div>
+            <div>carrel-core/src/db.rs — <span class="text-red-600">no query function exists</span></div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">Before — four filters, no module</div>
+              <pre class="mermaid">
+flowchart TD
+  DB[(books table)]
+  A["api.rs list_books<br/>q · series · sort · paging"]
+  O["opds_feed search_books<br/>q only · no paging"]
+  R["Library.tsx<br/>6 filters, in browser"]
+  J["app.js<br/>q + want_to_read, in browser"]
+  DB --> A
+  DB --> O
+  DB --> R
+  DB --> J
+  classDef dup fill:#fee2e2,stroke:#dc2626;
+  class A,O,R,J dup
+              </pre>
+            </div>
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">After — one interface, four adapters</div>
+              <pre class="mermaid">
+flowchart TD
+  DB[(books table)]
+  Q["db::query_books(BookQuery)<br/>→ Page&lt;BookGridItem&gt;"]
+  A[api.rs] ---> Q
+  O[opds_feed] ---> Q
+  R[Library.tsx] ---> Q
+  J[app.js] ---> Q
+  Q --> DB
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a,stroke-width:2px;
+  class Q deep
+              </pre>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            The predicate "case-insensitively match title or author" is written out four times, in three languages, and
+            each copy loads the whole table and filters in the host language.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            One <code class="font-mono text-xs">db::query_books(conn, &amp;BookQuery) -&gt; Page&lt;BookGridItem&gt;</code>
+            that compiles to SQL, with the id tie-break that makes paging stable living in its <code class="font-mono text-xs">ORDER BY</code>.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>leverage: one interface, four adapters</li>
+            <li>locality: filter rules stop drifting</li>
+            <li>OPDS search gains paging and ETag</li>
+            <li>Collections gain filters for free</li>
+            <li>Tests: SQL-level, no HTTP, no React</li>
+            <li>One place to add FTS or diacritic folding</li>
+          </ul>
+
+          <div class="rounded bg-amber-50 border border-amber-200 p-3 text-sm">
+            <strong>Already user-visible.</strong> Desktop filters on format, status, rating, source, want-to-read and tags.
+            Web and OPDS filter on title/author only. The same search gives different results on phone and desktop, and
+            nothing asserts they should agree. <code class="font-mono text-xs">api.rs:726-731</code> carries a comment noting
+            that <code class="font-mono text-xs">app.js</code> "needed the same fix for the same reason" — a correctness fix
+            applied twice, by hand, in two languages.
+          </div>
+        </article>
+
+        <!-- ============ 2 ============ -->
+        <article id="c2" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">2. <code class="font-mono text-xl">carrel_core::opds_feed</code> is a fork, not a seam</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">ports &amp; adapters</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>carrel-core/src/opds_feed.rs — 528 lines, <span class="text-red-600">0 callers</span>, 1 commit</div>
+            <div>src-tauri/src/web_server/opds_feed.rs — 1,148 lines, serves traffic, 19 commits</div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">Before — a seam with no adapters</div>
+              <div class="relative h-[280px]">
+                <div class="absolute left-0 top-2 w-[46%] rounded border-2 border-dashed border-slate-300 bg-slate-50 p-3">
+                  <div class="lbl text-slate-400">carrel-core::opds_feed</div>
+                  <div class="text-xs mt-2 text-slate-500">xml_escape · book_to_entry<br/>wrap_feed · EntryUrls · FeedKind</div>
+                  <div class="mt-3 text-xs text-slate-400 italic">297 lines of tests<br/>guarding nothing</div>
+                </div>
+                <div class="absolute right-0 top-2 w-[46%] rounded border-2 border-slate-800 bg-white p-3">
+                  <div class="lbl text-slate-500">web_server::opds_feed</div>
+                  <div class="text-xs mt-2">xml_escape · book_to_entry<br/>wrap_feed + ETag + 304<br/>+ OpenSearch descriptor</div>
+                  <div class="mt-3 text-xs text-emerald-700">serves every request</div>
+                </div>
+                <svg class="absolute inset-0 w-full h-full pointer-events-none">
+                  <line x1="46%" y1="80" x2="54%" y2="80" stroke="#dc2626" stroke-width="2" stroke-dasharray="3 3"/>
+                  <text x="50%" y="72" text-anchor="middle" fill="#dc2626" font-size="10">forked</text>
+                </svg>
+                <div class="absolute bottom-2 left-0 right-0 text-center text-xs text-red-600">no import edge exists</div>
+              </div>
+            </div>
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">After — one implementation, HTTP stays outside</div>
+              <div class="relative h-[280px]">
+                <div class="absolute left-1/2 -translate-x-1/2 top-2 w-[70%] rounded deep text-white p-3">
+                  <div class="lbl text-slate-300">carrel-core::opds_feed</div>
+                  <div class="text-xs mt-2 text-slate-200">entry + feed rendering<br/>escaping · FeedRevision · OpenSearch</div>
+                </div>
+                <div class="absolute left-1/2 -translate-x-1/2 bottom-6 w-[70%] rounded border border-slate-300 bg-white p-3">
+                  <div class="lbl text-slate-500">web_server::opds_feed</div>
+                  <div class="text-xs mt-2 text-slate-600">Router · headers · 304 · request_authority</div>
+                  <div class="text-xs mt-2 text-emerald-700">≈510 → ≈200 lines</div>
+                </div>
+                <svg class="absolute inset-0 w-full h-full pointer-events-none">
+                  <line x1="50%" y1="110" x2="50%" y2="170" stroke="#64748b" stroke-width="2" class="seam"/>
+                </svg>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            The module that exists to be shared has never been called, so every fix landed only in the copy that serves traffic.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            Fold the live copy's ETag, OpenSearch and stable-<code class="font-mono text-xs">updated</code> work into core, and have the web module call it.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Deletion test: deleting core's copy changes nothing</li>
+            <li>leverage: Carrel Server gets the real feed</li>
+            <li>297 test lines start guarding shipped behaviour</li>
+            <li>One answer to "is the id escaped?"</li>
+          </ul>
+
+          <div class="rounded bg-red-50 border border-red-200 p-3 text-sm">
+            <strong>Live divergence.</strong> Core escapes the book id into <code class="font-mono text-xs">&lt;id&gt;</code>
+            (<code class="font-mono text-xs">opds_feed.rs:137</code>); the copy actually serving traffic does not
+            (<code class="font-mono text-xs">web_server/opds_feed.rs:125</code>). A book id containing <code>&amp;</code>
+            emits malformed XML to OPDS clients. The core test that would catch it passes, because nothing calls the code it tests.
+          </div>
+        </article>
+
+        <!-- ============ 3 ============ -->
+        <article id="c3" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">3. Highlight anchoring: two offset conventions, one table</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>src-tauri/src/web_server/static/app.js:5856–5877 · 5165 · 5186</div>
+            <div>src/components/ReaderPane.tsx:1203–1225 · 1446–1505</div>
+            <div>carrel-core/src/db.rs:189 — one highlights table, both writers</div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">Before — the arithmetic lives in both callers</div>
+              <div class="space-y-2 text-xs">
+                <div class="rounded border border-red-300 bg-red-50 p-2">
+                  <div class="lbl text-red-700">web capture</div>
+                  <code class="block mt-1">start = pre.length + lead</code>
+                  <span class="text-slate-500">corrects leading whitespace</span>
+                </div>
+                <div class="rounded border border-red-300 bg-red-50 p-2">
+                  <div class="lbl text-red-700">desktop capture</div>
+                  <code class="block mt-1">start = pre.length</code>
+                  <span class="text-slate-500">no correction, text still trimmed</span>
+                </div>
+                <div class="flex justify-center text-slate-400">↓ same row ↓</div>
+                <div class="rounded border border-slate-800 p-2 text-center font-mono">highlights(start_offset, end_offset)</div>
+                <div class="flex justify-center text-slate-400">↓ read back ↓</div>
+                <div class="grid grid-cols-2 gap-2">
+                  <div class="rounded border border-slate-300 p-2">
+                    <div class="lbl text-slate-500">web render</div>
+                    <span class="text-slate-500">TreeWalker over DOM text</span>
+                  </div>
+                  <div class="rounded border border-slate-300 p-2">
+                    <div class="lbl text-slate-500">desktop render</div>
+                    <span class="text-slate-500">scanner over raw HTML<br/><code>&amp;amp;</code> counts 5</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">After — one anchor module, two renderers</div>
+              <div class="space-y-2 text-xs">
+                <div class="rounded deep text-white p-3">
+                  <div class="lbl text-slate-300">highlight anchor</div>
+                  <code class="block mt-1 text-slate-200">capture(range, el) → {text, start, end}</code>
+                  <code class="block text-slate-200">resolve(highlights, text) → ranges[]</code>
+                  <div class="mt-2 text-slate-400">owns: whitespace rule, entity rule, drift fallback</div>
+                </div>
+                <div class="flex justify-center text-slate-400">↓</div>
+                <div class="grid grid-cols-2 gap-2">
+                  <div class="rounded border border-slate-300 p-2 text-center">web wraps DOM</div>
+                  <div class="rounded border border-slate-300 p-2 text-center">desktop splices HTML</div>
+                </div>
+                <div class="text-center text-emerald-700 mt-2">offsets mean one thing</div>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            Web corrects a selection's leading whitespace before storing the offset; desktop does not, but trims the text anyway.
+            The same drag stores two different anchors.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            One module owning "where is this highlight now", with the whitespace and entity conventions as stated invariants.
+            Both UIs keep their own renderer and stop owning the arithmetic.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Corrupt anchors stop being writable</li>
+            <li>Desktop gains the drift fallback it lacks</li>
+            <li>locality: one convention, one place</li>
+            <li>Tests: a pure table, no DOM</li>
+          </ul>
+
+          <div class="rounded bg-red-50 border border-red-200 p-3 text-sm">
+            <strong>Verified against source.</strong> <code class="font-mono text-xs">app.js:5870</code> computes
+            <code class="font-mono text-xs">lead</code> and adds it; <code class="font-mono text-xs">ReaderPane.tsx:1224</code>
+            does not. Both then store the <em>trimmed</em> text, so a desktop highlight that starts on whitespace is stored
+            shifted left by the whitespace length. The React side is also inconsistent with itself: it captures at DOM-text
+            offsets and renders at HTML-string offsets. No test on either side reaches this.
+          </div>
+        </article>
+
+        <!-- ============ 4 ============ -->
+        <article id="c4" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">4. <code class="font-mono text-xl">AppHandle</code> makes 32 commands untestable</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">mock</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>src-tauri/src/commands.rs — 32 commands take a concrete AppHandle</div>
+            <div>src-tauri/src/commands.rs:11750–11755 — the module says so itself</div>
+            <div>7 <code>*_inner</code> shadows exist purely to route around it</div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">Before — interface as wide as the runtime</div>
+              <div class="flex items-end gap-6 h-[240px] justify-center">
+                <div class="text-center">
+                  <div class="w-24 bg-red-200 border border-red-400" style="height:150px"></div>
+                  <div class="w-24 bg-slate-200 border border-slate-400" style="height:60px"></div>
+                  <div class="lbl text-slate-500 mt-2">interface<br/>vs impl</div>
+                </div>
+                <div class="text-xs text-slate-600 max-w-[160px]">
+                  <p class="mb-2">Needs: an event sink, a cache dir.</p>
+                  <p>Demands: the entire Tauri runtime.</p>
+                  <p class="mt-2 text-red-600">→ mock runtime cannot build one</p>
+                </div>
+              </div>
+            </div>
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">After — two narrow interfaces</div>
+              <div class="flex items-end gap-6 h-[240px] justify-center">
+                <div class="text-center">
+                  <div class="w-24 bg-emerald-200 border border-emerald-500" style="height:36px"></div>
+                  <div class="w-24 deep" style="height:174px"></div>
+                  <div class="lbl text-slate-500 mt-2">interface<br/>vs impl</div>
+                </div>
+                <div class="text-xs text-slate-600 max-w-[160px]">
+                  <p><code class="font-mono">EventSink::emit</code></p>
+                  <p><code class="font-mono">Storage</code> (already exists)</p>
+                  <p class="mt-2 text-emerald-700">→ commands take State only</p>
+                  <p class="mt-2">3 commands keep a real handle, generically</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            The heaviest commands — <code class="font-mono text-xs">prepare_pdf</code>, <code class="font-mono text-xs">start_scan</code>,
+            <code class="font-mono text-xs">sync_pull_book</code>, <code class="font-mono text-xs">import_library_backup</code> — are exactly the ones no test can call.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            Depend on an event sink and a storage handle rather than the runtime that provides them. Four commands already
+            use the generic <code class="font-mono text-xs">AppHandle&lt;R&gt;</code> form successfully.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Event emission becomes assertable</li>
+            <li>Delete 7 <code class="font-mono text-xs">*_inner</code> shadows</li>
+            <li>Delete a hand-maintained mirror function</li>
+            <li>130 of 156 commands are untested today</li>
+          </ul>
+
+          <div class="rounded bg-amber-50 border border-amber-200 p-3 text-sm">
+            The IPC adapter has no end-to-end coverage either: <code class="font-mono text-xs">pnpm run test:e2e</code>
+            drives the axum harness, not Tauri. So for these 32, neither unit nor e2e tests exist.
+          </div>
+        </article>
+
+        <!-- ============ 5 ============ -->
+        <article id="c5" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">5. Both adapters hand-roll the same pre-read prelude</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>commands.rs — resolve_book_path ×19, validate_file_exists ×14, db::get_book ×30</div>
+            <div>api.rs — state.conn() ×34, book-lookup-or-404 ×15, map_err(carrel_status) ×90</div>
+            <div>web_server/mod.rs:131–170 — a line-for-line copy of commands.rs:280–322</div>
+          </div>
+
+          <div class="rounded border border-slate-200 p-4">
+            <div class="lbl text-slate-400 mb-3">Cross-section — what every read re-derives by hand</div>
+            <div class="grid md:grid-cols-2 gap-6">
+              <div>
+                <div class="lbl text-red-700 mb-2">Before · repeated 14–34×</div>
+                <div class="space-y-1">
+                  <div class="h-9 border-l-4 border-red-400 bg-red-50 px-3 flex items-center text-xs">get a pooled connection</div>
+                  <div class="h-9 border-l-4 border-red-400 bg-red-50 px-3 flex items-center text-xs">look up the book, 404 wording by hand</div>
+                  <div class="h-9 border-l-4 border-red-400 bg-red-50 px-3 flex items-center text-xs">check the format — or forget to</div>
+                  <div class="h-9 border-l-4 border-red-400 bg-red-50 px-3 flex items-center text-xs">resolve the path</div>
+                  <div class="h-9 border-l-4 border-red-400 bg-red-50 px-3 flex items-center text-xs">validate existence + symlink</div>
+                  <div class="h-9 border-l-4 border-red-400 bg-red-50 px-3 flex items-center text-xs">pick one of two error mappers</div>
+                </div>
+              </div>
+              <div>
+                <div class="lbl text-emerald-700 mb-2">After · one module decides</div>
+                <div class="h-[228px] deep text-white rounded flex flex-col items-center justify-center text-center px-4">
+                  <div class="lbl text-slate-300">open_book / BookCtx</div>
+                  <code class="text-xs mt-2 text-slate-200">→ { book, path, format }</code>
+                  <div class="text-xs mt-3 text-slate-400">one canonical order<br/>one error vocabulary<br/>staging can't be forgotten</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            The copies have already drifted. <code class="font-mono text-xs">prepare_pdf</code> checks the path before the format;
+            <code class="font-mono text-xs">get_pdf_page_glyphs</code> checks the format first. So one missing, wrong-format book
+            yields <code class="font-mono text-xs">NotFound</code> from one command and <code class="font-mono text-xs">InvalidInput</code>
+            from another — and <code class="font-mono text-xs">CarrelError::kind</code> is a documented frontend contract.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            One <code class="font-mono text-xs">open_book(book_id, expect)</code> on the desktop side and one axum extractor on the
+            web side, both returning a book already known to be readable.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Ordering becomes a testable property</li>
+            <li>"Book not found" stops having 3 spellings</li>
+            <li>Wrong error mapper stops leaking paths to the LAN</li>
+            <li>locality: 33 copies become 2 modules</li>
+          </ul>
+
+          <div class="rounded bg-red-50 border border-red-200 p-3 text-sm">
+            <strong>A gate is already missing.</strong> <code class="font-mono text-xs">get_pdf_page_count</code>
+            (<code class="font-mono text-xs">commands.rs:6516</code>) has no format check at all — verified — so a CBZ id
+            reaches <code class="font-mono text-xs">pdf::get_page_count</code> and fails with whatever pdfium says.
+          </div>
+        </article>
+
+        <!-- ============ 6 ============ -->
+        <article id="c6" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">6. <code class="font-mono text-xl">db.rs</code> is six modules fused</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-amber-100 text-amber-800">Worth exploring</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>carrel-core/src/db.rs — 3,018 impl lines, 104 pub fn, 19 tables</div>
+            <div>one public item per ~28 lines of implementation</div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">Before — one file, six vocabularies</div>
+              <pre class="mermaid">
+flowchart TB
+  subgraph F["db.rs — 104 pub fn"]
+    P["row CRUD"]
+    S["SQL compiler for<br/>collection rules · 148 ln"]
+    T["timezone streak<br/>analytics · 150 ln"]
+    R["recommendation<br/>heuristic · 196 ln"]
+    B["backup serializer"]
+    M["schema migrations"]
+  end
+  classDef odd fill:#fef3c7,stroke:#d97706;
+  class S,T,R,B odd
+              </pre>
+            </div>
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">After — aggregates with intent-level interfaces</div>
+              <pre class="mermaid">
+flowchart TB
+  BK["db::books"]
+  AN["db::annotations<br/>one soft-delete policy"]
+  ST["db::settings"]
+  SA["db::stats"]
+  CO["db::collections<br/>owns the rule compiler"]
+  SC["db::schema"]
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  class AN,CO deep
+              </pre>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            Because it exposes row CRUD, each adapter grew its own flavour: four
+            <code class="font-mono text-xs">*_scoped</code> near-duplicates, where only the scoped half can tell
+            "no such bookmark" from "deleted". The desktop command silently succeeds on a bogus id.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            Split by aggregate, not by table, and expose intent — <code class="font-mono text-xs">annotations::delete(...) -&gt; Deleted|Absent</code>
+            — so scoping stops being optional.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Unscoped variants stop being reachable</li>
+            <li>Rule validation stops living in another crate</li>
+            <li>Cross-function behaviour becomes testable</li>
+            <li>Deletion test: row CRUD merely moves; aggregates concentrate</li>
+          </ul>
+
+          <div class="rounded bg-red-50 border border-red-200 p-3 text-sm">
+            <strong>A live trap, verified.</strong> <code class="font-mono text-xs">db::delete_highlight</code>
+            (<code class="font-mono text-xs">db.rs:1970</code>) is a public <em>hard</em> delete with <strong>zero callers anywhere</strong>,
+            not even tests. It bypasses the <code class="font-mono text-xs">deleted_at</code> tombstone the sync layer depends on,
+            and sits in the public surface beside the correct function with the more obvious name.
+          </div>
+        </article>
+
+        <!-- ============ 7 ============ -->
+        <article id="c7" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">7. <code class="font-mono text-xl">app.js</code> exports nothing, so nothing in it is testable</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-amber-100 text-amber-800">Worth exploring</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>static/app.js — 8,536 lines, one IIFE, 0 exports, 0 unit tests</div>
+            <div>src/lib/ — 25 pure modules, each with a paired .test.ts</div>
+            <div>4 <code>window.__*</code> hooks exist in production purely so Playwright can observe internals</div>
+          </div>
+
+          <div class="rounded border border-slate-200 p-4">
+            <div class="lbl text-slate-400 mb-3">The same family, written five times</div>
+            <div class="grid md:grid-cols-2 gap-6">
+              <div>
+                <div class="lbl text-red-700 mb-2">Before</div>
+                <div class="grid grid-cols-5 gap-1 text-[10px] text-center">
+                  <div class="border border-red-300 bg-red-50 p-1">typography</div>
+                  <div class="border border-red-300 bg-red-50 p-1">TOC</div>
+                  <div class="border border-red-300 bg-red-50 p-1">bookmarks</div>
+                  <div class="border border-red-300 bg-red-50 p-1">highlights</div>
+                  <div class="border border-red-300 bg-red-50 p-1">vocabulary</div>
+                </div>
+                <div class="text-xs text-slate-600 mt-2">
+                  29 functions in the same six shapes, five module-level <code class="font-mono">open</code> flags,
+                  each panel closing the other four by hand.
+                </div>
+                <div class="text-xs text-slate-600 mt-2">
+                  Two structurally identical jump-token protocols; cancelling one from the other takes
+                  <strong>34 call sites</strong>.
+                </div>
+              </div>
+              <div>
+                <div class="lbl text-emerald-700 mb-2">After</div>
+                <div class="deep text-white rounded p-3 text-xs">
+                  <code>createDrawer({id, trigger, renderBody})</code>
+                  <div class="text-slate-400 mt-1">owns focus return, key containment, mutual exclusion</div>
+                </div>
+                <div class="deep text-white rounded p-3 text-xs mt-2">
+                  <code>createJumpToken({onArrive})</code>
+                  <div class="text-slate-400 mt-1">starting any jump clears the current one</div>
+                </div>
+                <div class="text-xs text-emerald-700 mt-2">≈900 lines move under vitest; the 4 test hooks disappear</div>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            A module with no interface grows globals instead of tests. The web UI's only checks are 205 Playwright cases
+            and four Rust string-literal greps.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            Pull the pure parts out as exported functions the IIFE consumes — the shape
+            <code class="font-mono text-xs">src/lib/</code> already proves on the React side, where
+            <code class="font-mono text-xs">jumpTokenGate.ts</code> is 35 lines with 50 lines of tests.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Gives the React side something to import</li>
+            <li>Removes production code that exists for tests</li>
+            <li>A third drawer stops being a 20-site edit</li>
+            <li>leverage: one drawer interface, five panels</li>
+          </ul>
+        </article>
+
+        <!-- ============ 8 ============ -->
+        <article id="c8" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">8. One thumbnail file, two freshness models</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-amber-100 text-amber-800">Worth exploring</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">ports &amp; adapters</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>commands.rs:515–530, 571–587 — writes via Storage, reads by existence</div>
+            <div>api.rs:912–985 — validates by mtime, writes by path arithmetic</div>
+            <div>api.rs:918, 937 — the web module reaches into <code>crate::commands::</code> for its constants</div>
+          </div>
+
+          <div class="rounded border border-slate-200 p-4">
+            <div class="lbl text-slate-400 mb-3">Before / after — who owns the derived artifact</div>
+            <pre class="mermaid">
+flowchart LR
+  subgraph B["Before"]
+    D1["desktop<br/>exists() only"] --> F1["thumb.jpg"]
+    W1["web<br/>mtime compare"] --> F1
+    W1 -.reaches into.-> C1["crate::commands::<br/>THUMB_WIDTH"]
+  end
+  subgraph A["After"]
+    D2[desktop] --> CV["carrel_core::covers"]
+    W2[web] --> CV
+    CV --> ST[Storage]
+  end
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  class W1,C1 leak
+  class CV deep
+            </pre>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            A <code class="font-mono text-xs">thumb.jpg</code> older than its cover is served as stale art by the desktop grid and
+            silently regenerated by the web server. Same file, same library, two answers, no test comparing them.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            A <code class="font-mono text-xs">carrel_core::covers</code> module owning the derived-artifact rule, with read-time
+            validation — the safer of the two models — winning for both.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>The web path stops leaving the Storage seam</li>
+            <li>Path-containment check stops being needed</li>
+            <li>Breaks the web → commands layering inversion</li>
+            <li>Stale-thumb case becomes one core test</li>
+          </ul>
+        </article>
+
+        <!-- ============ 9 ============ -->
+        <article id="c9" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">9. Route protection is a string comparison in two files</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-amber-100 text-amber-800">Worth exploring</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">ports &amp; adapters</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>auth.rs:283–374 · mod.rs:468–498 · api.rs:49–67 — three gates, never composed</div>
+            <div>mod.rs:51–103 — WebState: 12 public fields, no constructor, 12 struct literals</div>
+          </div>
+
+          <div class="grid md:grid-cols-2 gap-4">
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">Before — protection decided elsewhere</div>
+              <pre class="mermaid">
+flowchart TB
+  R["41 routes → Router&lt;WebState&gt;"]
+  G1["PIN gate<br/>path literals"]
+  G2["lock gate<br/>different literals"]
+  G3["require_configured_pin<br/>2 opt-in call sites"]
+  R --> G1
+  R --> G2
+  R -.remembered.-> G3
+  classDef leak stroke:#dc2626,stroke-width:2px;
+  class G3 leak
+              </pre>
+            </div>
+            <div class="rounded border border-slate-200 p-4">
+              <div class="lbl text-slate-400 mb-3">After — declared where the route is</div>
+              <pre class="mermaid">
+flowchart TB
+  R["routes declare<br/>Public | Authenticated | RequiresPin"]
+  M["middlewares read<br/>the classification"]
+  R --> M
+  T["table-driven test,<br/>no server"] --> R
+  classDef deep fill:#0f172a,color:#fff,stroke:#0f172a;
+  class R deep
+              </pre>
+            </div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            Nothing in a handler's signature says whether it is authenticated or returns bulk personal data.
+            <code class="font-mono text-xs">require_configured_pin</code>'s own doc concedes that two bulk personal routes are not gated.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            Classify at route registration and give <code class="font-mono text-xs">WebState</code> one constructor, so the
+            nine-comment sharing contract between it and <code class="font-mono text-xs">AppState</code> becomes unstatable.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>"Which routes are public" becomes a unit test</li>
+            <li>27 hand-rolled server harnesses collapse</li>
+            <li>Three production struct literals become one call</li>
+            <li>The <code class="font-mono text-xs">/api/auth</code> gate asymmetry gets a name</li>
+          </ul>
+        </article>
+
+        <!-- ============ 10 ============ -->
+        <article id="c10" class="rounded-lg border border-slate-200 bg-white p-6 space-y-4">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <h2 class="font-serif text-2xl">10. <code class="font-mono text-xl">IpcMetrics</code> is opt-in, and its success field is always true</h2>
+            <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-200 text-slate-700">Speculative</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
+            </div>
+          </div>
+
+          <div class="font-mono text-xs text-slate-500 space-y-0.5">
+            <div>src-tauri/src/ipc_metrics.rs — 330 lines, instrumenting 15 of 156 commands</div>
+            <div>mark_error — <span class="text-red-600">called only from its own test</span></div>
+          </div>
+
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
+            Each site hand-types a label that must match the function name, and nothing checks it. Coverage is arbitrary:
+            <code class="font-mono text-xs">start_folder_import</code> is timed, <code class="font-mono text-xs">start_files_import</code> is not.
+            Of the six longest command bodies, only one is instrumented.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+            Wrap once at the registry, deriving the label from the function name and reading success from the actual
+            <code class="font-mono text-xs">Result</code>.</p>
+
+          <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
+            <li>Coverage goes 15 → 156, opt-out not opt-in</li>
+            <li>Label can't disagree with the function</li>
+            <li>Deletion test: it currently carries no complexity</li>
+            <li>One test replaces 156 nobody will write</li>
+          </ul>
+
+          <div class="rounded bg-red-50 border border-red-200 p-3 text-sm">
+            <strong>Verified.</strong> <code class="font-mono text-xs">mark_error</code> is called from nowhere but
+            <code class="font-mono text-xs">ipc_metrics.rs</code>'s own tests, so every metric recorded in production carries
+            <code class="font-mono text-xs">success: true</code> regardless of outcome. A command that fails in 100 ms is
+            indistinguishable from one that succeeds in 100 ms.
+          </div>
+        </article>
+
+      </section>
+
+      <section id="top-recommendation" class="rounded-lg deep text-white p-8 space-y-4">
+        <div class="lbl text-slate-400">Top recommendation</div>
+        <h2 class="font-serif text-3xl">
+          <a href="#c1" class="underline decoration-emerald-400 decoration-2 underline-offset-4">Give "filter and sort a library" a home</a>
+        </h2>
+        <p class="text-slate-300 max-w-3xl">
+          It has the strongest deletion test in the codebase: deleting the query logic in
+          <code class="font-mono text-sm text-slate-200">api.rs</code> concentrates complexity nowhere, because it is already
+          scattered across four copies in three languages. One
+          <code class="font-mono text-sm text-slate-200">db::query_books</code> serves all four adapters, gives OPDS search the
+          paging and conditional-GET its three sibling feeds already have, deletes the web SPA's client-side filtering branch,
+          and puts full-text search behind one interface instead of four.
+        </p>
+        <p class="text-slate-400 text-sm max-w-3xl">
+          Tackle <a href="#c3" class="underline decoration-red-400 underline-offset-4">highlight anchoring</a> first if you would
+          rather fix a live defect than gain leverage: it is narrower, but the two surfaces are writing incompatible offsets into
+          one table right now, and every day of use adds rows that no single convention can interpret.
+        </p>
+      </section>
+
+      <footer class="text-xs text-slate-400 pt-4 border-t border-slate-200">
+        Vocabulary follows the codebase-design glossary: module, interface, implementation, depth, seam, adapter, leverage, locality.
+        Findings came from three parallel explorations; claims marked "verified" were independently re-checked against the source.
+      </footer>
+
+    </main>
+  </body>
+</html>
