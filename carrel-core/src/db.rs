@@ -801,8 +801,13 @@ pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
 // Callers: `api.rs::list_books`, `opds_feed.rs::search_books`,
 // `plugins/runtime.rs`'s `find_books`, and — through
 // `query_books_in_collection_grid` below — `api.rs::get_collection_books`.
-// One copy survives on purpose, in the desktop's `Library.tsx`, which filters
-// an already-loaded grid in React and derives tag facet counts from it.
+//
+// No server-side copy remains. Three client-side ones do, all in the React
+// desktop app and none of them reachable from here: `Library.tsx` filters an
+// already-loaded grid and derives tag facet counts from the result, which is
+// why it was left alone deliberately; `BookPickerModal.tsx` filters a list the
+// modal was handed; and `lib/utils.ts`'s `filterBooks` is imported by nothing
+// but its own test.
 
 /// Sort order for [`query_books_grid`]/[`query_books`]. A closed enum (not a
 /// caller-supplied string) so the `ORDER BY` fragment is always chosen from a

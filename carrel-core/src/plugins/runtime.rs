@@ -11,16 +11,16 @@ use std::time::{Duration, Instant};
 
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map as RhaiMap, Scope, AST};
 
-/// Cap on what `find_books` hands a plugin, documented in `docs/PLUGINS.md`
-/// as "array (max 50)". Applied as the query's `LIMIT` so the cap is enforced
-/// in SQL rather than by truncating a whole-table read in the host.
-const FIND_BOOKS_LIMIT: usize = 50;
-
 use super::permissions::Permission;
 use crate::db::{self, DbPool};
 use crate::error::{CarrelError, CarrelResult};
 use crate::events::CarrelEvent;
 use crate::models::{Book, Highlight};
+
+/// Cap on what `find_books` hands a plugin, documented in `docs/PLUGINS.md`
+/// as "array (max 50)". Applied as the query's `LIMIT` so the cap is enforced
+/// in SQL rather than by truncating a whole-table read in the host.
+const FIND_BOOKS_LIMIT: usize = 50;
 
 /// Capabilities that only the embedding app can provide (OS notifications,
 /// the book-import pipeline). `carrel-core` stays UI-free; the desktop shell
@@ -718,9 +718,11 @@ mod tests {
     }
 
     /// `docs/PLUGINS.md` promises "array (max 50)". That cap used to be a
-    /// `.take(50)` over a whole-table read; it is now the query's `LIMIT`, so
-    /// this pins that the promise still holds — and that the host is no longer
-    /// materialising every book to throw most of them away.
+    /// `.take(50)` over a whole-table read and is now the query's `LIMIT`;
+    /// this pins that the promise still holds across the move. Note what it
+    /// does *not* prove: a `.take(50)` over an unlimited query would pass it
+    /// identically, so it says nothing about the host having stopped
+    /// materialising every book. That part is visible in the SQL, not here.
     #[test]
     fn find_books_caps_results_at_fifty() {
         let f = fixture();
