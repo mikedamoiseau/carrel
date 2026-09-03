@@ -2408,8 +2408,17 @@
     let paginated = false;
     if (activeCollectionId) {
       // Item 14: the collections endpoint stays unpaginated (out of scope —
-      // collections are small; see docs/web-ui-improvements.md Item 14).
-      url = "/api/collections/" + encodeURIComponent(activeCollectionId) + "/books";
+      // collections are small; see docs/web-ui-improvements.md Item 14). M4:
+      // q/want_to_read now filter server-side (mirroring /api/books), so the
+      // client-side filtering that used to run over the full result below
+      // is gone.
+      const collectionParams = new URLSearchParams();
+      if (query) collectionParams.set("q", query);
+      if (activeWantToRead) collectionParams.set("want_to_read", "true");
+      const collectionQs = collectionParams.toString();
+      url =
+        "/api/collections/" + encodeURIComponent(activeCollectionId) + "/books" +
+        (collectionQs ? "?" + collectionQs : "");
     } else {
       paginated = true;
       url = "/api/books?" + booksPageParams(query, 0).toString();
@@ -2498,30 +2507,9 @@
       }
     }
 
-    // The `/api/collections/{id}/books` endpoint accepts no query params, so
-    // when a collection is active the "Want to read" filter is applied
-    // client-side to its result set (the `/api/books` path filters server-side
-    // via booksPageParams). Applied after the empty-heal check above so an
-    // empty want-filtered-but-still-valid collection doesn't trigger healing.
-    if (activeCollectionId && activeWantToRead) {
-      books = books.filter(b => b.want_to_read);
-    }
-
-    // If collection is active and search is typed, filter client-side
-    if (activeCollectionId && query) {
-      const q = query.toLowerCase();
-      const filtered = books.filter(b =>
-        b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q)
-      );
-      renderBooks(filtered);
-      // Finding 5: only restore scroll after a real, successful grid render
-      // — never on a 401/failed load, which would consume the saved offset
-      // and scroll whatever's currently on screen to the wrong spot.
-      // Item 14: this is the collection+search client-filter path — never
-      // paginated, so no setupInfiniteScroll() call here.
-      await restoreLibraryScrollPosition();
-      return;
-    }
+    // M4: `q`/`want_to_read` now filter server-side for a collection too (see
+    // the `loadBooks` url-building above), so `books` here is already the
+    // filtered set — no client-side re-filtering needed.
 
     // Item 5: shelves only appear on the unfiltered "home" view — any active
     // search/series/collection filter (or an empty library) falls back to

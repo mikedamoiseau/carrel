@@ -108,7 +108,7 @@ Bodies and responses are **camelCase** (matching the `Highlight` model's seriali
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/collections` | List all collections |
-| GET | `/api/collections/:id/books` | Books in a collection |
+| GET | `/api/collections/:id/books` | Books in a collection. Supports `?q=` (matches title or author, case/accent-insensitive) and `?want_to_read=true` (presence-only, same convention as `/api/books`), applied server-side for both manual and automated collections. Unpaginated, and ordering is unaffected by these filters — a manual collection stays ordered by when each book was added to it. |
 
 ### Profiles
 

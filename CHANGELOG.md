@@ -6,6 +6,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
+  in SQL for both manual and automated (rule-based) collections. The web UI's
+  collection view uses them, so searching or filtering inside a collection now
+  transfers only the matching books rather than the whole collection and
+  filtering it in the browser. Results and ordering are unchanged — a manual
+  collection stays in the order books were added to it — and the endpoint
+  remains unpaginated.
 - **The OPDS search feed (`/opds/search`) is now paged and conditionally
   cacheable**, matching the other catalog feeds: results beyond the first 50
   now require following the feed's `next` link rather than arriving in one

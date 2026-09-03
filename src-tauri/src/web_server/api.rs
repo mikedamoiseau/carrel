@@ -2149,12 +2149,27 @@ async fn list_collections(
     Ok(Json(result))
 }
 
+#[derive(serde::Deserialize)]
+struct CollectionBooksQuery {
+    q: Option<String>,
+    /// Presence-only, enabled by the literal `"true"` alone — same convention
+    /// as `BookQuery::want_to_read` above (see its doc comment for why this
+    /// is a lenient `Option<String>` rather than a `bool`).
+    want_to_read: Option<String>,
+}
+
 async fn get_collection_books(
     State(state): State<WebState>,
     Path(id): Path<String>,
+    Query(params): Query<CollectionBooksQuery>,
 ) -> Result<Json<Vec<PublicBookGridItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
-    let books = db::get_books_in_collection_grid(&conn, &id).map_err(carrel_status)?;
+    let query = db::BookQuery {
+        q: params.q,
+        want_to_read: params.want_to_read.as_deref() == Some("true"),
+        ..Default::default()
+    };
+    let books = db::query_books_in_collection_grid(&conn, &id, &query).map_err(carrel_status)?;
     Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
@@ -4776,6 +4791,248 @@ mod tests {
         );
         let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(json.as_array().unwrap().is_empty());
+    }
+
+    // --- M4: get_collection_books filters server-side --------------------
+
+    fn seed_collection(state: &WebState, id: &str, r#type: crate::models::CollectionType) {
+        let conn = state.conn().unwrap();
+        db::insert_collection(
+            &conn,
+            &crate::models::Collection {
+                id: id.to_string(),
+                name: "Test collection".to_string(),
+                r#type,
+                icon: None,
+                color: None,
+                created_at: 1,
+                updated_at: 1,
+                rules: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn add_to_collection(state: &WebState, book_id: &str, collection_id: &str) {
+        let conn = state.conn().unwrap();
+        db::add_book_to_collection(&conn, book_id, collection_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_filters_by_q_matching_title() {
+        let state = list_books_test_state();
+        seed_collection(&state, "coll-fox", crate::models::CollectionType::Manual);
+        seed_list_books_book(&state, "fox", "Red Fox", "Bob", 100, None, None, false);
+        seed_list_books_book(
+            &state,
+            "whale",
+            "Blue Whale",
+            "Alice",
+            200,
+            None,
+            None,
+            false,
+        );
+        add_to_collection(&state, "fox", "coll-fox");
+        add_to_collection(&state, "whale", "coll-fox");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-fox".to_string()),
+            Query(CollectionBooksQuery {
+                q: Some("fox".to_string()),
+                want_to_read: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["fox"],
+            "server-side q must match the title and exclude the non-matching member"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_want_to_read_true_literal_filters() {
+        let state = list_books_test_state();
+        seed_collection(&state, "coll-want", crate::models::CollectionType::Manual);
+        seed_list_books_book(&state, "wanted", "Wanted", "Author", 100, None, None, true);
+        seed_list_books_book(
+            &state,
+            "not-wanted",
+            "Not Wanted",
+            "Author",
+            200,
+            None,
+            None,
+            false,
+        );
+        add_to_collection(&state, "wanted", "coll-want");
+        add_to_collection(&state, "not-wanted", "coll-want");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-want".to_string()),
+            Query(CollectionBooksQuery {
+                q: None,
+                want_to_read: Some("true".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(ids_from(&json), vec!["wanted"]);
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_want_to_read_non_true_value_is_lenient() {
+        // Item-14/M3 convention: only the literal "true" enables the filter.
+        // A malformed/other value (e.g. "1", which a naive `bool` field would
+        // 400 on) must be treated the same as absent — no filter, not an error.
+        let state = list_books_test_state();
+        seed_collection(
+            &state,
+            "coll-lenient",
+            crate::models::CollectionType::Manual,
+        );
+        seed_list_books_book(
+            &state, "l-wanted", "Wanted", "Author", 100, None, None, true,
+        );
+        seed_list_books_book(
+            &state,
+            "l-not-wanted",
+            "Not Wanted",
+            "Author",
+            200,
+            None,
+            None,
+            false,
+        );
+        add_to_collection(&state, "l-wanted", "coll-lenient");
+        add_to_collection(&state, "l-not-wanted", "coll-lenient");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-lenient".to_string()),
+            Query(CollectionBooksQuery {
+                q: None,
+                want_to_read: Some("1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(
+            ids_from(&json).len(),
+            2,
+            "\"1\" is not the literal \"true\" — it must not enable the filter, and must not 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_absent_params_return_whole_collection() {
+        let state = list_books_test_state();
+        seed_collection(&state, "coll-absent", crate::models::CollectionType::Manual);
+        seed_list_books_book(&state, "abs-a", "A", "Author", 100, None, None, false);
+        seed_list_books_book(&state, "abs-b", "B", "Author", 200, None, None, false);
+        add_to_collection(&state, "abs-a", "coll-absent");
+        add_to_collection(&state, "abs-b", "coll-absent");
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-absent".to_string()),
+            Query(CollectionBooksQuery {
+                q: None,
+                want_to_read: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(ids_from(&json).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_collection_books_automated_rule_and_q_both_apply() {
+        let state = list_books_test_state();
+        let conn = state.conn().unwrap();
+        db::insert_collection(
+            &conn,
+            &crate::models::Collection {
+                id: "coll-auto".to_string(),
+                name: "Automated".to_string(),
+                r#type: crate::models::CollectionType::Automated,
+                icon: None,
+                color: None,
+                created_at: 1,
+                updated_at: 1,
+                rules: vec![crate::models::CollectionRule {
+                    id: "rule-1".to_string(),
+                    collection_id: "coll-auto".to_string(),
+                    field: "series".to_string(),
+                    operator: "equals".to_string(),
+                    value: "SciFi".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+        drop(conn);
+        seed_list_books_book(
+            &state,
+            "auto-a",
+            "Star Voyager",
+            "Nova",
+            100,
+            Some("SciFi"),
+            None,
+            false,
+        );
+        seed_list_books_book(
+            &state,
+            "auto-b",
+            "Star Kingdom",
+            "Nova",
+            100,
+            Some("Fantasy"),
+            None,
+            false,
+        );
+        // Matches the rule but not q — proves q still filters within a
+        // rule-matched set, not just that the rule alone decided the outcome.
+        seed_list_books_book(
+            &state,
+            "auto-c",
+            "Ocean Deep",
+            "Nova",
+            100,
+            Some("SciFi"),
+            None,
+            false,
+        );
+
+        let resp = get_collection_books(
+            State(state.clone()),
+            Path("coll-auto".to_string()),
+            Query(CollectionBooksQuery {
+                q: Some("star".to_string()),
+                want_to_read: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
+        assert_eq!(
+            ids_from(&json),
+            vec!["auto-a"],
+            "the automated collection's rule and the q predicate must both apply"
+        );
     }
 
     #[test]

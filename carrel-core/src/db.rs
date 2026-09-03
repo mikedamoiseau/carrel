@@ -1001,6 +1001,90 @@ pub fn query_books(conn: &Connection, query: &BookQuery) -> Result<Page<Book>> {
     query_books_generic(conn, query, BOOK_COLUMNS_B, row_to_book)
 }
 
+/// [`get_books_in_collection_grid`] with `query`'s `q`/`series`/`want_to_read`
+/// predicate ANDed into whichever branch (manual membership, or an
+/// automated collection's rule query) that function already uses — the same
+/// `build_book_predicate` every other query-module entry point shares,
+/// rather than a second copy of it.
+///
+/// `query.sort`, `query.limit` and `query.offset` are deliberately **not**
+/// honoured: a manual collection orders by `bc.added_at DESC` (the order
+/// books were added to the collection), which `BookSort` cannot express —
+/// running it through `book_sort_order_sql` would silently reorder every
+/// manual collection. So both branches keep their existing `ORDER BY`
+/// byte-for-byte, and this returns a plain `Vec` rather than a `Page`: there
+/// is no paging here to report a total for. Collections are deliberately
+/// unpaginated (see `app.js`'s `loadBooks`, which cites the same decision).
+pub fn query_books_in_collection_grid(
+    conn: &Connection,
+    collection_id: &str,
+    query: &BookQuery,
+) -> Result<Vec<BookGridItem>> {
+    register_carrel_lower(conn)?;
+
+    let mut type_stmt = conn.prepare("SELECT type FROM collections WHERE id = ?1")?;
+    let coll_type: String = type_stmt.query_row(params![collection_id], |row| row.get(0))?;
+
+    let (predicate_sql, predicate_params) = build_book_predicate(query);
+    // `build_book_predicate` returns "" or "WHERE ...". Strip the keyword so
+    // the clause can be ANDed onto whatever WHERE each branch below already
+    // has (which may itself be empty for a rule-less automated collection).
+    let predicate_and = predicate_sql
+        .strip_prefix("WHERE ")
+        .map(|clause| format!(" AND {clause}"))
+        .unwrap_or_default();
+
+    if coll_type == "manual" {
+        let sql = format!(
+            "SELECT {cols} FROM books b JOIN book_collections bc ON bc.book_id = b.id \
+             WHERE bc.collection_id = ?{predicate_and} ORDER BY bc.added_at DESC",
+            cols = GRID_COLUMNS_B
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut bound_params: Vec<Value> = vec![Value::Text(collection_id.to_string())];
+        bound_params.extend(predicate_params);
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(bound_params.iter()),
+            row_to_grid_item,
+        )?;
+        return rows.collect();
+    }
+
+    let rules = get_collection_rules(conn, collection_id)?;
+    let (joins, where_str, rule_params) = build_rule_query(&rules);
+
+    // `where_str` is "" or "WHERE ...", same shape as `predicate_sql` — a
+    // rule-less automated collection combines with a non-empty `q` the same
+    // way an empty predicate combines with rules, by just taking whichever
+    // side is non-empty.
+    let combined_where = if where_str.is_empty() {
+        predicate_sql
+    } else {
+        format!("{where_str}{predicate_and}")
+    };
+
+    let sql = format!(
+        "SELECT DISTINCT {cols}
+         FROM books b
+         {joins}
+         {combined_where}
+         ORDER BY b.added_at DESC",
+        cols = GRID_COLUMNS_B
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    // Positional parameters: `rule_params` come from `joins`/`where_str`,
+    // which precede `predicate_and` in the SQL text above, so they must be
+    // bound in that same order — rule params first, predicate params last.
+    let mut bound_params: Vec<Value> = rule_params.into_iter().map(Value::Text).collect();
+    bound_params.extend(predicate_params);
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(bound_params.iter()),
+        row_to_grid_item,
+    )?;
+    rows.collect()
+}
+
 pub fn update_book(conn: &Connection, book: &Book) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -7183,5 +7267,379 @@ mod tests {
 
         assert_eq!(page.total, 1);
         assert_eq!(ids(&page.items), vec!["x1"]);
+    }
+
+    // --- M4: query_books_in_collection_grid ---------------------------------
+
+    fn make_collection(id: &str, name: &str, r#type: CollectionType) -> Collection {
+        Collection {
+            id: id.to_string(),
+            name: name.to_string(),
+            r#type,
+            icon: None,
+            color: None,
+            created_at: 1,
+            updated_at: 1,
+            rules: Vec::new(),
+        }
+    }
+
+    fn make_rule(collection_id: &str, field: &str, operator: &str, value: &str) -> CollectionRule {
+        CollectionRule {
+            id: format!("rule-{collection_id}-{field}"),
+            collection_id: collection_id.to_string(),
+            field: field.to_string(),
+            operator: operator.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// Inserts a `book_collections` row with an explicit `added_at`, bypassing
+    /// `add_book_to_collection`'s `unixepoch()` — tests need to control
+    /// membership order independently of `books.added_at` and of wall-clock
+    /// time.
+    fn add_to_collection_at(conn: &Connection, book_id: &str, collection_id: &str, added_at: i64) {
+        conn.execute(
+            "INSERT INTO book_collections (book_id, collection_id, added_at) VALUES (?1, ?2, ?3)",
+            params![book_id, collection_id, added_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_manual_q_matches_title() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-m1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("m-fox", "Red Fox", "Bob Writer", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "m-whale",
+                "Blue Whale",
+                "Alice Author",
+                200,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "m-fox", "coll-m1", 100);
+        add_to_collection_at(&conn, "m-whale", "coll-m1", 200);
+
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-m1",
+            &BookQuery {
+                q: Some("fox".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids(&page),
+            vec!["m-fox"],
+            "q must match the title and exclude the non-matching member"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_manual_q_matches_author() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-m2", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("m-fox2", "Red Fox", "Bob Writer", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "m-whale2",
+                "Blue Whale",
+                "Alice Author",
+                200,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "m-fox2", "coll-m2", 100);
+        add_to_collection_at(&conn, "m-whale2", "coll-m2", 200);
+
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-m2",
+            &BookQuery {
+                q: Some("alice".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids(&page),
+            vec!["m-whale2"],
+            "q must match the author and exclude the non-matching member"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_automated_rule_and_q_both_apply() {
+        let (_dir, conn) = setup();
+        let mut coll = make_collection("coll-a1", "Automated", CollectionType::Automated);
+        coll.rules = vec![make_rule("coll-a1", "series", "equals", "SciFi")];
+        insert_collection(&conn, &coll).unwrap();
+
+        // Matches rule AND q.
+        insert_book(
+            &conn,
+            &qbook(
+                "auto-a",
+                "Star Voyager",
+                "Nova",
+                100,
+                Some("SciFi"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        // Matches rule but not q.
+        insert_book(
+            &conn,
+            &qbook(
+                "auto-b",
+                "Ocean Deep",
+                "Nova",
+                100,
+                Some("SciFi"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        // Matches q but not rule (wrong series).
+        insert_book(
+            &conn,
+            &qbook(
+                "auto-c",
+                "Star Kingdom",
+                "Nova",
+                100,
+                Some("Fantasy"),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-a1",
+            &BookQuery {
+                q: Some("star".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids(&page),
+            vec!["auto-a"],
+            "the rule and the q predicate must both apply (AND), not either alone"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_want_to_read_filter() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-w1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("w-yes", "Wanted", "Author", 100, None, None, true),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("w-no", "Not Wanted", "Author", 100, None, None, false),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "w-yes", "coll-w1", 100);
+        add_to_collection_at(&conn, "w-no", "coll-w1", 200);
+
+        let wanted_only = query_books_in_collection_grid(
+            &conn,
+            "coll-w1",
+            &BookQuery {
+                want_to_read: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids(&wanted_only), vec!["w-yes"]);
+
+        let all = query_books_in_collection_grid(&conn, "coll-w1", &BookQuery::default()).unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "want_to_read: false (the default) must not filter anything out"
+        );
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_non_ascii_q_folds_case() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-u1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "u-edu",
+                "Éducation sentimentale",
+                "Gustave Flaubert",
+                100,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook(
+                "u-other",
+                "Something Else",
+                "Someone",
+                200,
+                None,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "u-edu", "coll-u1", 100);
+        add_to_collection_at(&conn, "u-other", "coll-u1", 200);
+
+        // A naive ASCII-only LOWER()/LIKE would fail to match this — see
+        // `register_carrel_lower`'s doc comment.
+        let page = query_books_in_collection_grid(
+            &conn,
+            "coll-u1",
+            &BookQuery {
+                q: Some("éducation".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ids(&page), vec!["u-edu"]);
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_empty_and_absent_q_return_whole_collection() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-e1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("e-a", "A Book", "Author", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("e-b", "B Book", "Author", 200, None, None, false),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "e-a", "coll-e1", 100);
+        add_to_collection_at(&conn, "e-b", "coll-e1", 200);
+
+        let absent =
+            query_books_in_collection_grid(&conn, "coll-e1", &BookQuery::default()).unwrap();
+        assert_eq!(absent.len(), 2);
+
+        let empty = query_books_in_collection_grid(
+            &conn,
+            "coll-e1",
+            &BookQuery {
+                q: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.len(), 2);
+    }
+
+    #[test]
+    fn query_books_in_collection_grid_manual_membership_order_survives_filtering() {
+        let (_dir, conn) = setup();
+        insert_collection(
+            &conn,
+            &make_collection("coll-o1", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        // `books.added_at` order is the reverse of `book_collections.added_at`
+        // order, so the two orderings are distinguishable: if the function
+        // ever switched to `book_sort_order_sql`'s date-added ordering (or
+        // any b.added_at-based order), this would catch it.
+        insert_book(
+            &conn,
+            &qbook("ord-x", "Same Title", "Author", 100, None, None, false),
+        )
+        .unwrap();
+        insert_book(
+            &conn,
+            &qbook("ord-y", "Same Title", "Author", 500, None, None, false),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "ord-x", "coll-o1", 900); // added to collection most recently
+        add_to_collection_at(&conn, "ord-y", "coll-o1", 200); // added to collection long ago
+
+        let unfiltered =
+            query_books_in_collection_grid(&conn, "coll-o1", &BookQuery::default()).unwrap();
+        assert_eq!(
+            ids(&unfiltered),
+            vec!["ord-x", "ord-y"],
+            "membership order (bc.added_at DESC) must win over books.added_at order"
+        );
+
+        let filtered = query_books_in_collection_grid(
+            &conn,
+            "coll-o1",
+            &BookQuery {
+                q: Some("same title".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ids(&filtered),
+            vec!["ord-x", "ord-y"],
+            "filtering must not disturb the membership order"
+        );
     }
 }
