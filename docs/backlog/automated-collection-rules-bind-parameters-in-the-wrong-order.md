@@ -61,3 +61,13 @@ While there, `get_books_in_collection_grid` could delegate to
 carry the same two SQL shapes, and the default predicate contributes no
 clauses, so the SQL is identical. That removes the duplication rather than
 moving it, and it means one place to fix rather than two.
+
+The same applies to `list_books_grid` against `query_books_grid`: with a
+default `BookQuery` the predicate is empty and the order is `added_at DESC, id`
+in both, so the older function contributes nothing the newer one does not. Both
+wrappers are worth collapsing in the same pass — a whole-branch review of the
+epic above applied the deletion test to them and reached the same conclusion.
+Neither collapse is free, though: `list_books_grid` and
+`get_books_in_collection_grid` are called from the desktop IPC layer
+(`src-tauri/src/commands.rs`), so the change needs the Tauri-side tests run,
+not just `carrel-core`'s.

@@ -58,8 +58,8 @@ true before it — but a strict OPDS client would reject the response.
 Three more reasons these handlers want looking at together.
 
 **`all_books` has the same paging overflow `search_books` just fixed.**
-`start = page * OPDS_PAGE_SIZE` at `opds_feed.rs:335` and
-`start + OPDS_PAGE_SIZE` at `:344` are unsaturated, and `page` comes off the
+`start = page * OPDS_PAGE_SIZE` at `opds_feed.rs:343` and
+`start + OPDS_PAGE_SIZE` at `:352` are unsaturated, and `page` comes off the
 wire. A large-but-parseable `?page=` panics in debug — a 500, with no
 `CatchPanicLayer` in front of the web server — and wraps in release, where the
 wrapped sum reads as "there is a next page" and emits a `rel="next"` link back

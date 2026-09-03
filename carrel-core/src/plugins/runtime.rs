@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 
 use rhai::{Array, Dynamic, Engine, EvalAltResult, Map as RhaiMap, Scope, AST};
 
+/// Cap on what `find_books` hands a plugin, documented in `docs/PLUGINS.md`
+/// as "array (max 50)". Applied as the query's `LIMIT` so the cap is enforced
+/// in SQL rather than by truncating a whole-table read in the host.
+const FIND_BOOKS_LIMIT: usize = 50;
+
 use super::permissions::Permission;
 use crate::db::{self, DbPool};
 use crate::error::{CarrelError, CarrelResult};
@@ -159,15 +164,23 @@ fn register_host_fns(
                 "find_books",
                 move |query: &str| -> Result<Array, Box<EvalAltResult>> {
                     let conn = pool.get().map_err(host_err)?;
-                    let needle = query.to_lowercase();
-                    Ok(db::list_books(&conn)
-                        .map_err(host_err)?
+                    // The title-or-author match and the 50-item cap are the
+                    // database's job, not this closure's — see the query
+                    // module in `db.rs`. Doing it here meant loading the whole
+                    // `books` table into the plugin host on every call, and
+                    // keeping a fifth copy of a predicate that exists once.
+                    let page = db::query_books(
+                        &conn,
+                        &db::BookQuery {
+                            q: Some(query.to_string()),
+                            limit: Some(FIND_BOOKS_LIMIT),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(host_err)?;
+                    Ok(page
+                        .items
                         .iter()
-                        .filter(|b| {
-                            b.title.to_lowercase().contains(&needle)
-                                || b.author.to_lowercase().contains(&needle)
-                        })
-                        .take(50)
                         .map(|b| Dynamic::from_map(book_to_map(b)))
                         .collect())
                 },
@@ -702,6 +715,111 @@ mod tests {
         let notes = f.services.notes.lock().unwrap();
         assert_eq!(notes[0].1, "2");
         assert_eq!(notes[1].1, "2");
+    }
+
+    /// `docs/PLUGINS.md` promises "array (max 50)". That cap used to be a
+    /// `.take(50)` over a whole-table read; it is now the query's `LIMIT`, so
+    /// this pins that the promise still holds — and that the host is no longer
+    /// materialising every book to throw most of them away.
+    #[test]
+    fn find_books_caps_results_at_fifty() {
+        let f = fixture();
+        {
+            let conn = f.deps.pool.get().unwrap();
+            for i in 0..60 {
+                db::insert_book(
+                    &conn,
+                    &sample_book(&format!("b{i:02}"), "Dune Chronicle", "Frank Herbert"),
+                )
+                .unwrap();
+            }
+        }
+        let rt = PluginRuntime::load(
+            r#"fn on_event(event) {
+                notify("count", find_books("dune").len().to_string());
+            }"#,
+            &perms(&[Permission::ReadLibrary, Permission::Notify]),
+            &[],
+            f.deps.clone(),
+        )
+        .unwrap();
+
+        rt.dispatch(&imported("b00")).unwrap();
+        let notes = f.services.notes.lock().unwrap();
+        assert_eq!(notes[0].1, "50", "60 matches must be capped at 50");
+    }
+
+    /// Every fixture book here shares `added_at = 0`, so before this went
+    /// through the query module the 50 that survived `.take(50)` were whichever
+    /// 50 SQLite happened to return. `BookSort::DateAdded` ends in `id`, so the
+    /// selection is now deterministic — the first page by id among the ties.
+    #[test]
+    fn find_books_is_deterministic_across_added_at_ties() {
+        let f = fixture();
+        {
+            let conn = f.deps.pool.get().unwrap();
+            for i in (0..60).rev() {
+                db::insert_book(
+                    &conn,
+                    &sample_book(&format!("b{i:02}"), "Dune Chronicle", "Frank Herbert"),
+                )
+                .unwrap();
+            }
+        }
+        let rt = PluginRuntime::load(
+            r#"fn on_event(event) {
+                let found = find_books("dune");
+                notify("first", found[0].id);
+                notify("last", found[49].id);
+            }"#,
+            &perms(&[Permission::ReadLibrary, Permission::Notify]),
+            &[],
+            f.deps.clone(),
+        )
+        .unwrap();
+
+        rt.dispatch(&imported("b00")).unwrap();
+        let notes = f.services.notes.lock().unwrap();
+        // Inserted in descending id order, so insertion order cannot produce
+        // this — only the `ORDER BY ... b.id` tie-break can.
+        assert_eq!(notes[0].1, "b00");
+        assert_eq!(notes[1].1, "b49");
+    }
+
+    /// Rust's `to_lowercase` is Unicode-aware and SQLite's `LOWER()` is not, so
+    /// moving this predicate into SQL is only equivalent because of the
+    /// `carrel_lower` UDF. A plugin searching an accented title must still
+    /// find it.
+    #[test]
+    fn find_books_folds_unicode_case() {
+        let f = fixture();
+        {
+            let conn = f.deps.pool.get().unwrap();
+            db::insert_book(
+                &conn,
+                &sample_book("u1", "Éducation sentimentale", "Gustave Flaubert"),
+            )
+            .unwrap();
+            db::insert_book(&conn, &sample_book("u2", "Hyperion", "Dan Simmons")).unwrap();
+        }
+        let rt = PluginRuntime::load(
+            r#"fn on_event(event) {
+                notify("accented", find_books("éducation").len().to_string());
+                notify("ascii", find_books("education").len().to_string());
+            }"#,
+            &perms(&[Permission::ReadLibrary, Permission::Notify]),
+            &[],
+            f.deps.clone(),
+        )
+        .unwrap();
+
+        rt.dispatch(&imported("u1")).unwrap();
+        let notes = f.services.notes.lock().unwrap();
+        assert_eq!(
+            notes[0].1, "1",
+            "accented needle must match the accented title"
+        );
+        assert_eq!(notes[1].1, "0", "to_lowercase does not fold accents away");
     }
 
     #[test]

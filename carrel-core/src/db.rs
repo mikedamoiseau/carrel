@@ -791,13 +791,18 @@ pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
 
 // --- Query module: filter/sort/page a library in one place -----------------
 //
-// The predicate "case-insensitively match title or author" is written out
-// separately for the desktop app, the web API, and the OPDS feed, and every
-// server-side copy loads the whole `books` table and filters in the host
-// language. `query_books_grid`/`query_books` compile the same filter+sort+
-// page request to SQL instead, so it runs once, in the database, regardless
-// of caller. Those callers adopt it in the milestones that follow; as of
-// this commit nothing calls it yet.
+// The predicate "case-insensitively match title or author" used to be written
+// out separately for the web API, the OPDS feed, the plugin host, and the web
+// UI's collection view, and every server-side copy loaded the whole `books`
+// table to filter it in the host language. `query_books_grid`/`query_books`
+// compile the same filter+sort+page request to SQL instead, so it runs once,
+// in the database, regardless of caller.
+//
+// Callers: `api.rs::list_books`, `opds_feed.rs::search_books`,
+// `plugins/runtime.rs`'s `find_books`, and — through
+// `query_books_in_collection_grid` below — `api.rs::get_collection_books`.
+// One copy survives on purpose, in the desktop's `Library.tsx`, which filters
+// an already-loaded grid in React and derives tag facet counts from it.
 
 /// Sort order for [`query_books_grid`]/[`query_books`]. A closed enum (not a
 /// caller-supplied string) so the `ORDER BY` fragment is always chosen from a
@@ -955,12 +960,26 @@ fn query_books_generic<T>(
     let where_sql = where_clause(&predicate_clauses);
     let from_join = "FROM books b LEFT JOIN reading_progress rp ON rp.book_id = b.id";
 
-    let count_sql = format!("SELECT COUNT(*) {from_join} {where_sql}");
-    let total: i64 = conn.query_row(
-        &count_sql,
-        rusqlite::params_from_iter(where_params.iter()),
-        |row| row.get(0),
-    )?;
+    // An unpaginated query from the start already returns every matching row,
+    // so its own row count *is* the total and a second scan would just compute
+    // it again. That is not hypothetical: `opds_feed::search_books` asks for
+    // the whole filtered set and discards `total` entirely, and every request
+    // was paying for a duplicate filtered scan — with the `carrel_lower` UDF
+    // called per row — to produce a number nobody read.
+    //
+    // The shortcut needs `offset == 0` as well as no `limit`. With an offset
+    // the returned rows are only the tail, and an offset past the end returns
+    // nothing at all, which would report a total of zero for a non-empty set.
+    let counted_total: Option<i64> = if query.limit.is_none() && query.offset == 0 {
+        None
+    } else {
+        let count_sql = format!("SELECT COUNT(*) {from_join} {where_sql}");
+        Some(conn.query_row(
+            &count_sql,
+            rusqlite::params_from_iter(where_params.iter()),
+            |row| row.get(0),
+        )?)
+    };
 
     let order_sql = book_sort_order_sql(query.sort);
     let mut page_params = where_params;
@@ -990,10 +1009,11 @@ fn query_books_generic<T>(
     let rows = stmt.query_map(rusqlite::params_from_iter(page_params.iter()), row_mapper)?;
     let items = rows.collect::<Result<Vec<T>>>()?;
 
-    Ok(Page {
-        items,
-        total: total as usize,
-    })
+    let total = match counted_total {
+        Some(total) => total as usize,
+        None => items.len(),
+    };
+    Ok(Page { items, total })
 }
 
 /// Grid-projection counterpart of [`query_books`] — filters, sorts, and
@@ -7188,6 +7208,62 @@ mod tests {
             "offset past the end must return nothing, not wrap to page one"
         );
         assert_eq!(page.total, 5, "total still counts the whole filtered set");
+    }
+
+    /// An unpaginated query skips the `COUNT(*)` and reports `items.len()`
+    /// instead. That is only exact while `offset == 0`, so both halves are
+    /// pinned here: the shortcut must still report the *filtered* count rather
+    /// than the table size, and an offset past the end must not report zero
+    /// for a non-empty set.
+    #[test]
+    fn query_books_grid_total_is_exact_whether_or_not_the_count_is_skipped() {
+        let (_dir, conn) = setup();
+        seed_query_fixture(&conn);
+
+        // No limit, no offset — the skipped-count path. Two of five are wanted.
+        let page = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(
+            page.total, 2,
+            "skipping the COUNT must still report the filtered count, not the table size"
+        );
+
+        // No limit but a non-zero offset — the count must still run, or the
+        // tail's length would be mistaken for the whole.
+        let tail = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                offset: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tail.items.len(), 1, "one row of the two is skipped");
+        assert_eq!(tail.total, 2, "total is the filtered set, not the tail");
+
+        // An offset past the end returns nothing but still knows the total.
+        let past = query_books_grid(
+            &conn,
+            &BookQuery {
+                want_to_read: true,
+                offset: 99,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(past.items.is_empty());
+        assert_eq!(
+            past.total, 2,
+            "an empty tail must not report a total of zero"
+        );
     }
 
     #[test]
