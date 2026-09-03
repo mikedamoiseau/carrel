@@ -916,7 +916,8 @@ fn build_book_predicate(query: &BookQuery) -> (String, Vec<Value>) {
 /// can slice a book onto two pages or skip it entirely depending on how ties
 /// happen to resolve between two calls (mirrors the "Fix D" comment on
 /// `list_books_grid` above, and `resolveSeriesNav` in the web UI's `app.js`,
-/// which needed the same tie-break for the same reason). This is the only
+/// which appends the same tie-break to make its own ordering total, though
+/// for stable row order rather than for paging). This is the only
 /// remaining home for that rationale on the server side — the `api.rs` sort
 /// block that used to carry it is gone.
 fn book_sort_order_sql(sort: BookSort) -> &'static str {
