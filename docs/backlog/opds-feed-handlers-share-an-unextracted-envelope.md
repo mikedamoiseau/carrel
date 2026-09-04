@@ -31,13 +31,41 @@ the pre-fix code panics on the multiply, so the executed test pins the debug
 path only. Its `rel="next"` assertion would also catch the release-mode wrap,
 but nothing in the gate table runs these tests in release.
 
-Still open: the unextracted envelope, the `page` type mismatch between feeds,
-the whole-set-vs-per-page digest trade-off, the `xml_escape`
-control-character gap, and `collection_feed`'s own missing tie-break — it
-orders by `bc.added_at DESC` with no unique column, which is the same gap
-`list_books` just closed. That one is **latent rather than live**:
-`collection_feed` takes no page parameter, so nothing slices its order today.
-It would become live the moment that feed learns to paginate.
+M3 gave `carrel-core::opds_feed` the interface this document argues for:
+`render_feed(&FeedOptions) -> RenderedFeed` renders a page and digests the
+same value it rendered, so no caller can hash one input and emit another.
+The digest covers every `FeedOptions` field plus the rendering module's own
+source text (`include_str!`), which means a future change to the emitted
+shape invalidates cached feeds without anyone maintaining a list of what to
+hash. Three earlier attempts at that guarantee were each incomplete in a
+different place — a registry of template constants left the timestamp format,
+the ATOM type constants and the entry join separator outside the digest — and
+the seam that proves the property (`feed_etag_over`) exists because the first
+guard passed with the hash loop narrowed to one element.
+
+M4 deleted the desktop's copy. `xml_escape`, `book_to_entry`, `wrap_feed`,
+`cover_mime` and the ATOM/OPENSEARCH constants are gone from `src-tauri`
+(241 lines), and all six routes render through the core crate. Output is
+pinned byte-for-byte against baselines captured from the pre-adoption tree,
+including the two routes that had no baseline at all until the review.
+
+Still open: the `page` type mismatch between feeds, the whole-set-vs-per-page
+digest trade-off (the desktop deliberately keeps its own whole-set `ETag`
+rather than `RenderedFeed`'s narrower one, so an edit on a later page still
+invalidates earlier ones), the `xml_escape` control-character gap, and
+`collection_feed`'s own missing tie-break — it orders by `bc.added_at DESC`
+with no unique column, which is the same gap `list_books` just closed. That
+one is **latent rather than live**: `collection_feed` takes no page
+parameter, so nothing slices its order today. It would become live the moment
+that feed learns to paginate.
+
+The envelope itself is no longer duplicated in the sense this document was
+filed for, but the *conditional-request* half of it — build `pairs`, build
+`rendered_ids`, compute the tag, answer `304` — is still repeated per handler
+in `src-tauri`. That was left alone on purpose: `self_href`'s shape differs
+per handler, and folding it in would have meant moving the desktop's
+whole-set digest policy into core, which is the trade-off in the previous
+paragraph.
 
 ## What is duplicated
 
