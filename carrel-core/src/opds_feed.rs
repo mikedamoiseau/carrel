@@ -572,20 +572,26 @@ pub fn opensearch_descriptor(search_href: &str) -> String {
 /// `opensearch_href: None`, `updated: None`); output is byte-for-byte
 /// unchanged from before `render_feed` existed.
 /// Note the cost this delegation carries: `render_feed` always computes the
-/// digest, and `wrap_feed` throws it away. That was once most of the call —
-/// 158.8 µs of `render_feed`'s 160.6 µs in release, against 1.8 µs to build
-/// the body — because the digest re-read this file's ~50 KB of source on
-/// every render. `self_src_digest` now does that read once per process, which
-/// brings the whole call to 10.3 µs (9.3 µs of it still digest, since the
-/// entries are hashed per call and cannot be cached).
+/// digest, and `wrap_feed` throws it away.
 ///
-/// So a body-only caller still pays for a value it discards, but ~10 µs
-/// rather than ~160 µs. Left there deliberately: the two ways to remove it
-/// entirely both give up something. A body-only entry point restores the
-/// hazard `render_feed` exists to remove — a caller hashing one
-/// `FeedOptions` and rendering another — and making `RenderedFeed::etag`
-/// lazy changes the struct's shape, which the additive-only constraint
-/// forbids.
+/// Measured in release on an M-series Mac, on a full 50-entry page with
+/// realistic entries (664 B mean, 33 KB total): the digest is 97.3 µs of the
+/// call's 114.8 µs, and building the body is 17.5 µs. Before
+/// `self_src_digest` cached the source hash it was 258.5 µs of ~276 µs.
+///
+/// The saving is a constant ~161 µs — this file's ~55 KB, hashed once per
+/// process instead of once per render — so the *ratio* depends entirely on
+/// how much entry text a feed carries. On a near-empty feed it is ~15x; on a
+/// full page, 2.4x. Quote the full-page number: that is what a catalog
+/// actually serves. What remains is almost all entry text, which varies per
+/// call and so cannot be cached.
+///
+/// A body-only caller still pays that ~97 µs for a value it discards. Left
+/// there deliberately: the two ways to remove it both give something up. A
+/// body-only entry point restores the hazard `render_feed` exists to remove —
+/// a caller hashing one `FeedOptions` and rendering another — and making
+/// `RenderedFeed::etag` lazy changes the struct's shape, which the
+/// additive-only constraint forbids.
 pub fn wrap_feed(
     title: &str,
     feed_id: &str,

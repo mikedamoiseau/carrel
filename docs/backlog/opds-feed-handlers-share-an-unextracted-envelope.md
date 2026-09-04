@@ -52,29 +52,42 @@ renderer's. Output is
 pinned byte-for-byte against baselines captured from the pre-adoption tree,
 including the two routes that had no baseline at all until the review.
 
-One cost this epic introduced, measured rather than estimated: `render_feed`
-always computes the digest, and every caller in *this* repo discards it —
-`wrap_feed` returns `.body`, and all five desktop handlers keep their own
-whole-set tag. `wrap_feed` on `main` computed no digest at all, so an
-out-of-repo consumer picks this up per request on repin.
+One cost this epic introduced: `render_feed` always computes the digest, and
+every caller in *this* repo discards it — `wrap_feed` returns `.body`, and all
+five desktop handlers keep their own whole-set tag. `wrap_feed` on `main`
+computed no digest at all, so an out-of-repo consumer picks this up per
+request on repin.
 
-First measurement, release, M-series Mac: 158.8 µs of `render_feed`'s
-160.6 µs was the digest; building the body was 1.8 µs. Almost all of that was
-re-hashing this module's own ~50 KB of source text on every single render —
-the same 50 KB every time, for the life of the process. `self_src_digest`
-caches that read behind a `OnceLock` and the digest hashes the 32-byte result
-instead, which is equivalent (a change to the source changes its digest,
-which changes every feed's tag exactly as before) and costs nothing in
-properties. Re-measured: 10.3 µs for the whole call, 9.3 µs of it digest.
-15.6x, with no signature change, no `RenderedFeed` shape change and no
-body-only entry point.
+Most of it was re-hashing this module's own ~55 KB of source text on every
+render — the same bytes every time, for the life of the process.
+`self_src_digest` caches that read behind a `OnceLock` and the digest hashes
+the 32-byte result instead. Equivalent (a change to the source changes its
+digest, which changes every feed's tag) and it gives up no property, no
+signature and no struct shape.
 
-The residue is real and stays: the entries are hashed per call, so a caller
-that discards `.etag` still pays ~9 µs for nothing. Removing that needs one of
-the two changes this epic rejected — a body-only entry point (restores the
+Measured in release, on a full 50-entry page with realistic entries
+(664 B mean, 33 KB total):
+
+| | before | after |
+|---|---|---|
+| digest | 258.5 µs | 97.3 µs |
+| body | 17.5 µs | 17.5 µs |
+| whole call | ~276 µs | 114.8 µs |
+
+**Read the absolute number, not the ratio.** The saving is a constant ~161 µs
+— the source hash — so the ratio is whatever the entry payload makes it: 15.6x
+on a near-empty synthetic feed, 2.4x on a full page. The first bench here used
+38-byte entries and produced the 15.6x figure, which describes a feed nobody
+serves; the consuming project's session caught that the implied SHA-256
+throughput (~345 MB/s, consistent across both measurements) could not account
+for 50 real entries in the residue. Requote the full-page numbers.
+
+The residue is real and stays: ~97 µs is almost entirely entry text, which
+varies per call and cannot be cached. Removing it needs one of the two
+changes this epic rejected — a body-only entry point (restores the
 hash-one-render-another hazard) or a lazy `etag` field (changes
-`RenderedFeed`'s shape, forbidden while a consumer is pinned). Not worth
-either at ~10 µs against a feed request's DB work.
+`RenderedFeed`'s shape, forbidden while a consumer is pinned). Neither is
+worth it against a feed request's DB work.
 
 Worth recording how this was found: the module had already written the cost
 off as unavoidable, in a doc comment, having considered exactly two fixes.
