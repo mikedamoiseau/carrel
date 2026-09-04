@@ -22,6 +22,24 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   takes.
 
 ### Fixed
+- **Paging through `/opds/all` could serve a book twice or skip one
+  entirely.** `carrel-core`'s `list_books`, which `/opds/all` pages over,
+  ordered rows by `added_at DESC` alone. Books added
+  in the same second (routine after a batch import) had no stable order
+  across two requests, so slicing that order into pages could put one book on
+  two pages or lose it between them. `list_books` now breaks the tie by `id`,
+  the same fix `list_books_grid` already had. `/opds/new` never paginated, so
+  it could not lose a book this way — what it gains is a stable answer to
+  *which* 25 it shows when books tie. **Behaviour change:** anything
+  consuming `carrel-core` — including Carrel Server — now gets a
+  deterministic order for rows that tie on `added_at`, where the order was
+  previously unspecified.
+- **`/opds/all?page=` with a very large page number could 500 instead of
+  returning an empty page.** The paging arithmetic multiplied the page number
+  by the page size without checking for overflow, which panics in a debug
+  build and silently wraps in a release build — a wrapped result could then
+  advertise a `next` link pointing back at page 0. `/opds/search` already
+  guarded against this; `/opds/all` now does too.
 - **OPDS clients could be served an empty page.** In the two paginated feeds
   (`/opds/all` and `/opds/search`), every page got the same `ETag`, so a client
   that cached page 0's validator and then asked for page 1 with it could

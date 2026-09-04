@@ -13,10 +13,31 @@ page 0's validator got an empty `304` body back for `?page=1`. The fix folds
 each request's own feed URL (`self_href`) into `feed_etag`'s digest, so two
 page URLs can no longer produce the same tag, while the digest still hashes
 the whole matching set — a library change still invalidates every page at
-once. Everything else below is still open: the unextracted envelope, the
-`all_books` id tie-break, the `all_books` paging-overflow, the `page` type
-mismatch between feeds, the whole-set-vs-per-page digest trade-off, and the
-`xml_escape` control-character gap.
+once.
+
+M2 closed both paging-correctness bugs `all_books` still had. `db::list_books`
+now breaks an `added_at` tie by `id`, the same fix `list_books_grid` already
+carried, so `/opds/all` can no longer serve one book twice or skip it when a
+batch import ties several `added_at` values. `/opds/new` never paginated and
+so was never exposed to that; what it gains is a stable answer to *which* 25
+books it shows when several tie. `all_books`'s paging arithmetic
+(`page * OPDS_PAGE_SIZE`, `start + OPDS_PAGE_SIZE`) now uses
+`saturating_mul`/`saturating_add`, matching `search_books`, so a very large
+`?page=` value returns an empty page instead of panicking (debug) or wrapping
+into a bogus `rel="next"` link (release).
+
+Note what the overflow test does *not* prove: `cargo test` builds debug, where
+the pre-fix code panics on the multiply, so the executed test pins the debug
+path only. Its `rel="next"` assertion would also catch the release-mode wrap,
+but nothing in the gate table runs these tests in release.
+
+Still open: the unextracted envelope, the `page` type mismatch between feeds,
+the whole-set-vs-per-page digest trade-off, the `xml_escape`
+control-character gap, and `collection_feed`'s own missing tie-break — it
+orders by `bc.added_at DESC` with no unique column, which is the same gap
+`list_books` just closed. That one is **latent rather than live**:
+`collection_feed` takes no page parameter, so nothing slices its order today.
+It would become live the moment that feed learns to paginate.
 
 ## What is duplicated
 
@@ -45,21 +66,25 @@ Applying the deletion test separates the two halves:
   genuinely different shapes, and the second needs XML escaping the first does
   not. Leave them inline.
 
-## The bug the duplication is already hiding
+## The bug the duplication is already hiding — closed in M2
 
-`all_books` still reads through `db::list_books`, which is
-`ORDER BY added_at DESC` with **no `id` tie-break**. Books sharing an
-`added_at` — routine after a batch import — therefore have no stable order
-across two requests, so paging `/opds/all` can serve one book on two pages and
-skip another entirely. This is exactly the failure that
-`search_paging_over_tied_added_at_is_stable_no_repeat_no_skip` now guards for
-`/opds/search`, and the same argument is documented on `book_sort_order_sql`
-in `carrel-core/src/db.rs`.
+`all_books` read through `db::list_books`, which was `ORDER BY added_at DESC`
+with **no `id` tie-break**. Books sharing an `added_at` — routine after a
+batch import — therefore had no stable order across two requests, so paging
+`/opds/all` could serve one book on two pages and skip another entirely. This
+was exactly the failure that
+`search_paging_over_tied_added_at_is_stable_no_repeat_no_skip` already guarded
+for `/opds/search`, and the same argument was already documented on
+`book_sort_order_sql` in `carrel-core/src/db.rs`.
 
-The fix is the same one milestone 3 applied to search: read through
-`db::query_books` with `BookSort::DateAdded`, whose `ORDER BY` ends in `b.id`.
-`/opds/new` takes 25 by recency and `collection_feed` orders by its own
-join, so they want checking too rather than assuming.
+M2 fixed `list_books` itself rather than routing `all_books` through
+`db::query_books` as first proposed here: `list_books`'s `ORDER BY` now ends
+in `, id`, the same tie-break `list_books_grid` already had, which is a
+narrower change than moving to the query-module path and leaves `list_books`'s
+signature and column list untouched. `/opds/new` shares `all_books`'s fix
+since it also reads through `list_books`. `collection_feed` orders by its own
+join (`bc.added_at DESC`) and was not touched — it still wants checking rather
+than assuming.
 
 ## Also noticed, separate and pre-existing
 
@@ -72,14 +97,14 @@ true before it — but a strict OPDS client would reject the response.
 
 Three more reasons these handlers want looking at together.
 
-**`all_books` has the same paging overflow `search_books` just fixed.**
-`start = page * OPDS_PAGE_SIZE` at `opds_feed.rs:343` and
-`start + OPDS_PAGE_SIZE` at `:352` are unsaturated, and `page` comes off the
-wire. A large-but-parseable `?page=` panics in debug — a 500, with no
-`CatchPanicLayer` in front of the web server — and wraps in release, where the
-wrapped sum reads as "there is a next page" and emits a `rel="next"` link back
-to page 0. `search_books` now uses `saturating_mul`/`saturating_add` and has a
-test at `usize::MAX`; `all_books` was left alone as out of scope.
+**`all_books` had the same paging overflow `search_books` was fixed for —
+closed in M2.** `start = page * OPDS_PAGE_SIZE` and `start + OPDS_PAGE_SIZE`
+were unsaturated, and `page` comes off the wire. A large-but-parseable
+`?page=` panicked in debug — a 500, with no `CatchPanicLayer` in front of the
+web server — and wrapped in release, where the wrapped sum read as "there is a
+next page" and emitted a `rel="next"` link back to page 0. `all_books` now
+uses `saturating_mul`/`saturating_add`, matching `search_books`, and has its
+own test at `usize::MAX`.
 
 **The two feeds disagree on how strict a `page` is.** `SearchQuery::page` is a
 lenient `String`, because a strictly-typed optional param turns one malformed

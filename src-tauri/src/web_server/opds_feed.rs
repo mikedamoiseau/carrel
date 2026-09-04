@@ -364,7 +364,18 @@ async fn all_books(
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
 
-    let start = page * OPDS_PAGE_SIZE;
+    // Saturating, not `*`: `page` comes off the wire, so a large-but-parseable
+    // value reaches here — a strict `usize` does not prevent it, since a value
+    // can parse fine and still overflow the multiply. `page * OPDS_PAGE_SIZE` panics in debug and wraps in
+    // release, and a wrapped `start + OPDS_PAGE_SIZE` would then read as
+    // "there is a next page" and emit a `next` link to a near-zero page
+    // (page 0 exactly, at `usize::MAX`).
+    //
+    // `page + 1` below stays unsaturated on purpose: it is only reached when
+    // `has_next` holds, which requires `start + OPDS_PAGE_SIZE < books.len()`
+    // — and that bounds `page` far below the range where incrementing it
+    // could overflow.
+    let start = page.saturating_mul(OPDS_PAGE_SIZE);
     let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
 
     let entries: String = page_books
@@ -373,7 +384,7 @@ async fn all_books(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let has_next = start + OPDS_PAGE_SIZE < books.len();
+    let has_next = start.saturating_add(OPDS_PAGE_SIZE) < books.len();
     let next_href = if has_next {
         Some(format!("/opds/all?page={}", page + 1))
     } else {
@@ -555,7 +566,13 @@ async fn search_books(
     // Saturating, not `*`: `page` comes off the wire, so a large-but-parseable
     // value reaches here. `page * OPDS_PAGE_SIZE` panics in debug and wraps in
     // release, and a wrapped `start + OPDS_PAGE_SIZE` would then read as
-    // "there is a next page" and emit a `next` link back to page 0.
+    // "there is a next page" and emit a `next` link to a near-zero page
+    // (page 0 exactly, at `usize::MAX`).
+    //
+    // `page + 1` below stays unsaturated on purpose: it is only reached when
+    // `has_next` holds, which requires `start + OPDS_PAGE_SIZE < books.len()`
+    // — and that bounds `page` far below the range where incrementing it
+    // could overflow.
     let start = page.saturating_mul(OPDS_PAGE_SIZE);
     let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
 
@@ -1012,6 +1029,97 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "stale tag must re-send");
         assert_ne!(response_etag(&resp).unwrap(), etag);
+    }
+
+    /// `all_books` pages over `db::list_books`, which used to have no `id`
+    /// tie-break: 51 books sharing an `added_at` had no stable order across
+    /// two requests, so `/opds/all` could serve one book on two pages and
+    /// skip another entirely. Mirrors
+    /// `search_paging_over_tied_added_at_is_stable_no_repeat_no_skip`.
+    /// Inserted in DESCENDING id order (the opposite of the expected
+    /// ascending-id result) so this discriminates against a query that just
+    /// falls back to insertion/rowid order: with no tie-break, page 0 would
+    /// come back highest-id-first (b50..b01) and every assertion below would
+    /// fail.
+    #[tokio::test]
+    async fn all_books_paging_over_tied_added_at_is_stable_no_repeat_no_skip() {
+        let books: Vec<(String, i64)> = (0..51).rev().map(|i| (format!("b{i:02}"), 1000)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let expected_order: Vec<String> = {
+            let mut ids: Vec<String> = (0..51).map(|i| format!("b{i:02}")).collect();
+            ids.sort();
+            ids
+        };
+        let page0_ids = &expected_order[0..50];
+        let page1_ids = &expected_order[50..51];
+
+        let page0 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml_p0 = body_string(page0).await;
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml_p1 = body_string(page1).await;
+
+        for id in page0_ids {
+            assert!(
+                xml_p0.contains(&format!("urn:carrel:{id}")),
+                "page 0 missing {id}"
+            );
+            assert!(
+                !xml_p1.contains(&format!("urn:carrel:{id}")),
+                "page 1 must not repeat {id}"
+            );
+        }
+        for id in page1_ids {
+            assert!(
+                xml_p1.contains(&format!("urn:carrel:{id}")),
+                "page 1 missing {id}"
+            );
+            assert!(
+                !xml_p0.contains(&format!("urn:carrel:{id}")),
+                "page 0 must not have {id} — no book may be skipped or duplicated"
+            );
+        }
+    }
+
+    /// `page` is caller-supplied: a value large enough to overflow
+    /// `page * OPDS_PAGE_SIZE` is reachable via `?page=`. Unsaturated that
+    /// multiply panics in debug — a 500 with no `CatchPanicLayer` in front of
+    /// it — and wraps in release, where `start + OPDS_PAGE_SIZE` then wraps
+    /// back near zero and advertises a `next` link to page 0. Mirrors
+    /// `search_page_at_usize_max_is_empty_and_does_not_link_onward`.
+    #[tokio::test]
+    async fn all_books_page_at_usize_max_is_empty_and_does_not_link_onward() {
+        let state = seeded_state(&[("b1", 100), ("b2", 200), ("b3", 300)]);
+
+        let resp = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery {
+                page: Some(usize::MAX),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let xml = body_string(resp).await;
+        assert!(!xml.contains("<entry>"), "must be empty: {xml}");
+        assert!(
+            !xml.contains(r#"rel="next""#),
+            "must not link onward: {xml}"
+        );
     }
 
     #[tokio::test]
