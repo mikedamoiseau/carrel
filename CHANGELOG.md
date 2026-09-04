@@ -20,10 +20,21 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   of which the existing `wrap_feed` supported. This is purely additive:
   existing `wrap_feed` callers are unaffected — it now delegates to
   `render_feed` internally with today's defaults and its output is
-  byte-for-byte unchanged. Desktop adoption of the new interface is a later
-  milestone.
+  byte-for-byte unchanged.
 
 ### Changed
+- **The desktop/LAN web server's OPDS feeds now render through
+  `carrel-core::opds_feed`** instead of a second, independently-maintained
+  copy of the same Atom-building code. `xml_escape`, `book_to_entry`, and
+  `wrap_feed` are gone from `src-tauri`; every route (`/opds`, `/opds/all`,
+  `/opds/new`, `/opds/collections/{id}`, `/opds/search`,
+  `/opds/opensearch.xml`) now calls `render_feed`/`book_to_entry`/
+  `opensearch_descriptor` from the shared crate. The desktop keeps computing
+  its own whole-matching-set `ETag` rather than adopting `RenderedFeed`'s
+  narrower per-page digest — that would change cache-invalidation scope
+  (a later page's edit would stop invalidating an earlier page) and is out
+  of scope here. Emitted XML is byte-for-byte unchanged except the one fix
+  below.
 - **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
   in SQL for both manual and automated (rule-based) collections. The web UI's
   collection view uses them, so searching or filtering inside a collection now
@@ -40,6 +51,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   takes.
 
 ### Fixed
+- **An OPDS entry's `<id>` and per-book URLs were not XML-escaped** in the
+  desktop/LAN web server. Book ids are locally-generated UUIDs, so no
+  character in practice differs from what a raw, unescaped interpolation
+  would already produce — but `carrel-core::opds_feed::book_to_entry`
+  (which the desktop now calls, see above) always escapes it, closing the
+  gap for any future or external id that isn't UUID-shaped.
 - **Paging through `/opds/all` could serve a book twice or skip one
   entirely.** `carrel-core`'s `list_books`, which `/opds/all` pages over,
   ordered rows by `added_at DESC` alone. Books added
