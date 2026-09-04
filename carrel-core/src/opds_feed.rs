@@ -21,6 +21,8 @@
 //! today's defaults, kept only so existing callers are unaffected.
 
 use crate::models::Book;
+use std::sync::OnceLock;
+
 use sha2::{Digest, Sha256};
 
 /// OPDS Atom navigation feed content type.
@@ -386,19 +388,53 @@ fn hash_opt_str(hasher: &mut Sha256, s: Option<&str>) {
 /// works today and is silently broken. `updated` below is therefore
 /// hashed as the `Option` itself, never the resolved timestamp.
 fn feed_etag(opts: &FeedOptions<'_>) -> String {
-    feed_etag_over(opts, SELF_SRC)
+    feed_etag_over_digest(opts, self_src_digest())
 }
 
-/// `feed_etag`'s body, with the rendering source as a parameter.
+/// `feed_etag`, with the rendering source as a parameter and no caching.
 ///
 /// The parameter exists so a test can vary that input without copying the
 /// field-hashing sequence — a copy would drift the moment a field is added,
-/// and would not notice the regression it was written to catch. Production has
-/// exactly one caller, passing [`SELF_SRC`].
+/// and would not notice the regression it was written to catch.
+///
+/// Test-only since `feed_etag` started hashing the cached
+/// `self_src_digest()` instead of `SELF_SRC` itself. It earns its keep twice
+/// over now: `render_source_reaches_the_digest` uses it both to show that a
+/// different source yields a different tag, and — passing `SELF_SRC` — to
+/// prove the cached path agrees with hashing the source directly, which is
+/// the whole premise of the cache.
+#[cfg(test)]
 fn feed_etag_over(opts: &FeedOptions<'_>, render_src: &str) -> String {
+    feed_etag_over_digest(opts, &Sha256::digest(render_src.as_bytes()).into())
+}
+
+/// SHA-256 of [`SELF_SRC`], computed once per process.
+///
+/// Hashing the source's digest is equivalent to hashing the source — a change
+/// to this file changes its digest, which changes every feed's tag exactly as
+/// before — but the ~50 KB read happens once instead of on every render. That
+/// matters because the digest, not the rendering, was `render_feed`'s cost:
+/// 158.8 µs of 160.6 µs in release, against 1.8 µs to build the body.
+///
+/// The alternatives were both worse. A body-only entry point restores the
+/// hazard `render_feed` exists to remove (hash one `FeedOptions`, render
+/// another), and making `RenderedFeed::etag` lazy changes its shape, which
+/// the additive-only constraint forbids. Caching the digest changes no
+/// signature and gives up no property. Credit to the Carrel Server session
+/// for spotting it after this module had already written the cost off as
+/// unavoidable.
+fn self_src_digest() -> &'static [u8; 32] {
+    static SELF_SRC_DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+    SELF_SRC_DIGEST.get_or_init(|| Sha256::digest(SELF_SRC.as_bytes()).into())
+}
+
+/// The digest proper. `render_digest` is fixed-width, so unlike the
+/// variable-length fields below it needs no length prefix to stay
+/// unambiguous.
+fn feed_etag_over_digest(opts: &FeedOptions<'_>, render_digest: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
 
-    hash_len_prefixed(&mut hasher, render_src);
+    hasher.update(render_digest);
 
     hash_len_prefixed(&mut hasher, opts.title);
     hash_len_prefixed(&mut hasher, opts.feed_id);
@@ -536,19 +572,20 @@ pub fn opensearch_descriptor(search_href: &str) -> String {
 /// `opensearch_href: None`, `updated: None`); output is byte-for-byte
 /// unchanged from before `render_feed` existed.
 /// Note the cost this delegation carries: `render_feed` always computes the
-/// digest, and `wrap_feed` throws it away. The digest is SHA-256 over this
-/// file (~50 KB of source text) plus every entry, which measured 158.8 µs
-/// of `render_feed`'s 160.6 µs on an M-series Mac in release — building the
-/// body itself is 1.8 µs. So a body-only caller pays roughly 90x the body's
-/// cost for a value it discards, on every call.
+/// digest, and `wrap_feed` throws it away. That was once most of the call —
+/// 158.8 µs of `render_feed`'s 160.6 µs in release, against 1.8 µs to build
+/// the body — because the digest re-read this file's ~50 KB of source on
+/// every render. `self_src_digest` now does that read once per process, which
+/// brings the whole call to 10.3 µs (9.3 µs of it still digest, since the
+/// entries are hashed per call and cannot be cached).
 ///
-/// Left as-is deliberately. Splitting a body-only entry point back out would
-/// restore exactly the hazard `render_feed` exists to remove — a caller
-/// hashing one `FeedOptions` and rendering another — and making the field
-/// lazy would change `RenderedFeed`'s shape, which the additive-only
-/// constraint forbids. 160 µs against a feed request's DB work is a real but
-/// small cost, and the safe shape is worth it. See the backlog item on these
-/// handlers.
+/// So a body-only caller still pays for a value it discards, but ~10 µs
+/// rather than ~160 µs. Left there deliberately: the two ways to remove it
+/// entirely both give up something. A body-only entry point restores the
+/// hazard `render_feed` exists to remove — a caller hashing one
+/// `FeedOptions` and rendering another — and making `RenderedFeed::etag`
+/// lazy changes the struct's shape, which the additive-only constraint
+/// forbids.
 pub fn wrap_feed(
     title: &str,
     feed_id: &str,

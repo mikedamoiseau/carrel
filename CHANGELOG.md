@@ -35,6 +35,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   (a later page's edit would stop invalidating an earlier page) and is out
   of scope here. Emitted XML is byte-for-byte unchanged except for the two
   escaping fixes below.
+- **`carrel-core::opds_feed` renders a feed ~15x faster.** The ETag digest
+  covers this module's own source text, which was being re-hashed (~50 KB)
+  on every single render — 158.8 µs of `render_feed`'s 160.6 µs in release,
+  against 1.8 µs to actually build the body. That read now happens once per
+  process and the digest hashes its 32-byte result, which invalidates caches
+  on a source change exactly as before. A whole `render_feed` call measures
+  10.3 µs. **Behaviour note for consumers:** feed ETag *values* change with
+  this release, so every client refetches once — as they already would on any
+  release that touches this file.
 - **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
   in SQL for both manual and automated (rule-based) collections. The web UI's
   collection view uses them, so searching or filtering inside a collection now

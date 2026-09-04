@@ -55,16 +55,31 @@ including the two routes that had no baseline at all until the review.
 One cost this epic introduced, measured rather than estimated: `render_feed`
 always computes the digest, and every caller in *this* repo discards it —
 `wrap_feed` returns `.body`, and all five desktop handlers keep their own
-whole-set tag. In release on an M-series Mac the digest is 158.8 µs of
-`render_feed`'s 160.6 µs; building the body is 1.8 µs. `wrap_feed` on `main`
-computed no digest at all, so an out-of-repo consumer that repins picks this
-up per request.
+whole-set tag. `wrap_feed` on `main` computed no digest at all, so an
+out-of-repo consumer picks this up per request on repin.
 
-It is left in place on purpose. A body-only entry point would restore the
-hazard `render_feed` was built to remove (hash one `FeedOptions`, render
-another), and making the field lazy would change `RenderedFeed`'s shape,
-which the additive-only constraint forbids. Worth revisiting only if a feed
-route ever shows up in a profile.
+First measurement, release, M-series Mac: 158.8 µs of `render_feed`'s
+160.6 µs was the digest; building the body was 1.8 µs. Almost all of that was
+re-hashing this module's own ~50 KB of source text on every single render —
+the same 50 KB every time, for the life of the process. `self_src_digest`
+caches that read behind a `OnceLock` and the digest hashes the 32-byte result
+instead, which is equivalent (a change to the source changes its digest,
+which changes every feed's tag exactly as before) and costs nothing in
+properties. Re-measured: 10.3 µs for the whole call, 9.3 µs of it digest.
+15.6x, with no signature change, no `RenderedFeed` shape change and no
+body-only entry point.
+
+The residue is real and stays: the entries are hashed per call, so a caller
+that discards `.etag` still pays ~9 µs for nothing. Removing that needs one of
+the two changes this epic rejected — a body-only entry point (restores the
+hash-one-render-another hazard) or a lazy `etag` field (changes
+`RenderedFeed`'s shape, forbidden while a consumer is pinned). Not worth
+either at ~10 µs against a feed request's DB work.
+
+Worth recording how this was found: the module had already written the cost
+off as unavoidable, in a doc comment, having considered exactly two fixes.
+The third — cache the digest, not the source — came from the consuming
+project's session reading that comment and not accepting its premise.
 
 Still open: the `page` type mismatch between feeds, the whole-set-vs-per-page
 digest trade-off (the desktop deliberately keeps its own whole-set `ETag`
