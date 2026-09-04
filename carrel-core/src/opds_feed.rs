@@ -243,9 +243,18 @@ impl Default for FeedOptions<'_> {
 /// `updated: None` the body's `<updated>` carries the render time, so two
 /// renders a second apart share an etag and differ in bytes. That is the
 /// intended trade — see [`feed_etag`] for why the struct and not the body is
-/// hashed — but it means the etag is a **weak** validator. A caller putting it
-/// in an HTTP header must mark it weak (`W/"…"`); serving it as a strong
-/// validator would be a lie about byte-equality.
+/// hashed.
+///
+/// What that means for an HTTP caller depends on `updated`:
+///
+/// - `updated: None` — `now()` enters the body, so equal etags do not imply
+///   equal bytes. The validator **must** be marked weak (`W/"…"`).
+/// - `updated: Some(t)` that is representable — every byte of the body is
+///   determined by `opts`, so equal etags do imply equal bytes and a strong
+///   validator is correct.
+///
+/// Marking it weak is always safe; marking it strong is only honest in the
+/// second case.
 pub struct RenderedFeed {
     /// The complete Atom XML document.
     pub body: String,
@@ -256,13 +265,6 @@ pub struct RenderedFeed {
     pub etag: String,
 }
 
-// The envelope template's own source text is folded into `feed_etag`'s
-// digest (see below) so a future change to the emitted shape invalidates
-// every cached feed automatically, with no hand-maintained version
-// constant to remember to bump. The macro is expanded once as a `format!`
-// template (in `render_feed`) and once as a plain `const &str` (here) —
-// both expansions are byte-identical, since a `macro_rules!` invocation is
-// deterministic.
 /// The `<updated>` shape every feed and entry in this module emits.
 const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
@@ -300,17 +302,34 @@ macro_rules! feed_envelope_template {
     };
 }
 
-/// Every template whose bytes can reach a rendered feed. All four go into the
-/// digest, so editing any emitted shape moves the validator on its own — the
-/// envelope alone was not enough: the `next` and OpenSearch links and the
-/// timestamp format are substituted into it, and a change to one of those
-/// would otherwise alter the body while leaving the etag untouched.
-const RENDER_TEMPLATES: [&str; 4] = [
-    feed_envelope_template!(),
-    next_link_template!(),
-    opensearch_link_template!(),
-    TIMESTAMP_FORMAT,
-];
+/// This module's own source text, folded into every feed's digest so that a
+/// change to the emitted shape invalidates cached feeds automatically.
+///
+/// The obvious implementation is a registry of the templates that can reach a
+/// feed, and that is what this was. It kept being incomplete. Three separate
+/// reviews found three separate omissions — first the `next` and OpenSearch
+/// link templates and the timestamp format, then `ATOM_CONTENT_TYPE` and
+/// `ATOM_ACQ_TYPE` (which arrive as `format!` *arguments*, so only their
+/// placeholder names were in the envelope), then the `entries` join separator
+/// and `EPOCH_FALLBACK`. Each fix was correct and the next omission was the
+/// same bug. A registry only works while someone keeps it complete, and the
+/// evidence is that nobody does.
+///
+/// Hashing the file removes the obligation instead of restating it: a new
+/// inline `format!`, an edited content-type constant, a change to
+/// `xml_escape`'s entity list — all of it moves the validator, with nothing to
+/// remember.
+///
+/// The cost, stated plainly: **any** edit to this file invalidates every
+/// cached feed once, including a comment-only or test-only edit. That is one
+/// refetch per client per release that touches this module. Feeds are small
+/// and releases are rare, so the trade is worth it — but it is a real cost,
+/// not a free win.
+///
+/// Its limit, equally plainly: it covers this module and nothing else.
+/// `chrono`'s formatting, or `models::Book` changing shape, remains invisible
+/// to it.
+const SELF_SRC: &str = include_str!("opds_feed.rs");
 
 /// Length-delimited hash of `s` into `hasher`.
 ///
@@ -353,21 +372,19 @@ fn hash_opt_str(hasher: &mut Sha256, s: Option<&str>) {
 /// works today and is silently broken. `updated` below is therefore
 /// hashed as the `Option` itself, never the resolved timestamp.
 fn feed_etag(opts: &FeedOptions<'_>) -> String {
-    feed_etag_over(opts, &RENDER_TEMPLATES)
+    feed_etag_over(opts, SELF_SRC)
 }
 
-/// `feed_etag`'s body, with the template set as a parameter.
+/// `feed_etag`'s body, with the rendering source as a parameter.
 ///
-/// The parameter exists so a test can vary the template set without copying
-/// the field-hashing sequence — a copy would drift the moment a field is
-/// added, and would not notice the very regression it was written to catch.
-/// Production has exactly one caller, passing [`RENDER_TEMPLATES`].
-fn feed_etag_over(opts: &FeedOptions<'_>, templates: &[&str]) -> String {
+/// The parameter exists so a test can vary that input without copying the
+/// field-hashing sequence — a copy would drift the moment a field is added,
+/// and would not notice the regression it was written to catch. Production has
+/// exactly one caller, passing [`SELF_SRC`].
+fn feed_etag_over(opts: &FeedOptions<'_>, render_src: &str) -> String {
     let mut hasher = Sha256::new();
 
-    for template in templates {
-        hash_len_prefixed(&mut hasher, template);
-    }
+    hash_len_prefixed(&mut hasher, render_src);
 
     hash_len_prefixed(&mut hasher, opts.title);
     hash_len_prefixed(&mut hasher, opts.feed_id);
@@ -1194,19 +1211,36 @@ mod tests {
         );
     }
 
-    /// Every template whose bytes can reach a rendered feed is in the digest.
+    /// The two Atom content types as they appear on the wire.
     ///
-    /// This is the guard for a defect review found in the first cut of this
-    /// milestone: only the envelope was hashed, so editing the `next` link, the
-    /// OpenSearch link or the timestamp format changed the emitted body while
-    /// leaving the validator untouched. Nothing else in the suite notices that,
-    /// because the digest stays internally consistent either way — it is wrong
-    /// only relative to the bytes.
-    ///
-    /// Varying the template set through `feed_etag_over` rather than
-    /// re-implementing the hash means this cannot drift as fields are added.
+    /// Every other assertion in this module interpolates these constants, so
+    /// expectation and actual move together and an edit to either would change
+    /// what OPDS clients receive with nothing failing. This is the one place
+    /// the literal is written out. OPDS clients dispatch on these strings, so
+    /// changing one is a wire-format change and should be a deliberate,
+    /// visible act — not a silent diff.
     #[test]
-    fn every_render_template_reaches_the_digest() {
+    fn atom_content_types_are_pinned_to_their_wire_values() {
+        assert_eq!(
+            ATOM_CONTENT_TYPE,
+            "application/atom+xml;profile=opds-catalog;kind=navigation"
+        );
+        assert_eq!(
+            ATOM_ACQ_TYPE,
+            "application/atom+xml;profile=opds-catalog;kind=acquisition"
+        );
+    }
+
+    /// The module's own source text reaches the digest, so any change to how a
+    /// feed is rendered moves the validator without anyone maintaining a list.
+    ///
+    /// This replaced a registry of templates that three reviews found
+    /// incomplete three separate times — see [`SELF_SRC`]. The property being
+    /// pinned is one-directional and worth stating exactly: a different render
+    /// source yields a different digest. That is what makes an edit to this
+    /// file invalidate cached feeds.
+    #[test]
+    fn render_source_reaches_the_digest() {
         let opts = FeedOptions {
             title: "Library",
             feed_id: "urn:test:lib",
@@ -1214,36 +1248,27 @@ mod tests {
             self_href: "/opds/all",
             ..Default::default()
         };
-        let real = feed_etag(&opts);
 
         assert_eq!(
-            real,
-            feed_etag_over(&opts, &RENDER_TEMPLATES),
-            "feed_etag must hash exactly RENDER_TEMPLATES"
+            feed_etag(&opts),
+            feed_etag_over(&opts, SELF_SRC),
+            "feed_etag must hash this module's source"
+        );
+        assert_ne!(
+            feed_etag(&opts),
+            feed_etag_over(&opts, "a different rendering"),
+            "a change to the rendering source must move the digest"
         );
 
-        // Dropping any single template must change the digest — that is what
-        // makes an edit to that template invalidate cached feeds.
-        for omitted in 0..RENDER_TEMPLATES.len() {
-            let subset: Vec<&str> = RENDER_TEMPLATES
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != omitted)
-                .map(|(_, t)| *t)
-                .collect();
-            assert_ne!(
-                real,
-                feed_etag_over(&opts, &subset),
-                "template {omitted} is not contributing to the digest"
-            );
-        }
-
-        assert_eq!(
-            RENDER_TEMPLATES.len(),
-            4,
-            "a template was added or removed — if a new one can reach the body, \
-             it belongs in the digest"
-        );
+        // The content-type constants are the omission that motivated hashing
+        // the file rather than a template list: they reach the body as `type=`
+        // attribute values but arrive as `format!` arguments, so only their
+        // placeholder names ever appeared in the envelope template. They are
+        // in the source, so they are now in the digest.
+        assert!(SELF_SRC.contains(ATOM_ACQ_TYPE));
+        assert!(SELF_SRC.contains(ATOM_CONTENT_TYPE));
+        assert!(SELF_SRC.contains(TIMESTAMP_FORMAT));
+        assert!(SELF_SRC.contains(EPOCH_FALLBACK));
     }
 
     #[test]

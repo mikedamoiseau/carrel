@@ -12,9 +12,9 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   input in a single call, so a caller can no longer hash one `FeedOptions`
   value and render a different one. The ETag digest covers every
   `FeedOptions` field — including `next_href`, so distinct pages of a feed
-  never collide — plus the source text of every template that can reach a
-  rendered feed, so a future change to the emitted shape invalidates cached
-  feeds automatically.
+  never collide — plus the rendering module's own source text, so any future
+  change to the emitted shape invalidates cached feeds automatically, with no
+  list for anyone to keep complete.
   `prefix` and `opensearch_href` let a caller mount a catalog under a
   different path and advertise a discoverable OpenSearch descriptor, neither
   of which the existing `wrap_feed` supported. This is purely additive:
