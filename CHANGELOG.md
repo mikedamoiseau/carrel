@@ -33,8 +33,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   its own whole-matching-set `ETag` rather than adopting `RenderedFeed`'s
   narrower per-page digest — that would change cache-invalidation scope
   (a later page's edit would stop invalidating an earlier page) and is out
-  of scope here. Emitted XML is byte-for-byte unchanged except the one fix
-  below.
+  of scope here. Emitted XML is byte-for-byte unchanged except for the two
+  escaping fixes below.
 - **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
   in SQL for both manual and automated (rule-based) collections. The web UI's
   collection view uses them, so searching or filtering inside a collection now
@@ -57,6 +57,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   would already produce — but `carrel-core::opds_feed::book_to_entry`
   (which the desktop now calls, see above) always escapes it, closing the
   gap for any future or external id that isn't UUID-shaped.
+- **A collection feed's `<id>`, `<title>` and `rel="self"` href were not
+  XML-escaped either.** `/opds/collections/{id}` interpolates the request's
+  own path segment into all three, and the desktop's own feed envelope
+  escaped none of them. As with book ids this was not reachable: an id with
+  no matching row returns 500 before anything is rendered, and ids that do
+  have a row are UUIDs. `render_feed` escapes all three regardless, so the
+  guarantee no longer rests on the id scheme.
 - **Paging through `/opds/all` could serve a book twice or skip one
   entirely.** `carrel-core`'s `list_books`, which `/opds/all` pages over,
   ordered rows by `added_at DESC` alone. Books added
