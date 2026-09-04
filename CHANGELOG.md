@@ -5,6 +5,24 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`carrel-core::opds_feed` gained a real feed-rendering interface**:
+  `FeedOptions`, `RenderedFeed`, `render_feed`, and `opensearch_descriptor`.
+  `render_feed` renders a feed page and computes its ETag from one shared
+  input in a single call, so a caller can no longer hash one `FeedOptions`
+  value and render a different one. The ETag digest covers every
+  `FeedOptions` field — including `next_href`, so distinct pages of a feed
+  never collide — plus the source text of every template that can reach a
+  rendered feed, so a future change to the emitted shape invalidates cached
+  feeds automatically.
+  `prefix` and `opensearch_href` let a caller mount a catalog under a
+  different path and advertise a discoverable OpenSearch descriptor, neither
+  of which the existing `wrap_feed` supported. This is purely additive:
+  existing `wrap_feed` callers are unaffected — it now delegates to
+  `render_feed` internally with today's defaults and its output is
+  byte-for-byte unchanged. Desktop adoption of the new interface is a later
+  milestone.
+
 ### Changed
 - **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
   in SQL for both manual and automated (rule-based) collections. The web UI's

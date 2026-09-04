@@ -12,12 +12,16 @@
 //! file — live in the consuming app.
 //!
 //! Per-entry hrefs are injected via [`EntryUrls`] so this module never
-//! assumes a particular URL scheme. The wider [`wrap_feed`] still emits
-//! a hardcoded `/opds` start link and `/opds/search?q=...` search link
-//! to preserve the existing OPDS catalog shape exactly — consumers
-//! that need a different prefix should wrap the output.
+//! assumes a particular URL scheme. [`wrap_feed`] still emits a hardcoded
+//! `/opds` start link and `/opds/search?q=...` search link, to preserve the
+//! existing OPDS catalog shape exactly. Consumers that need a different
+//! mount prefix, a discoverable OpenSearch descriptor, or a
+//! caching-friendly ETag should call [`render_feed`] with a [`FeedOptions`]
+//! directly instead — `wrap_feed` is now a thin `render_feed` call with
+//! today's defaults, kept only so existing callers are unaffected.
 
 use crate::models::Book;
+use sha2::{Digest, Sha256};
 
 /// OPDS Atom navigation feed content type.
 pub const ATOM_CONTENT_TYPE: &str = "application/atom+xml;profile=opds-catalog;kind=navigation";
@@ -177,6 +181,312 @@ pub fn book_to_entry(book: &Book, urls: &EntryUrls) -> String {
     )
 }
 
+/// Options for [`render_feed`].
+///
+/// Construct with `..Default::default()` for any fields not being set
+/// explicitly, so fields added later don't break existing call sites.
+///
+/// `Default` is hand-written rather than derived (see [`Default for
+/// FeedOptions`](#impl-Default-for-FeedOptions%3C\'_%3E)): a derived
+/// `Default` would give `prefix` (and every other `&str` field) `""`,
+/// which for `prefix` specifically means a caller who forgets to set it
+/// silently gets `rel="start" href=""` — a well-formed feed pointing
+/// nowhere, with nothing to error on it.
+pub struct FeedOptions<'a> {
+    /// Feed-level `<title>`.
+    pub title: &'a str,
+    /// Feed-level `<id>`.
+    pub feed_id: &'a str,
+    /// Pre-built entry XML strings, inlined as-is (see [`book_to_entry`]).
+    pub entries: &'a [String],
+    /// This feed page's own URL, used for `rel="self"`.
+    pub self_href: &'a str,
+    /// Selects the navigation vs. acquisition `type=` attribute.
+    pub kind: FeedKind,
+    /// `Some(...)` adds a `rel="next"` pagination link.
+    pub next_href: Option<&'a str>,
+    /// Mount prefix (e.g. `"/opds"`), used to build `rel="start"` and the
+    /// inline-template `rel="search"` link.
+    pub prefix: &'a str,
+    /// `Some(...)` adds a `rel="search"` link of type
+    /// `application/opensearchdescription+xml` pointing at the URL an
+    /// [`opensearch_descriptor`] document is served from. `None` omits it.
+    pub opensearch_href: Option<&'a str>,
+    /// Feed-level `<updated>` timestamp (Unix seconds). `None` falls back
+    /// to the render-time wall clock.
+    pub updated: Option<i64>,
+}
+
+impl Default for FeedOptions<'_> {
+    fn default() -> Self {
+        Self {
+            title: "",
+            feed_id: "",
+            entries: &[],
+            self_href: "",
+            // Not derived: a `FeedKind::Navigation` default would let a
+            // forgotten `kind` field silently serve an acquisition feed
+            // with navigation `type=` attributes — nothing errors on
+            // that, clients just read it wrong.
+            kind: FeedKind::Acquisition,
+            next_href: None,
+            prefix: "/opds",
+            opensearch_href: None,
+            updated: None,
+        }
+    }
+}
+
+/// A rendered feed page and the validator for the *inputs* that produced it.
+///
+/// The etag identifies the [`FeedOptions`], not the exact octets: with
+/// `updated: None` the body's `<updated>` carries the render time, so two
+/// renders a second apart share an etag and differ in bytes. That is the
+/// intended trade — see [`feed_etag`] for why the struct and not the body is
+/// hashed — but it means the etag is a **weak** validator. A caller putting it
+/// in an HTTP header must mark it weak (`W/"…"`); serving it as a strong
+/// validator would be a lie about byte-equality.
+pub struct RenderedFeed {
+    /// The complete Atom XML document.
+    pub body: String,
+    /// Bare lowercase hex digest — no `W/`, no quotes. Callers wrap it
+    /// themselves (e.g. a tenant-scoped ETag helper that interpolates the
+    /// validator raw into the header must never receive anything but the
+    /// digest).
+    pub etag: String,
+}
+
+// The envelope template's own source text is folded into `feed_etag`'s
+// digest (see below) so a future change to the emitted shape invalidates
+// every cached feed automatically, with no hand-maintained version
+// constant to remember to bump. The macro is expanded once as a `format!`
+// template (in `render_feed`) and once as a plain `const &str` (here) —
+// both expansions are byte-identical, since a `macro_rules!` invocation is
+// deterministic.
+/// The `<updated>` shape every feed and entry in this module emits.
+const TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
+
+/// Deterministic stand-in for a timestamp `chrono` cannot represent, so that
+/// only `updated: None` can ever reach the wall clock. Matches the fallback
+/// `book_to_entry` already uses.
+const EPOCH_FALLBACK: &str = "2024-01-01T00:00:00Z";
+
+macro_rules! next_link_template {
+    () => {
+        r#"  <link rel="next" href="{href}" type="{kind_type}"/>"#
+    };
+}
+
+macro_rules! opensearch_link_template {
+    () => {
+        "  <link rel=\"search\" href=\"{href}\" type=\"application/opensearchdescription+xml\"/>\n"
+    };
+}
+
+macro_rules! feed_envelope_template {
+    () => {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>{feed_id_esc}</id>
+  <title>{title_esc}</title>
+  <updated>{updated}</updated>
+  <link rel="self" href="{self_href_esc}" type="{kind_type}"/>
+  <link rel="start" href="{prefix_esc}" type="{ATOM_CONTENT_TYPE}"/>
+{opensearch_link}  <link rel="search" href="{prefix_esc}/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}"/>
+{next_link}
+{entries_joined}
+</feed>"#
+    };
+}
+
+/// Every template whose bytes can reach a rendered feed. All four go into the
+/// digest, so editing any emitted shape moves the validator on its own — the
+/// envelope alone was not enough: the `next` and OpenSearch links and the
+/// timestamp format are substituted into it, and a change to one of those
+/// would otherwise alter the body while leaving the etag untouched.
+const RENDER_TEMPLATES: [&str; 4] = [
+    feed_envelope_template!(),
+    next_link_template!(),
+    opensearch_link_template!(),
+    TIMESTAMP_FORMAT,
+];
+
+/// Length-delimited hash of `s` into `hasher`.
+///
+/// Length-delimited (rather than just hashing the bytes) so that hashing
+/// two adjacent fields back-to-back can't be confused with hashing one
+/// field that happens to contain the same concatenated bytes.
+fn hash_len_prefixed(hasher: &mut Sha256, s: &str) {
+    hasher.update((s.len() as u64).to_le_bytes());
+    hasher.update(s.as_bytes());
+}
+
+/// Hashes `Option<&str>` with an explicit discriminant byte, so `None`
+/// and `Some("")` — and `Some("a")` followed by `Some("b")` vs.
+/// `Some("ab")` alone — cannot collide.
+fn hash_opt_str(hasher: &mut Sha256, s: Option<&str>) {
+    match s {
+        None => hasher.update([0u8]),
+        Some(v) => {
+            hasher.update([1u8]);
+            hash_len_prefixed(hasher, v);
+        }
+    }
+}
+
+/// Digest identifying a [`FeedOptions`] value, used as [`RenderedFeed`]'s
+/// `etag`.
+///
+/// Hashes every field of `opts` — not a hand-picked subset, which would
+/// drift from the real inputs as fields are added — plus
+/// the source text of every template in [`RENDER_TEMPLATES`], so a change to
+/// any emitted shape invalidates cached feeds with nothing to remember to
+/// bump. Hashing only the envelope was not enough: the `next` link, the
+/// OpenSearch link and the timestamp format are substituted *into* it, so
+/// editing one of those changed the body while leaving the digest alone.
+///
+/// Deliberately hashes the *struct*, never the rendered body: by the time
+/// a body exists, `render_feed` has already substituted `now()` for
+/// `updated: None`, so hashing the body would make the digest change on
+/// every single request in exactly the `None` case that looks like it
+/// works today and is silently broken. `updated` below is therefore
+/// hashed as the `Option` itself, never the resolved timestamp.
+fn feed_etag(opts: &FeedOptions<'_>) -> String {
+    feed_etag_over(opts, &RENDER_TEMPLATES)
+}
+
+/// `feed_etag`'s body, with the template set as a parameter.
+///
+/// The parameter exists so a test can vary the template set without copying
+/// the field-hashing sequence — a copy would drift the moment a field is
+/// added, and would not notice the very regression it was written to catch.
+/// Production has exactly one caller, passing [`RENDER_TEMPLATES`].
+fn feed_etag_over(opts: &FeedOptions<'_>, templates: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+
+    for template in templates {
+        hash_len_prefixed(&mut hasher, template);
+    }
+
+    hash_len_prefixed(&mut hasher, opts.title);
+    hash_len_prefixed(&mut hasher, opts.feed_id);
+    hasher.update((opts.entries.len() as u64).to_le_bytes());
+    for entry in opts.entries {
+        hash_len_prefixed(&mut hasher, entry);
+    }
+    hash_len_prefixed(&mut hasher, opts.self_href);
+    hasher.update([match opts.kind {
+        FeedKind::Navigation => 0u8,
+        FeedKind::Acquisition => 1u8,
+    }]);
+    hash_opt_str(&mut hasher, opts.next_href);
+    hash_len_prefixed(&mut hasher, opts.prefix);
+    hash_opt_str(&mut hasher, opts.opensearch_href);
+    // CRITICAL: the Option, not the now()-resolved value — see doc comment.
+    match opts.updated {
+        None => hasher.update([0u8]),
+        Some(t) => {
+            hasher.update([1u8]);
+            hasher.update(t.to_le_bytes());
+        }
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+/// Render a complete Atom feed page from `opts`, plus its ETag.
+///
+/// One call, deliberately: hashing and rendering share `opts`, so a
+/// caller can never hash one `FeedOptions` value and render a different
+/// one — the only failure mode here that yields a *wrong* answer (a
+/// validator for content the client didn't get) rather than merely a
+/// slow one.
+pub fn render_feed(opts: &FeedOptions<'_>) -> RenderedFeed {
+    let etag = feed_etag(opts);
+
+    let kind_type = opts.kind.as_content_type();
+    let title_esc = xml_escape(opts.title);
+    let feed_id_esc = xml_escape(opts.feed_id);
+    let self_href_esc = xml_escape(opts.self_href);
+    let prefix_esc = xml_escape(opts.prefix);
+    // Only `None` may reach the wall clock. An out-of-range `Some(t)` falls
+    // back to a fixed instant instead, the way `book_to_entry` already does:
+    // the digest hashes `Some(t)` and would stay stable while a `now()` body
+    // changed every request, which is exactly the etag-stops-describing-the-
+    // bytes failure this design exists to prevent.
+    let updated = match opts.updated {
+        Some(t) => chrono::DateTime::from_timestamp(t, 0)
+            .map(|dt| dt.format(TIMESTAMP_FORMAT).to_string())
+            .unwrap_or_else(|| EPOCH_FALLBACK.to_string()),
+        None => chrono::Utc::now().format(TIMESTAMP_FORMAT).to_string(),
+    };
+    let next_link = opts
+        .next_href
+        .map(|h| {
+            format!(
+                next_link_template!(),
+                href = xml_escape(h),
+                kind_type = kind_type
+            )
+        })
+        .unwrap_or_default();
+    let opensearch_link = opts
+        .opensearch_href
+        .map(|h| format!(opensearch_link_template!(), href = xml_escape(h)))
+        .unwrap_or_default();
+    let entries_joined = opts.entries.join("\n");
+
+    let body = format!(
+        feed_envelope_template!(),
+        feed_id_esc = feed_id_esc,
+        title_esc = title_esc,
+        updated = updated,
+        self_href_esc = self_href_esc,
+        kind_type = kind_type,
+        prefix_esc = prefix_esc,
+        ATOM_CONTENT_TYPE = ATOM_CONTENT_TYPE,
+        opensearch_link = opensearch_link,
+        ATOM_ACQ_TYPE = ATOM_ACQ_TYPE,
+        next_link = next_link,
+        entries_joined = entries_joined,
+    );
+
+    RenderedFeed { body, etag }
+}
+
+/// OpenSearch Description Document for a catalog's search facility.
+///
+/// OPDS 1.2 advertises search as a `rel="search"` link of type
+/// `application/opensearchdescription+xml` pointing at a document like
+/// this one, for third-party readers that only recognise the spec's form
+/// (Carrel's own client uses the feed's inline `{searchTerms}` template
+/// directly instead, for one fewer round trip). Modeled on the descriptor
+/// the desktop app already serves from
+/// `src-tauri/src/web_server/opds_feed.rs`, but parameterised by the
+/// caller-supplied search href rather than assuming a fixed origin —
+/// this module has no access to the request's authority.
+///
+/// **Caller obligation:** pass a href that is already correct for whoever will
+/// resolve it, and prefer an absolute URL. Third-party readers resolve the
+/// `template` attribute out of band, where a relative href may not resolve
+/// against the feed at all; the desktop app builds this from the request's
+/// authority for that reason, and search would silently disappear rather than
+/// error if it did not. This function escapes the href but cannot validate
+/// it — the same convention [`EntryUrls`] documents.
+pub fn opensearch_descriptor(search_href: &str) -> String {
+    let template = xml_escape(search_href);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>Carrel</ShortName>
+  <Description>Search the Carrel library</Description>
+  <InputEncoding>UTF-8</InputEncoding>
+  <Url type="{ATOM_ACQ_TYPE}" template="{template}"/>
+</OpenSearchDescription>"#
+    )
+}
+
 /// Wrap a sequence of pre-built entry XML strings into a complete
 /// Atom feed.
 ///
@@ -190,6 +500,10 @@ pub fn book_to_entry(book: &Book, urls: &EntryUrls) -> String {
 /// elements that match the OPDS catalog shape shipped today. Consumers
 /// that mount their catalog under a different prefix should post-process
 /// the output.
+///
+/// Delegates to [`render_feed`] with today's defaults (`prefix: "/opds"`,
+/// `opensearch_href: None`, `updated: None`); output is byte-for-byte
+/// unchanged from before `render_feed` existed.
 pub fn wrap_feed(
     title: &str,
     feed_id: &str,
@@ -198,34 +512,16 @@ pub fn wrap_feed(
     kind: FeedKind,
     next_href: Option<&str>,
 ) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
-    let kind_type = kind.as_content_type();
-    let title_esc = xml_escape(title);
-    let feed_id_esc = xml_escape(feed_id);
-    let self_href_esc = xml_escape(self_href);
-    let next_link = next_href
-        .map(|h| {
-            format!(
-                r#"  <link rel="next" href="{}" type="{kind_type}"/>"#,
-                xml_escape(h)
-            )
-        })
-        .unwrap_or_default();
-    let entries_joined = entries.join("\n");
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"
-      xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>{feed_id_esc}</id>
-  <title>{title_esc}</title>
-  <updated>{now}</updated>
-  <link rel="self" href="{self_href_esc}" type="{kind_type}"/>
-  <link rel="start" href="/opds" type="{ATOM_CONTENT_TYPE}"/>
-  <link rel="search" href="/opds/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}"/>
-{next_link}
-{entries_joined}
-</feed>"#
-    )
+    render_feed(&FeedOptions {
+        title,
+        feed_id,
+        entries,
+        self_href,
+        kind,
+        next_href,
+        ..Default::default()
+    })
+    .body
 }
 
 #[cfg(test)]
@@ -524,5 +820,495 @@ mod tests {
             )),
             "navigation self link should advertise navigation MIME:\n{feed}"
         );
+    }
+
+    /// Extracts the text between `<updated>` and `</updated>` so
+    /// timestamp-bearing output can be compared without racing the clock.
+    fn extract_updated(feed: &str) -> &str {
+        let start = feed.find("<updated>").expect("missing <updated>") + "<updated>".len();
+        let end = feed[start..]
+            .find("</updated>")
+            .expect("missing </updated>")
+            + start;
+        &feed[start..end]
+    }
+
+    /// Blanks out the `<updated>` element's content so two feeds that were
+    /// rendered from independent `now()` calls can still be compared for
+    /// byte-identical *structure*.
+    fn normalize_updated(feed: &str) -> String {
+        let start = feed.find("<updated>").expect("missing <updated>");
+        let end = feed.find("</updated>").expect("missing </updated>") + "</updated>".len();
+        format!("{}<updated>X</updated>{}", &feed[..start], &feed[end..])
+    }
+
+    /// Reconstructs the pre-refactor `wrap_feed` template by hand, so the
+    /// delegating implementation can be checked against it byte-for-byte
+    /// rather than merely "looks right".
+    fn expected_wrap_feed_body(
+        title_esc: &str,
+        feed_id_esc: &str,
+        updated: &str,
+        self_href_esc: &str,
+        kind_type: &str,
+        next_link: &str,
+        entries_joined: &str,
+    ) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>{feed_id_esc}</id>
+  <title>{title_esc}</title>
+  <updated>{updated}</updated>
+  <link rel="self" href="{self_href_esc}" type="{kind_type}"/>
+  <link rel="start" href="/opds" type="{ATOM_CONTENT_TYPE}"/>
+  <link rel="search" href="/opds/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}"/>
+{next_link}
+{entries_joined}
+</feed>"#
+        )
+    }
+
+    #[test]
+    fn wrap_feed_navigation_feed_is_byte_identical_to_pre_refactor_shape() {
+        let feed = wrap_feed(
+            "Root",
+            "urn:test:root",
+            &[],
+            "/opds",
+            FeedKind::Navigation,
+            None,
+        );
+        let updated = extract_updated(&feed);
+        let expected = expected_wrap_feed_body(
+            "Root",
+            "urn:test:root",
+            updated,
+            "/opds",
+            ATOM_CONTENT_TYPE,
+            "",
+            "",
+        );
+        assert_eq!(feed, expected);
+    }
+
+    #[test]
+    fn wrap_feed_acquisition_feed_is_byte_identical_to_pre_refactor_shape() {
+        let entries = vec![
+            "<entry><id>a</id></entry>".to_string(),
+            "<entry><id>b</id></entry>".to_string(),
+        ];
+        let feed = wrap_feed(
+            "Library",
+            "urn:test:lib",
+            &entries,
+            "/opds/all",
+            FeedKind::Acquisition,
+            None,
+        );
+        let updated = extract_updated(&feed);
+        let expected = expected_wrap_feed_body(
+            "Library",
+            "urn:test:lib",
+            updated,
+            "/opds/all",
+            ATOM_ACQ_TYPE,
+            "",
+            &entries.join("\n"),
+        );
+        assert_eq!(feed, expected);
+    }
+
+    #[test]
+    fn wrap_feed_with_next_href_is_byte_identical_to_pre_refactor_shape() {
+        let feed = wrap_feed(
+            "Page 1",
+            "urn:test:lib:p1",
+            &[],
+            "/opds/all?page=1",
+            FeedKind::Acquisition,
+            Some("/opds/all?page=2&from=somewhere"),
+        );
+        let updated = extract_updated(&feed);
+        let next_link = format!(
+            r#"  <link rel="next" href="/opds/all?page=2&amp;from=somewhere" type="{ATOM_ACQ_TYPE}"/>"#
+        );
+        let expected = expected_wrap_feed_body(
+            "Page 1",
+            "urn:test:lib:p1",
+            updated,
+            "/opds/all?page=1",
+            ATOM_ACQ_TYPE,
+            &next_link,
+            "",
+        );
+        assert_eq!(feed, expected);
+    }
+
+    #[test]
+    fn wrap_feed_without_next_href_is_byte_identical_to_pre_refactor_shape() {
+        let feed = wrap_feed(
+            "All",
+            "urn:test:all",
+            &[],
+            "/opds/all",
+            FeedKind::Acquisition,
+            None,
+        );
+        let updated = extract_updated(&feed);
+        let expected = expected_wrap_feed_body(
+            "All",
+            "urn:test:all",
+            updated,
+            "/opds/all",
+            ATOM_ACQ_TYPE,
+            "",
+            "",
+        );
+        assert_eq!(feed, expected);
+    }
+
+    #[test]
+    fn render_feed_matches_wrap_feed_with_default_options() {
+        let entries = vec!["<entry><id>a</id></entry>".to_string()];
+        let wrapped = wrap_feed(
+            "Library",
+            "urn:test:lib",
+            &entries,
+            "/opds/all",
+            FeedKind::Acquisition,
+            Some("/opds/all?page=1"),
+        );
+
+        let rendered = render_feed(&FeedOptions {
+            title: "Library",
+            feed_id: "urn:test:lib",
+            entries: &entries,
+            self_href: "/opds/all",
+            kind: FeedKind::Acquisition,
+            next_href: Some("/opds/all?page=1"),
+            ..Default::default()
+        });
+
+        // Both calls independently resolve `updated: None` via `now()`;
+        // normalize it out rather than racing the clock between the two
+        // calls.
+        assert_eq!(
+            normalize_updated(&rendered.body),
+            normalize_updated(&wrapped)
+        );
+    }
+
+    #[test]
+    fn feed_etag_is_stable_across_a_real_second_boundary_when_updated_is_none() {
+        // Back-to-back calls are NOT a sufficient test here: chrono formats
+        // `now()` at second granularity, so two calls made within the same
+        // wall-clock second would pass even if the bug (hashing the
+        // *resolved* substitution timestamp instead of the `Option` itself)
+        // were present. This test forces a real second to elapse between
+        // the two calls so a granularity-masked bug cannot hide.
+        let opts = FeedOptions {
+            title: "Library",
+            feed_id: "urn:test:lib",
+            entries: &[],
+            self_href: "/opds/all",
+            updated: None,
+            ..Default::default()
+        };
+
+        let first = render_feed(&opts).etag;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = render_feed(&opts).etag;
+
+        assert_eq!(
+            first, second,
+            "etag for updated: None must not depend on now()"
+        );
+    }
+
+    #[test]
+    fn feed_etag_differs_by_updated_value() {
+        fn opts_with_updated(updated: Option<i64>) -> FeedOptions<'static> {
+            FeedOptions {
+                title: "Library",
+                feed_id: "urn:test:lib",
+                entries: &[],
+                self_href: "/opds/all",
+                updated,
+                ..Default::default()
+            }
+        }
+
+        let none_tag = render_feed(&opts_with_updated(None)).etag;
+        let some_a = render_feed(&opts_with_updated(Some(1_700_000_000))).etag;
+        let some_b = render_feed(&opts_with_updated(Some(1_800_000_000))).etag;
+
+        assert_ne!(none_tag, some_a);
+        assert_ne!(none_tag, some_b);
+        assert_ne!(some_a, some_b);
+    }
+
+    /// One `assert_ne!` per digest field. `next_href` had one of these from the
+    /// start; the rest did not, which meant `self_href` — the field whose
+    /// absence let page 1 answer 304 to page 0's validator, the defect this
+    /// whole redesign exists to fix — could be deleted from `feed_etag` with
+    /// the entire suite still green. So could `entries`, which is the whole
+    /// point of hashing rendered bytes rather than `(id, updated_at)` pairs.
+    ///
+    /// Each case changes exactly one field from the same base, so a passing
+    /// row means that field reached the hasher.
+    #[test]
+    fn feed_etag_reflects_every_field() {
+        let base_entries = vec!["<entry><id>a</id></entry>".to_string()];
+        let other_entries = vec!["<entry><id>b</id></entry>".to_string()];
+
+        // A fresh base per case, mutated in one field. `FeedKind` is not
+        // `Copy`, so `..base` cannot be used, and mutating a field is clearer
+        // than nine full literals.
+        let base = || FeedOptions {
+            title: "Library",
+            feed_id: "urn:test:lib",
+            entries: &base_entries,
+            self_href: "/opds/all",
+            kind: FeedKind::Acquisition,
+            next_href: None,
+            prefix: "/opds",
+            opensearch_href: None,
+            updated: None,
+        };
+
+        let base_tag = feed_etag(&base());
+
+        let mut cases: Vec<(&str, String)> = Vec::new();
+        let mut o = base();
+        o.title = "Other";
+        cases.push(("title", feed_etag(&o)));
+
+        let mut o = base();
+        o.feed_id = "urn:test:other";
+        cases.push(("feed_id", feed_etag(&o)));
+
+        let mut o = base();
+        o.entries = &other_entries;
+        cases.push(("entries", feed_etag(&o)));
+
+        let mut o = base();
+        o.self_href = "/opds/all?page=1";
+        cases.push(("self_href", feed_etag(&o)));
+
+        let mut o = base();
+        o.kind = FeedKind::Navigation;
+        cases.push(("kind", feed_etag(&o)));
+
+        let mut o = base();
+        o.next_href = Some("/opds/all?page=1");
+        cases.push(("next_href", feed_etag(&o)));
+
+        let mut o = base();
+        o.prefix = "/catalog";
+        cases.push(("prefix", feed_etag(&o)));
+
+        let mut o = base();
+        o.opensearch_href = Some("/opds/opensearch.xml");
+        cases.push(("opensearch_href", feed_etag(&o)));
+
+        let mut o = base();
+        o.updated = Some(1_700_000_000);
+        cases.push(("updated", feed_etag(&o)));
+
+        for (field, tag) in cases {
+            assert_ne!(
+                base_tag, tag,
+                "changing `{field}` must change the digest — if this fails, \
+                 that field is not reaching the hasher"
+            );
+        }
+    }
+
+    /// An `updated: Some(t)` that chrono cannot represent must still render a
+    /// deterministic `<updated>`. Falling back to `now()` there would leave the
+    /// digest stable (it hashes `Some(t)`) while the body changed every
+    /// request — the etag would stop describing the bytes, which is the exact
+    /// failure the `Option`-not-value rule exists to prevent.
+    #[test]
+    fn out_of_range_updated_renders_deterministically() {
+        let opts = FeedOptions {
+            title: "Library",
+            feed_id: "urn:test:lib",
+            entries: &[],
+            self_href: "/opds/all",
+            updated: Some(i64::MAX),
+            ..Default::default()
+        };
+
+        let first = render_feed(&opts).body;
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = render_feed(&opts).body;
+
+        assert_eq!(
+            first, second,
+            "an unrepresentable Some(t) must not fall through to now()"
+        );
+        assert!(first.contains(&format!("<updated>{EPOCH_FALLBACK}</updated>")));
+    }
+
+    /// A representable `Some(t)` reaches the body in the same shape `now()`
+    /// produces — the digest distinguishing `Some` values would be worth
+    /// little if the body ignored them.
+    #[test]
+    fn some_updated_reaches_the_body() {
+        let opts = FeedOptions {
+            title: "Library",
+            feed_id: "urn:test:lib",
+            entries: &[],
+            self_href: "/opds/all",
+            updated: Some(1_700_000_000),
+            ..Default::default()
+        };
+        assert!(render_feed(&opts)
+            .body
+            .contains("<updated>2023-11-14T22:13:20Z</updated>"));
+    }
+
+    #[test]
+    fn feed_etag_reflects_next_href() {
+        fn opts_with_next(next_href: Option<&str>) -> FeedOptions<'_> {
+            FeedOptions {
+                title: "Library",
+                feed_id: "urn:test:lib",
+                entries: &[],
+                self_href: "/opds/all",
+                next_href,
+                ..Default::default()
+            }
+        }
+
+        let without = render_feed(&opts_with_next(None)).etag;
+        let with = render_feed(&opts_with_next(Some("/opds/all?page=1"))).etag;
+
+        assert_ne!(
+            without, with,
+            "next_href must be part of the etag digest — this is the assertion \
+             that fails if next_href is later dropped from the hash"
+        );
+    }
+
+    /// Every template whose bytes can reach a rendered feed is in the digest.
+    ///
+    /// This is the guard for a defect review found in the first cut of this
+    /// milestone: only the envelope was hashed, so editing the `next` link, the
+    /// OpenSearch link or the timestamp format changed the emitted body while
+    /// leaving the validator untouched. Nothing else in the suite notices that,
+    /// because the digest stays internally consistent either way — it is wrong
+    /// only relative to the bytes.
+    ///
+    /// Varying the template set through `feed_etag_over` rather than
+    /// re-implementing the hash means this cannot drift as fields are added.
+    #[test]
+    fn every_render_template_reaches_the_digest() {
+        let opts = FeedOptions {
+            title: "Library",
+            feed_id: "urn:test:lib",
+            entries: &[],
+            self_href: "/opds/all",
+            ..Default::default()
+        };
+        let real = feed_etag(&opts);
+
+        assert_eq!(
+            real,
+            feed_etag_over(&opts, &RENDER_TEMPLATES),
+            "feed_etag must hash exactly RENDER_TEMPLATES"
+        );
+
+        // Dropping any single template must change the digest — that is what
+        // makes an edit to that template invalidate cached feeds.
+        for omitted in 0..RENDER_TEMPLATES.len() {
+            let subset: Vec<&str> = RENDER_TEMPLATES
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != omitted)
+                .map(|(_, t)| *t)
+                .collect();
+            assert_ne!(
+                real,
+                feed_etag_over(&opts, &subset),
+                "template {omitted} is not contributing to the digest"
+            );
+        }
+
+        assert_eq!(
+            RENDER_TEMPLATES.len(),
+            4,
+            "a template was added or removed — if a new one can reach the body, \
+             it belongs in the digest"
+        );
+    }
+
+    #[test]
+    fn prefix_reaches_start_and_search_links() {
+        let rendered = render_feed(&FeedOptions {
+            title: "Root",
+            feed_id: "urn:test:root",
+            entries: &[],
+            self_href: "/catalog",
+            kind: FeedKind::Navigation,
+            prefix: "/catalog",
+            ..Default::default()
+        });
+
+        assert!(rendered
+            .body
+            .contains(&format!(r#"href="/catalog" type="{ATOM_CONTENT_TYPE}""#)));
+        assert!(rendered.body.contains(&format!(
+            r#"rel="search" href="/catalog/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}""#
+        )));
+    }
+
+    #[test]
+    fn opensearch_href_some_adds_descriptor_link_and_none_omits_it() {
+        let with = render_feed(&FeedOptions {
+            title: "Root",
+            feed_id: "urn:test:root",
+            entries: &[],
+            self_href: "/opds",
+            opensearch_href: Some("/opds/opensearch.xml"),
+            ..Default::default()
+        });
+        assert!(with.body.contains(
+            r#"<link rel="search" href="/opds/opensearch.xml" type="application/opensearchdescription+xml"/>"#
+        ));
+
+        let without = render_feed(&FeedOptions {
+            title: "Root",
+            feed_id: "urn:test:root",
+            entries: &[],
+            self_href: "/opds",
+            opensearch_href: None,
+            ..Default::default()
+        });
+        assert!(!without.body.contains("opensearchdescription+xml"));
+    }
+
+    #[test]
+    fn feed_options_default_uses_opds_prefix_and_acquisition_kind() {
+        let opts = FeedOptions::default();
+        assert_eq!(opts.prefix, "/opds");
+        assert!(matches!(opts.kind, FeedKind::Acquisition));
+    }
+
+    #[test]
+    fn opensearch_descriptor_uses_caller_supplied_href() {
+        let doc = opensearch_descriptor("https://example.test/opds/search?q={searchTerms}");
+        assert!(doc.contains(r#"template="https://example.test/opds/search?q={searchTerms}""#));
+        assert!(doc.contains("<ShortName>Carrel</ShortName>"));
+    }
+
+    #[test]
+    fn opensearch_descriptor_escapes_href() {
+        let doc = opensearch_descriptor("/opds/search?q={searchTerms}&x=1");
+        assert!(doc.contains("&amp;x=1"));
+        assert!(!doc.contains("&x=1"));
     }
 }
