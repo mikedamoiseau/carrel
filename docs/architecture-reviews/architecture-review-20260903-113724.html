@@ -177,7 +177,8 @@ flowchart TD
           </div>
 
           <div class="font-mono text-xs text-slate-500 space-y-0.5">
-            <div>carrel-core/src/opds_feed.rs — 528 lines, <span class="text-red-600">0 callers</span>, 1 commit</div>
+            <div>carrel-core/src/opds_feed.rs — 528 lines, <span class="text-red-600 line-through">0 callers</span>
+              <span class="text-emerald-700">live: Carrel Server calls all 7 exports + both ATOM_* constants</span>, 1 commit</div>
             <div>src-tauri/src/web_server/opds_feed.rs — <span class="text-red-600">1,680</span> lines, serves traffic
               <span class="text-slate-400">(was 1,148; PR #142 added paging + ETag to the live copy only, widening the fork)</span></div>
           </div>
@@ -189,7 +190,7 @@ flowchart TD
                 <div class="absolute left-0 top-2 w-[46%] rounded border-2 border-dashed border-slate-300 bg-slate-50 p-3">
                   <div class="lbl text-slate-400">carrel-core::opds_feed</div>
                   <div class="text-xs mt-2 text-slate-500">xml_escape · book_to_entry<br/>wrap_feed · EntryUrls · FeedKind</div>
-                  <div class="mt-3 text-xs text-slate-400 italic">297 lines of tests<br/>guarding nothing</div>
+                  <div class="mt-3 text-xs text-slate-400 italic">297 lines of tests —<br/>guarding Carrel Server,<br/>not this repo</div>
                 </div>
                 <div class="absolute right-0 top-2 w-[46%] rounded border-2 border-slate-800 bg-white p-3">
                   <div class="lbl text-slate-500">web_server::opds_feed</div>
@@ -200,7 +201,7 @@ flowchart TD
                   <line x1="46%" y1="80" x2="54%" y2="80" stroke="#dc2626" stroke-width="2" stroke-dasharray="3 3"/>
                   <text x="50%" y="72" text-anchor="middle" fill="#dc2626" font-size="10">forked</text>
                 </svg>
-                <div class="absolute bottom-2 left-0 right-0 text-center text-xs text-red-600">no import edge exists</div>
+                <div class="absolute bottom-2 left-0 right-0 text-center text-xs text-red-600">no import edge <em>in this repo</em></div>
               </div>
             </div>
             <div class="rounded border border-slate-200 p-4">
@@ -222,26 +223,57 @@ flowchart TD
             </div>
           </div>
 
-          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
-            The module that exists to be shared has never been called, so every fix landed only in the copy that serves traffic.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span> <span class="text-xs text-red-600">(restated 2026-09-04 — the original was wrong)</span><br/>
+            The module that exists to be shared <em>is</em> called — by Carrel Server, the out-of-repo consumer this review could not
+            see. So the two copies are not "live vs dead"; they are two live renderers, one per product, and every fix lands in
+            whichever one the author happened to be looking at.</p>
           <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
             Fold the live copy's ETag, OpenSearch and stable-<code class="font-mono text-xs">updated</code> work into core, and have the web module call it.</p>
 
           <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
-            <li>Deletion test: deleting core's copy changes nothing</li>
-            <li>leverage: Carrel Server gets the real feed</li>
-            <li>297 test lines start guarding shipped behaviour</li>
+            <li><span class="line-through text-slate-400">Deletion test: deleting core's copy changes nothing</span> — false, it breaks Carrel Server</li>
+            <li>leverage: one renderer, two products</li>
+            <li>297 test lines start guarding both, not one</li>
             <li>One answer to "is the id escaped?"</li>
           </ul>
 
-          <div class="rounded bg-amber-50 border border-amber-300 p-3 text-sm">
-            <strong>Divergence still live, severity corrected 2026-09-04.</strong> Re-verified: core still binds
+          <div class="rounded bg-red-50 border border-red-300 p-4 text-sm space-y-2">
+            <div><strong>Confirmed by the consumer, 2026-09-04.</strong> The Carrel Server session was asked directly and
+              answered with file:line evidence: it imports <code class="font-mono text-xs">book_to_entry</code>,
+              <code class="font-mono text-xs">wrap_feed</code>, <code class="font-mono text-xs">EntryUrls</code>,
+              <code class="font-mono text-xs">FeedKind</code>, <code class="font-mono text-xs">xml_escape</code>,
+              <code class="font-mono text-xs">mobi_ext_and_mime</code>, <code class="font-mono text-xs">cover_mime</code> and both
+              <code class="font-mono text-xs">ATOM_*</code> constants, pinned at <code class="font-mono text-xs">v3.0.3</code>
+              (<code class="font-mono text-xs">c2734df</code>, verified to be that tag's commit, and the file is unchanged since).
+              It has <em>no</em> renderer of its own — every OPDS byte it serves comes from core. So the escapes in core's
+              <code class="font-mono text-xs">book_to_entry</code> are load-bearing for a live product, and the ones that matter
+              most are <strong>title, author and description</strong>: tenant-controlled metadata read out of uploaded EPUB/PDF
+              files. Dropping them would be an XML-injection hole, not a tidiness regression.</div>
+            <div><strong>Two more of this review's claims were wrong.</strong> Core <em>does</em> have paging —
+              <code class="font-mono text-xs">wrap_feed</code>'s sixth parameter is <code class="font-mono text-xs">next_href: Option&lt;&amp;str&gt;</code>
+              and it emits <code class="font-mono text-xs">&lt;link rel="next"&gt;</code> (opds_feed.rs:205-213), which Carrel Server
+              uses with the same 50-item page size. The only thing PR #142 added that core genuinely lacks is the whole-set feed ETag
+              and the OpenSearch descriptor.</div>
+            <div><strong>A defect found while checking, affecting the consumer.</strong> Core builds
+              <code class="font-mono text-xs">&lt;updated&gt;</code> from <code class="font-mono text-xs">chrono::Utc::now()</code>
+              (opds_feed.rs:201), so it changes on every request; the desktop copy takes
+              <code class="font-mono text-xs">updated_ts: Option&lt;i64&gt;</code> and derives it from the data. Carrel Server has no
+              feed-level ETag, so <code class="font-mono text-xs">&lt;updated&gt;</code> is the only freshness signal its feeds carry —
+              and it is pure noise. Reported to them.</div>
+            <div><strong>Escape divergence, severity corrected.</strong> Re-verified: core still binds
             <code class="font-mono text-xs">let id = xml_escape(&amp;book.id)</code>, the copy serving traffic still binds
             <code class="font-mono text-xs">let id = &amp;book.id</code>. The core test that would catch it still passes, because
             nothing calls the code it tests. But the original card overstated the impact: book ids are locally-generated
             <code class="font-mono text-xs">Uuid::new_v4()</code> strings, so no <code>&amp;</code> can occur in normal use.
-            This is <em>latent</em>, not exploitable today — it becomes reachable only if a foreign id ever enters the table,
-            which the sync layer is the plausible route for. The argument for this candidate is the fork, not the escape bug.
+            This is <em>latent</em> for the id specifically: Carrel Server confirmed its ids are server-minted
+              <code class="font-mono text-xs">Uuid::new_v4()</code> on both write paths, with no handler accepting a client-supplied
+              id — so it holds by construction on both sides, not by luck. The argument for this candidate is the fork, not the
+              escape bug.</div>
+            <div><strong>Direction settled with the consumer:</strong> fold the live copy's ETag and OpenSearch work
+              <em>into</em> core, never the reverse, and keep it additive — new functions and a new options struct rather than any
+              change to <code class="font-mono text-xs">wrap_feed</code>'s or <code class="font-mono text-xs">book_to_entry</code>'s
+              existing arity, since Carrel Server pins a release tag. Any arity change needs a tag bump and a heads-up, not a
+              silent change on main.</div>
           </div>
         </article>
 
