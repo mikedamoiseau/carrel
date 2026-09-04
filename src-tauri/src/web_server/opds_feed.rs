@@ -1127,17 +1127,25 @@ mod tests {
     /// template last leaves Carrel's own client on the cheaper direct-template
     /// path. The descriptor is written to be correct either way, so a future
     /// parser that took the first link instead would also work.
-    #[test]
-    fn feed_advertises_search_as_descriptor_and_inline_template() {
-        let xml = render_feed(&FeedOptions {
-            title: "T",
-            feed_id: "urn:carrel:test",
-            self_href: "/opds/all",
-            kind: FeedKind::Acquisition,
-            opensearch_href: Some("/opds/opensearch.xml"),
-            ..Default::default()
-        })
-        .body;
+    ///
+    /// Goes through the handler, not `render_feed` directly. On `main` the
+    /// descriptor link was unconditional in the desktop's own `wrap_feed`, so
+    /// building a feed by hand did constrain every route. Since M3 it is
+    /// per-call opt-in (`opensearch_href`), and a hand-built `FeedOptions`
+    /// that sets the field only asserts that `render_feed` honours it — this
+    /// test passed with the field deleted from all five handlers, which was
+    /// verified by doing exactly that.
+    #[tokio::test]
+    async fn feed_advertises_search_as_descriptor_and_inline_template() {
+        let state = seeded_state(&[("b1", 100)]);
+        let resp = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml = body_string(resp).await;
         let descriptor = format!(
             r#"<link rel="search" href="/opds/opensearch.xml" type="{OPENSEARCH_DESC_TYPE}"/>"#
         );

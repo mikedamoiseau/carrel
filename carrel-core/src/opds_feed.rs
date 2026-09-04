@@ -168,6 +168,12 @@ pub fn book_to_entry(book: &Book, urls: &EntryUrls) -> String {
         r#"<link rel="http://opds-spec.org/acquisition" href="{download_href}" type="{mime}" title="{title}.{ext}"/>"#,
     );
 
+    // OPDS clients cache and dedupe on feed and entry ids, so changing the
+    // `urn:carrel:*` scheme makes every entry look new to an already-subscribed
+    // client. This is the only place the entry-id shape exists — the desktop
+    // web server used to carry an identical copy, with this same note, until it
+    // adopted this module and the copy was deleted. See the
+    // persistence-boundary table in CLAUDE.md.
     format!(
         r#"<entry>
   <title>{title}</title>
@@ -186,8 +192,8 @@ pub fn book_to_entry(book: &Book, urls: &EntryUrls) -> String {
 /// Construct with `..Default::default()` for any fields not being set
 /// explicitly, so fields added later don't break existing call sites.
 ///
-/// `Default` is hand-written rather than derived (see [`Default for
-/// FeedOptions`](#impl-Default-for-FeedOptions%3C\'_%3E)): a derived
+/// `Default` is hand-written rather than derived (see the `Default` impl
+/// below): a derived
 /// `Default` would give `prefix` (and every other `&str` field) `""`,
 /// which for `prefix` specifically means a caller who forgets to set it
 /// silently gets `rel="start" href=""` — a well-formed feed pointing
@@ -242,8 +248,8 @@ impl Default for FeedOptions<'_> {
 /// The etag identifies the [`FeedOptions`], not the exact octets: with
 /// `updated: None` the body's `<updated>` carries the render time, so two
 /// renders a second apart share an etag and differ in bytes. That is the
-/// intended trade — see [`feed_etag`] for why the struct and not the body is
-/// hashed.
+/// intended trade — the private `feed_etag` explains why the struct and not
+/// the body is hashed.
 ///
 /// What that means for an HTTP caller depends on `updated`:
 ///
@@ -529,6 +535,20 @@ pub fn opensearch_descriptor(search_href: &str) -> String {
 /// Delegates to [`render_feed`] with today's defaults (`prefix: "/opds"`,
 /// `opensearch_href: None`, `updated: None`); output is byte-for-byte
 /// unchanged from before `render_feed` existed.
+/// Note the cost this delegation carries: `render_feed` always computes the
+/// digest, and `wrap_feed` throws it away. The digest is SHA-256 over this
+/// file (~50 KB of source text) plus every entry, which measured 158.8 µs
+/// of `render_feed`'s 160.6 µs on an M-series Mac in release — building the
+/// body itself is 1.8 µs. So a body-only caller pays roughly 90x the body's
+/// cost for a value it discards, on every call.
+///
+/// Left as-is deliberately. Splitting a body-only entry point back out would
+/// restore exactly the hazard `render_feed` exists to remove — a caller
+/// hashing one `FeedOptions` and rendering another — and making the field
+/// lazy would change `RenderedFeed`'s shape, which the additive-only
+/// constraint forbids. 160 µs against a feed request's DB work is a real but
+/// small cost, and the safe shape is worth it. See the backlog item on these
+/// handlers.
 pub fn wrap_feed(
     title: &str,
     feed_id: &str,

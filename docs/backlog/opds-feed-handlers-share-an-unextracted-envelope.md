@@ -44,10 +44,27 @@ the seam that proves the property (`feed_etag_over`) exists because the first
 guard passed with the hash loop narrowed to one element.
 
 M4 deleted the desktop's copy. `xml_escape`, `book_to_entry`, `wrap_feed`,
-`cover_mime` and the ATOM/OPENSEARCH constants are gone from `src-tauri`
-(241 lines), and all six routes render through the core crate. Output is
+`cover_mime` and the `ATOM_*` constants are gone from `src-tauri` (241
+lines), and all six routes render through the core crate.
+`OPENSEARCH_DESC_TYPE` deliberately stays desktop-local: it types the
+descriptor *response*, which is the web server's business, not the feed
+renderer's. Output is
 pinned byte-for-byte against baselines captured from the pre-adoption tree,
 including the two routes that had no baseline at all until the review.
+
+One cost this epic introduced, measured rather than estimated: `render_feed`
+always computes the digest, and every caller in *this* repo discards it —
+`wrap_feed` returns `.body`, and all five desktop handlers keep their own
+whole-set tag. In release on an M-series Mac the digest is 158.8 µs of
+`render_feed`'s 160.6 µs; building the body is 1.8 µs. `wrap_feed` on `main`
+computed no digest at all, so an out-of-repo consumer that repins picks this
+up per request.
+
+It is left in place on purpose. A body-only entry point would restore the
+hazard `render_feed` was built to remove (hash one `FeedOptions`, render
+another), and making the field lazy would change `RenderedFeed`'s shape,
+which the additive-only constraint forbids. Worth revisiting only if a feed
+route ever shows up in a profile.
 
 Still open: the `page` type mismatch between feeds, the whole-set-vs-per-page
 digest trade-off (the desktop deliberately keeps its own whole-set `ETag`
