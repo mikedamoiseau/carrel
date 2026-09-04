@@ -5,6 +5,19 @@ which gave `/opds/search` the paging and conditional-request handling the other
 feeds already had. Deferred deliberately: the fix touches handlers that
 milestone did not write.
 
+## Status
+
+M1 of the OPDS-feed-one-renderer epic fixed the actual bug this duplication
+was hiding: every page of a feed got the same ETag, so a client that cached
+page 0's validator got an empty `304` body back for `?page=1`. The fix folds
+each request's own feed URL (`self_href`) into `feed_etag`'s digest, so two
+page URLs can no longer produce the same tag, while the digest still hashes
+the whole matching set — a library change still invalidates every page at
+once. Everything else below is still open: the unextracted envelope, the
+`all_books` id tie-break, the `all_books` paging-overflow, the `page` type
+mismatch between feeds, the whole-set-vs-per-page digest trade-off, and the
+`xml_escape` control-character gap.
+
 ## What is duplicated
 
 `all_books`, `collection_feed` and now `search_books` in
@@ -13,7 +26,7 @@ milestone did not write.
 ```rust
 let pairs = db::book_etag_pairs(&conn)?;
 let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-let etag = feed_etag("<feed id>", &rendered_ids, &pairs);
+let etag = feed_etag("<feed id>", &self_href, &rendered_ids, &pairs);
 if if_none_match_matches(&headers, &etag) {
     return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
 }
@@ -23,9 +36,11 @@ Ok(([(header::CONTENT_TYPE, ...), (header::ETAG, etag)], xml).into_response())
 
 Applying the deletion test separates the two halves:
 
-- **The envelope concentrates complexity.** It needs only `feed_id`,
+- **The envelope concentrates complexity.** It needs `feed_id`, `self_href`,
   `rendered_ids`, `pairs` and `headers`, and it has three call sites. Worth
-  extracting.
+  extracting — though `self_href`, added by M1, is the one input whose *shape*
+  differs per handler (`?page=N` vs `?q=X&amp;page=N` vs a constant), which is
+  the same reason the next bullet leaves the href builders inline.
 - **The href builders only move it.** `?page=N` and `?q=X&amp;page=N` are
   genuinely different shapes, and the second needs XML escaping the first does
   not. Leave them inline.
@@ -77,12 +92,14 @@ is the wrong way round. Neither tolerates a *repeated* `?page=1&page=2`, since
 serde's derive rejects the duplicate field first; that is at least consistent
 with how a repeated `?q=` has always behaved.
 
-**SQL paging is available if the whole-set ETag is given up.** The reason
+**SQL paging is available if the whole-set digest is given up.** The reason
 `search_books` fetches every matching row to render fifty is that its tag
 covers the whole filtered set, so it needs the complete id list. A per-page tag
 would also be *correct* — it hashes the ids actually rendered, and a deletion
 on an earlier page changes which ids those are — so `LIMIT`/`OFFSET` paging
 via `db::query_books`'s existing `limit`/`offset` is on the table. What would
-be lost is what `all_books:325-327` documents: uniform invalidation, one
-library change invalidating every page URL at once. Worth deciding once, for
-all four feeds, rather than per handler.
+be lost is uniform invalidation: one library change moving every page's tag
+at once, which the whole-set digest still does today (each page's tag is now
+also unique to its own URL, per the fix in "Status" above, but the digest
+itself still covers the whole filtered set, not just the page). Worth
+deciding once, for all four feeds, rather than per handler.

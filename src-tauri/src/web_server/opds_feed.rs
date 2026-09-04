@@ -35,16 +35,35 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Weak ETag over the rendered book subset: SHA-256 of the feed id plus the
-/// sorted `(id, updated_at)` pairs of exactly the books this feed renders.
-/// Weak (`W/"..."`) because equal-state bodies are not byte-identical.
-/// Hashing pairs (not raw timestamps in the tag) avoids leaking library
-/// activity times to clients.
-fn feed_etag(feed_id: &str, rendered_ids: &[&str], pairs: &HashMap<String, i64>) -> String {
+/// Weak ETag for one feed response: SHA-256 of the feed id, this request's
+/// own feed URL (`self_href`), and the sorted `(id, updated_at)` pairs of
+/// every book the feed *covers*. Weak (`W/"..."`) because equal-state bodies
+/// are not byte-identical. Hashing pairs rather than putting raw timestamps in
+/// the tag avoids leaking library activity times to clients.
+///
+/// "Covers", not "renders": for the two paginated feeds `rendered_ids` is the
+/// whole matching set, not the slice this page shows. That is deliberate — it
+/// is what makes one change to any covered book invalidate every page of that
+/// feed at once, so a deletion on a later page cannot leave an earlier page
+/// pointing at a stale `next`.
+///
+/// `self_href` is folded in so two page URLs of the same feed can never
+/// produce the same tag despite hashing that identical whole-set input.
+/// Ambiguity between the three fields is prevented by a `\0` separator, which
+/// is sound only because none of them can contain a NUL byte: feed ids are
+/// literals plus a DB-generated id, and `self_href` is percent-encoded.
+fn feed_etag(
+    feed_id: &str,
+    self_href: &str,
+    rendered_ids: &[&str],
+    pairs: &HashMap<String, i64>,
+) -> String {
     let mut ids: Vec<&str> = rendered_ids.to_vec();
     ids.sort_unstable();
     let mut h = Sha256::new();
     h.update(feed_id.as_bytes());
+    h.update([0u8]); // separator, as below — see the note on NUL in the doc comment
+    h.update(self_href.as_bytes());
     for id in ids {
         h.update([0u8]); // separator so ("ab","c") != ("a","bc")
         h.update(id.as_bytes());
@@ -330,16 +349,21 @@ async fn all_books(
     let books = db::list_books(&conn).map_err(carrel_status)?;
     let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
-    // Whole-set tag shared by every page: clients cache per-URL, so a
-    // shared tag across page URLs is correct and any library change
-    // invalidates all pages at once.
+    // The digest covers the whole matching set *and* this request's own URL
+    // (self_href): a library change still invalidates every page, but two
+    // page URLs never share a validator.
+    let page = params.page.unwrap_or(0);
+    let self_href = if page > 0 {
+        format!("/opds/all?page={page}")
+    } else {
+        "/opds/all".to_string()
+    };
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:carrel:all", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:all", &self_href, &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
 
-    let page = params.page.unwrap_or(0);
     let start = page * OPDS_PAGE_SIZE;
     let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
 
@@ -354,11 +378,6 @@ async fn all_books(
         Some(format!("/opds/all?page={}", page + 1))
     } else {
         None
-    };
-    let self_href = if page > 0 {
-        format!("/opds/all?page={page}")
-    } else {
-        "/opds/all".to_string()
     };
 
     let xml = wrap_feed(
@@ -394,7 +413,7 @@ async fn new_books(
     books.truncate(25);
 
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:carrel:new", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:new", "/opds/new", &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
@@ -437,7 +456,8 @@ async fn collection_feed(
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
     // Hash the RESOLVED membership — works for manual and rule-based collections alike.
     let feed_id = format!("urn:carrel:collection:{id}");
-    let etag = feed_etag(&feed_id, &rendered_ids, &pairs);
+    let self_href = format!("/opds/collections/{id}");
+    let etag = feed_etag(&feed_id, &self_href, &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
@@ -452,7 +472,7 @@ async fn collection_feed(
         &format!("Collection {id}"),
         &feed_id,
         &entries,
-        &format!("/opds/collections/{id}"),
+        &self_href,
         ATOM_ACQ_TYPE,
         None,
         max_updated(&rendered_ids, &pairs),
@@ -500,20 +520,21 @@ async fn search_books(
     let conn = state.conn().map_err(carrel_status)?;
     let page = params.page();
     let search_term = params.q.unwrap_or_default();
+    let encoded_term = urlencoding::encode(&search_term);
+    let self_href = if page > 0 {
+        format!("/opds/search?q={}&amp;page={page}", encoded_term)
+    } else {
+        format!("/opds/search?q={}", encoded_term)
+    };
 
     // Filter and sort in SQL; page in Rust. `limit`/`offset` deliberately go
     // unused here, because the ETag below covers the whole *filtered* set and
     // therefore needs the complete matching list before it can be sliced.
     //
-    // That whole-set tag is a consistency choice, not a correctness one, and
-    // it is worth being precise about which: a per-page tag would also be
-    // correct, since it hashes the ids actually rendered and a deletion on an
-    // earlier page changes which ids those are. What the shared tag buys is
-    // what `all_books` documents — uniform invalidation, so one library
-    // change invalidates every page URL at once. Matching the other three
-    // feeds is the reason to keep it; the cost is fetching every matching row
-    // to render fifty. See the note in `docs/backlog/` on these handlers for
-    // the SQL-paging alternative.
+    // The digest also folds in this request's own URL (self_href), so two
+    // different pages of one search never share a validator even though both
+    // hash the same whole-set `pairs` input. See the note in `docs/backlog/`
+    // on these handlers for the SQL-paging alternative.
     let query = db::BookQuery {
         q: Some(search_term.clone()),
         series: None,
@@ -526,7 +547,7 @@ async fn search_books(
     let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:carrel:search", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:search", &self_href, &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
@@ -544,7 +565,6 @@ async fn search_books(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let encoded_term = urlencoding::encode(&search_term);
     let has_next = start.saturating_add(OPDS_PAGE_SIZE) < books.len();
     // `&amp;` (not a raw `&`): these hrefs sit inside a double-quoted XML
     // attribute, and an unescaped `&` starts an entity reference — the same
@@ -557,11 +577,6 @@ async fn search_books(
         ))
     } else {
         None
-    };
-    let self_href = if page > 0 {
-        format!("/opds/search?q={}&amp;page={page}", encoded_term)
-    } else {
-        format!("/opds/search?q={}", encoded_term)
     };
 
     let xml = wrap_feed(
@@ -777,8 +792,8 @@ mod tests {
     #[test]
     fn feed_etag_is_order_independent_and_weak() {
         let p = pairs(&[("a", 1), ("b", 2)]);
-        let t1 = feed_etag("urn:carrel:all", &["a", "b"], &p);
-        let t2 = feed_etag("urn:carrel:all", &["b", "a"], &p);
+        let t1 = feed_etag("urn:carrel:all", "/opds/all", &["a", "b"], &p);
+        let t2 = feed_etag("urn:carrel:all", "/opds/all", &["b", "a"], &p);
         assert_eq!(t1, t2);
         assert!(t1.starts_with("W/\""), "weak ETag required, got {t1}");
         assert!(t1.ends_with('"'));
@@ -787,26 +802,44 @@ mod tests {
     #[test]
     fn feed_etag_changes_on_updated_at_bump_and_set_change() {
         let p1 = pairs(&[("a", 1), ("b", 2)]);
-        let base = feed_etag("urn:carrel:all", &["a", "b"], &p1);
+        let base = feed_etag("urn:carrel:all", "/opds/all", &["a", "b"], &p1);
 
         // updated_at bump
         let p2 = pairs(&[("a", 1), ("b", 3)]);
-        assert_ne!(base, feed_etag("urn:carrel:all", &["a", "b"], &p2));
+        assert_ne!(
+            base,
+            feed_etag("urn:carrel:all", "/opds/all", &["a", "b"], &p2)
+        );
 
         // id removed from rendered set
-        assert_ne!(base, feed_etag("urn:carrel:all", &["a"], &p1));
+        assert_ne!(base, feed_etag("urn:carrel:all", "/opds/all", &["a"], &p1));
 
         // id added to rendered set
         let p3 = pairs(&[("a", 1), ("b", 2), ("c", 9)]);
-        assert_ne!(base, feed_etag("urn:carrel:all", &["a", "b", "c"], &p3));
+        assert_ne!(
+            base,
+            feed_etag("urn:carrel:all", "/opds/all", &["a", "b", "c"], &p3)
+        );
     }
 
     #[test]
     fn feed_etag_differs_across_feed_ids() {
         let p = pairs(&[("a", 1)]);
         assert_ne!(
-            feed_etag("urn:carrel:all", &["a"], &p),
-            feed_etag("urn:carrel:new", &["a"], &p)
+            feed_etag("urn:carrel:all", "/opds/all", &["a"], &p),
+            feed_etag("urn:carrel:new", "/opds/all", &["a"], &p)
+        );
+    }
+
+    #[test]
+    fn feed_etag_differs_across_self_href() {
+        // Two page URLs of the same feed, hashing the identical whole-set
+        // `pairs` input, must still produce different tags — this is the
+        // mechanism the handler-level page-collision tests below rely on.
+        let p = pairs(&[("a", 1)]);
+        assert_ne!(
+            feed_etag("urn:carrel:all", "/opds/all", &["a"], &p),
+            feed_etag("urn:carrel:all", "/opds/all?page=1", &["a"], &p)
         );
     }
 
@@ -1400,15 +1433,19 @@ mod tests {
         }
     }
 
-    /// The design decision behind this feed's ETag is that the tag covers the
-    /// whole *filtered* set — not the whole library, and not the page. Both
-    /// wrong implementations pass `search_etag_changes_when_matching_set_changes`,
-    /// because adding a matching book changes all three. These two assertions
-    /// are what actually separate them:
-    ///   * a non-matching book changing must NOT move the tag (rules out
-    ///     hashing every pair in the library), and
-    ///   * two pages of one search must share a tag (rules out a per-page
-    ///     tag, which would serve a stale page 2 after a deletion on page 1).
+    /// The design decision behind this feed's ETag is that the digest covers
+    /// the whole *filtered* set (not the whole library, not just the page)
+    /// *and* the request's own URL. Two pages of one search therefore no
+    /// longer share a literal tag (see `search_page_urls_get_different_etags`
+    /// above) — self_href differs — but they must still move *together* on a
+    /// change to the filtered set. These assertions are what separate that
+    /// from wrong implementations:
+    ///   * a non-matching book changing must NOT move either page's tag
+    ///     (rules out hashing every pair in the library), and
+    ///   * editing a book that only renders on page 0 must still move page
+    ///     1's tag too (rules out a tag that hashes only the ids actually
+    ///     rendered on that page, which would serve a stale page 1 after a
+    ///     deletion on page 0).
     #[tokio::test]
     async fn search_etag_covers_the_filtered_set_not_the_library_or_the_page() {
         let mut books: Vec<Book> = (0..51)
@@ -1421,37 +1458,55 @@ mod tests {
         let tag0 = response_etag(&page0).expect("search must set an ETag");
         let page1 = call_search(&state, Some("Matched"), Some(1)).await;
         let tag1 = response_etag(&page1).expect("search must set an ETag");
-        assert_eq!(
-            tag0, tag1,
-            "one search's pages must share a tag — a per-page tag cannot see a \
-             shift caused by a deletion on an earlier page"
-        );
 
         // Touch only the book that does not match the term.
         {
             let conn = state.conn().unwrap();
             carrel_core::db::set_want_to_read(&conn, "other", true).unwrap();
         }
-        let after = call_search(&state, Some("Matched"), None).await;
+        let after0 = call_search(&state, Some("Matched"), None).await;
+        let after1 = call_search(&state, Some("Matched"), Some(1)).await;
         assert_eq!(
-            response_etag(&after).as_deref(),
+            response_etag(&after0).as_deref(),
             Some(tag0.as_str()),
-            "a change to a book outside the filtered set must not move the tag"
+            "a change to a book outside the filtered set must not move page 0's tag"
+        );
+        assert_eq!(
+            response_etag(&after1).as_deref(),
+            Some(tag1.as_str()),
+            "a change to a book outside the filtered set must not move page 1's tag"
         );
 
-        // ...but editing a book that IS in the set must move it. Without this
-        // the whole suite passes against a tag that ignores `pairs` and hashes
-        // only the id list, which would serve a stale feed forever after an
-        // in-place title edit.
+        // ...but editing a book that IS in the set must move BOTH pages' tags.
+        //
+        // Which assertion does the work here is not obvious, so state it: the
+        // fixture is m00..m50 with `added_at = i`, sorted `added_at DESC, id`,
+        // so the order is m50..m00 and m00 lands at index 50 — alone on page 1.
+        // Editing m00 therefore makes the page-1 assertion a tautology: a
+        // digest scoped to a single page's rendered ids would move page 1's tag
+        // too, because m00 is exactly what page 1 renders.
+        //
+        // The **page-0** assertion is the discriminating one. m00 is not among
+        // page 0's rendered ids, so a per-page digest would leave page 0's tag
+        // unmoved and that assertion would fail. Delete it and criterion 4
+        // stops being pinned while the test still passes.
         {
             let conn = state.conn().unwrap();
             carrel_core::db::set_want_to_read(&conn, "m00", true).unwrap();
         }
-        let edited = call_search(&state, Some("Matched"), None).await;
+        let edited0 = call_search(&state, Some("Matched"), None).await;
+        let edited1 = call_search(&state, Some("Matched"), Some(1)).await;
         assert_ne!(
-            response_etag(&edited).as_deref(),
+            response_etag(&edited0).as_deref(),
             Some(tag0.as_str()),
-            "editing a book inside the filtered set must move the tag"
+            "editing m00 — which page 0 does NOT render — must still move page \
+             0's tag, because the digest covers the whole filtered set. This is \
+             the assertion that rules out a per-page digest."
+        );
+        assert_ne!(
+            response_etag(&edited1).as_deref(),
+            Some(tag1.as_str()),
+            "editing m00 must move page 1's tag, which renders it"
         );
     }
 
@@ -1653,6 +1708,177 @@ mod tests {
                 "page 0 must not have {id} — no book may be skipped or duplicated"
             );
         }
+    }
+
+    // --- Per-URL ETag (self_href in the digest) -----------------------
+    //
+    // Every page of a feed used to get the same ETag, so a client that cached
+    // page 0's validator got an empty 304 body back for page 1. These pin the
+    // fix at the handler level: two page URLs of the same feed/search must
+    // never share a tag, a stale (other page's) tag must not short-circuit a
+    // 304, and a page's own tag must still 304 — the feature must stop
+    // misfiring, not stop working.
+
+    #[tokio::test]
+    async fn all_books_page_urls_get_different_etags() {
+        let books: Vec<(String, i64)> = (0..60).map(|i| (format!("b{i:02}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let page0 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        assert_ne!(
+            tag0, tag1,
+            "page 0 and page 1 of /opds/all must not share an ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_books_page1_with_page0_etag_is_200_not_304() {
+        let books: Vec<(String, i64)> = (0..60).map(|i| (format!("b{i:02}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let page0 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag0.parse().unwrap());
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1.status(),
+            StatusCode::OK,
+            "page 0's ETag must not satisfy page 1's If-None-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_books_page1_with_own_etag_is_still_304() {
+        let books: Vec<(String, i64)> = (0..60).map(|i| (format!("b{i:02}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag1.parse().unwrap());
+        let page1_again = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1_again.status(),
+            StatusCode::NOT_MODIFIED,
+            "a page's own ETag must still 304 it"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page_urls_get_different_etags() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let page0 = call_search(&state, Some("Matched"), None).await;
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+        let page1 = call_search(&state, Some("Matched"), Some(1)).await;
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        assert_ne!(
+            tag0, tag1,
+            "page 0 and page 1 of the same search must not share an ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page1_with_page0_etag_is_200_not_304() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let page0 = call_search(&state, Some("Matched"), None).await;
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag0.parse().unwrap());
+        let page1 = search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(Some("Matched"), Some(1))),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1.status(),
+            StatusCode::OK,
+            "page 0's ETag must not satisfy page 1's If-None-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page1_with_own_etag_is_still_304() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let page1 = call_search(&state, Some("Matched"), Some(1)).await;
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag1.parse().unwrap());
+        let page1_again = search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(Some("Matched"), Some(1))),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1_again.status(),
+            StatusCode::NOT_MODIFIED,
+            "a page's own ETag must still 304 it"
+        );
     }
 
     #[tokio::test]

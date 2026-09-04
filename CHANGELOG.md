@@ -22,6 +22,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   takes.
 
 ### Fixed
+- **OPDS clients could be served an empty page.** In the two paginated feeds
+  (`/opds/all` and `/opds/search`), every page got the same `ETag`, so a client
+  that cached page 0's validator and then asked for page 1 with it could
+  receive a `304 Not Modified` with no body instead of page 1's actual entries.
+  Each page's `ETag` now also reflects its own URL, so two pages never share a
+  validator, while a change to a book the feed covers still invalidates all of
+  that feed's pages at once. Re-requesting a page you already have still gets a
+  `304`. The single-page feeds (`/opds/new` and collection feeds) were never
+  affected.
 - **An automated collection that mixed a tag rule with a metadata rule showed
   the wrong books.** A rule set like "series is Dune" plus "tag contains
   scifi" compared each rule's value against the other rule's field, so the
