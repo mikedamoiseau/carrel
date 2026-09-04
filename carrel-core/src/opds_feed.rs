@@ -358,12 +358,20 @@ fn hash_opt_str(hasher: &mut Sha256, s: Option<&str>) {
 /// `etag`.
 ///
 /// Hashes every field of `opts` — not a hand-picked subset, which would
-/// drift from the real inputs as fields are added — plus
-/// the source text of every template in [`RENDER_TEMPLATES`], so a change to
-/// any emitted shape invalidates cached feeds with nothing to remember to
-/// bump. Hashing only the envelope was not enough: the `next` link, the
-/// OpenSearch link and the timestamp format are substituted *into* it, so
-/// editing one of those changed the body while leaving the digest alone.
+/// drift from the real inputs as fields are added — plus this module's own
+/// source text ([`SELF_SRC`]), so a change to any emitted shape invalidates
+/// cached feeds with nothing to remember to bump. Hashing only the envelope
+/// was not enough: the `next` link, the OpenSearch link and the timestamp
+/// format are substituted *into* it, so editing one of those changed the
+/// body while leaving the digest alone. A registry of template constants was
+/// not enough either — three attempts at one each left something out (the
+/// timestamp format, the `ATOM_*` constants, the entries join separator),
+/// which is why the digest reads the file rather than a list.
+///
+/// The cost is that any edit to this file moves every feed's tag, including
+/// a comment-only one. That is the direction to fail in, but it means a
+/// caller must not expect a stable tag across a crate version bump, and no
+/// test may assert a literal digest value.
 ///
 /// Deliberately hashes the *struct*, never the rendered body: by the time
 /// a body exists, `render_feed` has already substituted `now()` for
