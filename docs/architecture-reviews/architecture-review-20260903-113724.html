@@ -55,6 +55,9 @@
         </div>
 
         <p class="text-sm text-slate-600 border-l-2 border-emerald-500 pl-3">
+          <strong>Status, 2026-09-04:</strong> candidate 1 shipped as PR #142 (6 milestones, merged to <code class="font-mono text-xs">main</code>
+          <code class="font-mono text-xs">6a03e72</code>). Candidates 2&ndash;10 are untouched and their claims were re-verified
+          against the source on 2026-09-04, except where a card says otherwise.<br/><br/>
           Scope: <code class="font-mono text-xs">carrel_core::reader</code> and the chapter/page read path are excluded —
           deepened across five milestones in PR #141, merged 2026-08-27. Three explorations ran over the IPC adapter and
           data layer, the LAN web server, and both user interfaces. Every claim below carries file:line evidence; the
@@ -69,17 +72,18 @@
           <div class="flex items-start justify-between gap-4 flex-wrap">
             <h2 class="font-serif text-2xl">1. Give "filter and sort a library" a home</h2>
             <div class="flex gap-2 shrink-0">
-              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-600 text-white">Shipped · PR #142</span>
               <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">in-process</span>
             </div>
           </div>
 
           <div class="font-mono text-xs text-slate-500 space-y-0.5">
-            <div>src-tauri/src/web_server/api.rs:684–793</div>
-            <div>src-tauri/src/web_server/opds_feed.rs:469–488</div>
-            <div>src/screens/Library.tsx:571–598</div>
-            <div>src-tauri/src/web_server/static/app.js:2507–2523</div>
-            <div>carrel-core/src/db.rs — <span class="text-red-600">no query function exists</span></div>
+            <div><span class="text-emerald-700">✓</span> api.rs <span class="text-slate-400">— now a mapping and one call</span></div>
+            <div><span class="text-emerald-700">✓</span> opds_feed.rs <span class="text-slate-400">— filters through the module; gained paging + ETag</span></div>
+            <div><span class="text-emerald-700">✓</span> app.js <span class="text-slate-400">— both client-side filter blocks deleted</span></div>
+            <div><span class="text-emerald-700">✓</span> plugins/runtime.rs <span class="text-slate-400">— the fifth copy, missed by this review</span></div>
+            <div><span class="text-amber-600">○</span> src/screens/Library.tsx <span class="text-slate-400">— still filters in the browser (desktop, in-memory)</span></div>
+            <div><span class="text-emerald-700">✓</span> carrel-core/src/db.rs <span class="text-slate-400">— BookQuery · Page&lt;T&gt; · query_books{,_grid}</span></div>
           </div>
 
           <div class="grid md:grid-cols-2 gap-4">
@@ -117,28 +121,48 @@ flowchart TD
             </div>
           </div>
 
-          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
-            The predicate "case-insensitively match title or author" is written out four times, in three languages, and
-            each copy loads the whole table and filters in the host language.</p>
-          <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span> <span class="text-xs text-slate-400">(as found)</span><br/>
+            The predicate "case-insensitively match title or author" was written out five times, in three languages, and
+            each copy loaded the whole table and filtered in the host language.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Solution</span> <span class="text-xs text-emerald-700">(as built)</span><br/>
             One <code class="font-mono text-xs">db::query_books(conn, &amp;BookQuery) -&gt; Page&lt;BookGridItem&gt;</code>
-            that compiles to SQL, with the id tie-break that makes paging stable living in its <code class="font-mono text-xs">ORDER BY</code>.</p>
+            compiling to SQL, with the id tie-break that makes paging stable living in its <code class="font-mono text-xs">ORDER BY</code>.
+            Case folding needed a <code class="font-mono text-xs">carrel_lower</code> scalar UDF: Rust's
+            <code class="font-mono text-xs">to_lowercase()</code> is Unicode-aware and SQLite's <code class="font-mono text-xs">LOWER()</code>
+            is ASCII-only, so SQL alone could not reproduce the Rust predicate.</p>
 
           <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
-            <li>leverage: one interface, four adapters</li>
-            <li>locality: filter rules stop drifting</li>
-            <li>OPDS search gains paging and ETag</li>
-            <li>Collections gain filters for free</li>
-            <li>Tests: SQL-level, no HTTP, no React</li>
-            <li>One place to add FTS or diacritic folding</li>
+            <li>leverage: one interface, four adapters ✓</li>
+            <li>locality: filter rules stopped drifting ✓</li>
+            <li>OPDS search gained paging, ETag and 304 ✓</li>
+            <li>Collections gained filters ✓</li>
+            <li>Tests: SQL-level, no HTTP, no React ✓</li>
+            <li>One place to add FTS or diacritic folding ✓</li>
           </ul>
 
-          <div class="rounded bg-amber-50 border border-amber-200 p-3 text-sm">
-            <strong>Already user-visible.</strong> Desktop filters on format, status, rating, source, want-to-read and tags.
-            Web and OPDS filter on title/author only. The same search gives different results on phone and desktop, and
-            nothing asserts they should agree. <code class="font-mono text-xs">api.rs:726-731</code> carries a comment noting
-            that <code class="font-mono text-xs">app.js</code> "needed the same fix for the same reason" — a correctness fix
-            applied twice, by hand, in two languages.
+          <div class="rounded bg-emerald-50 border border-emerald-300 p-4 text-sm space-y-2">
+            <div><strong>Shipped 2026-09-03</strong> — PR #142, 6 milestones, 15 files, ~+4,100/−180. Merge commit
+              <code class="font-mono text-xs">6a03e72</code>, full CI green on the merge commit itself.</div>
+            <div><strong>This review found four of the five.</strong> The card originally said four copies.
+              The fifth — the plugin host's <code class="font-mono text-xs">find_books</code> in
+              <code class="font-mono text-xs">carrel-core/src/plugins/runtime.rs</code> — was found only by reviewing the whole
+              branch as one change, after the per-milestone reviews had all passed. It loaded the whole table, ran the identical
+              match in Rust, and truncated to 50 over an order with no tie-break.</div>
+            <div><strong>It also uncovered a live wrong-results bug</strong> that this review did not spot.
+              <code class="font-mono text-xs">db::build_rule_query</code> emitted tag rules into <code class="font-mono text-xs">joins</code>
+              and field rules into <code class="font-mono text-xs">where</code>, while pushing every parameter onto one flat vector in
+              <em>rule</em> order — so <code class="font-mono text-xs">[series equals "Dune", tag contains "scifi"]</code> ran
+              <code class="font-mono text-xs">tt1.name LIKE 'Dune'</code> and <code class="font-mono text-xs">b.series = '%scifi%'</code>.
+              Wrong books, no error, and <code class="font-mono text-xs">preview_collection_rules</code> counted the same wrong set,
+              so the rule builder's own preview agreed with the bug instead of exposing it. Fixed in M6; existing collections needed
+              no action, since the rules were always <em>stored</em> correctly.</div>
+            <div><strong>Not done, written up in <code class="font-mono text-xs">docs/backlog/</code>:</strong> the desktop's
+              <code class="font-mono text-xs">Library.tsx</code> still filters in the browser (it holds the library in memory, so the
+              case for pushing it to SQL is weaker); the OPDS handlers still share an unextracted ETag envelope, and
+              <code class="font-mono text-xs">all_books</code> keeps the unsaturated paging arithmetic and missing tie-break that M3
+              fixed for search; and <code class="font-mono text-xs">get_books_in_collection_grid</code> / <code class="font-mono text-xs">list_books_grid</code>
+              now produce SQL identical to their query-module counterparts under a default <code class="font-mono text-xs">BookQuery</code>,
+              so both are deletable — but they are called from the desktop IPC layer, so it needs the Tauri-side tests too.</div>
           </div>
         </article>
 
@@ -147,14 +171,17 @@ flowchart TD
           <div class="flex items-start justify-between gap-4 flex-wrap">
             <h2 class="font-serif text-2xl">2. <code class="font-mono text-xl">carrel_core::opds_feed</code> is a fork, not a seam</h2>
             <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-600 text-white">Shipped &middot; PR #143</span>
               <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
               <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">ports &amp; adapters</span>
             </div>
           </div>
 
           <div class="font-mono text-xs text-slate-500 space-y-0.5">
-            <div>carrel-core/src/opds_feed.rs — 528 lines, <span class="text-red-600">0 callers</span>, 1 commit</div>
-            <div>src-tauri/src/web_server/opds_feed.rs — 1,148 lines, serves traffic, 19 commits</div>
+            <div>carrel-core/src/opds_feed.rs — 528 lines, <span class="text-red-600 line-through">0 callers</span>
+              <span class="text-emerald-700">live: Carrel Server calls all 7 exports + both ATOM_* constants</span>, 1 commit</div>
+            <div>src-tauri/src/web_server/opds_feed.rs — <span class="text-red-600">1,680</span> lines, serves traffic
+              <span class="text-slate-400">(was 1,148; PR #142 added paging + ETag to the live copy only, widening the fork)</span></div>
           </div>
 
           <div class="grid md:grid-cols-2 gap-4">
@@ -164,7 +191,7 @@ flowchart TD
                 <div class="absolute left-0 top-2 w-[46%] rounded border-2 border-dashed border-slate-300 bg-slate-50 p-3">
                   <div class="lbl text-slate-400">carrel-core::opds_feed</div>
                   <div class="text-xs mt-2 text-slate-500">xml_escape · book_to_entry<br/>wrap_feed · EntryUrls · FeedKind</div>
-                  <div class="mt-3 text-xs text-slate-400 italic">297 lines of tests<br/>guarding nothing</div>
+                  <div class="mt-3 text-xs text-slate-400 italic">297 lines of tests —<br/>guarding Carrel Server,<br/>not this repo</div>
                 </div>
                 <div class="absolute right-0 top-2 w-[46%] rounded border-2 border-slate-800 bg-white p-3">
                   <div class="lbl text-slate-500">web_server::opds_feed</div>
@@ -175,7 +202,7 @@ flowchart TD
                   <line x1="46%" y1="80" x2="54%" y2="80" stroke="#dc2626" stroke-width="2" stroke-dasharray="3 3"/>
                   <text x="50%" y="72" text-anchor="middle" fill="#dc2626" font-size="10">forked</text>
                 </svg>
-                <div class="absolute bottom-2 left-0 right-0 text-center text-xs text-red-600">no import edge exists</div>
+                <div class="absolute bottom-2 left-0 right-0 text-center text-xs text-red-600">no import edge <em>in this repo</em></div>
               </div>
             </div>
             <div class="rounded border border-slate-200 p-4">
@@ -197,23 +224,85 @@ flowchart TD
             </div>
           </div>
 
-          <p class="text-sm"><span class="lbl text-slate-400">Problem</span><br/>
-            The module that exists to be shared has never been called, so every fix landed only in the copy that serves traffic.</p>
+          <p class="text-sm"><span class="lbl text-slate-400">Problem</span> <span class="text-xs text-red-600">(restated 2026-09-04 — the original was wrong)</span><br/>
+            The module that exists to be shared <em>is</em> called — by Carrel Server, the out-of-repo consumer this review could not
+            see. So the two copies are not "live vs dead"; they are two live renderers, one per product, and every fix lands in
+            whichever one the author happened to be looking at.</p>
           <p class="text-sm"><span class="lbl text-slate-400">Solution</span><br/>
             Fold the live copy's ETag, OpenSearch and stable-<code class="font-mono text-xs">updated</code> work into core, and have the web module call it.</p>
 
           <ul class="text-sm grid sm:grid-cols-2 gap-x-6 gap-y-1 list-disc list-inside text-slate-700">
-            <li>Deletion test: deleting core's copy changes nothing</li>
-            <li>leverage: Carrel Server gets the real feed</li>
-            <li>297 test lines start guarding shipped behaviour</li>
+            <li><span class="line-through text-slate-400">Deletion test: deleting core's copy changes nothing</span> — false, it breaks Carrel Server</li>
+            <li>leverage: one renderer, two products</li>
+            <li>297 test lines start guarding both, not one</li>
             <li>One answer to "is the id escaped?"</li>
           </ul>
 
-          <div class="rounded bg-red-50 border border-red-200 p-3 text-sm">
-            <strong>Live divergence.</strong> Core escapes the book id into <code class="font-mono text-xs">&lt;id&gt;</code>
-            (<code class="font-mono text-xs">opds_feed.rs:137</code>); the copy actually serving traffic does not
-            (<code class="font-mono text-xs">web_server/opds_feed.rs:125</code>). A book id containing <code>&amp;</code>
-            emits malformed XML to OPDS clients. The core test that would catch it passes, because nothing calls the code it tests.
+          <div class="rounded bg-red-50 border border-red-300 p-4 text-sm space-y-2">
+            <div><strong>Confirmed by the consumer, 2026-09-04.</strong> The Carrel Server session was asked directly and
+              answered with file:line evidence: it imports <code class="font-mono text-xs">book_to_entry</code>,
+              <code class="font-mono text-xs">wrap_feed</code>, <code class="font-mono text-xs">EntryUrls</code>,
+              <code class="font-mono text-xs">FeedKind</code>, <code class="font-mono text-xs">xml_escape</code>,
+              <code class="font-mono text-xs">mobi_ext_and_mime</code>, <code class="font-mono text-xs">cover_mime</code> and both
+              <code class="font-mono text-xs">ATOM_*</code> constants, pinned at <code class="font-mono text-xs">v3.0.3</code>
+              (<code class="font-mono text-xs">c2734df</code>, verified to be that tag's commit, and the file is unchanged since).
+              It has <em>no</em> renderer of its own — every OPDS byte it serves comes from core. So the escapes in core's
+              <code class="font-mono text-xs">book_to_entry</code> are load-bearing for a live product, and the ones that matter
+              most are <strong>title, author and description</strong>: tenant-controlled metadata read out of uploaded EPUB/PDF
+              files. Dropping them would be an XML-injection hole, not a tidiness regression.</div>
+            <div><strong>Two more of this review's claims were wrong.</strong> Core <em>does</em> have paging —
+              <code class="font-mono text-xs">wrap_feed</code>'s sixth parameter is <code class="font-mono text-xs">next_href: Option&lt;&amp;str&gt;</code>
+              and it emits <code class="font-mono text-xs">&lt;link rel="next"&gt;</code> (opds_feed.rs:205-213), which Carrel Server
+              uses with the same 50-item page size. The only thing PR #142 added that core genuinely lacks is the whole-set feed ETag
+              and the OpenSearch descriptor.</div>
+            <div><strong>A defect found while checking, affecting the consumer.</strong> Core builds
+              <code class="font-mono text-xs">&lt;updated&gt;</code> from <code class="font-mono text-xs">chrono::Utc::now()</code>
+              (opds_feed.rs:201), so it changes on every request; the desktop copy takes
+              <code class="font-mono text-xs">updated_ts: Option&lt;i64&gt;</code> and derives it from the data. Carrel Server has no
+              feed-level ETag, so <code class="font-mono text-xs">&lt;updated&gt;</code> is the only freshness signal its feeds carry —
+              and it is pure noise. Reported to them.</div>
+            <div><strong>Escape divergence, severity corrected.</strong> Re-verified: core still binds
+            <code class="font-mono text-xs">let id = xml_escape(&amp;book.id)</code>, the copy serving traffic still binds
+            <code class="font-mono text-xs">let id = &amp;book.id</code>. The core test that would catch it still passes, because
+            nothing calls the code it tests. But the original card overstated the impact: book ids are locally-generated
+            <code class="font-mono text-xs">Uuid::new_v4()</code> strings, so no <code>&amp;</code> can occur in normal use.
+            This is <em>latent</em> for the id specifically: Carrel Server confirmed its ids are server-minted
+              <code class="font-mono text-xs">Uuid::new_v4()</code> on both write paths, with no handler accepting a client-supplied
+              id — so it holds by construction on both sides, not by luck. The argument for this candidate is the fork, not the
+              escape bug.</div>
+            <div><strong>Direction settled with the consumer:</strong> fold the live copy's ETag and OpenSearch work
+              <em>into</em> core, never the reverse, and keep it additive — new functions and a new options struct rather than any
+              change to <code class="font-mono text-xs">wrap_feed</code>'s or <code class="font-mono text-xs">book_to_entry</code>'s
+              existing arity, since Carrel Server pins a release tag. Any arity change needs a tag bump and a heads-up, not a
+              silent change on main.</div>
+          </div>
+
+          <div class="rounded bg-emerald-50 border border-emerald-300 p-4 text-sm space-y-2">
+            <div><strong>Shipped 2026-09-05</strong> &mdash; PR #143, 4 milestones plus a whole-branch pass, ~+2,100/&minus;390.
+              Merge commit <code class="font-mono text-xs">3fe05aa</code>, full CI green on
+              <code class="font-mono text-xs">86ea5cc</code>. The desktop copy is gone: 241 lines deleted, all six OPDS routes
+              render through core, and every route is pinned byte-identical against baselines captured from the pre-adoption
+              tree rather than from the new renderer.</div>
+            <div><strong>The fork was hiding a live bug, which is the better argument than the fork itself.</strong> Every page
+              of a paginated feed shared one ETag. Proven by probe before any fix: page 0 and page 1 both returned
+              <code class="font-mono text-xs">W/"1da890753598ce82"</code>, and page 1 answered <strong>304 Not Modified</strong>
+              to page 0's validator &mdash; an empty body for a page the client had never seen. Four comments in the tree asserted
+              the sharing was deliberate and correct. All four were wrong and are gone.</div>
+            <div><strong>Three claims on this card were wrong, and two of them were mine.</strong> The
+              <span class="line-through">0 callers</span> correction above was the first. The second: the escape divergence is
+              latent for collection feeds too, not only for book ids &mdash; but the shipped code could never reach it, because an
+              unknown collection id raises <code class="font-mono text-xs">QueryReturnedNoRows</code> and answers 500 before
+              rendering, and real ids are <code class="font-mono text-xs">Uuid::new_v4()</code>. The third was a benchmark:
+              &ldquo;15.6x faster&rdquo; came from a synthetic feed whose entries were 38 bytes. On a real 50-entry page it is
+              <strong>2.4x</strong> (~276&nbsp;&micro;s &rarr; 114.8&nbsp;&micro;s). Caught by the consumer's session from the
+              arithmetic alone, without running anything.</div>
+            <div><strong>What the process caught, and what it did not.</strong> Every real defect came from reading the code or
+              injecting a fault &mdash; never from the nine CI gates, which only ever caught slips in the fixes themselves. The
+              whole-branch pass found what four per-milestone reviews structurally could not: a
+              <code class="font-mono text-xs">urn:carrel:*</code> persistence-boundary warning that lived on one of two duplicate
+              copies and was deleted along with the duplicate, leaving the id shape in core unannotated while
+              <code class="font-mono text-xs">CLAUDE.md</code> still pointed at the file that no longer held it. Nobody removed a
+              guardrail on purpose.</div>
           </div>
         </article>
 
@@ -730,28 +819,35 @@ flowchart TB
       </section>
 
       <section id="top-recommendation" class="rounded-lg deep text-white p-8 space-y-4">
-        <div class="lbl text-slate-400">Top recommendation</div>
+        <div class="lbl text-slate-400">Top recommendation — updated 2026-09-04</div>
+        <p class="text-sm text-slate-400">
+          <a href="#c1" class="underline decoration-emerald-400 underline-offset-4">Candidate 1 shipped</a> as PR #142. Next:
+        </p>
         <h2 class="font-serif text-3xl">
-          <a href="#c1" class="underline decoration-emerald-400 decoration-2 underline-offset-4">Give "filter and sort a library" a home</a>
+          <a href="#c3" class="underline decoration-red-400 decoration-2 underline-offset-4">Highlight anchoring: two offset conventions, one table</a>
         </h2>
         <p class="text-slate-300 max-w-3xl">
-          It has the strongest deletion test in the codebase: deleting the query logic in
-          <code class="font-mono text-sm text-slate-200">api.rs</code> concentrates complexity nowhere, because it is already
-          scattered across four copies in three languages. One
-          <code class="font-mono text-sm text-slate-200">db::query_books</code> serves all four adapters, gives OPDS search the
-          paging and conditional-GET its three sibling feeds already have, deletes the web SPA's client-side filtering branch,
-          and puts full-text search behind one interface instead of four.
+          It is the only remaining candidate that is actively corrupting data. Web corrects a selection's leading whitespace
+          before storing the offset and desktop does not, but both store the <em>trimmed</em> text — so the same drag on the same
+          book writes two different anchors into one <code class="font-mono text-sm text-slate-200">highlights</code> table, and
+          every day of use adds rows no single convention can interpret. The other candidates cost leverage; this one costs rows
+          that cannot be repaired later, because nothing records which convention wrote them.
         </p>
         <p class="text-slate-400 text-sm max-w-3xl">
-          Tackle <a href="#c3" class="underline decoration-red-400 underline-offset-4">highlight anchoring</a> first if you would
-          rather fix a live defect than gain leverage: it is narrower, but the two surfaces are writing incompatible offsets into
-          one table right now, and every day of use adds rows that no single convention can interpret.
+          Prefer leverage over triage?
+          <a href="#c2" class="underline decoration-emerald-400 underline-offset-4">Candidate 2</a> got
+          <em>worse</em> while candidate 1 shipped: PR #142 added paging and ETag to the live OPDS copy only, so the uncalled fork
+          in <code class="font-mono text-sm text-slate-200">carrel-core</code> now trails it by ~1,150 lines instead of ~620. Every
+          milestone that touches the feed widens a gap that already has 297 test lines guarding the wrong side of it.
         </p>
       </section>
 
       <footer class="text-xs text-slate-400 pt-4 border-t border-slate-200">
         Vocabulary follows the codebase-design glossary: module, interface, implementation, depth, seam, adapter, leverage, locality.
         Findings came from three parallel explorations; claims marked "verified" were independently re-checked against the source.
+        Revised 2026-09-04 after candidate 1 shipped — candidate 1's card records what actually happened (including one copy this
+        review missed and one bug it did not find), and candidates 2's line counts and severity were re-checked against the
+        post-merge tree rather than carried forward.
       </footer>
 
     </main>
