@@ -171,6 +171,7 @@ flowchart TD
           <div class="flex items-start justify-between gap-4 flex-wrap">
             <h2 class="font-serif text-2xl">2. <code class="font-mono text-xl">carrel_core::opds_feed</code> is a fork, not a seam</h2>
             <div class="flex gap-2 shrink-0">
+              <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-600 text-white">Shipped &middot; PR #143</span>
               <span class="px-2 py-1 rounded text-xs font-medium bg-emerald-100 text-emerald-800">Strong</span>
               <span class="px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-700">ports &amp; adapters</span>
             </div>
@@ -274,6 +275,34 @@ flowchart TD
               change to <code class="font-mono text-xs">wrap_feed</code>'s or <code class="font-mono text-xs">book_to_entry</code>'s
               existing arity, since Carrel Server pins a release tag. Any arity change needs a tag bump and a heads-up, not a
               silent change on main.</div>
+          </div>
+
+          <div class="rounded bg-emerald-50 border border-emerald-300 p-4 text-sm space-y-2">
+            <div><strong>Shipped 2026-09-05</strong> &mdash; PR #143, 4 milestones plus a whole-branch pass, ~+2,100/&minus;390.
+              Merge commit <code class="font-mono text-xs">3fe05aa</code>, full CI green on
+              <code class="font-mono text-xs">86ea5cc</code>. The desktop copy is gone: 241 lines deleted, all six OPDS routes
+              render through core, and every route is pinned byte-identical against baselines captured from the pre-adoption
+              tree rather than from the new renderer.</div>
+            <div><strong>The fork was hiding a live bug, which is the better argument than the fork itself.</strong> Every page
+              of a paginated feed shared one ETag. Proven by probe before any fix: page 0 and page 1 both returned
+              <code class="font-mono text-xs">W/"1da890753598ce82"</code>, and page 1 answered <strong>304 Not Modified</strong>
+              to page 0's validator &mdash; an empty body for a page the client had never seen. Four comments in the tree asserted
+              the sharing was deliberate and correct. All four were wrong and are gone.</div>
+            <div><strong>Three claims on this card were wrong, and two of them were mine.</strong> The
+              <span class="line-through">0 callers</span> correction above was the first. The second: the escape divergence is
+              latent for collection feeds too, not only for book ids &mdash; but the shipped code could never reach it, because an
+              unknown collection id raises <code class="font-mono text-xs">QueryReturnedNoRows</code> and answers 500 before
+              rendering, and real ids are <code class="font-mono text-xs">Uuid::new_v4()</code>. The third was a benchmark:
+              &ldquo;15.6x faster&rdquo; came from a synthetic feed whose entries were 38 bytes. On a real 50-entry page it is
+              <strong>2.4x</strong> (~276&nbsp;&micro;s &rarr; 114.8&nbsp;&micro;s). Caught by the consumer's session from the
+              arithmetic alone, without running anything.</div>
+            <div><strong>What the process caught, and what it did not.</strong> Every real defect came from reading the code or
+              injecting a fault &mdash; never from the nine CI gates, which only ever caught slips in the fixes themselves. The
+              whole-branch pass found what four per-milestone reviews structurally could not: a
+              <code class="font-mono text-xs">urn:carrel:*</code> persistence-boundary warning that lived on one of two duplicate
+              copies and was deleted along with the duplicate, leaving the id shape in core unannotated while
+              <code class="font-mono text-xs">CLAUDE.md</code> still pointed at the file that no longer held it. Nobody removed a
+              guardrail on purpose.</div>
           </div>
         </article>
 
