@@ -5,7 +5,47 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`carrel-core::opds_feed` gained a real feed-rendering interface**:
+  `FeedOptions`, `RenderedFeed`, `render_feed`, and `opensearch_descriptor`.
+  `render_feed` renders a feed page and computes its ETag from one shared
+  input in a single call, so a caller can no longer hash one `FeedOptions`
+  value and render a different one. The ETag digest covers every
+  `FeedOptions` field — including `next_href`, so distinct pages of a feed
+  never collide — plus the rendering module's own source text, so any future
+  change to the emitted shape invalidates cached feeds automatically, with no
+  list for anyone to keep complete.
+  `prefix` and `opensearch_href` let a caller mount a catalog under a
+  different path and advertise a discoverable OpenSearch descriptor, neither
+  of which the existing `wrap_feed` supported. This is purely additive:
+  existing `wrap_feed` callers are unaffected — it now delegates to
+  `render_feed` internally with today's defaults and its output is
+  byte-for-byte unchanged.
+
 ### Changed
+- **The desktop/LAN web server's OPDS feeds now render through
+  `carrel-core::opds_feed`** instead of a second, independently-maintained
+  copy of the same Atom-building code. `xml_escape`, `book_to_entry`, and
+  `wrap_feed` are gone from `src-tauri`; every route (`/opds`, `/opds/all`,
+  `/opds/new`, `/opds/collections/{id}`, `/opds/search`,
+  `/opds/opensearch.xml`) now calls `render_feed`/`book_to_entry`/
+  `opensearch_descriptor` from the shared crate. The desktop keeps computing
+  its own whole-matching-set `ETag` rather than adopting `RenderedFeed`'s
+  narrower per-page digest — that would change cache-invalidation scope
+  (a later page's edit would stop invalidating an earlier page) and is out
+  of scope here. Emitted XML is byte-for-byte unchanged except for the two
+  escaping fixes below.
+- **`carrel-core::opds_feed` renders a feed roughly twice as fast.** The ETag
+  digest covers this module's own source text, which was being re-hashed
+  (~55 KB) on every single render. That read now happens once per process and
+  the digest hashes its 32-byte result, which invalidates caches on a source
+  change exactly as before. Measured in release on a full 50-entry page:
+  ~276 µs to 114.8 µs, of which the digest is 97.3 µs (was 258.5 µs). The
+  saving is a constant ~161 µs, so the speedup is larger on small feeds and
+  smaller on full ones. **Behaviour note for consumers:** feed ETag *values*
+  change with this release, so every client refetches once — as they already
+  would on any release that touches this file.
+
 - **`GET /api/collections/{id}/books` accepts `q` and `want_to_read`**, applied
   in SQL for both manual and automated (rule-based) collections. The web UI's
   collection view uses them, so searching or filtering inside a collection now
@@ -22,6 +62,46 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   takes.
 
 ### Fixed
+- **An OPDS entry's `<id>` and per-book URLs were not XML-escaped** in the
+  desktop/LAN web server. Book ids are locally-generated UUIDs, so no
+  character in practice differs from what a raw, unescaped interpolation
+  would already produce — but `carrel-core::opds_feed::book_to_entry`
+  (which the desktop now calls, see above) always escapes it, closing the
+  gap for any future or external id that isn't UUID-shaped.
+- **A collection feed's `<id>`, `<title>` and `rel="self"` href were not
+  XML-escaped either.** `/opds/collections/{id}` interpolates the request's
+  own path segment into all three, and the desktop's own feed envelope
+  escaped none of them. As with book ids this was not reachable: an id with
+  no matching row returns 500 before anything is rendered, and ids that do
+  have a row are UUIDs. `render_feed` escapes all three regardless, so the
+  guarantee no longer rests on the id scheme.
+- **Paging through `/opds/all` could serve a book twice or skip one
+  entirely.** `carrel-core`'s `list_books`, which `/opds/all` pages over,
+  ordered rows by `added_at DESC` alone. Books added
+  in the same second (routine after a batch import) had no stable order
+  across two requests, so slicing that order into pages could put one book on
+  two pages or lose it between them. `list_books` now breaks the tie by `id`,
+  the same fix `list_books_grid` already had. `/opds/new` never paginated, so
+  it could not lose a book this way — what it gains is a stable answer to
+  *which* 25 it shows when books tie. **Behaviour change:** anything
+  consuming `carrel-core` — including Carrel Server — now gets a
+  deterministic order for rows that tie on `added_at`, where the order was
+  previously unspecified.
+- **`/opds/all?page=` with a very large page number could 500 instead of
+  returning an empty page.** The paging arithmetic multiplied the page number
+  by the page size without checking for overflow, which panics in a debug
+  build and silently wraps in a release build — a wrapped result could then
+  advertise a `next` link pointing back at page 0. `/opds/search` already
+  guarded against this; `/opds/all` now does too.
+- **OPDS clients could be served an empty page.** In the two paginated feeds
+  (`/opds/all` and `/opds/search`), every page got the same `ETag`, so a client
+  that cached page 0's validator and then asked for page 1 with it could
+  receive a `304 Not Modified` with no body instead of page 1's actual entries.
+  Each page's `ETag` now also reflects its own URL, so two pages never share a
+  validator, while a change to a book the feed covers still invalidates all of
+  that feed's pages at once. Re-requesting a page you already have still gets a
+  `304`. The single-page feeds (`/opds/new` and collection feeds) were never
+  affected.
 - **An automated collection that mixed a tag rule with a metadata rule showed
   the wrong books.** A rule set like "series is Dune" plus "tag contains
   scifi" compared each rule's value against the other rule's field, so the

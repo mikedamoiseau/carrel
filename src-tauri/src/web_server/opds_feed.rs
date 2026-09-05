@@ -9,11 +9,18 @@ use axum::{
 use super::{carrel_status, WebState};
 use crate::db;
 use crate::models::Book;
+use carrel_core::opds_feed::{
+    book_to_entry, mobi_ext_and_mime, opensearch_descriptor as build_opensearch_descriptor,
+    render_feed, EntryUrls, FeedKind, FeedOptions, ATOM_ACQ_TYPE, ATOM_CONTENT_TYPE,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-const ATOM_CONTENT_TYPE: &str = "application/atom+xml;profile=opds-catalog;kind=navigation";
-const ATOM_ACQ_TYPE: &str = "application/atom+xml;profile=opds-catalog;kind=acquisition";
+/// Media type for the OpenSearch Description Document itself (the response
+/// this route serves, and the `type=` on the `rel="search"` link that points
+/// at it). `carrel_core::opds_feed` has no equivalent constant — it only
+/// renders the *feed*-side `<link rel="search">` pointing at this document,
+/// hardcoded into its own template — so this one stays desktop-local.
 const OPENSEARCH_DESC_TYPE: &str = "application/opensearchdescription+xml";
 
 /// Build all `/opds/` routes.
@@ -28,23 +35,35 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .with_state(state)
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// Weak ETag over the rendered book subset: SHA-256 of the feed id plus the
-/// sorted `(id, updated_at)` pairs of exactly the books this feed renders.
-/// Weak (`W/"..."`) because equal-state bodies are not byte-identical.
-/// Hashing pairs (not raw timestamps in the tag) avoids leaking library
-/// activity times to clients.
-fn feed_etag(feed_id: &str, rendered_ids: &[&str], pairs: &HashMap<String, i64>) -> String {
+/// Weak ETag for one feed response: SHA-256 of the feed id, this request's
+/// own feed URL (`self_href`), and the sorted `(id, updated_at)` pairs of
+/// every book the feed *covers*. Weak (`W/"..."`) because equal-state bodies
+/// are not byte-identical. Hashing pairs rather than putting raw timestamps in
+/// the tag avoids leaking library activity times to clients.
+///
+/// "Covers", not "renders": for the two paginated feeds `rendered_ids` is the
+/// whole matching set, not the slice this page shows. That is deliberate — it
+/// is what makes one change to any covered book invalidate every page of that
+/// feed at once, so a deletion on a later page cannot leave an earlier page
+/// pointing at a stale `next`.
+///
+/// `self_href` is folded in so two page URLs of the same feed can never
+/// produce the same tag despite hashing that identical whole-set input.
+/// Ambiguity between the three fields is prevented by a `\0` separator, which
+/// is sound only because none of them can contain a NUL byte: feed ids are
+/// literals plus a DB-generated id, and `self_href` is percent-encoded.
+fn feed_etag(
+    feed_id: &str,
+    self_href: &str,
+    rendered_ids: &[&str],
+    pairs: &HashMap<String, i64>,
+) -> String {
     let mut ids: Vec<&str> = rendered_ids.to_vec();
     ids.sort_unstable();
     let mut h = Sha256::new();
     h.update(feed_id.as_bytes());
+    h.update([0u8]); // separator, as below — see the note on NUL in the doc comment
+    h.update(self_href.as_bytes());
     for id in ids {
         h.update([0u8]); // separator so ("ab","c") != ("a","bc")
         h.update(id.as_bytes());
@@ -81,135 +100,41 @@ fn max_updated(rendered_ids: &[&str], pairs: &HashMap<String, i64>) -> Option<i6
         .max()
 }
 
-/// Derive an OPDS acquisition extension + MIME from a MOBI-family book's
-/// stored file path. Import preserves the original extension when copying
-/// into the library, so the filename is authoritative. Falls back to plain
-/// `.mobi` when the extension is missing or unrecognized.
-fn mobi_ext_and_mime(file_path: &str) -> (&'static str, &'static str) {
-    let ext = std::path::Path::new(file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase);
-    match ext.as_deref() {
-        Some("azw3") => ("azw3", "application/vnd.amazon.ebook"),
-        Some("azw") => ("azw", "application/vnd.amazon.ebook"),
-        _ => ("mobi", "application/x-mobipocket-ebook"),
+/// The acquisition-link file extension for `book`, matching what
+/// `carrel_core::opds_feed::book_to_entry` independently derives from
+/// `book.format` for the entry's MIME and `title=` attribute. Building the
+/// URL here and the MIME there from the same `book.format` match keeps the
+/// two in lockstep without either one needing to know about the other.
+fn download_extension(book: &Book) -> &'static str {
+    match book.format {
+        crate::models::BookFormat::Epub => "epub",
+        crate::models::BookFormat::Pdf => "pdf",
+        crate::models::BookFormat::Cbz => "cbz",
+        crate::models::BookFormat::Cbr => "cbr",
+        // `BookFormat::Mobi` is a single enum variant covering `.mobi`,
+        // `.azw`, and `.azw3` — collapsed on import. Derive the real
+        // container extension from the stored file path so
+        // `opds_extension_from_url` can disambiguate on import.
+        crate::models::BookFormat::Mobi => mobi_ext_and_mime(&book.file_path).0,
     }
 }
 
-fn cover_mime(cover_path: Option<&str>) -> &'static str {
-    // Stays in lockstep with the actual cover endpoint at
-    // `web_server/api.rs::get_cover`, which derives the response
-    // `Content-Type` from the path extension via `mime_guess`. If the
-    // feed advertised a different MIME than the endpoint serves, strict
-    // OPDS clients can mis-cache or reject the response — that is the
-    // exact bug this function exists to prevent, so the explicit
-    // `webp` arm is required (mime_guess returns `image/webp` for it).
-    match cover_path
-        .and_then(|path| std::path::Path::new(path).extension())
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("gif") => "image/gif",
-        Some("bmp") => "image/bmp",
-        Some("webp") => "image/webp",
-        _ => "image/jpeg",
-    }
-}
-
-fn book_to_entry(book: &Book) -> String {
-    let title = xml_escape(&book.title);
-    let author = xml_escape(&book.author);
+/// Cover and download URLs for `book`, in the shape
+/// `carrel_core::opds_feed::book_to_entry` requires as caller-supplied
+/// [`EntryUrls`]. The download filename is derived from the book id rather
+/// than the title, because the id is stable across a rename. It is not
+/// assumed to be XML-safe: `book_to_entry` escapes both hrefs, which
+/// `entry_book_id_containing_ampersand_is_escaped` below pins.
+fn entry_urls(book: &Book) -> EntryUrls {
     let id = &book.id;
-    let updated = chrono::DateTime::from_timestamp(book.added_at, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| "2024-01-01T00:00:00Z".to_string());
-
-    let description = book
-        .description
-        .as_ref()
-        .map(|d| format!("<summary>{}</summary>", xml_escape(d)))
-        .unwrap_or_default();
-
-    let cover_link = format!(
-        r#"<link rel="http://opds-spec.org/image" href="/api/books/{id}/cover" type="{}"/>"#,
-        cover_mime(book.cover_path.as_deref())
-    );
-
-    // `BookFormat::Mobi` is a single enum variant covering `.mobi`, `.azw`, and
-    // `.azw3` — we collapsed them on import. For OPDS we need the actual
-    // container type so clients pick the right parser/MIME; derive it from the
-    // stored file path (import preserves the original extension).
-    let (ext, mime) = match book.format {
-        crate::models::BookFormat::Epub => ("epub", "application/epub+zip"),
-        crate::models::BookFormat::Pdf => ("pdf", "application/pdf"),
-        crate::models::BookFormat::Cbz => ("cbz", "application/x-cbz"),
-        crate::models::BookFormat::Cbr => ("cbr", "application/x-cbr"),
-        crate::models::BookFormat::Mobi => mobi_ext_and_mime(&book.file_path),
-    };
-    // The extension is included in the URL path so `opds_extension_from_url`
-    // can disambiguate on import — this matters for the MOBI family, where
-    // `application/vnd.amazon.ebook` covers both `.azw` and `.azw3` and the
-    // MIME alone can't tell them apart. The filename is derived from the
-    // book id (stable, no escaping hazard) rather than the title.
-    let download_link = format!(
-        r#"<link rel="http://opds-spec.org/acquisition" href="/api/books/{id}/download/{id}.{ext}" type="{mime}" title="{title}.{ext}"/>"#
-    );
-
-    // OPDS clients cache and dedupe on feed and entry ids, so changing the
-    // `urn:carrel:*` scheme used throughout this module makes every entry look
-    // new to an already-subscribed client.
-    format!(
-        r#"<entry>
-  <title>{title}</title>
-  <id>urn:carrel:{id}</id>
-  <updated>{updated}</updated>
-  <author><name>{author}</name></author>
-  {description}
-  {cover_link}
-  {download_link}
-</entry>"#
-    )
+    let ext = download_extension(book);
+    EntryUrls {
+        cover_href: format!("/api/books/{id}/cover"),
+        download_href: format!("/api/books/{id}/download/{id}.{ext}"),
+    }
 }
 
 const OPDS_PAGE_SIZE: usize = 50;
-
-fn wrap_feed(
-    title: &str,
-    feed_id: &str,
-    entries: &str,
-    self_href: &str,
-    kind: &str,
-    next_href: Option<&str>,
-    updated_ts: Option<i64>,
-) -> String {
-    // Feed-level <updated>: the library-state change time for ETag-scoped
-    // feeds (max updated_at of rendered books), request time otherwise.
-    let updated = updated_ts
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
-    let next_link = next_href
-        .map(|h| format!(r#"  <link rel="next" href="{h}" type="{kind}"/>"#))
-        .unwrap_or_default();
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"
-      xmlns:opds="http://opds-spec.org/2010/catalog">
-  <id>{feed_id}</id>
-  <title>{title}</title>
-  <updated>{updated}</updated>
-  <link rel="self" href="{self_href}" type="{kind}"/>
-  <link rel="start" href="/opds" type="{ATOM_CONTENT_TYPE}"/>
-  <link rel="search" href="/opds/opensearch.xml" type="{OPENSEARCH_DESC_TYPE}"/>
-  <link rel="search" href="/opds/search?q={{searchTerms}}" type="{ATOM_ACQ_TYPE}"/>
-{next_link}
-{entries}
-</feed>"#
-    )
-}
 
 /// The authority (`host[:port]`) this request was addressed to, if it is safe
 /// to interpolate into a URL inside an XML attribute.
@@ -260,19 +185,14 @@ async fn opensearch_descriptor(headers: HeaderMap, uri: axum::http::Uri) -> Resp
         .and_then(|v| v.to_str().ok())
         .filter(|s| *s == "https")
         .unwrap_or("http");
-    let template = xml_escape(&format!(
-        "{scheme}://{authority}/opds/search?q={{searchTerms}}"
-    ));
-
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
-  <ShortName>Carrel</ShortName>
-  <Description>Search the Carrel library</Description>
-  <InputEncoding>UTF-8</InputEncoding>
-  <Url type="{ATOM_ACQ_TYPE}" template="{template}"/>
-</OpenSearchDescription>"#
-    );
+    // Raw, not pre-escaped: `build_opensearch_descriptor` XML-escapes the
+    // href itself, same as `render_feed` does for the hrefs below. Pre-escaping
+    // here would double-escape whatever the callee then escapes again. Nothing
+    // in this href needs escaping today (one parameter, no `&`), so the bug
+    // would only appear if a second parameter were ever added — which is
+    // exactly why the convention, not the current string, is what matters.
+    let search_href = format!("{scheme}://{authority}/opds/search?q={{searchTerms}}");
+    let xml = build_opensearch_descriptor(&search_href);
 
     ([(header::CONTENT_TYPE, OPENSEARCH_DESC_TYPE)], xml).into_response()
 }
@@ -296,15 +216,16 @@ async fn root_catalog() -> Response {
         now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
     );
 
-    let xml = wrap_feed(
-        "Carrel Library",
-        "urn:carrel:root",
-        &entries,
-        "/opds",
-        ATOM_CONTENT_TYPE,
-        None,
-        None,
-    );
+    let xml = render_feed(&FeedOptions {
+        title: "Carrel Library",
+        feed_id: "urn:carrel:root",
+        entries: &[entries],
+        self_href: "/opds",
+        kind: FeedKind::Navigation,
+        opensearch_href: Some("/opds/opensearch.xml"),
+        ..Default::default()
+    })
+    .body;
 
     ([(header::CONTENT_TYPE, ATOM_CONTENT_TYPE)], xml).into_response()
 }
@@ -330,46 +251,66 @@ async fn all_books(
     let books = db::list_books(&conn).map_err(carrel_status)?;
     let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
-    // Whole-set tag shared by every page: clients cache per-URL, so a
-    // shared tag across page URLs is correct and any library change
-    // invalidates all pages at once.
-    let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:carrel:all", &rendered_ids, &pairs);
-    if if_none_match_matches(&headers, &etag) {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
-    }
-
+    // The digest covers the whole matching set *and* this request's own URL
+    // (self_href): a library change still invalidates every page, but two
+    // page URLs never share a validator.
     let page = params.page.unwrap_or(0);
-    let start = page * OPDS_PAGE_SIZE;
-    let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
-
-    let entries: String = page_books
-        .iter()
-        .map(|b| book_to_entry(b))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let has_next = start + OPDS_PAGE_SIZE < books.len();
-    let next_href = if has_next {
-        Some(format!("/opds/all?page={}", page + 1))
-    } else {
-        None
-    };
     let self_href = if page > 0 {
         format!("/opds/all?page={page}")
     } else {
         "/opds/all".to_string()
     };
+    let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
+    let etag = feed_etag("urn:carrel:all", &self_href, &rendered_ids, &pairs);
+    if if_none_match_matches(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
 
-    let xml = wrap_feed(
-        "All Books",
-        "urn:carrel:all",
-        &entries,
-        &self_href,
-        ATOM_ACQ_TYPE,
-        next_href.as_deref(),
-        max_updated(&rendered_ids, &pairs),
-    );
+    // Saturating, not `*`: `page` comes off the wire, so a large-but-parseable
+    // value reaches here — a strict `usize` does not prevent it, since a value
+    // can parse fine and still overflow the multiply. `page * OPDS_PAGE_SIZE` panics in debug and wraps in
+    // release, and a wrapped `start + OPDS_PAGE_SIZE` would then read as
+    // "there is a next page" and emit a `next` link to a near-zero page
+    // (page 0 exactly, at `usize::MAX`).
+    //
+    // `page + 1` below stays unsaturated on purpose: it is only reached when
+    // `has_next` holds, which requires `start + OPDS_PAGE_SIZE < books.len()`
+    // — and that bounds `page` far below the range where incrementing it
+    // could overflow.
+    let start = page.saturating_mul(OPDS_PAGE_SIZE);
+    let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
+
+    let entries: Vec<String> = page_books
+        .iter()
+        .map(|b| book_to_entry(b, &entry_urls(b)))
+        .collect();
+
+    let has_next = start.saturating_add(OPDS_PAGE_SIZE) < books.len();
+    let next_href = if has_next {
+        Some(format!("/opds/all?page={}", page + 1))
+    } else {
+        None
+    };
+
+    // `RenderedFeed.etag` (discarded below) digests every `FeedOptions` field
+    // — including the module's own source — but its view of the books is
+    // `entries`, i.e. the rendered page, not the whole matching set that
+    // `feed_etag` above covers. Adopting it would narrow invalidation scope (a
+    // change on page 2 would stop moving page 1's tag), which is a deliberate
+    // design change this milestone does not make. Only `.body` is used; the
+    // desktop keeps computing its own whole-set `etag` above.
+    let xml = render_feed(&FeedOptions {
+        title: "All Books",
+        feed_id: "urn:carrel:all",
+        entries: &entries,
+        self_href: &self_href,
+        kind: FeedKind::Acquisition,
+        next_href: next_href.as_deref(),
+        opensearch_href: Some("/opds/opensearch.xml"),
+        updated: max_updated(&rendered_ids, &pairs),
+        ..Default::default()
+    })
+    .body;
 
     Ok((
         [
@@ -394,26 +335,29 @@ async fn new_books(
     books.truncate(25);
 
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:carrel:new", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:new", "/opds/new", &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
 
-    let entries: String = books
+    let entries: Vec<String> = books
         .iter()
-        .map(book_to_entry)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|b| book_to_entry(b, &entry_urls(b)))
+        .collect();
 
-    let xml = wrap_feed(
-        "Recently Added",
-        "urn:carrel:new",
-        &entries,
-        "/opds/new",
-        ATOM_ACQ_TYPE,
-        None,
-        max_updated(&rendered_ids, &pairs),
-    );
+    // See the comment in `all_books`: `.etag` is discarded on purpose, the
+    // desktop's own whole-set `etag` above stays authoritative.
+    let xml = render_feed(&FeedOptions {
+        title: "Recently Added",
+        feed_id: "urn:carrel:new",
+        entries: &entries,
+        self_href: "/opds/new",
+        kind: FeedKind::Acquisition,
+        opensearch_href: Some("/opds/opensearch.xml"),
+        updated: max_updated(&rendered_ids, &pairs),
+        ..Default::default()
+    })
+    .body;
 
     Ok((
         [
@@ -437,26 +381,30 @@ async fn collection_feed(
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
     // Hash the RESOLVED membership — works for manual and rule-based collections alike.
     let feed_id = format!("urn:carrel:collection:{id}");
-    let etag = feed_etag(&feed_id, &rendered_ids, &pairs);
+    let self_href = format!("/opds/collections/{id}");
+    let etag = feed_etag(&feed_id, &self_href, &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
 
-    let entries: String = books
+    let entries: Vec<String> = books
         .iter()
-        .map(book_to_entry)
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|b| book_to_entry(b, &entry_urls(b)))
+        .collect();
 
-    let xml = wrap_feed(
-        &format!("Collection {id}"),
-        &feed_id,
-        &entries,
-        &format!("/opds/collections/{id}"),
-        ATOM_ACQ_TYPE,
-        None,
-        max_updated(&rendered_ids, &pairs),
-    );
+    // See the comment in `all_books`: `.etag` is discarded on purpose, the
+    // desktop's own whole-set `etag` above stays authoritative.
+    let xml = render_feed(&FeedOptions {
+        title: &format!("Collection {id}"),
+        feed_id: &feed_id,
+        entries: &entries,
+        self_href: &self_href,
+        kind: FeedKind::Acquisition,
+        opensearch_href: Some("/opds/opensearch.xml"),
+        updated: max_updated(&rendered_ids, &pairs),
+        ..Default::default()
+    })
+    .body;
 
     Ok((
         [
@@ -500,20 +448,25 @@ async fn search_books(
     let conn = state.conn().map_err(carrel_status)?;
     let page = params.page();
     let search_term = params.q.unwrap_or_default();
+    let encoded_term = urlencoding::encode(&search_term);
+    // Raw `&`, not pre-escaped: `render_feed` XML-escapes `self_href` (and
+    // `next_href` below) itself. Pre-escaping here, as this handler used to
+    // when it built the feed XML directly, would now double-escape into
+    // `&amp;amp;`.
+    let self_href = if page > 0 {
+        format!("/opds/search?q={}&page={page}", encoded_term)
+    } else {
+        format!("/opds/search?q={}", encoded_term)
+    };
 
     // Filter and sort in SQL; page in Rust. `limit`/`offset` deliberately go
     // unused here, because the ETag below covers the whole *filtered* set and
     // therefore needs the complete matching list before it can be sliced.
     //
-    // That whole-set tag is a consistency choice, not a correctness one, and
-    // it is worth being precise about which: a per-page tag would also be
-    // correct, since it hashes the ids actually rendered and a deletion on an
-    // earlier page changes which ids those are. What the shared tag buys is
-    // what `all_books` documents — uniform invalidation, so one library
-    // change invalidates every page URL at once. Matching the other three
-    // feeds is the reason to keep it; the cost is fetching every matching row
-    // to render fifty. See the note in `docs/backlog/` on these handlers for
-    // the SQL-paging alternative.
+    // The digest also folds in this request's own URL (self_href), so two
+    // different pages of one search never share a validator even though both
+    // hash the same whole-set `pairs` input. See the note in `docs/backlog/`
+    // on these handlers for the SQL-paging alternative.
     let query = db::BookQuery {
         q: Some(search_term.clone()),
         series: None,
@@ -526,7 +479,7 @@ async fn search_books(
     let pairs = db::book_etag_pairs(&conn).map_err(carrel_status)?;
 
     let rendered_ids: Vec<&str> = books.iter().map(|b| b.id.as_str()).collect();
-    let etag = feed_etag("urn:carrel:search", &rendered_ids, &pairs);
+    let etag = feed_etag("urn:carrel:search", &self_href, &rendered_ids, &pairs);
     if if_none_match_matches(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
@@ -534,45 +487,44 @@ async fn search_books(
     // Saturating, not `*`: `page` comes off the wire, so a large-but-parseable
     // value reaches here. `page * OPDS_PAGE_SIZE` panics in debug and wraps in
     // release, and a wrapped `start + OPDS_PAGE_SIZE` would then read as
-    // "there is a next page" and emit a `next` link back to page 0.
+    // "there is a next page" and emit a `next` link to a near-zero page
+    // (page 0 exactly, at `usize::MAX`).
+    //
+    // `page + 1` below stays unsaturated on purpose: it is only reached when
+    // `has_next` holds, which requires `start + OPDS_PAGE_SIZE < books.len()`
+    // — and that bounds `page` far below the range where incrementing it
+    // could overflow.
     let start = page.saturating_mul(OPDS_PAGE_SIZE);
     let page_books: Vec<&Book> = books.iter().skip(start).take(OPDS_PAGE_SIZE).collect();
 
-    let entries: String = page_books
+    let entries: Vec<String> = page_books
         .iter()
-        .map(|b| book_to_entry(b))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .map(|b| book_to_entry(b, &entry_urls(b)))
+        .collect();
 
-    let encoded_term = urlencoding::encode(&search_term);
     let has_next = start.saturating_add(OPDS_PAGE_SIZE) < books.len();
-    // `&amp;` (not a raw `&`): these hrefs sit inside a double-quoted XML
-    // attribute, and an unescaped `&` starts an entity reference — the same
-    // reason `opensearch_descriptor`'s template runs through `xml_escape`.
+    // Raw `&`, not pre-escaped — see the note on `self_href` above.
     let next_href = if has_next {
-        Some(format!(
-            "/opds/search?q={}&amp;page={}",
-            encoded_term,
-            page + 1
-        ))
+        Some(format!("/opds/search?q={}&page={}", encoded_term, page + 1))
     } else {
         None
     };
-    let self_href = if page > 0 {
-        format!("/opds/search?q={}&amp;page={page}", encoded_term)
-    } else {
-        format!("/opds/search?q={}", encoded_term)
-    };
 
-    let xml = wrap_feed(
-        &format!("Search: {}", xml_escape(&search_term)),
-        "urn:carrel:search",
-        &entries,
-        &self_href,
-        ATOM_ACQ_TYPE,
-        next_href.as_deref(),
-        max_updated(&rendered_ids, &pairs),
-    );
+    // See the comment in `all_books`: `.etag` is discarded on purpose, the
+    // desktop's own whole-set `etag` above stays authoritative. `title` is
+    // passed raw (not pre-escaped) for the same reason as `self_href`.
+    let xml = render_feed(&FeedOptions {
+        title: &format!("Search: {search_term}"),
+        feed_id: "urn:carrel:search",
+        entries: &entries,
+        self_href: &self_href,
+        kind: FeedKind::Acquisition,
+        next_href: next_href.as_deref(),
+        opensearch_href: Some("/opds/opensearch.xml"),
+        updated: max_updated(&rendered_ids, &pairs),
+        ..Default::default()
+    })
+    .body;
 
     Ok((
         [
@@ -587,13 +539,6 @@ async fn search_books(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_xml_escape() {
-        assert_eq!(xml_escape("foo & bar"), "foo &amp; bar");
-        assert_eq!(xml_escape("<script>"), "&lt;script&gt;");
-        assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
-    }
 
     #[test]
     fn test_book_to_entry_contains_required_elements() {
@@ -622,7 +567,7 @@ mod tests {
             want_to_read: false,
         };
 
-        let entry = book_to_entry(&book);
+        let entry = book_to_entry(&book, &entry_urls(&book));
         assert!(entry.contains("<title>Test &amp; Book</title>"));
         assert!(entry.contains("Author &lt;Name&gt;"));
         assert!(entry.contains("urn:carrel:test-1"));
@@ -665,22 +610,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cover_mime_matches_cover_extension() {
-        assert_eq!(cover_mime(Some("/tmp/cover.jpg")), "image/jpeg");
-        assert_eq!(cover_mime(Some("/tmp/cover.png")), "image/png");
-        assert_eq!(cover_mime(Some("/tmp/cover.gif")), "image/gif");
-        assert_eq!(cover_mime(Some("/tmp/cover.bmp")), "image/bmp");
-        assert_eq!(cover_mime(Some("/tmp/cover.webp")), "image/webp");
-        assert_eq!(cover_mime(Some("/tmp/cover.jpeg")), "image/jpeg");
-        // Unknown / missing extensions default to JPEG so the link tag
-        // still validates; the cover endpoint's mime_guess fallback is
-        // also octet-stream → image/jpeg here is the safer OPDS-side
-        // default since clients will at least try to render it.
-        assert_eq!(cover_mime(Some("/tmp/cover.xyz")), "image/jpeg");
-        assert_eq!(cover_mime(None), "image/jpeg");
-    }
-
     fn make_book(file_path: &str, format: crate::models::BookFormat) -> Book {
         Book {
             id: "book-1".to_string(),
@@ -714,7 +643,7 @@ mod tests {
         // the acquisition URL so opds_extension_from_url disambiguates the
         // ambiguous `application/vnd.amazon.ebook` MIME.
         let book = make_book("/lib/story.azw3", crate::models::BookFormat::Mobi);
-        let entry = book_to_entry(&book);
+        let entry = book_to_entry(&book, &entry_urls(&book));
         assert!(
             entry.contains("/api/books/book-1/download/book-1.azw3"),
             "acquisition href missing .azw3 suffix: {entry}"
@@ -725,7 +654,7 @@ mod tests {
     #[test]
     fn download_url_carries_extension_for_azw() {
         let book = make_book("/lib/story.azw", crate::models::BookFormat::Mobi);
-        let entry = book_to_entry(&book);
+        let entry = book_to_entry(&book, &entry_urls(&book));
         assert!(
             entry.contains("/api/books/book-1/download/book-1.azw"),
             "acquisition href missing .azw suffix: {entry}"
@@ -745,7 +674,7 @@ mod tests {
             ("/lib/a.mobi", crate::models::BookFormat::Mobi, "mobi"),
         ] {
             let book = make_book(path, fmt);
-            let entry = book_to_entry(&book);
+            let entry = book_to_entry(&book, &entry_urls(&book));
             let expected = format!("/api/books/book-1/download/book-1.{ext}");
             assert!(
                 entry.contains(&expected),
@@ -759,7 +688,7 @@ mod tests {
         let mut book = make_book("/lib/story.mobi", crate::models::BookFormat::Mobi);
         book.cover_path = Some("/tmp/covers/book-1/cover.png".to_string());
 
-        let entry = book_to_entry(&book);
+        let entry = book_to_entry(&book, &entry_urls(&book));
 
         assert!(
             entry.contains(r#"href="/api/books/book-1/cover" type="image/png""#),
@@ -777,8 +706,8 @@ mod tests {
     #[test]
     fn feed_etag_is_order_independent_and_weak() {
         let p = pairs(&[("a", 1), ("b", 2)]);
-        let t1 = feed_etag("urn:carrel:all", &["a", "b"], &p);
-        let t2 = feed_etag("urn:carrel:all", &["b", "a"], &p);
+        let t1 = feed_etag("urn:carrel:all", "/opds/all", &["a", "b"], &p);
+        let t2 = feed_etag("urn:carrel:all", "/opds/all", &["b", "a"], &p);
         assert_eq!(t1, t2);
         assert!(t1.starts_with("W/\""), "weak ETag required, got {t1}");
         assert!(t1.ends_with('"'));
@@ -787,26 +716,44 @@ mod tests {
     #[test]
     fn feed_etag_changes_on_updated_at_bump_and_set_change() {
         let p1 = pairs(&[("a", 1), ("b", 2)]);
-        let base = feed_etag("urn:carrel:all", &["a", "b"], &p1);
+        let base = feed_etag("urn:carrel:all", "/opds/all", &["a", "b"], &p1);
 
         // updated_at bump
         let p2 = pairs(&[("a", 1), ("b", 3)]);
-        assert_ne!(base, feed_etag("urn:carrel:all", &["a", "b"], &p2));
+        assert_ne!(
+            base,
+            feed_etag("urn:carrel:all", "/opds/all", &["a", "b"], &p2)
+        );
 
         // id removed from rendered set
-        assert_ne!(base, feed_etag("urn:carrel:all", &["a"], &p1));
+        assert_ne!(base, feed_etag("urn:carrel:all", "/opds/all", &["a"], &p1));
 
         // id added to rendered set
         let p3 = pairs(&[("a", 1), ("b", 2), ("c", 9)]);
-        assert_ne!(base, feed_etag("urn:carrel:all", &["a", "b", "c"], &p3));
+        assert_ne!(
+            base,
+            feed_etag("urn:carrel:all", "/opds/all", &["a", "b", "c"], &p3)
+        );
     }
 
     #[test]
     fn feed_etag_differs_across_feed_ids() {
         let p = pairs(&[("a", 1)]);
         assert_ne!(
-            feed_etag("urn:carrel:all", &["a"], &p),
-            feed_etag("urn:carrel:new", &["a"], &p)
+            feed_etag("urn:carrel:all", "/opds/all", &["a"], &p),
+            feed_etag("urn:carrel:new", "/opds/all", &["a"], &p)
+        );
+    }
+
+    #[test]
+    fn feed_etag_differs_across_self_href() {
+        // Two page URLs of the same feed, hashing the identical whole-set
+        // `pairs` input, must still produce different tags — this is the
+        // mechanism the handler-level page-collision tests below rely on.
+        let p = pairs(&[("a", 1)]);
+        assert_ne!(
+            feed_etag("urn:carrel:all", "/opds/all", &["a"], &p),
+            feed_etag("urn:carrel:all", "/opds/all?page=1", &["a"], &p)
         );
     }
 
@@ -981,6 +928,97 @@ mod tests {
         assert_ne!(response_etag(&resp).unwrap(), etag);
     }
 
+    /// `all_books` pages over `db::list_books`, which used to have no `id`
+    /// tie-break: 51 books sharing an `added_at` had no stable order across
+    /// two requests, so `/opds/all` could serve one book on two pages and
+    /// skip another entirely. Mirrors
+    /// `search_paging_over_tied_added_at_is_stable_no_repeat_no_skip`.
+    /// Inserted in DESCENDING id order (the opposite of the expected
+    /// ascending-id result) so this discriminates against a query that just
+    /// falls back to insertion/rowid order: with no tie-break, page 0 would
+    /// come back highest-id-first (b50..b01) and every assertion below would
+    /// fail.
+    #[tokio::test]
+    async fn all_books_paging_over_tied_added_at_is_stable_no_repeat_no_skip() {
+        let books: Vec<(String, i64)> = (0..51).rev().map(|i| (format!("b{i:02}"), 1000)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let expected_order: Vec<String> = {
+            let mut ids: Vec<String> = (0..51).map(|i| format!("b{i:02}")).collect();
+            ids.sort();
+            ids
+        };
+        let page0_ids = &expected_order[0..50];
+        let page1_ids = &expected_order[50..51];
+
+        let page0 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml_p0 = body_string(page0).await;
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml_p1 = body_string(page1).await;
+
+        for id in page0_ids {
+            assert!(
+                xml_p0.contains(&format!("urn:carrel:{id}")),
+                "page 0 missing {id}"
+            );
+            assert!(
+                !xml_p1.contains(&format!("urn:carrel:{id}")),
+                "page 1 must not repeat {id}"
+            );
+        }
+        for id in page1_ids {
+            assert!(
+                xml_p1.contains(&format!("urn:carrel:{id}")),
+                "page 1 missing {id}"
+            );
+            assert!(
+                !xml_p0.contains(&format!("urn:carrel:{id}")),
+                "page 0 must not have {id} — no book may be skipped or duplicated"
+            );
+        }
+    }
+
+    /// `page` is caller-supplied: a value large enough to overflow
+    /// `page * OPDS_PAGE_SIZE` is reachable via `?page=`. Unsaturated that
+    /// multiply panics in debug — a 500 with no `CatchPanicLayer` in front of
+    /// it — and wraps in release, where `start + OPDS_PAGE_SIZE` then wraps
+    /// back near zero and advertises a `next` link to page 0. Mirrors
+    /// `search_page_at_usize_max_is_empty_and_does_not_link_onward`.
+    #[tokio::test]
+    async fn all_books_page_at_usize_max_is_empty_and_does_not_link_onward() {
+        let state = seeded_state(&[("b1", 100), ("b2", 200), ("b3", 300)]);
+
+        let resp = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery {
+                page: Some(usize::MAX),
+            }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let xml = body_string(resp).await;
+        assert!(!xml.contains("<entry>"), "must be empty: {xml}");
+        assert!(
+            !xml.contains(r#"rel="next""#),
+            "must not link onward: {xml}"
+        );
+    }
+
     #[tokio::test]
     async fn new_books_ignores_changes_outside_top_25() {
         // 26 books: ids b00..b25, added_at ascending — b00 is outside top-25.
@@ -1089,17 +1127,25 @@ mod tests {
     /// template last leaves Carrel's own client on the cheaper direct-template
     /// path. The descriptor is written to be correct either way, so a future
     /// parser that took the first link instead would also work.
-    #[test]
-    fn feed_advertises_search_as_descriptor_and_inline_template() {
-        let xml = wrap_feed(
-            "T",
-            "urn:carrel:test",
-            "",
-            "/opds/all",
-            ATOM_ACQ_TYPE,
-            None,
-            None,
-        );
+    ///
+    /// Goes through the handler, not `render_feed` directly. On `main` the
+    /// descriptor link was unconditional in the desktop's own `wrap_feed`, so
+    /// building a feed by hand did constrain every route. Since M3 it is
+    /// per-call opt-in (`opensearch_href`), and a hand-built `FeedOptions`
+    /// that sets the field only asserts that `render_feed` honours it — this
+    /// test passed with the field deleted from all five handlers, which was
+    /// verified by doing exactly that.
+    #[tokio::test]
+    async fn feed_advertises_search_as_descriptor_and_inline_template() {
+        let state = seeded_state(&[("b1", 100)]);
+        let resp = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml = body_string(resp).await;
         let descriptor = format!(
             r#"<link rel="search" href="/opds/opensearch.xml" type="{OPENSEARCH_DESC_TYPE}"/>"#
         );
@@ -1400,15 +1446,19 @@ mod tests {
         }
     }
 
-    /// The design decision behind this feed's ETag is that the tag covers the
-    /// whole *filtered* set — not the whole library, and not the page. Both
-    /// wrong implementations pass `search_etag_changes_when_matching_set_changes`,
-    /// because adding a matching book changes all three. These two assertions
-    /// are what actually separate them:
-    ///   * a non-matching book changing must NOT move the tag (rules out
-    ///     hashing every pair in the library), and
-    ///   * two pages of one search must share a tag (rules out a per-page
-    ///     tag, which would serve a stale page 2 after a deletion on page 1).
+    /// The design decision behind this feed's ETag is that the digest covers
+    /// the whole *filtered* set (not the whole library, not just the page)
+    /// *and* the request's own URL. Two pages of one search therefore no
+    /// longer share a literal tag (see `search_page_urls_get_different_etags`
+    /// above) — self_href differs — but they must still move *together* on a
+    /// change to the filtered set. These assertions are what separate that
+    /// from wrong implementations:
+    ///   * a non-matching book changing must NOT move either page's tag
+    ///     (rules out hashing every pair in the library), and
+    ///   * editing a book that only renders on page 0 must still move page
+    ///     1's tag too (rules out a tag that hashes only the ids actually
+    ///     rendered on that page, which would serve a stale page 1 after a
+    ///     deletion on page 0).
     #[tokio::test]
     async fn search_etag_covers_the_filtered_set_not_the_library_or_the_page() {
         let mut books: Vec<Book> = (0..51)
@@ -1421,37 +1471,55 @@ mod tests {
         let tag0 = response_etag(&page0).expect("search must set an ETag");
         let page1 = call_search(&state, Some("Matched"), Some(1)).await;
         let tag1 = response_etag(&page1).expect("search must set an ETag");
-        assert_eq!(
-            tag0, tag1,
-            "one search's pages must share a tag — a per-page tag cannot see a \
-             shift caused by a deletion on an earlier page"
-        );
 
         // Touch only the book that does not match the term.
         {
             let conn = state.conn().unwrap();
             carrel_core::db::set_want_to_read(&conn, "other", true).unwrap();
         }
-        let after = call_search(&state, Some("Matched"), None).await;
+        let after0 = call_search(&state, Some("Matched"), None).await;
+        let after1 = call_search(&state, Some("Matched"), Some(1)).await;
         assert_eq!(
-            response_etag(&after).as_deref(),
+            response_etag(&after0).as_deref(),
             Some(tag0.as_str()),
-            "a change to a book outside the filtered set must not move the tag"
+            "a change to a book outside the filtered set must not move page 0's tag"
+        );
+        assert_eq!(
+            response_etag(&after1).as_deref(),
+            Some(tag1.as_str()),
+            "a change to a book outside the filtered set must not move page 1's tag"
         );
 
-        // ...but editing a book that IS in the set must move it. Without this
-        // the whole suite passes against a tag that ignores `pairs` and hashes
-        // only the id list, which would serve a stale feed forever after an
-        // in-place title edit.
+        // ...but editing a book that IS in the set must move BOTH pages' tags.
+        //
+        // Which assertion does the work here is not obvious, so state it: the
+        // fixture is m00..m50 with `added_at = i`, sorted `added_at DESC, id`,
+        // so the order is m50..m00 and m00 lands at index 50 — alone on page 1.
+        // Editing m00 therefore makes the page-1 assertion a tautology: a
+        // digest scoped to a single page's rendered ids would move page 1's tag
+        // too, because m00 is exactly what page 1 renders.
+        //
+        // The **page-0** assertion is the discriminating one. m00 is not among
+        // page 0's rendered ids, so a per-page digest would leave page 0's tag
+        // unmoved and that assertion would fail. Delete it and criterion 4
+        // stops being pinned while the test still passes.
         {
             let conn = state.conn().unwrap();
             carrel_core::db::set_want_to_read(&conn, "m00", true).unwrap();
         }
-        let edited = call_search(&state, Some("Matched"), None).await;
+        let edited0 = call_search(&state, Some("Matched"), None).await;
+        let edited1 = call_search(&state, Some("Matched"), Some(1)).await;
         assert_ne!(
-            response_etag(&edited).as_deref(),
+            response_etag(&edited0).as_deref(),
             Some(tag0.as_str()),
-            "editing a book inside the filtered set must move the tag"
+            "editing m00 — which page 0 does NOT render — must still move page \
+             0's tag, because the digest covers the whole filtered set. This is \
+             the assertion that rules out a per-page digest."
+        );
+        assert_ne!(
+            response_etag(&edited1).as_deref(),
+            Some(tag1.as_str()),
+            "editing m00 must move page 1's tag, which renders it"
         );
     }
 
@@ -1532,10 +1600,12 @@ mod tests {
     }
 
     /// The paged hrefs carry two query params, so they contain a literal `&`
-    /// inside a double-quoted XML attribute — and `wrap_feed` interpolates
-    /// `self_href`/`next_href` raw, with no escaping of its own. A raw `&`
-    /// there opens an entity reference that never terminates, which every
-    /// `contains(...)` assertion in this module would happily pass.
+    /// inside a double-quoted XML attribute. `render_feed` XML-escapes
+    /// `self_href`/`next_href` itself — this handler must pass them raw, not
+    /// pre-escaped (see the note where `self_href` is built above), or the
+    /// `&` would end up double-escaped instead of simply missing. Either
+    /// mistake produces bad XML that every `contains(...)` assertion in this
+    /// module would happily pass.
     ///
     /// Note that merely reading the events is *not* enough: quick-xml's
     /// reader tolerates an unescaped `&` in an attribute value and only
@@ -1655,6 +1725,177 @@ mod tests {
         }
     }
 
+    // --- Per-URL ETag (self_href in the digest) -----------------------
+    //
+    // Every page of a feed used to get the same ETag, so a client that cached
+    // page 0's validator got an empty 304 body back for page 1. These pin the
+    // fix at the handler level: two page URLs of the same feed/search must
+    // never share a tag, a stale (other page's) tag must not short-circuit a
+    // 304, and a page's own tag must still 304 — the feature must stop
+    // misfiring, not stop working.
+
+    #[tokio::test]
+    async fn all_books_page_urls_get_different_etags() {
+        let books: Vec<(String, i64)> = (0..60).map(|i| (format!("b{i:02}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let page0 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        assert_ne!(
+            tag0, tag1,
+            "page 0 and page 1 of /opds/all must not share an ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_books_page1_with_page0_etag_is_200_not_304() {
+        let books: Vec<(String, i64)> = (0..60).map(|i| (format!("b{i:02}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let page0 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag0.parse().unwrap());
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1.status(),
+            StatusCode::OK,
+            "page 0's ETag must not satisfy page 1's If-None-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_books_page1_with_own_etag_is_still_304() {
+        let books: Vec<(String, i64)> = (0..60).map(|i| (format!("b{i:02}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+
+        let page1 = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag1.parse().unwrap());
+        let page1_again = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: Some(1) }),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1_again.status(),
+            StatusCode::NOT_MODIFIED,
+            "a page's own ETag must still 304 it"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page_urls_get_different_etags() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let page0 = call_search(&state, Some("Matched"), None).await;
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+        let page1 = call_search(&state, Some("Matched"), Some(1)).await;
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        assert_ne!(
+            tag0, tag1,
+            "page 0 and page 1 of the same search must not share an ETag"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page1_with_page0_etag_is_200_not_304() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let page0 = call_search(&state, Some("Matched"), None).await;
+        let tag0 = response_etag(&page0).expect("page 0 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag0.parse().unwrap());
+        let page1 = search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(Some("Matched"), Some(1))),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1.status(),
+            StatusCode::OK,
+            "page 0's ETag must not satisfy page 1's If-None-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_page1_with_own_etag_is_still_304() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let page1 = call_search(&state, Some("Matched"), Some(1)).await;
+        let tag1 = response_etag(&page1).expect("page 1 must carry an ETag");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, tag1.parse().unwrap());
+        let page1_again = search_books(
+            AxumState(state.clone()),
+            AxumQuery(search_query(Some("Matched"), Some(1))),
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1_again.status(),
+            StatusCode::NOT_MODIFIED,
+            "a page's own ETag must still 304 it"
+        );
+    }
+
     #[tokio::test]
     async fn feed_updated_reflects_max_book_updated_at() {
         let state = seeded_state(&[("b1", 100), ("b2", 1700000000)]);
@@ -1675,6 +1916,435 @@ mod tests {
             xml.contains("<updated>2023-11-14T22:13:20Z</updated>"),
             "feed <updated> must be max book updated_at; got: {}",
             &xml[..xml.len().min(600)]
+        );
+    }
+
+    /// Captured from `all_books` BEFORE this milestone's adoption of
+    /// `carrel_core::opds_feed`, with the desktop's then-own `wrap_feed` +
+    /// `book_to_entry`. Every OPDS route must still emit byte-identical XML
+    /// after the switch (the milestone's core acceptance criterion) — this
+    /// is the representative acquisition-feed case: envelope shape, link
+    /// order/indentation, the blank line before `<entry>`, and per-entry
+    /// shape (including the blank `{description}` line when there is none).
+    #[tokio::test]
+    async fn all_books_xml_is_byte_identical_to_pre_adoption_baseline() {
+        let state = seeded_state(&[("b1", 100), ("b2", 200)]);
+        let resp = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml = body_string(resp).await;
+        assert_eq!(
+            xml, EXPECTED_ALL_BOOKS_XML,
+            "all_books output must be byte-identical to the pre-adoption baseline"
+        );
+    }
+
+    const EXPECTED_ALL_BOOKS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:carrel:all</id>
+  <title>All Books</title>
+  <updated>1970-01-01T00:03:20Z</updated>
+  <link rel="self" href="/opds/all" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="/opds/opensearch.xml" type="application/opensearchdescription+xml"/>
+  <link rel="search" href="/opds/search?q={searchTerms}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+
+<entry>
+  <title>Book b2</title>
+  <id>urn:carrel:b2</id>
+  <updated>1970-01-01T00:03:20Z</updated>
+  <author><name>Author</name></author>
+  
+  <link rel="http://opds-spec.org/image" href="/api/books/b2/cover" type="image/jpeg"/>
+  <link rel="http://opds-spec.org/acquisition" href="/api/books/b2/download/b2.epub" type="application/epub+zip" title="Book b2.epub"/>
+</entry>
+<entry>
+  <title>Book b1</title>
+  <id>urn:carrel:b1</id>
+  <updated>1970-01-01T00:01:40Z</updated>
+  <author><name>Author</name></author>
+  
+  <link rel="http://opds-spec.org/image" href="/api/books/b1/cover" type="image/jpeg"/>
+  <link rel="http://opds-spec.org/acquisition" href="/api/books/b1/download/b1.epub" type="application/epub+zip" title="Book b1.epub"/>
+</entry>
+</feed>"#;
+
+    /// Neither byte-identity baseline covers a page that carries a
+    /// `rel="next"` link — `all_books` and `collection_feed` are both seeded
+    /// with a single page — so the next link's rendered shape moved from the
+    /// desktop's own envelope into `carrel-core`'s `next_link_template`
+    /// unpinned. Existing tests assert only that the element is present or
+    /// absent, and one asserts an href prefix; none pins the whole line,
+    /// which is where an indentation or `type` regression would hide.
+    #[tokio::test]
+    async fn next_link_line_is_byte_identical_to_pre_adoption_baseline() {
+        let books: Vec<(String, i64)> = (0..51).map(|i| (format!("b{i:03}"), i as i64)).collect();
+        let refs: Vec<(&str, i64)> = books.iter().map(|(id, t)| (id.as_str(), *t)).collect();
+        let state = seeded_state(&refs);
+        let resp = all_books(
+            AxumState(state.clone()),
+            AxumQuery(PaginationQuery { page: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml = body_string(resp).await;
+        assert!(
+            xml.contains(
+                "\n  <link rel=\"next\" href=\"/opds/all?page=1\" type=\"application/atom+xml;profile=opds-catalog;kind=acquisition\"/>\n"
+            ),
+            "the whole `rel=\"next\"` line — indentation, attribute order and \
+             type — must match the pre-adoption envelope; got: {xml}"
+        );
+    }
+
+    /// `/opds/new` had no byte-identity baseline until the M4 review noticed
+    /// that only two of the five acquisition routes were pinned. It differs
+    /// from `all_books` in exactly two respects — a fixed `self_href` and no
+    /// `rel="next"` — so pinning it is what stops a regression in the
+    /// truncating (rather than paginating) route from passing unseen.
+    #[tokio::test]
+    async fn new_books_xml_is_byte_identical_to_pre_adoption_baseline() {
+        let state = seeded_state(&[("b1", 100), ("b2", 200)]);
+        let resp = new_books(AxumState(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        let xml = body_string(resp).await;
+        assert_eq!(
+            xml, EXPECTED_NEW_BOOKS_XML,
+            "new_books output must be byte-identical to the pre-adoption baseline"
+        );
+    }
+
+    const EXPECTED_NEW_BOOKS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:carrel:new</id>
+  <title>Recently Added</title>
+  <updated>1970-01-01T00:03:20Z</updated>
+  <link rel="self" href="/opds/new" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="/opds/opensearch.xml" type="application/opensearchdescription+xml"/>
+  <link rel="search" href="/opds/search?q={searchTerms}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+
+<entry>
+  <title>Book b2</title>
+  <id>urn:carrel:b2</id>
+  <updated>1970-01-01T00:03:20Z</updated>
+  <author><name>Author</name></author>
+  
+  <link rel="http://opds-spec.org/image" href="/api/books/b2/cover" type="image/jpeg"/>
+  <link rel="http://opds-spec.org/acquisition" href="/api/books/b2/download/b2.epub" type="application/epub+zip" title="Book b2.epub"/>
+</entry>
+<entry>
+  <title>Book b1</title>
+  <id>urn:carrel:b1</id>
+  <updated>1970-01-01T00:01:40Z</updated>
+  <author><name>Author</name></author>
+  
+  <link rel="http://opds-spec.org/image" href="/api/books/b1/cover" type="image/jpeg"/>
+  <link rel="http://opds-spec.org/acquisition" href="/api/books/b1/download/b1.epub" type="application/epub+zip" title="Book b1.epub"/>
+</entry>
+</feed>"#;
+
+    /// `/opds/collections/{id}` is the one route whose output this milestone
+    /// does not keep byte-identical for every input, and until the M4 review
+    /// it was also the one with no baseline at all. Its `feed_id`,
+    /// `self_href` and `title` are built from the path segment, which
+    /// `render_feed` escapes and the pre-adoption `wrap_feed` did not — see
+    /// `collection_feed_escapes_a_hostile_id` below for why that difference
+    /// is unreachable in the shipped app. Real ids are UUIDs, so this
+    /// baseline pins the only case that actually occurs, and the two
+    /// renderers agree on it byte for byte.
+    #[tokio::test]
+    async fn collection_feed_xml_is_byte_identical_to_pre_adoption_baseline() {
+        let state = seeded_state(&[("b1", 100)]);
+        seed_collection(&state, "c1", &["b1"]);
+        let resp = collection_feed(
+            AxumState(state.clone()),
+            AxumPath("c1".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml = body_string(resp).await;
+        assert_eq!(
+            xml, EXPECTED_COLLECTION_XML,
+            "collection_feed output must be byte-identical to the pre-adoption baseline for a benign id"
+        );
+    }
+
+    const EXPECTED_COLLECTION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:carrel:collection:c1</id>
+  <title>Collection c1</title>
+  <updated>1970-01-01T00:01:40Z</updated>
+  <link rel="self" href="/opds/collections/c1" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="/opds/opensearch.xml" type="application/opensearchdescription+xml"/>
+  <link rel="search" href="/opds/search?q={searchTerms}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+
+<entry>
+  <title>Book b1</title>
+  <id>urn:carrel:b1</id>
+  <updated>1970-01-01T00:01:40Z</updated>
+  <author><name>Author</name></author>
+  
+  <link rel="http://opds-spec.org/image" href="/api/books/b1/cover" type="image/jpeg"/>
+  <link rel="http://opds-spec.org/acquisition" href="/api/books/b1/download/b1.epub" type="application/epub+zip" title="Book b1.epub"/>
+</entry>
+</feed>"#;
+
+    /// The one place this milestone's output deviates from the pre-adoption
+    /// renderer, and a guard rather than a live-bug regression test.
+    ///
+    /// `collection_feed` interpolates its percent-decoded `Path<String>` into
+    /// three places: `<id>`, the `rel="self"` href, and `<title>`. The
+    /// desktop's pre-adoption `wrap_feed` contained no `xml_escape` call at
+    /// all, so a `"` in the id would have broken out of the href attribute and
+    /// a `<` out of the title element. `render_feed` escapes all three.
+    ///
+    /// That was **not** reachable in the shipped app, and this test does not
+    /// claim otherwise. `get_books_in_collection` reads the collection's type
+    /// with `query_row` (`carrel-core/src/db.rs`), so an id with no matching
+    /// row is a `QueryReturnedNoRows` error and the handler answers 500 before
+    /// rendering anything — an arbitrary path segment never reaches the
+    /// renderer. Ids that *do* have a row are `Uuid::new_v4().to_string()`
+    /// (`src-tauri/src/commands.rs`), i.e. hex and dashes, which contain
+    /// nothing to escape. The test therefore has to insert a collection whose
+    /// id is hostile, which no code path in the app can produce.
+    ///
+    /// It is worth keeping anyway: it pins that the escaping is the
+    /// renderer's job rather than the caller's, so the guarantee survives a
+    /// future id scheme that is not a UUID.
+    ///
+    /// Asserting the escaped forms is not enough on its own — a renderer that
+    /// emitted both the escaped and the raw text would pass that half. The
+    /// negative assertions are the load-bearing ones.
+    #[tokio::test]
+    async fn collection_feed_escapes_a_hostile_id() {
+        let state = seeded_state(&[("b1", 100)]);
+        let hostile = r#""><script>alert(1)</script>"#;
+        seed_collection(&state, hostile, &["b1"]);
+        let resp = collection_feed(
+            AxumState(state.clone()),
+            AxumPath(hostile.to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let xml = body_string(resp).await;
+
+        // All three interpolation sites carry the escaped form.
+        let escaped = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;";
+        assert!(
+            xml.contains(&format!("<id>urn:carrel:collection:{escaped}</id>")),
+            "hostile id must be escaped in <id>; got: {xml}"
+        );
+        assert!(
+            xml.contains(&format!("<title>Collection {escaped}</title>")),
+            "hostile id must be escaped in <title>; got: {xml}"
+        );
+        assert!(
+            xml.contains(&format!(r#"href="/opds/collections/{escaped}""#)),
+            "hostile id must be escaped in the self href; got: {xml}"
+        );
+
+        // …and the raw form appears nowhere, so nothing broke out of the
+        // attribute or the element.
+        assert!(
+            !xml.contains("<script>"),
+            "raw `<script>` must not survive into the feed; got: {xml}"
+        );
+        assert!(
+            !xml.contains(r#""><"#),
+            "raw attribute-breaking `\"><` must not survive into the feed; got: {xml}"
+        );
+    }
+
+    /// Insert a manual collection and put `book_ids` in it.
+    fn seed_collection(state: &WebState, id: &str, book_ids: &[&str]) {
+        let conn = state.conn().unwrap();
+        let coll = crate::models::Collection {
+            id: id.to_string(),
+            name: format!("Collection {id}"),
+            r#type: crate::models::CollectionType::Manual,
+            icon: None,
+            color: None,
+            created_at: 1,
+            updated_at: 1,
+            rules: Vec::new(),
+        };
+        crate::db::insert_collection(&conn, &coll).unwrap();
+        for b in book_ids {
+            crate::db::add_book_to_collection(&conn, b, id).unwrap();
+        }
+    }
+
+    /// Representative navigation feed, pinned the same way as
+    /// `all_books_xml_is_byte_identical_to_pre_adoption_baseline` above.
+    /// `<updated>` is wall-clock (root has no ETag scope), so every
+    /// occurrence is normalized to a placeholder before comparing —
+    /// everything else must still match exactly, including that the two
+    /// synthetic entries are NOT built via `book_to_entry`/`entry_urls` and
+    /// so must be entirely unaffected by this milestone's changes to those.
+    #[tokio::test]
+    async fn root_catalog_xml_is_byte_identical_to_pre_adoption_baseline() {
+        let resp = root_catalog().await;
+        let xml = normalize_updated_elements(&body_string(resp).await);
+        let expected = normalize_updated_elements(EXPECTED_ROOT_XML);
+        assert_eq!(xml, expected, "root_catalog output must be byte-identical to the pre-adoption baseline (modulo <updated>)");
+    }
+
+    const EXPECTED_ROOT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:carrel:root</id>
+  <title>Carrel Library</title>
+  <updated>2026-09-04T07:22:25Z</updated>
+  <link rel="self" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="/opds/opensearch.xml" type="application/opensearchdescription+xml"/>
+  <link rel="search" href="/opds/search?q={searchTerms}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+
+<entry>
+  <title>All Books</title>
+  <id>urn:carrel:all</id>
+  <updated>2026-09-04T07:22:25Z</updated>
+  <content type="text">Browse the entire library</content>
+  <link rel="subsection" href="/opds/all" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+</entry>
+<entry>
+  <title>Recently Added</title>
+  <id>urn:carrel:new</id>
+  <updated>2026-09-04T07:22:25Z</updated>
+  <content type="text">Books added recently</content>
+  <link rel="subsection" href="/opds/new" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+</entry>
+</feed>"#;
+
+    /// Blanks every `<updated>...</updated>` occurrence so a wall-clock-based
+    /// feed's baseline comparison does not race real time.
+    fn normalize_updated_elements(xml: &str) -> String {
+        let mut out = String::new();
+        let mut rest = xml;
+        while let Some(start) = rest.find("<updated>") {
+            out.push_str(&rest[..start]);
+            out.push_str("<updated>X</updated>");
+            let after_open = &rest[start + "<updated>".len()..];
+            let end = after_open
+                .find("</updated>")
+                .expect("unterminated <updated>");
+            rest = &after_open[end + "</updated>".len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Representative case for the search feed's ampersand-bearing
+    /// `self_href` (`q=...&page=1`): this handler used to pre-escape `&` to
+    /// `&amp;` itself before handing the string to `wrap_feed`, which did no
+    /// escaping of its own. `render_feed` now escapes `self_href` (and
+    /// `next_href`) internally, so the handler was changed to pass the RAW
+    /// href instead (see the comment where `self_href` is built in
+    /// `search_books`) — this test is what would catch either a missed
+    /// unescaped `&` or a double-escaped `&amp;amp;` if that pairing broke.
+    #[tokio::test]
+    async fn search_page1_xml_is_byte_identical_to_pre_adoption_baseline() {
+        let books: Vec<Book> = (0..51)
+            .map(|i| search_test_book(&format!("m{i:02}"), "Matched Title", "Author", i as i64))
+            .collect();
+        let state = seeded_state_with_books(books);
+
+        let xml = body_string(call_search(&state, Some("Matched"), Some(1)).await).await;
+        assert_eq!(
+            xml, EXPECTED_SEARCH_PAGE1_XML,
+            "search page 1 output must be byte-identical to the pre-adoption baseline"
+        );
+    }
+
+    const EXPECTED_SEARCH_PAGE1_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <id>urn:carrel:search</id>
+  <title>Search: Matched</title>
+  <updated>1970-01-01T00:00:50Z</updated>
+  <link rel="self" href="/opds/search?q=Matched&amp;page=1" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+  <link rel="start" href="/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  <link rel="search" href="/opds/opensearch.xml" type="application/opensearchdescription+xml"/>
+  <link rel="search" href="/opds/search?q={searchTerms}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>
+
+<entry>
+  <title>Matched Title</title>
+  <id>urn:carrel:m00</id>
+  <updated>1970-01-01T00:00:00Z</updated>
+  <author><name>Author</name></author>
+  
+  <link rel="http://opds-spec.org/image" href="/api/books/m00/cover" type="image/jpeg"/>
+  <link rel="http://opds-spec.org/acquisition" href="/api/books/m00/download/m00.epub" type="application/epub+zip" title="Matched Title.epub"/>
+</entry>
+</feed>"#;
+
+    /// The OpenSearch descriptor route also used to build its own XML
+    /// directly (with its own now-deleted `xml_escape`); it now calls
+    /// `carrel_core::opds_feed::opensearch_descriptor`. Pinned the same way.
+    #[tokio::test]
+    async fn opensearch_descriptor_xml_is_byte_identical_to_pre_adoption_baseline() {
+        let xml = body_string(descriptor_body(Some("192.168.0.50:7788"), None).await).await;
+        assert_eq!(
+            xml, EXPECTED_OPENSEARCH_XML,
+            "opensearch descriptor output must be byte-identical to the pre-adoption baseline"
+        );
+    }
+
+    const EXPECTED_OPENSEARCH_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">
+  <ShortName>Carrel</ShortName>
+  <Description>Search the Carrel library</Description>
+  <InputEncoding>UTF-8</InputEncoding>
+  <Url type="application/atom+xml;profile=opds-catalog;kind=acquisition" template="http://192.168.0.50:7788/opds/search?q={searchTerms}"/>
+</OpenSearchDescription>"#;
+
+    /// One of the two places this milestone changes behaviour (the other is
+    /// `collection_feed_escapes_a_hostile_id` above): the desktop's own
+    /// (now-deleted) `book_to_entry` interpolated `book.id` unescaped into
+    /// the `<id>` element and the hrefs built from it here in `entry_urls`;
+    /// `carrel_core::opds_feed::book_to_entry` XML-escapes it. Book ids are
+    /// locally-generated UUIDs today so no character can actually differ,
+    /// but Carrel Server (an out-of-repo consumer of the same core crate)
+    /// depends on the escaped behaviour, and this pins it at the point
+    /// where the desktop's own URL-building (`entry_urls`) feeds it.
+    #[test]
+    fn entry_book_id_containing_ampersand_is_escaped() {
+        let mut book = make_book("/lib/story.epub", crate::models::BookFormat::Epub);
+        book.id = "x&y".to_string();
+
+        let entry = book_to_entry(&book, &entry_urls(&book));
+
+        assert!(
+            entry.contains("<id>urn:carrel:x&amp;y</id>"),
+            "book id must be XML-escaped in <id>: {entry}"
+        );
+        assert!(
+            entry.contains(r#"href="/api/books/x&amp;y/cover""#),
+            "book id must be XML-escaped in the cover href: {entry}"
+        );
+        assert!(
+            entry.contains(r#"href="/api/books/x&amp;y/download/x&amp;y.epub""#),
+            "book id must be XML-escaped in the download href: {entry}"
+        );
+        // Widened from `<id>` alone: the raw id must appear nowhere in the
+        // entry, so a renderer that escaped the element but not the hrefs
+        // (or emitted both forms) fails here.
+        assert!(
+            !entry.contains("x&y"),
+            "the raw, unescaped book id must not appear anywhere in the entry: {entry}"
         );
     }
 }

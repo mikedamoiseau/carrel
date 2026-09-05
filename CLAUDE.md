@@ -54,7 +54,7 @@ together with a migration.
 | `carrel-web-server` | `web_server/auth.rs` | orphan the stored web-UI PIN |
 | `Carrel Library` | `carrel-core/src/paths.rs` | silently relocate the library for every install that never set `library_folder` (it is an unwritten *fallback*, not a stored setting) |
 | `.carrel-sync/…` | `carrel-core/src/sync.rs` | orphan sync state already written to the user's own remote |
-| `urn:carrel:*` | `web_server/opds_feed.rs` | break OPDS clients, which cache on feed/entry ids |
+| `urn:carrel:*` | `carrel-core/src/opds_feed.rs` (entry ids), `web_server/opds_feed.rs` (feed ids) | break OPDS clients, which cache on feed/entry ids |
 | `carrel_session` cookie, `x-carrel-profile` header | `web_server/` + `static/` | break offline-cached `app.js`/`sw.js`, which still send and read the old names |
 | `carrel-shell-*`, `carrel-offline-book-*`, `carrel-offline-scope` | `static/sw.js`, `static/app.js` | orphan every offline-saved book on every user's device |
 | `carrel-*` / `carrel_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |

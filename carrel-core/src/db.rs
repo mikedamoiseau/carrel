@@ -610,7 +610,15 @@ pub fn get_book_by_file_hash(conn: &Connection, hash: &str) -> Result<Option<Boo
 }
 
 pub fn list_books(conn: &Connection) -> Result<Vec<Book>> {
-    let sql = format!("SELECT {} FROM books ORDER BY added_at DESC", BOOK_COLUMNS);
+    // `, id` makes the order total: `added_at` ties at second granularity, and
+    // `/opds/all` pages over this function, so without a unique tiebreaker a
+    // book can land on two pages or neither. Same fix and same reason as
+    // `list_books_grid` and `book_sort_order_sql`, where the rationale is
+    // written out in full.
+    let sql = format!(
+        "SELECT {} FROM books ORDER BY added_at DESC, id",
+        BOOK_COLUMNS
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_to_book)?;
     rows.collect()
@@ -934,9 +942,8 @@ fn where_clause(clauses: &[String]) -> String {
 /// happen to resolve between two calls (mirrors the "Fix D" comment on
 /// `list_books_grid` above, and `resolveSeriesNav` in the web UI's `app.js`,
 /// which appends the same tie-break to make its own ordering total, though
-/// for stable row order rather than for paging). This is the only
-/// remaining home for that rationale on the server side — the `api.rs` sort
-/// block that used to carry it is gone.
+/// for stable row order rather than for paging). `list_books` carries a short
+/// pointer to this rationale too, added when it got the same tie-break.
 fn book_sort_order_sql(sort: BookSort) -> &'static str {
     match sort {
         BookSort::DateAdded => "b.added_at DESC, b.id",
@@ -5605,6 +5612,62 @@ mod tests {
         // Most recent first
         assert_eq!(items[0].id, "grid-ord-2");
         assert_eq!(items[1].id, "grid-ord-1");
+    }
+
+    /// `list_books` lacked the `id` tie-break `list_books_grid` already has
+    /// (see the comment on that function): with only `added_at DESC`, two
+    /// books sharing a timestamp — routine after a batch import, since
+    /// `added_at` has second granularity — have no stable order across two
+    /// calls, so `/opds/all`'s offset paging can serve one twice and skip
+    /// the other. Insert the higher id first, so insertion order and the
+    /// tie-broken order disagree.
+    ///
+    /// The first assertion is the one that discriminates — pre-fix it returns
+    /// `["tie-z", "tie-a"]`. The repeated-call assertion does *not*: with the
+    /// fix reverted SQLite returns rowid order both times, so it passes either
+    /// way. It documents the intended property rather than pinning it. The
+    /// `list_books_grid` comparison is what pins the two functions together.
+    #[test]
+    fn test_list_books_tie_broken_by_id_and_matches_grid_order() {
+        let (_dir, conn) = setup();
+        let mut book_z = sample_book("tie-z");
+        book_z.file_path = "/tmp/tie-z.epub".to_string();
+        book_z.added_at = 1700000000;
+        insert_book(&conn, &book_z).unwrap();
+
+        let mut book_a = sample_book("tie-a");
+        book_a.file_path = "/tmp/tie-a.epub".to_string();
+        book_a.added_at = 1700000000;
+        insert_book(&conn, &book_a).unwrap();
+
+        let first_call = list_books(&conn).unwrap();
+        assert_eq!(first_call.len(), 2);
+        assert_eq!(
+            first_call.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            vec!["tie-a", "tie-z"],
+            "tied added_at must break the tie by ascending id, not insertion order"
+        );
+
+        let second_call = list_books(&conn).unwrap();
+        assert_eq!(
+            second_call
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect::<Vec<_>>(),
+            first_call.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            "the order must be stable across repeated calls"
+        );
+
+        let grid_order: Vec<String> = list_books_grid(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(
+            first_call.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+            grid_order,
+            "list_books and list_books_grid must agree on tied-row order"
+        );
     }
 
     #[test]
