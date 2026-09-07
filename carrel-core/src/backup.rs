@@ -569,6 +569,46 @@ pub fn pull_json<T: serde::de::DeserializeOwned>(op: &Operator, path: &str) -> C
         .map_err(|e| CarrelError::invalid(format!("Failed to parse {path}: {e}")))
 }
 
+/// The extension to use in a remote object path, or `fallback` if the local
+/// name does not carry one we recognise.
+///
+/// Remote paths reach the FTP backend as arguments on a line-oriented
+/// control channel, so a control character in one is a command-injection
+/// primitive: a file called `book.ep\r\nDELE other.epub` would put `DELE
+/// other.epub` on that channel as a command of its own. suppaftp 6.3.0
+/// does not reject this (RUSTSEC-2026-0271) and no usable `opendal` pulls
+/// the fixed 10.0.2: 0.55/0.56 require suppaftp ^6.3.0, 0.57/0.58 require
+/// ^8.0.3, and 0.59.0 — the only release that requires ^10.0.2 — does not
+/// compile from crates.io. So the bound has to live here rather than in the
+/// transport. See `.cargo/audit.toml` for the full reasoning.
+///
+/// The extension is attacker-chosen in the sense that matters: it is read
+/// off a filename on disk, and handing someone a book to import is how you
+/// choose that filename. Whitespace and separators are rejected alongside
+/// CR and LF because an FTP argument is whitespace-delimited; the effect is
+/// that only a plain alphanumeric run survives, which is every extension we
+/// have ever written.
+fn remote_ext<'a>(local_path: &str, fallback: &'a str) -> std::borrow::Cow<'a, str> {
+    std::path::Path::new(local_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| std::borrow::Cow::Owned(e.to_string()))
+        .unwrap_or(std::borrow::Cow::Borrowed(fallback))
+}
+
+/// Remote path for a book's file, keyed by content hash so identical files
+/// upload once. See [`remote_ext`] for why the extension is bounded.
+fn remote_file_path(file_hash: &str, local_path: &str) -> String {
+    format!("files/{}.{}", file_hash, remote_ext(local_path, "epub"))
+}
+
+/// Remote path for a book's cover, keyed by book id.
+/// See [`remote_ext`] for why the extension is bounded.
+fn remote_cover_path(book_id: &str, cover_path: &str) -> String {
+    format!("covers/{}.{}", book_id, remote_ext(cover_path, "jpg"))
+}
+
 pub fn push_file_if_missing(
     op: &Operator,
     remote_path: &str,
@@ -721,11 +761,7 @@ pub fn run_incremental_backup_with_progress(
                 continue;
             }
             if let Some(ref hash) = book.file_hash {
-                let ext = std::path::Path::new(&book.file_path)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("epub");
-                let remote_path = format!("files/{}.{}", hash, ext);
+                let remote_path = remote_file_path(hash, &book.file_path);
 
                 // Imported books may carry either a storage key (post-M4)
                 // or a legacy absolute path. Storage keys read through the
@@ -757,11 +793,7 @@ pub fn run_incremental_backup_with_progress(
                 ));
             }
             if let Some(ref cover) = book.cover_path {
-                let ext = std::path::Path::new(cover)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("jpg");
-                let remote_path = format!("covers/{}.{}", book.id, ext);
+                let remote_path = remote_cover_path(&book.id, cover);
                 if let Err(e) = push_file_if_missing(op, &remote_path, cover) {
                     result
                         .warnings
@@ -868,6 +900,56 @@ pub fn run_incremental_backup_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A book's file extension ends up as an argument on the FTP backend's
+    /// line-oriented control channel, so a control character in it is a
+    /// command-injection primitive (RUSTSEC-2026-0271). The extension comes
+    /// from a filename on disk, which an attacker can choose by handing the
+    /// user a book to import — so this is a real boundary, not a
+    /// user-attacks-themselves case.
+    #[test]
+    fn remote_paths_reject_a_crlf_bearing_extension() {
+        let hostile = "/books/innocent.ep\r\nDELE important.epub";
+        let path = remote_file_path("a".repeat(64).as_str(), hostile);
+        assert!(
+            !path.contains('\r') && !path.contains('\n'),
+            "CRLF reached the remote path: {path:?}"
+        );
+        assert_eq!(path, format!("files/{}.epub", "a".repeat(64)));
+
+        let cover = remote_cover_path("book-id", "/covers/x.jp\r\nSTOR evil");
+        assert!(
+            !cover.contains('\r') && !cover.contains('\n'),
+            "CRLF reached the cover path: {cover:?}"
+        );
+        assert_eq!(cover, "covers/book-id.jpg");
+    }
+
+    /// Anything that is not a plain alphanumeric run is not an extension we
+    /// have ever written, so falling back is free. Spaces and separators
+    /// matter as much as CRLF: an FTP argument is whitespace-delimited.
+    #[test]
+    fn remote_paths_reject_non_alphanumeric_extensions() {
+        for hostile in ["x.ep ub", "x.ep/ub", "x.ep\tub", "x.ep;ub", "x.ep\0ub"] {
+            let path = remote_file_path("h", hostile);
+            assert_eq!(path, "files/h.epub", "not bounded: {hostile:?}");
+        }
+    }
+
+    /// The fallback must not swallow the extensions we actually use.
+    #[test]
+    fn remote_paths_keep_real_extensions() {
+        for (input, want) in [
+            ("/l/x.epub", "files/h.epub"),
+            ("/l/x.cbz", "files/h.cbz"),
+            ("/l/x.azw3", "files/h.azw3"),
+            ("/l/x.CBR", "files/h.CBR"),
+        ] {
+            assert_eq!(remote_file_path("h", input), want);
+        }
+        assert_eq!(remote_file_path("h", "/l/no-extension"), "files/h.epub");
+        assert_eq!(remote_cover_path("b", "/c/x.png"), "covers/b.png");
+    }
 
     #[test]
     fn backup_restore_preserves_want_to_read() {
