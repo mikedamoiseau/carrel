@@ -147,6 +147,32 @@ jobs:
       - name: cargo fmt check
         run: cargo fmt --all --check
 
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      # Caches ~/.cargo/bin, so the cargo-audit build below is a no-op
+      # on every run after the first.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: audit
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
+      # Reads Cargo.lock only -- no workspace build, so this job needs
+      # none of the system dependencies the other Rust jobs install.
+      # The accepted-advisory list lives in `.cargo/audit.toml` with a
+      # written reason per entry; anything not listed there fails the job.
+      - name: cargo audit
+        run: cargo audit
+
   test-mobi-macos:
     # Second-class smoke test for the mobi feature on macOS (Linux is the
     # primary test runner). libmobi on macOS uses a different iconv (Apple's

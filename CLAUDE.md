@@ -153,6 +153,7 @@ This is the authoritative list — every command CI runs, and the directory it r
 | Rust tests | `cargo test` | `src-tauri/` |
 | Rust tests (mobi) | `cargo test --features mobi` | `src-tauri/` |
 | Core tests (mobi) | `cargo test -p carrel-core --features mobi -- --test-threads=1` | repo root |
+| Advisories | `cargo audit` | repo root |
 | Type-check | `pnpm run type-check` | repo root |
 | Frontend tests | `pnpm run test` (Vitest) | repo root |
 | Web UI e2e | `pnpm run test:e2e` (Playwright) | repo root |
@@ -161,13 +162,15 @@ Two `--workspace`/`-p` distinctions bite anything that scopes to one crate: clip
 
 ### The pre-push hook is weaker than CI
 
-A pre-push hook runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, `cargo test` (in `src-tauri/`), `npm run type-check`, `npm run test`. That is **five of the nine gates** — it does not run either mobi clippy/test variant, the carrel-core test binary, or the e2e suite, and it still shells out to `npm`. A green hook is not a green CI. Run the table above yourself; do not treat the hook as the gate, and never bypass it with `--no-verify`.
+A pre-push hook runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, `cargo test` (in `src-tauri/`), `npm run type-check`, `npm run test`. That is **five of the ten gates** — it does not run either mobi clippy/test variant, the carrel-core test binary, `cargo audit`, or the e2e suite, and it still shells out to `npm`. A green hook is not a green CI. Run the table above yourself; do not treat the hook as the gate, and never bypass it with `--no-verify`.
 
 ### CI only triggers on `main`
 
 `.github/workflows/ci.yml` is `on: push: branches: [main]` and `pull_request: branches: [main]`. **Pushing a feature or epic branch triggers no run at all.** An absent run looks identical to a passing one in `gh run list` output, so a branch push with no PR reads as "no failures" when it means "nothing was checked". To get CI on a branch, open a PR targeting `main` (a draft PR is enough) and watch `gh pr checks <branch>`.
 
-Jobs: `Rust Tests` (ubuntu), `Rust Lint`, `Rust Tests (macOS, --features mobi)`, `Rust Tests (Windows, --features mobi)`, `Frontend TypeScript Check`, `Web UI E2E`.
+Jobs: `Rust Tests` (ubuntu), `Rust Lint`, `Cargo Audit`, `Rust Tests (macOS, --features mobi)`, `Rust Tests (Windows, --features mobi)`, `Frontend TypeScript Check`, `Web UI E2E`.
+
+`cargo audit` needs `cargo install cargo-audit --locked` once, and reads `Cargo.lock` only — it compiles nothing. Advisories that are accepted rather than fixed are listed in `.cargo/audit.toml`, each with a written reason; anything not listed there fails the gate. When an advisory lands on a transitive crate we do not control, the entry says which upstream bump would clear it, so the list stays reviewable instead of becoming a permanent mute.
 
 ### User-facing docs to update alongside a change
 
