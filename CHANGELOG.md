@@ -5,6 +5,48 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **Dependency advisories swept.** `ammonia` 4.1.2 → 4.1.4, `h2` 0.4.13 →
+  0.4.19, `crossbeam-epoch` 0.9.18 → 0.9.21, `quinn-proto` 0.11.14 → 0.11.17,
+  `rustls-webpki` 0.103.12 → 0.103.15, clearing five RUSTSEC advisories.
+  Neither `ammonia` advisory was reachable — both need a non-default
+  allowlist (SVG `animate`/`set`, or MathML `math` + `annotation-xml` with
+  `encoding` disabled) and every call site uses `ammonia::clean`, the
+  defaults. Taken so a future custom sanitizer config cannot inherit a known
+  hole.
+- **Backup remote paths no longer pass a book's file extension through
+  unbounded.** The remote object path for a book is `files/{hash}.{ext}`,
+  where `ext` was read straight off the local filename. On the FTP backend
+  that path becomes an argument on a line-oriented control channel, so a
+  book named `x.ep\r\nDELE y.epub` could put `DELE y.epub` on that channel
+  as a command of its own (RUSTSEC-2026-0271, unfixable by upgrade: no
+  released `opendal` pulls the patched `suppaftp`, and 0.59.0 does not
+  compile from crates.io). The extension is now kept only when it is a plain
+  alphanumeric run and falls back to `epub`/`jpg` otherwise, which covers
+  every extension the app has ever written. Affects FTP backups only in
+  practice, but the bound is provider-agnostic.
+- **Storage keys can no longer carry control characters.**
+  `carrel_core::storage::validate_key` already rejected absolute keys,
+  backslashes and traversal segments; it now also rejects control characters
+  (`char::is_control`). This is the same injection primitive as the backup
+  entry above, at a second site: `epub::get_chapter_content` builds a
+  chapter-image key from the basename of an `<img src>` inside a
+  user-supplied EPUB, and a `Storage` implementation may turn a key into
+  protocol traffic — the remote backends do, and they live outside this
+  crate. Printable characters, spaces and non-ASCII included, are untouched,
+  so keys already on disk keep validating and no cached image is orphaned.
+  A rejected key makes that one image fail to extract; the chapter still
+  renders.
+
+### Added
+- **`cargo audit` is now a CI gate** (`Cargo Audit` job), bringing the gate
+  set to ten. Advisories that are accepted rather than fixed live in
+  `.cargo/audit.toml`, each with a written reason and an exit condition;
+  anything not listed there fails the gate. Three are currently accepted —
+  two `quick-xml` DoS advisories reachable only through `opendal`/`tauri`
+  transitives (our own EPUB and OPDS parsers are already on the fixed
+  0.41.0) and the `suppaftp` advisory above.
+
 ## [3.2.0] - 2026-09-07
 
 ### Added

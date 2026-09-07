@@ -1,0 +1,69 @@
+# Advisories that are accepted rather than fixed, read by `cargo audit`
+# (the "Advisories" gate in CLAUDE.md's gate table, and the `Cargo Audit`
+# job in ci.yml). Anything NOT listed here fails the gate, so this file is
+# the whole mute list — keep a reason and an exit condition on every entry,
+# and delete an entry the moment its exit condition is met.
+#
+# Warnings (unmaintained / unsound / yanked) are reported but do not fail
+# the gate, so they are deliberately not listed. Most are the gtk-rs GTK3
+# bindings that `tauri` pulls on Linux and that nobody upstream will
+# revive; muting them here would only hide the day one of them becomes a
+# real advisory.
+
+[advisories]
+ignore = [
+    # quick-xml: unbounded namespace-declaration allocation (RUSTSEC-2026-0195,
+    # 7.5 high) and quadratic duplicate-attribute checking (RUSTSEC-2026-0194).
+    # Both are memory/CPU exhaustion on malformed XML, both fixed in 0.41.0.
+    #
+    # Our own XML parsing — the EPUB OPF/NCX reader in `carrel-core::epub` and
+    # the OPDS reader in `carrel-core::opds`, i.e. every path that sees an
+    # untrusted book — is already on 0.41.0, because the workspace requires
+    # `quick-xml = "0.41"`. A caret requirement cannot resolve below 0.41.0,
+    # so muting these two advisories cannot hide a regression of our own
+    # parser; it would take a manifest edit, which is a visible diff.
+    #
+    # The three affected trees are all transitive and none of them parse book
+    # content:
+    #   0.37.5  <- reqsign <- opendal        (AWS SigV4; parses S3 responses)
+    #   0.38.4  <- opendal, and plist <- tauri (S3/WebDAV responses; Info.plist)
+    #   0.39.2  <- wayland-scanner           (Linux build script, parses the
+    #                                         protocol XML shipped in-crate,
+    #                                         i.e. trusted, at build time only)
+    #
+    # Exit condition: opendal and tauri bump their quick-xml. Nothing we can
+    # do from here short of vendoring them.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # suppaftp 6.3.0: FTP command injection via CRLF in control-channel
+    # arguments. Fixed in suppaftp 10.0.2, which no *usable*
+    # `opendal` pulls. Per crates.io's dependency API, `opendal-service-ftp`
+    # requires:
+    #   0.55, 0.56  ->  suppaftp ^6.3.0   (vulnerable)
+    #   0.57, 0.58  ->  suppaftp ^8.0.3   (vulnerable; resolves to 8.0.5)
+    #   0.59.0      ->  suppaftp ^10.0.2  (fixed)
+    # and 0.59.0 does not compile from crates.io at all: `opendal-core`
+    # 0.59.0's `src/docs/mod.rs` carries an unconditional
+    # `#[doc = include_str!("../../../CHANGELOG.md")]`, `pub mod docs;` is not
+    # feature-gated, and no CHANGELOG.md is present anywhere in the published
+    # 243-file tarball. So the one release that fixes this is unbuildable and
+    # there is no version to upgrade to.
+    #
+    # We do reach this code: `services-ftp` is enabled and `ProviderType::Ftp`
+    # is a user-selectable backup provider (`carrel-core/src/backup.rs`).
+    #
+    # Mitigated at our own boundary instead of in the transport: the remote
+    # object paths we hand opendal are built by `remote_file_path` /
+    # `remote_cover_path`, which bound the only attacker-influenced component
+    # (a book's file extension, read off a filename on disk) to a plain
+    # alphanumeric run. The FTP endpoint/user/password/root fields are also
+    # concatenated into control-channel traffic, but those come from the
+    # install's own backup settings — the only person who can inject there is
+    # the person configuring their own backup.
+    #
+    # Exit condition: an `opendal` release that both compiles and pulls
+    # suppaftp >= 10.0.2. Re-check on every opendal release; drop this entry
+    # and keep the path bounds (they are correct independently of suppaftp).
+    "RUSTSEC-2026-0271",
+]
