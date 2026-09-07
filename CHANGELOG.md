@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-07
+
 ### Added
 - **`carrel-core::opds_feed` gained a real feed-rendering interface**:
   `FeedOptions`, `RenderedFeed`, `render_feed`, and `opensearch_descriptor`.
