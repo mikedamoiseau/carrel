@@ -74,14 +74,30 @@ pub trait Storage: Send + Sync {
     fn local_path(&self, key: &str) -> CarrelResult<PathBuf>;
 }
 
-/// Reject keys that are absolute, empty, contain `..` / empty segments, or
-/// contain a backslash.
+/// Reject keys that are absolute, empty, contain `..` / empty segments,
+/// contain a backslash, or contain a control character.
 ///
 /// Backslashes are rejected outright: the documented separator is `/`, and
 /// accepting `\` would let the same logical key map to different on-disk
 /// layouts depending on platform (Unix treats `books\x` as one filename
 /// with a literal backslash; Windows-flavored callers might expect it to
 /// behave as a path separator). Rejecting keeps the contract backend-stable.
+///
+/// Control characters are rejected for the same backend-stability reason,
+/// with a sharper edge: a `Storage` implementation may turn a key into
+/// protocol traffic, and the remote backends do exactly that (they live
+/// outside this crate — see [`Storage::local_path`]). CR and LF are command
+/// separators on a line-oriented control channel such as FTP's, so a key
+/// carrying them is a command-injection primitive. Keys are not always
+/// crate-minted: `epub::get_chapter_content` builds a chapter-image key
+/// from the basename of an `<img src>` inside a user-supplied EPUB, which
+/// is arbitrary text. Bounding here rather than at that call site means a
+/// backend cannot be handed such a key by any caller, present or future.
+/// Every Unicode control character is rejected (`char::is_control`, i.e.
+/// C0 `U+0000..=U+001F` and C1 `U+007F..=U+009F`), not just CR/LF, because
+/// which bytes are structural depends on the protocol; printable characters
+/// — spaces and non-ASCII included — are untouched, so keys that already
+/// exist on disk keep validating.
 ///
 /// Returned error is [`CarrelError::InvalidInput`] so callers surface a
 /// consistent message to users.
@@ -92,6 +108,13 @@ pub fn validate_key(key: &str) -> CarrelResult<()> {
     if key.contains('\\') {
         return Err(CarrelError::invalid(format!(
             "storage key must not contain backslashes: {key}"
+        )));
+    }
+    if let Some(c) = key.chars().find(|c| c.is_control()) {
+        return Err(CarrelError::invalid(format!(
+            "storage key must not contain control characters (found U+{:04X}): {}",
+            c as u32,
+            key.escape_debug()
         )));
     }
     if key.starts_with('/') {
@@ -337,6 +360,35 @@ mod tests {
         assert!(validate_key("a.epub").is_ok());
         assert!(validate_key("books/abc.epub").is_ok());
         assert!(validate_key("covers/42/cover.jpg").is_ok());
+    }
+
+    /// A key can carry text lifted straight out of an untrusted EPUB — the
+    /// chapter-image key in `epub::get_chapter_content` is
+    /// `{prefix}/{hash}-{basename}` where `basename` is the basename of an
+    /// `<img src>`. A remote backend turns a key into protocol traffic (an
+    /// FTP control-channel argument, an HTTP request line), where CR and LF
+    /// are command separators, so a control character in a key is an
+    /// injection primitive. Reject at the boundary rather than relying on
+    /// each backend, since backends live outside this crate.
+    #[test]
+    fn validate_key_rejects_control_characters() {
+        assert!(validate_key("images/1/a-cover.pn\r\nDELE x").is_err());
+        assert!(validate_key("images/1/a-cover\n.png").is_err());
+        assert!(validate_key("images/1/a-cover\t.png").is_err());
+        assert!(validate_key("images/1/a-cover\0.png").is_err());
+        assert!(validate_key("images/1/a-cover\u{7f}.png").is_err());
+    }
+
+    /// The bound must not reject anything a real book already produces —
+    /// existing cached keys have to keep validating, or every previously
+    /// extracted image is orphaned. Spaces and non-ASCII are ordinary in
+    /// EPUB image names.
+    #[test]
+    fn validate_key_accepts_printable_and_non_ascii_keys() {
+        assert!(validate_key("images/1/ab12cd-cover art.png").is_ok());
+        assert!(validate_key("images/1/ab12cd-café.jpeg").is_ok());
+        assert!(validate_key("images/1/ab12cd-\u{2014}dash.png").is_ok());
+        assert!(validate_key("images/1/ab12cd-i18n_\u{65e5}\u{672c}.png").is_ok());
     }
 
     #[test]
