@@ -18,8 +18,46 @@ const CATEGORY_RE = /^### (.+)$/;
 const ENTRY_RE = /^- \*\*(.+?)\*\*(.*)$/;
 const PLAIN_ENTRY_RE = /^- (.+)$/;
 
+/**
+ * CHANGELOG entries wrap across several lines, but the parser below matches one
+ * line at a time — so a `- **Title**` whose closing `**` sits on the next line
+ * would otherwise surface in the UI as a sentence cut mid-word with a literal
+ * `**` on the front. Join each entry's continuation lines (indented two spaces,
+ * not themselves a bullet) back onto its `- ` line first. Nested bullets and
+ * their own deeper-indented continuations are dropped, as they always were.
+ */
+function unwrapEntries(lines: string[]): string[] {
+  const out: string[] = [];
+  let entryIndex = -1;
+
+  for (const line of lines) {
+    if (/^- /.test(line)) {
+      out.push(line);
+      entryIndex = out.length - 1;
+      continue;
+    }
+
+    if (entryIndex >= 0 && /^ {2}(?![-*] )\S/.test(line)) {
+      out[entryIndex] += " " + line.trim();
+      continue;
+    }
+
+    if (/^\s+\S/.test(line)) {
+      // A nested bullet or one of its continuations: skipped, and it ends the
+      // parent entry so nothing after it can be glued back on.
+      entryIndex = -1;
+      continue;
+    }
+
+    out.push(line);
+    entryIndex = -1;
+  }
+
+  return out;
+}
+
 export function parseChangelog(raw: string, maxVersions = 3): ReleaseVersion[] {
-  const lines = raw.split("\n");
+  const lines = unwrapEntries(raw.split("\n"));
   const versions: ReleaseVersion[] = [];
   let current: ReleaseVersion | null = null;
   let currentCategory = "";

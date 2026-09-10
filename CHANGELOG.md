@@ -5,6 +5,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **The "What's New" dialog cut entries off mid-sentence.** The changelog
+  parser matched one line at a time, so any entry whose bold title wrapped
+  onto a second line — most of them, at this file's line width — was
+  truncated at the wrap point and shown with a literal `**` on the front.
+  Continuation lines are now joined back onto their entry before parsing;
+  nested bullets are still left out, as before.
+
 ### Security
 - **Dependency advisories swept.** `ammonia` 4.1.2 → 4.1.4, `h2` 0.4.13 →
   0.4.19, `crossbeam-epoch` 0.9.18 → 0.9.21, `quinn-proto` 0.11.14 → 0.11.17,
