@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-09-11
+
 ### Fixed
 - **The "What's New" dialog cut entries off mid-sentence.** The changelog
   parser matched one line at a time, so any entry whose bold title wrapped
