@@ -6,6 +6,23 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel a PR's in-flight run when a new commit supersedes it. Pushing
+# several times in quick succession to a PR branch otherwise leaves every
+# older run going to completion — 7 jobs each, two of them on the 10x
+# macOS and 2x Windows runners.
+#
+# `github.ref` is `refs/pull/<n>/merge` on pull_request and
+# `refs/heads/main` on push, so each PR gets its own group and never
+# collides with main's.
+#
+# Cancellation is deliberately limited to pull_request: a run on `main`
+# must finish, because a release tag pushed right after a merge is gated
+# on main's conclusion, and a second merge landing first would otherwise
+# cancel it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # Pin to a specific chromium build. Update to latest from:
   # https://github.com/bblanchon/pdfium-binaries/releases
