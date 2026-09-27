@@ -49,10 +49,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Temporary: surface the agent's turn-by-turn output + final report in
-          # the run log so a no-op success (no docs PR opened) is diagnosable.
+          # Temporary: surface the agent's final report in the Step Summary so a
+          # no-op success (no docs PR opened) is diagnosable. Full turn-by-turn
+          # output stays off: the repo is public and it includes every tool result.
           display_report: true
-          show_full_output: true
+          show_full_output: false
           prompt: |
             A pull request was just merged into main of Carrel, a local-first
             desktop app (Tauri + Rust + React) for reading and organizing EPUB,
