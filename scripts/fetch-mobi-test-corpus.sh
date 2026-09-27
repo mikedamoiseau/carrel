@@ -65,8 +65,13 @@ mkdir -p "${FIXTURES_DIR}"
 # identical to its original pin, which is the useful signal here: only the
 # KF8 rendition is being regenerated upstream, so expect this hash to keep
 # moving and re-run the verification each time rather than repinning blind.
+#
+# 2026-09-27: reissued again (Last-Modified 2026-09-01, now 255486 bytes).
+# Same verification, same result: PalmDB name, BOOK/MOBI, file-version 8, and
+# Carroll/Alice/Wonderland in the body, with the fixture-gated KF8 tests green.
+# `pg11.mobi` still matches its original pin.
 declare -a FILES=(
-  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|fffee390f393ecf004f65c7fcd2cbefb3ee2652ff6f3fa8daa09c8a9a5644df0"
+  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|b3c9067848d28f8c0f36adbb198b306791884319e8b2f8ea7083f844d8876815"
   "alice-legacy.mobi|https://www.gutenberg.org/cache/epub/11/pg11.mobi|c6de8f83459904177eac2623aa653ef57483ed6968078c8fc3d3171f20e06408"
 )
 
