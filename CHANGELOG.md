@@ -5,6 +5,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **`rustls` 0.23.38 → 0.23.45, clearing RUSTSEC-2026-0285.** `rustls`, the
+  TLS stack under the app's outbound HTTPS requests (`reqwest`) and the
+  `opendal`/`suppaftp` backup transports, accepted TLS 1.3 handshake messages
+  sent at the wrong encryption level. Low impact: the handshake transcript is
+  still authenticated, so an attacker on the network cannot alter or complete
+  a handshake; a server could only send messages in plaintext that should have
+  been encrypted without the connection being rejected.
+
 ## [3.2.1] - 2026-09-11
 
 ### Fixed
