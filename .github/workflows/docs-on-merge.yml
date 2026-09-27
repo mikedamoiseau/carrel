@@ -36,19 +36,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      contents: write        # commit doc edits to a branch
-      pull-requests: write   # open the follow-up docs PR + comment
+      contents: write        # push the docs/pr-N branch
+      pull-requests: write   # read the merged PR, open the docs PR, comment
       id-token: write        # token minting for the action
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0     # full history so the merged diff is readable
+
+      # The agent gets no shell. Everything it needs from GitHub is fetched
+      # here, and everything it produces is published by the last step, so a
+      # PR description or diff can steer its prose but not a command.
+      - name: Fetch the merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p .pr-context
+          gh pr view "$PR" --json number,title,body,author,labels,files > .pr-context/pr.json
+          gh pr diff "$PR" > .pr-context/diff.patch
 
       - name: Draft release notes and sync docs
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --allowedTools "Read,Glob,Grep,Edit,Write"
+            --disallowedTools "Bash"
           # Temporary: surface the agent's final report in the Step Summary so a
           # no-op success (no docs PR opened) is diagnosable. Full turn-by-turn
           # output stays off: the repo is public and it includes every tool result.
@@ -70,16 +83,21 @@ jobs:
             damoiseau.xyz site is maintained by its own agent that pulls this repo
             on a schedule; you produce in-repo doc edits only, no website handoff.
 
-            1. Read the PR. Use `gh pr view ${{ github.event.pull_request.number }}`
-               and `gh pr diff ${{ github.event.pull_request.number }}` to read the
-               title, description, and diff. Identify the user-visible change and
-               classify it: New, Improved, Fixed, Breaking, or Internal-only.
+            You have no shell. The PR is already fetched into `.pr-context/`, and a
+            later workflow step publishes your work, so your job is editing files:
+            CHANGELOG.md, README.md, docs/USER_GUIDE.md, and the output files in
+            step 7.
+
+            1. Read the PR: `.pr-context/pr.json` (title, description, author,
+               labels, changed files) and `.pr-context/diff.patch`. Identify the
+               user-visible change and classify it: New, Improved, Fixed, Breaking,
+               or Internal-only.
 
             2. If the change is internal-only (tests, CI, build tooling, comments,
                dead-code removal, pure refactors, dependency bumps with no user
-               impact), stop here: post one comment with
-               `gh pr comment ${{ github.event.pull_request.number }}
-               --body "Internal change — no docs update."` and do nothing else.
+               impact), write `internal` to `.pr-context/classification` and stop
+               there. The workflow comments "Internal change — no docs update." on
+               the PR.
 
             3. Otherwise, draft one canonical entry, written for end users (people
                reading books in the app), not contributors:
@@ -110,16 +128,51 @@ jobs:
                silently delete it — flag the drift in the PR description so a human
                can decide.
 
-            7. Output: create a branch named `docs/pr-${{ github.event.pull_request.number }}`,
-               commit only the in-repo doc edits (CHANGELOG / README / USER_GUIDE),
-               and open a pull request whose title starts with "docs:" (this is what
-               keeps the workflow from re-triggering on itself). In the PR body,
-               include: the canonical entry, its classification, affected platforms,
-               the list of in-repo files changed, and any drift flagged in step 6.
-               Don't push to main directly.
+            7. Output: write the classification (New, Improved, Fixed, or Breaking)
+               to `.pr-context/classification`, and the docs PR's description to
+               `.pr-context/pr-body.md`: the canonical entry, its classification,
+               affected platforms, the list of in-repo files changed, and any drift
+               flagged in step 6. The workflow commits only CHANGELOG.md, README.md,
+               and docs/USER_GUIDE.md to a `docs/pr-${{ github.event.pull_request.number }}`
+               branch and opens the PR.
 
             Keep the changelog and README entries short — long notes don't get read.
             The user guide is the one place to be thorough.
+
+      # Deterministic publishing: comment, or branch + commit + push + PR. The
+      # PR title starts with "docs:", which is what keeps this workflow from
+      # re-triggering on its own PR (see the job's `if:`). A PR opened with
+      # this job's token doesn't trigger CI on its own; the docs PR is docs-only.
+      - name: Publish the docs PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          class="$(tr -d '[:space:]' < .pr-context/classification 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+          if [ "$class" = "internal" ]; then
+            gh pr comment "$PR" --body "Internal change — no docs update."
+            exit 0
+          fi
+          docs=(CHANGELOG.md README.md docs/USER_GUIDE.md)
+          if git diff --quiet -- "${docs[@]}"; then
+            echo "::warning::No doc changes for #$PR (classification: ${class:-none}); nothing to publish."
+            exit 0
+          fi
+          branch="docs/pr-$PR"
+          git switch -c "$branch"
+          git add -- "${docs[@]}"
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "docs: sync docs for #$PR"
+          # Push with this job's own token, explicitly: the action reconfigures
+          # git auth for its app token, which it revokes when it finishes.
+          git -c http.https://github.com/.extraheader= \
+              push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "HEAD:refs/heads/$branch"
+          [ -s .pr-context/pr-body.md ] || printf 'Docs sync for #%s.\n' "$PR" > .pr-context/pr-body.md
+          gh pr create --base main --head "$branch" \
+            --title "docs: sync docs for #$PR" --body-file .pr-context/pr-body.md
 
 # ---------------------------------------------------------------------------
 # WEBSITE (damoiseau.xyz) — NOT handled here, by design.
