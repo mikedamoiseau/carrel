@@ -16,15 +16,17 @@ auto-recreates when the file is deleted (a manual reset), not on schema change.
 
 ### 1. Add additive SQL — `carrel-core/src/db.rs::run_schema`
 
-`run_schema` is a single `conn.execute_batch(...)` of `CREATE TABLE IF NOT
-EXISTS` statements. To add:
+`run_schema` is a `conn.execute_batch(...)` of `CREATE TABLE IF NOT EXISTS`
+statements followed by additive `ALTER TABLE` migrations. To add:
 
 - **New table:** add a `CREATE TABLE IF NOT EXISTS my_table (...)` block.
 - **New column on an existing table:** SQLite has no `ADD COLUMN IF NOT EXISTS`.
-  Use a guarded `ALTER TABLE`, following the existing helper pattern
-  (`migrate_file_path_to_key` is the in-repo example of a conditional
-  migration). Check for the column / a `schema_version` marker before altering
-  so re-runs are no-ops.
+  Follow the idiom after the batch in `run_schema`:
+  `let _ = conn.execute_batch("ALTER TABLE t ADD COLUMN c ...;");` discards the
+  "duplicate column" error on re-run. It discards every other error too, so a
+  typo in that SQL fails silently — cover the new column with a test that reads
+  it back. For a conditional data migration (more than a new column), follow
+  `migrate_file_path_to_key` or check the `schema_version` table.
 
 Never write `DROP TABLE`, `DROP COLUMN`, or anything that discards user data on
 startup.
@@ -67,7 +69,7 @@ Then prove the migration on a REAL pre-existing DB, not just a fresh one:
 | Mistake | Symptom |
 |---------|---------|
 | `CREATE TABLE` without `IF NOT EXISTS` | Startup error on second launch ("table already exists") |
-| `ALTER TABLE ADD COLUMN` unguarded | Errors on re-run; SQLite has no `IF NOT EXISTS` for columns |
+| `ALTER TABLE ADD COLUMN` propagated with `?` instead of `let _ =` | Startup fails on every launch after the first ("duplicate column name") |
 | Changed a column without grepping consumers | Silent runtime break in an unupdated reader/writer |
 | Only tested a fresh DB | Migration path on existing installs untested — the risky case |
 | Destructive migration (DROP/recreate) | User data loss on upgrade |

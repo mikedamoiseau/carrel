@@ -18,7 +18,7 @@ easy-to-forget step is registration in `lib.rs`. Three edits, in order.
 ```rust
 #[tauri::command]
 pub async fn my_command(arg: String, state: State<'_, AppState>) -> CarrelResult<MyReturn> {
-    let conn = state.pool.get().map_err(...)?;   // r2d2 pooled connection
+    let conn = state.active_db()?.get()?;   // r2d2 connection from the active profile's pool
     db::do_thing(&conn, &arg)
 }
 ```
@@ -33,7 +33,7 @@ pub async fn my_command(arg: String, state: State<'_, AppState>) -> CarrelResult
 
 ### 2. Register it — `src-tauri/src/lib.rs`
 
-Add the path inside `tauri::generate_handler![ ... ]` (around line 325):
+Add the path inside `tauri::generate_handler![ ... ]` (search for `generate_handler!`):
 
 ```rust
 .invoke_handler(tauri::generate_handler![

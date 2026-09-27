@@ -34,17 +34,15 @@ The backend is two crates: **`carrel`** (`src-tauri/src/`) — the Tauri shell, 
 
 ### Persistence-boundary identifiers — keep stable
 
-The app was renamed Folio → Carrel after `v2.11.1`. `3.0.0` shipped the
-user-visible half; the rename was then completed in full, including the bundle
-identifier and every persisted key, so no `folio` identifiers remain. `CHANGELOG.md`,
-`docs/superpowers/`, and `src-tauri/.pr-reviews/` still say Folio because they
-are historical records of work that shipped under that name — leave them.
+The app was called Folio up to `v2.11.1`; no `folio` identifiers remain in code.
+`CHANGELOG.md`, `docs/superpowers/`, and `src-tauri/.pr-reviews/` still say Folio
+because they are historical records of work that shipped under that name — leave
+them.
 
-What follows is **not** a do-not-rename list any more. It is the list of strings
-that key data living *outside* the repo — on disk, in the OS keychain, in a
-browser, on a user's own remote. Changing one of them does not migrate the data
-it names; it orphans it. Treat each as a stable identifier and change it only
-together with a migration.
+The table below lists the strings that key data living *outside* the repo — on
+disk, in the OS keychain, in a browser, on a user's own remote. Changing one of
+them does not migrate the data it names; it orphans it. Treat each as a stable
+identifier and change it only together with a migration.
 
 | Identifier | Where | Changing it would… |
 |---|---|---|
@@ -98,7 +96,7 @@ The embedded web UI (`src-tauri/src/web_server/static/`: `index.html` + `app.js`
 
 ### Book Storage
 
-Books are copied into an app-managed library folder (default `~/Documents/Carrel Library/`). The `file_path` in the DB points to the library-internal copy. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
+By default books are copied into an app-managed library folder (default `~/Documents/Carrel Library/`), and `file_path` in the DB holds a storage key relative to that folder (`{book_id}.{ext}`), not a filesystem path. With the `import_mode` setting set to `link`, books stay where they are and `file_path` holds the original absolute path. Covers are extracted to `{app_data_dir}/covers/{book_id}/`.
 
 ## Adding Common Things
 
@@ -120,7 +118,7 @@ This is added to Mike's `~/.zshrc`. If builds fail with `fatal error: 'new' file
 
 ## Coding Principles
 
-**Think first.** State assumptions before coding. If multiple interpretations exist, present them — don't pick silently. If a simpler approach exists, say so. If something is unclear, stop and ask.
+**Think first.** State assumptions before coding. If multiple interpretations exist, present them — don't pick silently. If a simpler approach exists, say so. If something is unclear and neither the code nor a sensible default settles it, ask; otherwise state the assumption and keep going.
 
 **Simplicity over cleverness.** Write the minimum code that solves the problem. No speculative features, no abstractions for single-use code, no "just in case" error handling. If 200 lines could be 50, rewrite it.
 
