@@ -55,14 +55,17 @@ jobs:
           show_full_output: true
           prompt: |
             A pull request was just merged into main of Carrel, a local-first
-            DESKTOP app (Tauri + Rust + React) for reading and organizing EPUBs,
-            PDFs, CBZ, and CBR — supported platforms are macOS, Windows, and Linux.
+            desktop app (Tauri + Rust + React) for reading and organizing EPUB,
+            MOBI / AZW / AZW3, PDF, CBZ, and CBR — supported platforms are macOS,
+            Windows, and Linux. The desktop app also serves a built-in web reader
+            (any browser on the same network, including phones and tablets) and an
+            OPDS catalog, so a change may be desktop-only, web-reader-only, or both.
 
             Merged PR: #${{ github.event.pull_request.number }}
             Title: "${{ github.event.pull_request.title }}"
 
             Follow the project's CLAUDE.md conventions throughout. Keep the in-repo
-            documentation surfaces below in sync. Do NOT touch the website — the
+            documentation surfaces below in sync. Leave the website alone — the
             damoiseau.xyz site is maintained by its own agent that pulls this repo
             on a schedule; you produce in-repo doc edits only, no website handoff.
 
@@ -73,13 +76,13 @@ jobs:
 
             2. If the change is internal-only (tests, CI, build tooling, comments,
                dead-code removal, pure refactors, dependency bumps with no user
-               impact), STOP. Post one comment with
+               impact), stop here: post one comment with
                `gh pr comment ${{ github.event.pull_request.number }}
                --body "Internal change — no docs update."` and do nothing else.
 
-            3. Otherwise, draft ONE canonical entry, written for end users (people
+            3. Otherwise, draft one canonical entry, written for end users (people
                reading books in the app), not contributors:
-               - 2 to 4 sentences, plain language. No jargon, internal codenames,
+               - A short paragraph in plain language. No jargon, internal codenames,
                  file paths, function names, or commit SHAs.
                - If the change behaves differently or is only available on some
                  platforms (macOS / Windows / Linux), say which.
@@ -91,30 +94,28 @@ jobs:
                - CHANGELOG.md — one terse line under the matching heading
                  (New / Improved / Fixed / Breaking) in the Unreleased/top section.
                  Match the file's existing Keep a Changelog style.
-               - README.md — update ONLY if the change alters Carrel's headline
+               - README.md — update only if the change alters Carrel's headline
                  capabilities. If so, slot it into the correct "Highlights"
                  subsection (Reading / Library / Catalogs, metadata, and backup).
                  Skip README for minor fixes. Keep the feature list accurate, not noisy.
                - docs/USER_GUIDE.md — add or revise the how-to: where the feature
                  lives in the UI and the steps to use it. Be as thorough as needed;
-                 the brevity rule does NOT apply to this file.
+                 the brevity rule does not apply to this file.
 
             5. Voice per surface: changelog = terse imperative ("Add…", "Fix…");
                user guide = second-person instructional ("To …, open …").
 
-            6. If any doc surface claims a capability the code doesn't have (e.g. the
-               live user guide currently mentions phone access / sync, which the repo
-               doesn't implement), do NOT silently delete it — flag the drift in the
-               PR description so a human can decide.
+            6. If any doc surface claims a capability the code doesn't have, don't
+               silently delete it — flag the drift in the PR description so a human
+               can decide.
 
             7. Output: create a branch named `docs/pr-${{ github.event.pull_request.number }}`,
-               commit ONLY the in-repo doc edits (CHANGELOG / README / USER_GUIDE),
+               commit only the in-repo doc edits (CHANGELOG / README / USER_GUIDE),
                and open a pull request whose title starts with "docs:" (this is what
                keeps the workflow from re-triggering on itself). In the PR body,
                include: the canonical entry, its classification, affected platforms,
                the list of in-repo files changed, and any drift flagged in step 6.
-               Do NOT push to main directly, and do NOT edit or reference any website
-               files or open any cross-repo PR.
+               Don't push to main directly.
 
             Keep the changelog and README entries short — long notes don't get read.
             The user guide is the one place to be thorough.
