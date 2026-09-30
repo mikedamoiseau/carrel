@@ -992,6 +992,8 @@ The web UI can be installed like an app, so it opens full-screen without browser
 - **iOS (Safari):** open the web UI URL, tap the **Share** icon, then **Add to Home Screen**.
 - **Android / desktop (Chrome or another Chromium browser):** open the web UI URL, then use the browser's **Install app** option (usually in the address bar or the ⋮ menu).
 
+The home-screen icon and the browser-tab icon both show the Carrel mark. If you added the web UI to your home screen before this was fixed and it still shows the old "F", remove the shortcut and add it again — existing shortcuts keep the icon they were created with.
+
 Once installed, the app shell (not your book content) can be cached for faster loads — this only kicks in when the page is served over `https` or accessed as `localhost`. Over a plain HTTP address on your home WiFi (the normal way to reach it, e.g. `http://192.168.1.20:7788`), the app still installs to your home screen and looks the same, it just always fetches the shell fresh rather than caching it offline.
 
 ### Reading offline
