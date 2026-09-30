@@ -15,6 +15,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   been encrypted without the connection being rejected.
 
 ### Fixed
+- **Web UI: home-screen icon and favicon now show the Carrel mark.** The
+  desktop icons were regenerated for the rename, but the web UI's own icons
+  (used by "Add to Home Screen" and the browser tab) still showed the old
+  Folio "F". Already-added home-screen shortcuts keep their old icon until
+  removed and re-added.
 - **Web UI: offline copies stay out of reach when the active library can't be
   confirmed.** If the web UI loaded while the server was reachable but its
   active-profile check failed, the page correctly stopped using offline copies

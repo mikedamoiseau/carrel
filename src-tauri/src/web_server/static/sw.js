@@ -3,7 +3,7 @@
 // complexity isn't worth it for v1; see docs/web-ui-improvements.md Item 9).
 //
 // Finding 9: CACHE_VERSION must embed a short content hash of the shell
-// assets (index.html + app.js + app.css + manifest.json) — enforced by
+// assets (index.html + app.js + app.css + manifest.json + fonts + icons) — enforced by
 // `cache_version_embeds_shell_asset_content_hash` in mod.rs, which fails CI
 // with the expected hash whenever one of those files changes without this
 // being regenerated to match. Don't hand-edit the version without re-running
@@ -26,7 +26,7 @@
 // The `carrel-` prefix on this and the two cache names below names caches held
 // in the user's browser: renaming it orphans every offline-saved book rather
 // than migrating it. Only the trailing content hash is meant to change.
-const CACHE_VERSION = "carrel-shell-aed522c1629b";
+const CACHE_VERSION = "carrel-shell-b5f9666b67e3";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW
