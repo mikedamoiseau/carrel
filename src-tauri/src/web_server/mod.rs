@@ -4666,6 +4666,15 @@ mod tests {
         for (_p, bytes) in web_ui::FONT_ASSETS {
             hasher.update(bytes);
         }
+        // Same for the precached icons: the shell is cache-first, so a swapped
+        // icon without a bump keeps serving the old one from installed caches.
+        for bytes in [
+            include_bytes!("static/favicon.png").as_slice(),
+            include_bytes!("static/icon-192.png").as_slice(),
+            include_bytes!("static/icon-512.png").as_slice(),
+        ] {
+            hasher.update(bytes);
+        }
         let digest = format!("{:x}", hasher.finalize());
         let expected_fragment = &digest[..12];
 
@@ -4677,7 +4686,7 @@ mod tests {
         assert!(
             cache_version_line.contains(expected_fragment),
             "sw.js's CACHE_VERSION is stale relative to the current shell asset content \
-             (index.html + app.js + app.css + manifest.json). Update it to embed \
+             (index.html + app.js + app.css + manifest.json + fonts + icons). Update it to embed \
              {expected_fragment:?}, e.g. CACHE_VERSION = \"carrel-shell-{expected_fragment}\"; \
              found: {cache_version_line}"
         );
