@@ -14,6 +14,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   a handshake; a server could only send messages in plaintext that should have
   been encrypted without the connection being rejected.
 
+### Fixed
+- **Web UI: offline copies stay out of reach when the active library can't be
+  confirmed.** If the web UI loaded while the server was reachable but its
+  active-profile check failed, the page correctly stopped using offline copies
+  itself, yet its service worker kept serving books saved under the
+  *previous* profile. Going offline in that state could open another
+  library's saved book. The service worker is now switched off along with the
+  page until the profile is confirmed.
+
 ## [3.2.1] - 2026-09-11
 
 ### Fixed

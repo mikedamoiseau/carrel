@@ -1244,6 +1244,13 @@ test.describe("offline mode — profile scoping", () => {
     await saveBookOffline(page, EPUB_ID);
     await switchProfile(page, "magazines");
     await reloadControlled(page);
+    // Wait for boot to confirm the new profile before cutting the network.
+    // reloadControlled returns once the worker controls the page, which is
+    // before boot's /api/profiles answers; until then the worker still holds
+    // the previous profile's marker (the last known scope, exactly what a cold
+    // offline launch would use), and going offline inside that window made
+    // this flake on CI. route() runs only after the sync.
+    await expect(page.getByRole("heading", { level: 1, name: "Book 050" })).toBeVisible();
 
     await context.setOffline(true);
     try {
@@ -1269,6 +1276,42 @@ test.describe("offline mode — profile scoping", () => {
       await expect(page.locator("#offline-retry-btn")).toHaveCount(0);
     } finally {
       await context.setOffline(false);
+    }
+  });
+
+  test("a boot that cannot confirm the active profile stops the worker serving the previous profile's saved book", async ({
+    page,
+    context,
+  }) => {
+    await page.goto("/");
+    await saveBookOffline(page, EPUB_ID);
+    await switchProfile(page, "magazines");
+
+    // Boot re-publishes the scope it last stored (the previous profile's)
+    // before it asks the server which profile is active. When that question
+    // goes unanswered — here a 500, on CI a connection that dropped at exactly
+    // that moment — the page knows its namespace is unconfirmed, and the
+    // worker must not keep answering out of the stale one.
+    await page.route("**/api/profiles", (route) => route.fulfill({ status: 500, body: "" }));
+    await reloadControlled(page);
+    // route() runs only after boot's profile sync, so the rendered detail view
+    // means the page has already given up on confirming the profile.
+    await expect(page.getByRole("heading", { level: 1, name: "Book 050" })).toBeVisible();
+
+    await context.setOffline(true);
+    try {
+      const outcome = await page.evaluate(async (id) => {
+        try {
+          const resp = await fetch(`/api/books/${id}`, { credentials: "same-origin" });
+          return { status: resp.status, body: (await resp.text()).slice(0, 120) };
+        } catch (e) {
+          return { failed: true };
+        }
+      }, EPUB_ID);
+      expect(outcome).toEqual({ failed: true });
+    } finally {
+      await context.setOffline(false);
+      await page.unroute("**/api/profiles");
     }
   });
 });
