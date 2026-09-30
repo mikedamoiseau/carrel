@@ -420,6 +420,17 @@
     return (await applyOfflineScope(active.name)) ? "changed" : "unchanged";
   }
 
+  /// Fail closed on an online probe that could not confirm the active profile.
+  /// The flag only gates this page; the worker still holds the marker boot
+  /// re-published from storage — the *previous* profile's — and would keep
+  /// answering that profile's saved books under this one's ids. Dropping the
+  /// marker turns it off too. The next successful sync republishes it, and a
+  /// cold offline launch restores the last known scope from storage as before.
+  async function markOfflineProfileUnknown() {
+    offlineProfileUnknown = true;
+    try { await caches.delete(OFFLINE_SCOPE_CACHE); } catch (e) { /* nothing left to try */ }
+  }
+
   // Lazy singleton connection; a failed open clears the promise so a later
   // call can retry (e.g. transient quota pressure at first open). The open
   // is raced against a timeout: some browsers' IndexedDB can hang without
@@ -1741,7 +1752,7 @@
         // offline saves could land in the wrong profile's namespace.
         const loginScope = await syncOfflineScopeWithServer();
         // Same reasoning as init() below.
-        if (loginScope === "unknown") offlineProfileUnknown = true;
+        if (loginScope === "unknown") await markOfflineProfileUnknown();
         else if (loginScope === "changed") await verifyOfflineIntegrity();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
@@ -8505,7 +8516,7 @@
       // built from. `offlineUnavailable` gates all of that through
       // offlineSupported() (replayProgressQueue included), so online browsing
       // carries on unaffected. Cleared as soon as a profile request succeeds.
-      offlineProfileUnknown = true;
+      await markOfflineProfileUnknown();
     } else if (bootScope === "changed") {
       await verifyOfflineIntegrity();
     }
