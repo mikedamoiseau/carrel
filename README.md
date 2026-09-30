@@ -169,23 +169,11 @@ Carrel is for the opposite case: you already have the files, and you want a bett
 - Web server / API reference: [`docs/WEB_SERVER_API.md`](docs/WEB_SERVER_API.md)
 - Changelog: [`docs/changelog.html`](docs/changelog.html) ([raw](CHANGELOG.md))
 
-## Project status — maintenance mode
+## Feature requests
 
-Carrel has been in maintenance mode since `v2.0.0` (2026-05-03). Development
-effort has moved to Carrel Server, a separate commercial multi-user server.
-
-| | |
-|---|---|
-| Bug fixes | yes |
-| Security patches | yes |
-| Dependency updates | yes |
-| Small UX polish | case by case |
-| New file formats | no |
-| New feature requests | politely declined |
-
-The app is feature-complete for its intended scope. Issues reporting real
-breakage are welcome; feature proposals will most likely be declined, so please
-don't invest much effort in one without asking first.
+Carrel is actively developed, and new feature requests are more than welcome!
+Open an issue on [GitHub](https://github.com/mikedamoiseau/carrel/issues) to
+suggest one or to report a bug.
 
 ## Installation
 

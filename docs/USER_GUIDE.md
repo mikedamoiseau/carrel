@@ -600,10 +600,10 @@ Custom catalogs can be removed at any time (with a confirmation). If you ever ha
 
 ### Catalogs that require signing in
 
-Some catalogs don't allow anonymous access — for example, a Carrel Server instance you run yourself. Carrel supports two ways to sign in:
+Some catalogs don't allow anonymous access — for example, a private catalog you run yourself. Carrel supports two ways to sign in:
 
 - **Username / password** — the account's login credentials.
-- **Bearer token** — a single API key (Carrel Server calls its own key format `ck_live_…`), with no separate username.
+- **Bearer token** — a single API key, with no separate username.
 
 You can add credentials in either of two places:
 
