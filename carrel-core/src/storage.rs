@@ -244,17 +244,11 @@ impl Storage for LocalStorage {
         // part up to and including its last `/` — rather than the whole
         // root, then apply the same starts-with filter. Keys stay relative
         // to `self.root`, so the output is identical to a whole-root walk.
-        let mut start = self.root.clone();
-        if let Some(i) = prefix.rfind('/') {
-            for segment in prefix[..i].split('/') {
-                start.push(segment);
-            }
-            // A prefix running through a file (`a/b/` when `a/b` is a file)
-            // or a missing directory matches nothing, as it always did.
-            if !start.is_dir() {
-                return Ok(Vec::new());
-            }
-        }
+        let start = match scoped_start(&self.root, prefix)? {
+            Scope::Dir(dir) => dir,
+            Scope::NoMatch => return Ok(Vec::new()),
+            Scope::WholeRoot => self.root.clone(),
+        };
         let mut out = Vec::new();
         walk(&self.root, &start, &mut out)?;
         if !prefix.is_empty() {
@@ -330,6 +324,64 @@ where
     }
 
     Ok(())
+}
+
+enum Scope {
+    /// Walk this directory.
+    Dir(PathBuf),
+    /// The prefix names a directory that does not exist (or is a file).
+    NoMatch,
+    /// Not safely scopable; walk the whole root and filter, as before.
+    WholeRoot,
+}
+
+/// Resolve the directory part of `prefix` (up to its last `/`) to a walk
+/// start, or decide it cannot be scoped without changing what `list` returns.
+///
+/// Two things make a naive `root.join(segments)` wrong, so both are handled
+/// conservatively:
+/// - A segment that is not exactly one `Component::Normal` (`C:` or `a:b` on
+///   Windows, `.`, an empty segment from `a//`) can replace or escape the
+///   path, so those fall back to the whole-root walk.
+/// - On a case-insensitive filesystem (macOS, Windows) `read_dir` on
+///   `PAGE-CACHE/` succeeds and yields keys in the caller's spelling, where
+///   the whole-root walk yields the on-disk spelling and so would never match
+///   a differently-cased prefix. Each segment is therefore checked against an
+///   exact-name entry in its parent's listing; a mismatch matches nothing.
+///   This reads one directory per segment, still far cheaper than the cache.
+fn scoped_start(root: &Path, prefix: &str) -> CarrelResult<Scope> {
+    let Some(i) = prefix.rfind('/') else {
+        return Ok(Scope::WholeRoot);
+    };
+    let mut cur = root.to_path_buf();
+    for segment in prefix[..i].split('/') {
+        let mut comps = Path::new(segment).components();
+        let normal = matches!(
+            (comps.next(), comps.next()),
+            (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(segment)
+        );
+        if !normal {
+            return Ok(Scope::WholeRoot);
+        }
+        let entries = match fs::read_dir(&cur) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Scope::NoMatch),
+            Err(e) => return Err(e.into()),
+        };
+        let mut found = None;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() == std::ffi::OsStr::new(segment) {
+                found = Some(entry.path());
+                break;
+            }
+        }
+        match found {
+            Some(path) if path.is_dir() => cur = path,
+            _ => return Ok(Scope::NoMatch),
+        }
+    }
+    Ok(Scope::Dir(cur))
 }
 
 fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) -> CarrelResult<()> {
@@ -542,6 +594,10 @@ mod tests {
         for prefix in [
             "", "a", "a/", "a/b", "a/b/", "a/bc", "a/bc/", "a/bc/d", "ab", "ab/", "t", "top",
             "top/", "nope/", "a/nope/", "a//", "x/y/z",
+            // Segments that are not a single normal path component. On
+            // unix `C:` is an ordinary name, so there these only guard
+            // equality; on Windows they are what a naive join would escape by.
+            "C:/", "a/C:/", "C:/x", "a/./", "./a/",
         ] {
             let mut got = storage.list(prefix).unwrap();
             let mut want = list_by_whole_root_walk(&storage, prefix);
@@ -552,6 +608,31 @@ mod tests {
         // Guard against a vacuous oracle: the interesting prefixes are non-empty.
         assert_eq!(storage.list("a/bc/").unwrap().len(), 2);
         assert_eq!(storage.list("a/b").unwrap().len(), 3);
+    }
+
+    /// On a case-insensitive filesystem (macOS APFS, Windows) a differently
+    /// cased prefix must match nothing, exactly as the whole-root walk does
+    /// (its keys carry the on-disk spelling). Through `evict_book` a wrongly
+    /// matching prefix could delete another prefix's files. This fails
+    /// without the fix on macOS and passes trivially on case-sensitive Linux.
+    #[test]
+    fn scoped_list_is_case_exact_like_the_whole_root_walk() {
+        let (_d, storage) = temp_storage();
+        storage.put("page-cache/abc/0", b"").unwrap();
+        for prefix in [
+            "PAGE-CACHE/",
+            "page-cache/ABC/",
+            "Page-Cache/abc/",
+            "page-cache/abc/",
+        ] {
+            let mut got = storage.list(prefix).unwrap();
+            let mut want = list_by_whole_root_walk(&storage, prefix);
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "prefix {prefix:?}");
+        }
+        assert!(storage.list("PAGE-CACHE/").unwrap().is_empty());
+        assert_eq!(storage.list("page-cache/abc/").unwrap().len(), 1);
     }
 
     /// Proves the walk is scoped, not just that the filter is right: a

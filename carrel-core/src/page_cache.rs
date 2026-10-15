@@ -372,11 +372,13 @@ fn extract_comic_full(
     // Counted through `extract_comic_subset`'s existing per-page callback,
     // which fires immediately after each successful `put`. A failure with
     // this still at zero wrote nothing, and must not pay for a cleanup:
-    // `evict_book` lists the book's prefix, and `LocalStorage::list` walks
-    // the *whole* cache root before filtering. Without this guard a corrupt
-    // comic — or a permanently unwritable cache, where the very first `put`
-    // fails — would walk the entire cache on every request, and the web
-    // route's PIN is optional (M3 review round 8).
+    // `evict_book` lists the book's prefix (a per-book directory walk since
+    // `LocalStorage::list` was scoped to its prefix) and issues deletes.
+    // Without this guard a corrupt comic — or a permanently unwritable
+    // cache, where the very first `put` fails — would pay that listing plus
+    // delete attempts on every request, and the web route's PIN is optional
+    // (M3 review round 8). Before the listing was scoped the cost was a
+    // whole-cache walk.
     let mut written = 0usize;
     let extracted = (|| {
         let total_size =
@@ -394,8 +396,8 @@ fn extract_comic_full(
         // deliberate trade (M3 review round 9): this also skips reclaiming
         // any pre-existing manifest-less residue for the same hash, which a
         // cleanup here would have swept. Recovering someone else's residue
-        // is not worth one whole-cache walk per failed request on a route an
-        // unauthenticated LAN client can loop — and that residue is already
+        // is not worth a listing and delete attempts per failed request on a
+        // route an unauthenticated LAN client can loop — and that residue is already
         // outside the size budget either way.
         Err(e) if written == 0 => Err(e),
         Err(e) => {
@@ -723,10 +725,11 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
 /// nothing is at index 0 at all. That is what the listing fallback is for,
 /// and why it must not be deleted as redundant. The fallback is worth
 /// confining rather than defaulting to: `Storage::list` filters by prefix
-/// but the local implementation walks the whole storage root to build the
-/// list first, and that root is the entire app cache — exactly the
-/// "whole-cache stat storm on the book-open path" that
-/// [`complete_manifest`]'s doc comment above avoids for comics.
+/// the local implementation now walks only the directory the prefix names,
+/// so the cost is one book's directory rather than the entire app cache.
+/// It is still a directory walk plus a stat per page on the book-open path,
+/// which [`complete_manifest`]'s doc comment above avoids for comics, so
+/// the fallback stays confined to the case that needs it.
 pub fn pdf_manifest_page_count(storage: &dyn Storage, book_hash: &str) -> Option<u32> {
     let manifest = read_manifest(storage, book_hash)?;
     if manifest.format != BookFormat::Pdf || manifest.page_count == 0 {
@@ -2008,11 +2011,11 @@ mod tests {
     }
 
     /// M3 review round 8: a failure that wrote nothing must not pay for a
-    /// cleanup. `evict_book` lists the book's prefix, and
-    /// `LocalStorage::list` walks the whole cache root before filtering, so
-    /// cleaning up after a write that never landed would walk the entire
-    /// cache on every request — on a route an unauthenticated LAN client can
-    /// loop.
+    /// cleanup. `evict_book` lists the book's prefix (one per-book directory
+    /// walk now that `LocalStorage::list` is prefix-scoped; it used to be a
+    /// whole-cache walk), so cleaning up after a write that never landed
+    /// would still cost a listing plus delete attempts on every request — on
+    /// a route an unauthenticated LAN client can loop.
     ///
     /// Observed as the `list` count, because the visible outcome (an empty
     /// prefix) is the same whether or not the cleanup ran.

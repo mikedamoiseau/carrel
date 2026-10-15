@@ -48,9 +48,11 @@ Two separable pieces:
   which share `collect_image_names` with extraction, so the counts agree) on a
   cold miss only and returns the usual `NotFound` before extracting; that test
   became `out_of_range_page_on_a_cold_book_is_rejected_without_extracting`.
-  The desktop does not have this shape: `ensure_comic_fast` extracts page 0
-  plus whichever priority pages are in range and silently skips the rest, so an
-  out-of-range `start_page` never triggers a full extraction.
+  The desktop does not have this bug, for two other reasons: `prepare_comic`
+  extracts the whole book on open by design (page 0 and the resume page on the
+  fast path, then `extract_comic_remaining` for every other page in the
+  background), and its page reads use `OnMiss::ReadSource`, which never primes
+  the cache, so no page request can trigger an extraction.
 - **Books over budget.** Decide up front, from the archive's declared size,
   whether priming can survive the configured cap, and take the direct-decode
   path from the start instead of extract-then-evict. `ensure_cached` would
@@ -87,8 +89,9 @@ list before writing anything, so a corrupt CBZ or an unopenable CBR fails
 having written nothing at all. Firing there gave an unauthenticated LAN
 client a full-cache eviction walk per request against a single broken comic.
 Telling the two cases apart cheaply is not possible in that spot either:
-`Storage::list` walks the whole storage root, so probing on every error would
-cost more than the sweep it was guarding.
+`Storage::list` walked the whole storage root at the time, so probing on every
+error would cost more than the sweep it was guarding. (Since the backlog-sweep
+M3 it walks only the prefix's directory, so that probe is now cheap.)
 
 **Resolved in round 7, and the reasoning above was wrong twice over.**
 

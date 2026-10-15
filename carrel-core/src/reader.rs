@@ -514,8 +514,8 @@ pub enum OnMiss {
 /// the caller's budget, and a request that goes on to fail — a failed
 /// read-back, a resize error — has still put a whole archive on disk. (An
 /// out-of-range index on a cold comic no longer gets that far: it is
-/// rejected from the archive's page count before anything is extracted.) It fires on those paths too, including ones that
-/// return `Err`.
+/// rejected from the archive's page count before anything is extracted.)
+/// It fires on those paths too, including ones that return `Err`.
 ///
 /// A *failed* `ensure_cached` does not fire it, because that function
 /// cleans up after itself: a failure part-way through removes what it had
@@ -722,7 +722,12 @@ where
         // an extraction. The page count is read from the archive's directory
         // (`get_page_count` shares `collect_page_names`' entry filter and
         // sort, so it agrees with what extraction would write) and is far
-        // cheaper than extracting. A warm book skips this — its manifest
+        // cheaper than extracting. The price: a cold *in-range* miss now
+        // reads the entry list twice (here, then in extraction). On a NAS
+        // path — `file_path` stays the NAS path until a staged copy exists
+        // (see `web_server::resolve_book_path`) — that is one extra
+        // directory read (CBZ) or header walk (CBR), small next to the
+        // extraction it precedes. A warm book skips this — its manifest
         // already answers it — and a count that cannot be read falls through
         // to the existing path, whose own errors are unchanged. Nothing was
         // written, so the eviction hook does not fire.
@@ -833,10 +838,10 @@ where
         // motivated it was an out-of-range page of a cold book, which the
         // page-count pre-check above now rejects before extracting; what
         // still reaches here is a book evicted between extract and read-back
-        // or an unreadable page, with the archive on disk. Firing before the direct decode
-        // rather than after, so a decode that also fails still sweeps; the
-        // decode reads the archive, not the cache, so eviction cannot take
-        // its bytes away.
+        // or an unreadable page, with the archive on disk. Firing before the
+        // direct decode rather than after, so a decode that also fails still
+        // sweeps; the decode reads the archive, not the cache, so eviction
+        // cannot take its bytes away.
         // Timed and subtracted for the same reason the success path above
         // does it: the web adapter runs `run_eviction` inline in this
         // callback, and the desktop `[page-load]` lines this number is

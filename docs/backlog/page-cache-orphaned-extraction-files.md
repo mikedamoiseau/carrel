@@ -1,6 +1,18 @@
 # Reclaim page files left behind by a failed comic extraction
 
-**Status:** open (noted 2026-08-26, during the M1 comic-page-reads review).
+**Status:** fixed except for one gap (noted 2026-08-26, during the M1
+comic-page-reads review).
+
+> **Fixed:** `extract_comic_full` (`carrel-core/src/page_cache.rs`) now cleans
+> up its own partial writes on failure — the "cleanup-on-error" option below —
+> added in an earlier epic (M3 review round 7; pinned by
+> `a_failed_extraction_leaves_nothing_behind`). **Remaining gap:** the cleanup
+> is best effort; if it fails for the same reason the write did (a full disk),
+> manifest-less pages persist until `clear_cache`, and fixing that needs an
+> in-flight marker. That residue is tracked in
+> `priming-an-over-budget-comic-rerents-every-request.md` ("Related: a
+> partially-written extraction is not swept promptly"). The text below is the
+> original write-up.
 
 ## What
 
