@@ -13,6 +13,47 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   still authenticated, so an attacker on the network cannot alter or complete
   a handshake; a server could only send messages in plaintext that should have
   been encrypted without the connection being rejected.
+- **`rustls` 0.23.45 → 0.23.46, clearing RUSTSEC-2026-0346, -0347, -0348 and
+  -0349.** The worst of the four lets a server make the client allocate up to
+  1 GiB while decompressing a brotli-compressed certificate, before the
+  certificate is authenticated. The others are a TLS secret printable through
+  a client session's `Debug` output (Carrel never logs these), application
+  data sent to the outer server after an ECH rejection (Carrel does not use
+  ECH), and a downgrade of later connections to classical key exchange by an
+  unauthenticated ServerHello.
+- **`quinn-proto` 0.11.17 → 0.11.19, clearing RUSTSEC-2026-0338, -0340 and
+  -0343.** Three ways for a QUIC peer to panic the connection. Not reachable:
+  `quinn-proto` is in `Cargo.lock` only as an optional `reqwest` dependency
+  and is not compiled into the app (`cargo tree -i quinn-proto` is empty), but
+  `cargo audit` reads the lockfile, so it failed the Advisories gate.
+- **`ammonia` 4.1.4 → 4.2.3, clearing RUSTSEC-2021-0157 and RUSTSEC-2021-0158.**
+  `ammonia` is the server-side EPUB sanitizer. The advisories cover SVG
+  `animateMotion`/`animateTransform`/`animateColor` tags carrying
+  `javascript:` URLs, and unescaped quotes in CSS `url()` inside `style`
+  attributes. Neither was reachable: Carrel uses ammonia's default policy,
+  which allows none of those tags and no `style` attribute.
+- **`dompurify` 3.4.12 → 3.4.17, clearing GHSA-55q2-fjhq-7xh7 and
+  GHSA-6688-9rhm-gjv2.** Both affect only DOMPurify's `IN_PLACE` mode. The
+  desktop reader's client-side sanitizer returns a new string instead, so
+  neither applied.
+- **`react-router-dom` 7.13 → 7.18, clearing eleven React Router advisories.**
+  Almost all of them concern server rendering, single-fetch, RSC and the
+  `__manifest` endpoint, none of which a client-only desktop app uses. The
+  ones that touch client code are open redirects via `<Link>`/`useNavigate`,
+  which need an attacker-controlled path.
+- **Build and test tooling updated, clearing the rest of `pnpm audit`.**
+  `vite` 7.3.7, `vitest` 4.1.11, and their transitive `postcss`, `nanoid`,
+  `esbuild`, `browserslist`, `source-map-js`, `undici` and `@babel/core`.
+  None of these ship in the app. `pnpm audit` and `cargo audit` now both
+  report zero vulnerabilities.
+
+### Changed
+- **Tauri 2.10 → 2.12.** The Rust crates (`tauri` 2.12.4, `wry` 0.57,
+  `tao` 0.37) and the JS side (`@tauri-apps/api` 2.12.4, `@tauri-apps/cli`
+  2.12.3) move together, along with the opener, dialog, clipboard,
+  notification, autostart and fs plugins. Other in-range dependency updates:
+  React 19.3, i18next 26.4, Playwright 1.64, Tailwind 4.3. The yanked
+  `chacha20` 0.10.0 is replaced by 0.10.2.
 
 ### Fixed
 - **Web UI: home-screen icon and favicon now show the Carrel mark.** The
