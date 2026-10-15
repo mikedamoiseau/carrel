@@ -24,6 +24,10 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   manual collection in the same second, or imported in the same second into an
   automated one) now keep a consistent order instead of shuffling between
   loads.
+- **A bogus page number on a big comic no longer extracts the whole comic.**
+  Requesting a page past the end of a not-yet-cached CBZ/CBR through the web
+  reader used to unpack the entire archive before answering "not found"; it
+  now answers from the archive's page count.
 
 ## [3.2.2] - 2026-10-15
 

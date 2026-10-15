@@ -511,9 +511,10 @@ pub enum OnMiss {
 /// Whether the page then read back successfully is deliberately not part of
 /// the condition (M3 review round 4). `ensure_cached` has no size cap of its
 /// own, so this callback is the only thing bounding what it wrote against
-/// the caller's budget, and a request that goes on to fail — an
-/// out-of-range index, a failed read-back, a resize error — has still put a
-/// whole archive on disk. It fires on those paths too, including ones that
+/// the caller's budget, and a request that goes on to fail — a failed
+/// read-back, a resize error — has still put a whole archive on disk. (An
+/// out-of-range index on a cold comic no longer gets that far: it is
+/// rejected from the archive's page count before anything is extracted.) It fires on those paths too, including ones that
 /// return `Err`.
 ///
 /// A *failed* `ensure_cached` does not fire it, because that function
@@ -717,6 +718,28 @@ where
         // because nothing was written — while still letting the degrade path
         // below fire it when an extraction really did happen.
         let extracted = page_cache::complete_manifest(pages, hash).is_none();
+        // Cold: reject an index the archive cannot satisfy before paying for
+        // an extraction. The page count is read from the archive's directory
+        // (`get_page_count` shares `collect_page_names`' entry filter and
+        // sort, so it agrees with what extraction would write) and is far
+        // cheaper than extracting. A warm book skips this — its manifest
+        // already answers it — and a count that cannot be read falls through
+        // to the existing path, whose own errors are unchanged. Nothing was
+        // written, so the eviction hook does not fire.
+        if extracted {
+            let count = if format == BookFormat::Cbz {
+                crate::cbz::get_page_count(file_path)
+            } else {
+                crate::cbr::get_page_count(file_path)
+            };
+            if let Ok(total) = count {
+                if page_index >= total {
+                    return Err(CarrelError::not_found(format!(
+                        "Page index {page_index} out of range (total pages: {total})"
+                    )));
+                }
+            }
+        }
         // A failing `ensure_cached` degrades to a direct decode rather than
         // failing the request (M3 review round 6). Its errors are not all
         // about the archive: a full disk, an unwritable `Storage`, a failed
@@ -806,10 +829,11 @@ where
         // it backwards: `ensure_cached` has no size cap of its own, so if it
         // just wrote a whole archive to disk, this callback is the only thing
         // bounding that write against `page_cache_max_size_mb` — and the
-        // read-back failing is no reason to leave it unbounded. The reachable
-        // case is an out-of-range page of a cold book: extract 800 MB, fail
-        // the read-back, degrade, error — with the archive on disk and, until
-        // this fix, nothing sweeping it. Firing before the direct decode
+        // read-back failing is no reason to leave it unbounded. The case that
+        // motivated it was an out-of-range page of a cold book, which the
+        // page-count pre-check above now rejects before extracting; what
+        // still reaches here is a book evicted between extract and read-back
+        // or an unreadable page, with the archive on disk. Firing before the direct decode
         // rather than after, so a decode that also fails still sweeps; the
         // decode reads the archive, not the cache, so eviction cannot take
         // its bytes away.
@@ -1685,27 +1709,21 @@ mod tests {
         );
     }
 
-    /// M3 review round 4: the mirror of F7 below. An out-of-range page of a
-    /// *cold* book DOES fire the eviction hook, because `ensure_cached` just
-    /// wrote the whole archive to disk before the read-back failed, and this
-    /// callback is the only thing that bounds that write against
-    /// `page_cache_max_size_mb` — `ensure_cached` has no size cap of its own.
-    ///
-    /// Without it, `GET /books/{id}/pages/999` on a cold 800 MB comic
-    /// extracts the archive, errors, and leaves it on disk unswept; repeated
-    /// across books that grows the cache past its budget with nothing
-    /// reclaiming it. Together with F7 this pins the actual rule: fire iff an
-    /// extraction really happened, regardless of whether the read-back after
-    /// it succeeded.
+    /// An out-of-range page of a *cold* comic is rejected from the archive's
+    /// page count, before anything is extracted. Previously the miss primed
+    /// the whole archive (800 MB for a big comic) and only then found the
+    /// index invalid, so `GET /books/{id}/pages/999` cost a full extraction.
+    /// With no extraction there is nothing written and so nothing to sweep:
+    /// the eviction hook must not fire, and the cache must hold nothing for
+    /// this hash. (This inverts the M3 round-4 rule, which only existed
+    /// because the extraction had already happened.)
     #[test]
-    fn out_of_range_page_on_a_cold_book_still_fires_on_extracted() {
+    fn out_of_range_page_on_a_cold_book_is_rejected_without_extracting() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_cbz(dir.path(), &[encode_jpeg(10, 10), encode_jpeg(10, 10)]);
         let pages = pages_storage(dir.path());
         let calls = std::cell::Cell::new(0);
 
-        // Cold: nothing cached yet, so the miss primes the whole archive and
-        // only then discovers the page index is out of range.
         let err = page_image(
             BookFormat::Cbz,
             &path,
@@ -1722,14 +1740,70 @@ mod tests {
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
 
         assert!(
-            page_cache::complete_manifest(&pages, "hash-cold-oor").is_some(),
-            "the archive really was extracted, or this test proves nothing"
+            pages.list("").unwrap().is_empty(),
+            "nothing may be written to the cache for a rejected index"
         );
+        assert_eq!(calls.get(), 0, "no extraction, so nothing to sweep");
+    }
+
+    /// The pre-check's page count must come from the same entry filter that
+    /// extraction uses, or a valid page of a cold comic would be rejected.
+    /// This archive carries a directory entry, `ComicInfo.xml`, and
+    /// `__MACOSX/` junk (including a fake image) around two real pages: the
+    /// last real page must still be served cold, and the first index past it
+    /// rejected without extraction.
+    #[test]
+    fn cold_range_check_agrees_with_extraction_on_archives_with_non_page_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("junk.cbz");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.add_directory("pages/", opts).unwrap();
+            zip.start_file("ComicInfo.xml", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"<ComicInfo/>").unwrap();
+            zip.start_file("__MACOSX/pages/._p1.jpg", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"junk").unwrap();
+            for name in ["pages/p1.jpg", "pages/p2.jpg"] {
+                zip.start_file(name, opts).unwrap();
+                std::io::Write::write_all(&mut zip, &encode_jpeg(10, 10)).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let path = path.to_string_lossy().into_owned();
+        let pages = pages_storage(dir.path());
+
+        let read = |idx: u32, hash: &str| {
+            page_image(
+                BookFormat::Cbz,
+                &path,
+                idx,
+                None,
+                "bk",
+                Some(hash),
+                Some(&pages),
+                || {},
+                false,
+                OnMiss::Prime,
+            )
+        };
+
+        let err = read(2, "hash-junk-oor").unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+        assert!(
+            page_cache::complete_manifest(&pages, "hash-junk-oor").is_none(),
+            "index 2 is past the two real pages and must not extract"
+        );
+
+        let (bytes, _) = read(1, "hash-junk-last").expect("last real page must be served cold");
+        assert!(!bytes.is_empty());
         assert_eq!(
-            calls.get(),
-            1,
-            "a real extraction must fire the eviction hook even though the \
-             read-back failed — nothing else bounds what it just wrote"
+            page_cache::complete_manifest(&pages, "hash-junk-last")
+                .unwrap()
+                .page_count,
+            2,
+            "extraction and the pre-check must agree on the page count"
         );
     }
 

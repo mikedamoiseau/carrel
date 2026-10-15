@@ -240,8 +240,23 @@ impl Storage for LocalStorage {
                 "list prefix contains traversal segment: {prefix}"
             )));
         }
+        // Walk only the deepest directory the prefix names in full — the
+        // part up to and including its last `/` — rather than the whole
+        // root, then apply the same starts-with filter. Keys stay relative
+        // to `self.root`, so the output is identical to a whole-root walk.
+        let mut start = self.root.clone();
+        if let Some(i) = prefix.rfind('/') {
+            for segment in prefix[..i].split('/') {
+                start.push(segment);
+            }
+            // A prefix running through a file (`a/b/` when `a/b` is a file)
+            // or a missing directory matches nothing, as it always did.
+            if !start.is_dir() {
+                return Ok(Vec::new());
+            }
+        }
         let mut out = Vec::new();
-        walk(&self.root, &self.root, &mut out)?;
+        walk(&self.root, &start, &mut out)?;
         if !prefix.is_empty() {
             out.retain(|k| k.starts_with(prefix));
         }
@@ -505,6 +520,64 @@ mod tests {
     fn list_empty_storage_returns_empty_vec() {
         let (_d, storage) = temp_storage();
         assert!(storage.list("").unwrap().is_empty());
+    }
+
+    /// The pre-scoping algorithm, kept as the oracle: walk the whole root,
+    /// then filter. `list` must return exactly this for every prefix.
+    fn list_by_whole_root_walk(storage: &LocalStorage, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(storage.root(), storage.root(), &mut out).unwrap();
+        out.retain(|k| k.starts_with(prefix));
+        out
+    }
+
+    #[test]
+    fn scoped_list_matches_the_whole_root_walk_for_every_prefix_shape() {
+        let (_d, storage) = temp_storage();
+        // Names that share prefixes at every level: `a/b` is a file while
+        // `a/bc` is a directory, `ab` is a sibling directory of `a`.
+        for key in ["top", "a/b", "a/bc/x", "a/bc/deep/z", "a/c", "ab/y"] {
+            storage.put(key, b"").unwrap();
+        }
+        for prefix in [
+            "", "a", "a/", "a/b", "a/b/", "a/bc", "a/bc/", "a/bc/d", "ab", "ab/", "t", "top",
+            "top/", "nope/", "a/nope/", "a//", "x/y/z",
+        ] {
+            let mut got = storage.list(prefix).unwrap();
+            let mut want = list_by_whole_root_walk(&storage, prefix);
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "prefix {prefix:?}");
+        }
+        // Guard against a vacuous oracle: the interesting prefixes are non-empty.
+        assert_eq!(storage.list("a/bc/").unwrap().len(), 2);
+        assert_eq!(storage.list("a/b").unwrap().len(), 3);
+    }
+
+    /// Proves the walk is scoped, not just that the filter is right: a
+    /// sibling directory the process cannot read would make a whole-root
+    /// walk fail, so listing a different book's prefix succeeding shows the
+    /// sibling was never entered.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_list_never_enters_unrelated_sibling_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, storage) = temp_storage();
+        storage.put("page-cache/abc/0", b"").unwrap();
+        storage.put("page-cache/other/0", b"").unwrap();
+        let locked = storage.root().join("page-cache/other");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let unreadable = fs::read_dir(&locked).is_err();
+        let result = storage.list("page-cache/abc/");
+        // Restore so TempDir can clean up, before any assertion can panic.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !unreadable {
+            return; // running as root: permissions do not bite, test is moot
+        }
+        assert_eq!(result.unwrap(), vec!["page-cache/abc/0".to_string()]);
     }
 
     // --- put_path ---
