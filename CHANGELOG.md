@@ -11,6 +11,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   grows without limit.
 
 ### Fixed
+- **"Don't track this session" now covers comics and network-mounted books.**
+  With it on, opening a CBZ/CBR no longer extracts its pages into the page
+  cache or records it there (pages are read straight from the file, in the
+  desktop app and the web reader alike), and opening a PDF or comic from a
+  network share no longer copies it to this computer or refreshes an existing
+  copy. Pages and copies saved earlier are still used.
 - **The web reader no longer re-extracts a comic that is larger than the page
   cache limit on every page.** A comic bigger than the "page cache size"
   setting was unpacked and then thrown away again for each page you turned;

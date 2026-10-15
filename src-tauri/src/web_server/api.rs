@@ -1357,10 +1357,20 @@ async fn get_page_image(
     // it's cheap once staged (local check + LRU touch) and deduped while a copy
     // is in flight. Only the page-image formats below reach a per-page render
     // over the (possibly remote) file, so gate the trigger to them.
-    if matches!(
-        book.format,
-        BookFormat::Pdf | BookFormat::Cbz | BookFormat::Cbr
-    ) {
+    //
+    // Private mode (M5) skips it: staging creates, and the touch bumps, a file
+    // in the source cache whose mtime is a durable record that the book was
+    // read. `resolve_book_path` above still picks up a copy that already
+    // exists (existence check only, no write), so a private read of a staged
+    // book is served locally; an unstaged remote one is read in place.
+    // Read once per request and shared with the format arms below.
+    let is_private = state.is_private();
+    if !is_private
+        && matches!(
+            book.format,
+            BookFormat::Pdf | BookFormat::Cbz | BookFormat::Cbr
+        )
+    {
         crate::commands::ensure_web_source_staged(&state.cache_dir, &book, &file_path);
     }
 
@@ -1394,7 +1404,6 @@ async fn get_page_image(
             };
             let book_id = id.clone();
             let file_hash = book.file_hash.clone();
-            let is_private = state.is_private();
             let (bytes, mime) = tokio::task::spawn_blocking(move || {
                 let evict_storage = pages_storage.clone();
                 carrel_core::reader::page_image(
@@ -1527,12 +1536,7 @@ async fn get_page_image(
                             log::warn!("comic page-cache eviction failed: {e}");
                         }
                     },
-                    // Comics do not yet consult private mode (tracked in
-                    // `docs/backlog/comic-cache-ignores-private-mode.md`) —
-                    // hardcoded rather than wired to `state.is_private()`
-                    // so fixing that gap later is a deliberate, reviewed
-                    // change, not an accidental side effect of this one.
-                    false,
+                    is_private,
                     // The web reader has no book-open event of its own — a
                     // miss must prime the whole archive itself, or a book
                     // never gets cached at all — unless the book cannot fit
@@ -3190,6 +3194,98 @@ mod tests {
         let storage = state.pages_storage().unwrap();
         assert!(
             carrel_core::page_cache::read_manifest(storage.as_ref(), "comic-hash-big").is_none()
+        );
+    }
+
+    /// M5: with private mode on, a cold comic page is served but nothing is
+    /// recorded in the page cache — no page files, no manifest. Read off the
+    /// disk: priming creates `page-cache/{hash}/`. Pins that the route wires
+    /// `state.is_private()` rather than a hardcoded `false`.
+    #[tokio::test]
+    async fn web_comic_private_mode_cold_read_writes_no_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        state
+            .private_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-comic-private", &cbz, Some("comic-hash-private"));
+
+        let bytes = read_comic_page(&state, "bk-comic-private", 0).await;
+        assert!(!bytes.is_empty(), "private mode must still serve the page");
+
+        assert!(
+            !state
+                .cache_dir
+                .join("page-cache/comic-hash-private")
+                .exists(),
+            "a private comic read must not create a page-cache entry"
+        );
+    }
+
+    /// Backdated staged copy of `comic.cbz` for `hash` under `state`'s
+    /// source cache, plus its fixed old mtime.
+    fn seed_backdated_staged_copy(
+        state: &WebState,
+        src: &std::path::Path,
+        hash: &str,
+    ) -> (std::path::PathBuf, std::time::SystemTime) {
+        let staged = carrel_core::source_cache::stage(&state.cache_dir, src, hash, "cbz").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        (staged, old)
+    }
+
+    /// M5: the source-staging touch is a durable on-disk record that the book
+    /// was read (the copy's mtime), so a private page request must leave an
+    /// existing staged copy's mtime alone. Reading *from* the copy is fine.
+    #[tokio::test]
+    async fn web_private_mode_page_read_does_not_touch_the_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        state
+            .private_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(
+            &state,
+            "bk-staged-private",
+            &cbz,
+            Some("staged-hash-private"),
+        );
+        let (staged, old) = seed_backdated_staged_copy(&state, &cbz, "staged-hash-private");
+
+        let bytes = read_comic_page(&state, "bk-staged-private", 0).await;
+        assert!(!bytes.is_empty());
+
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().modified().unwrap(),
+            old,
+            "private mode must not bump the staged copy's mtime"
+        );
+    }
+
+    /// Control for the test above: with private mode off the same request
+    /// does bump the staged copy (unchanged behaviour), so the private test
+    /// cannot pass merely because the touch never happens on this route.
+    #[tokio::test]
+    async fn web_non_private_page_read_still_touches_the_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-staged-public", &cbz, Some("staged-hash-public"));
+        let (staged, old) = seed_backdated_staged_copy(&state, &cbz, "staged-hash-public");
+
+        read_comic_page(&state, "bk-staged-public", 0).await;
+
+        assert!(
+            std::fs::metadata(&staged).unwrap().modified().unwrap() > old,
+            "a non-private read keeps bumping the staged copy's LRU mtime"
         );
     }
 

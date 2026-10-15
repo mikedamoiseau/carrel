@@ -1,6 +1,34 @@
 # Comic page-cache writes don't consult private mode
 
-**Status:** open (noted 2026-08-26, during the M1 comic-page-reads review).
+**Status:** FIXED (backlog-sweep M5). Noted 2026-08-26, during the M1
+comic-page-reads review.
+
+> **Resolution.** Private mode now *serves* comics but records nothing, the
+> same as PDF, on both surfaces together:
+>
+> - `carrel_core::reader::page_image`'s comic arm honours `is_private`: a
+>   private miss decodes the one page straight from the archive (never primes,
+>   no manifest, `on_extracted` does not fire); a page already cached by a
+>   non-private read is still served, and, like PDF's cached-page hit, a
+>   private hit does not refresh `last_accessed`.
+> - Web `get_page_image` passes `state.is_private()` instead of a hardcoded
+>   `false`.
+> - Desktop `get_comic_page_bytes` passes `is_private`; `prepare_comic` in
+>   private mode skips `ensure_comic_fast` and the background
+>   `extract_comic_remaining` pass and returns a manifest built without
+>   writing anything (page count from the archive, or a complete existing
+>   manifest read-only).
+> - Source staging (see "Related" below) is skipped in private mode: the web
+>   page route no longer calls `ensure_web_source_staged`, and
+>   `prepare_comic` / `prepare_pdf` no longer touch or stage the source, so no
+>   staged copy is created and no existing one has its mtime bumped. An
+>   existing staged copy is still *read* (`resolve_book_path` only checks for
+>   it). This also covers PDF, which shares the staging calls.
+>
+> Not changed: desktop `prepare_pdf` still writes its zero-page manifest
+> unconditionally in private mode (pre-existing, outside this item).
+>
+> The text below is the original analysis, kept as written.
 
 ## What
 

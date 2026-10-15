@@ -2557,11 +2557,9 @@ pub async fn get_comic_page_bytes(
 
     // `reader::page_image` accepts PDF as well as CBZ/CBR, so it cannot be
     // this command's format guard (M3 review, finding 1). Without one, a PDF
-    // passed to the *comic* command would reach the PDF arm carrying this
-    // call site's hardcoded `is_private = false` — correct for comics, which
-    // have no private-mode plumbing yet, but it would write rendered pages to
-    // the shared cache during a private session, the exact write
-    // `get_pdf_page_bytes` suppresses. The frontend dispatches on format and
+    // passed to the *comic* command would reach the PDF arm, whose cache
+    // behaviour (a manifest, rendered pages) is `get_pdf_page_bytes`'s to
+    // decide, not this command's. The frontend dispatches on format and
     // never does this; these are public IPC commands, so the guard the
     // pre-M3 inline `match` provided has to stay somewhere.
     //
@@ -2611,6 +2609,8 @@ pub async fn get_comic_page_bytes(
     // including the page the user is actually waiting on).
     let book_hash = book.file_hash.clone();
     let format = book.format;
+    // Read once per request (see `AppState::is_private`).
+    let is_private = state.is_private();
     let (bytes, mime) =
         tauri::async_runtime::spawn_blocking(move || -> CarrelResult<(Vec<u8>, String)> {
             // An unopenable cache directory must cost the cache, not the
@@ -2630,9 +2630,7 @@ pub async fn get_comic_page_bytes(
                 // `prepare_comic`'s and its background
                 // `extract_comic_remaining` pass's job, not this command's.
                 || {},
-                // Comics do not yet consult private mode (tracked in
-                // docs/backlog/comic-cache-ignores-private-mode.md).
-                false,
+                is_private,
                 // Desktop: `prepare_comic` (book-open) and its background
                 // prerender pass own priming. This foreground page read must
                 // only ever read what's already there, or read the one page
@@ -2827,6 +2825,59 @@ pub(crate) fn ensure_web_source_staged(cache_dir: &std::path::Path, book: &Book,
     stage_remote_source_in_background(cache_dir.to_path_buf(), book, real_path);
 }
 
+/// Desktop book-open staging (`prepare_comic` / `prepare_pdf`): mark an
+/// existing staged copy most-recently-used and stage a network-mounted source
+/// in the background. Both leave a durable record in the source cache (a new
+/// copy, or a bumped mtime), so private mode (`is_private`, read once by the
+/// caller) skips them entirely. Reading from an already-staged copy is
+/// unaffected: `resolve_book_path` has resolved it before this is called.
+pub(crate) fn stage_source_on_open(
+    cache_dir: &std::path::Path,
+    book: &Book,
+    real_path: &str,
+    is_private: bool,
+) {
+    if is_private {
+        return;
+    }
+    touch_staged_book(cache_dir, book);
+    stage_remote_source_in_background(cache_dir.to_path_buf(), book, real_path);
+}
+
+/// What `prepare_comic` returns in private mode: the same manifest shape, but
+/// built without writing a page or a manifest. A complete manifest left by a
+/// non-private open is returned as it is (read-only); otherwise the page count
+/// comes from the archive directory and `pages` is empty. (The frontend
+/// ignores the return value; the shape is the command's contract.)
+pub(crate) fn private_comic_manifest(
+    storage: &dyn Storage,
+    book_id: &str,
+    book_hash: &str,
+    file_path: &str,
+    format: &BookFormat,
+) -> CarrelResult<page_cache::CacheManifest> {
+    if let Some(m) = page_cache::complete_manifest(storage, book_hash) {
+        return Ok(m);
+    }
+    let page_count = if *format == BookFormat::Cbz {
+        carrel_core::cbz::get_page_count(file_path)?
+    } else {
+        carrel_core::cbr::get_page_count(file_path)?
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    Ok(page_cache::CacheManifest {
+        book_id: book_id.to_string(),
+        book_hash: book_hash.to_string(),
+        page_count,
+        total_size_bytes: 0,
+        extracted_at: now.clone(),
+        last_accessed: now,
+        pages: Vec::new(),
+        format: format.clone(),
+        canonical_width: None,
+    })
+}
+
 #[tauri::command]
 pub async fn prepare_comic(
     book_id: String,
@@ -2860,11 +2911,19 @@ pub async fn prepare_comic(
     // a network-mounted source to local disk on open (background, non-blocking)
     // so page reads stop hitting the share at render time. After the format
     // check so a wrong-format call can't launch a large copy.
-    touch_staged_book(&state.cache_dir, &book);
-    stage_remote_source_in_background(state.cache_dir.clone(), &book, &file_path);
+    // Private mode (M5) neither touches nor stages the source; read once.
+    let is_private = state.is_private();
+    stage_source_on_open(&state.cache_dir, &book, &file_path, is_private);
 
     let book_hash = book.file_hash.as_deref().ok_or("Book has no file hash")?;
     let storage = page_cache_storage(&app)?;
+
+    // Private mode: no page extraction, no manifest, no background pass (so
+    // no eviction either: nothing was written). Pages are then served by
+    // `get_comic_page_bytes`, which also never writes while private.
+    if is_private {
+        return private_comic_manifest(&storage, &book_id, book_hash, &file_path, &book.format);
+    }
 
     // F-4-1 fast path: extract only page 0 (plus the resume page, if the
     // caller opened mid-book) and return immediately so the reader can paint.
@@ -3004,8 +3063,7 @@ pub async fn prepare_pdf(
     // a network-mounted source to local disk on open (background, non-blocking)
     // so page reads stop hitting the share at render time. After the format
     // check so a wrong-format call can't launch a large copy.
-    touch_staged_book(&state.cache_dir, &book);
-    stage_remote_source_in_background(state.cache_dir.clone(), &book, &file_path);
+    stage_source_on_open(&state.cache_dir, &book, &file_path, state.is_private());
     let book_hash = book
         .file_hash
         .as_deref()
@@ -12271,6 +12329,128 @@ mod tests {
         // A book with no hash is a no-op (guards the early return).
         book.file_hash = None;
         ensure_web_source_staged(cache.path(), &book, "/bogus/remote/c.pdf");
+    }
+
+    fn staging_test_book(path: &str, hash: &str, format: BookFormat) -> Book {
+        Book {
+            id: "stage-m5".to_string(),
+            title: "M5".to_string(),
+            author: String::new(),
+            file_path: path.to_string(),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 0,
+            format,
+            file_hash: Some(hash.to_string()),
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: None,
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: false,
+            want_to_read: false,
+        }
+    }
+
+    /// Backdate a staged copy's mtime and return that fixed instant.
+    fn backdate(path: &std::path::Path) -> std::time::SystemTime {
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        old
+    }
+
+    /// M5: desktop open must not bump an existing staged copy's mtime in
+    /// private mode (a durable "this book was opened" record), and must keep
+    /// doing so otherwise. Covers `prepare_comic` and `prepare_pdf`, which
+    /// share this helper.
+    #[test]
+    fn stage_source_on_open_touches_only_when_not_private() {
+        let cache = tempfile::tempdir().unwrap();
+        let srcdir = tempfile::tempdir().unwrap();
+        let src = srcdir.path().join("c.pdf");
+        std::fs::write(&src, b"staged bytes").unwrap();
+        let staged = carrel_core::source_cache::stage(cache.path(), &src, "m5hash", "pdf").unwrap();
+        let old = backdate(&staged);
+        let book = staging_test_book("/Volumes/remote/c.pdf", "m5hash", BookFormat::Pdf);
+
+        stage_source_on_open(cache.path(), &book, "/bogus/c.pdf", true);
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().modified().unwrap(),
+            old,
+            "private open must not bump the staged copy"
+        );
+
+        stage_source_on_open(cache.path(), &book, "/bogus/c.pdf", false);
+        assert!(
+            std::fs::metadata(&staged).unwrap().modified().unwrap() > old,
+            "a normal open keeps bumping the staged copy"
+        );
+    }
+
+    fn write_test_cbz(dir: &std::path::Path, pages: usize) -> String {
+        let path = dir.join("m5.cbz");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for i in 0..pages {
+            zip.start_file(format!("page{i:02}.jpg"), opts).unwrap();
+            std::io::Write::write_all(&mut zip, &[0xABu8; 64]).unwrap();
+        }
+        zip.finish().unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// M5: a private `prepare_comic` returns the real page count but writes
+    /// neither pages nor a manifest.
+    #[test]
+    fn private_comic_manifest_reports_page_count_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_cbz(dir.path(), 3);
+        let storage = carrel_core::storage::LocalStorage::new(dir.path().join("cache")).unwrap();
+
+        let m =
+            private_comic_manifest(&storage, "bk", "m5-private", &path, &BookFormat::Cbz).unwrap();
+
+        assert_eq!(m.page_count, 3);
+        assert!(page_cache::read_manifest(&storage, "m5-private").is_none());
+        assert!(
+            storage.list("page-cache/m5-private/").unwrap().is_empty(),
+            "a private open must not extract pages"
+        );
+    }
+
+    /// M5: a complete manifest from an earlier non-private open is returned
+    /// unchanged and not rewritten (`last_accessed` stays put).
+    #[test]
+    fn private_comic_manifest_reuses_an_existing_complete_manifest_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_cbz(dir.path(), 2);
+        let storage = carrel_core::storage::LocalStorage::new(dir.path().join("cache")).unwrap();
+        let primed =
+            page_cache::ensure_cached(&storage, "bk", "m5-warm", &path, &BookFormat::Cbz).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let m = private_comic_manifest(&storage, "bk", "m5-warm", &path, &BookFormat::Cbz).unwrap();
+
+        assert_eq!(m.page_count, 2);
+        assert_eq!(m.pages, primed.pages);
+        assert_eq!(
+            page_cache::read_manifest(&storage, "m5-warm")
+                .unwrap()
+                .last_accessed,
+            primed.last_accessed,
+            "a private open must not rewrite the manifest"
+        );
     }
 
     #[test]

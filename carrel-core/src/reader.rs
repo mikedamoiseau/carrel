@@ -575,9 +575,11 @@ pub enum OnMiss {
 /// [`page_cache::get_or_render_pdf_page_with_eviction`]'s `suppress_write`,
 /// matching `commands::get_pdf_page_bytes`'s desktop behaviour, and for one
 /// with no entry yet it declines to create it at all.
-/// Comics ignore it: there is no equivalent write-suppression path for
-/// CBZ/CBR yet (tracked in
-/// `docs/backlog/comic-cache-ignores-private-mode.md`).
+/// For a comic (M5) a private read never primes: a miss is decoded straight
+/// from the archive (as with [`OnMiss::ReadSource`]), no manifest or page is
+/// written and `on_extracted` does not fire. A page already cached by a
+/// non-private read is still served, and, like PDF's cached-page hit, the
+/// private hit does not refresh `last_accessed`.
 ///
 /// `on_miss` (M3) is what makes this one function usable by both surfaces
 /// despite their different book-open behaviour — see [`OnMiss`]'s doc
@@ -644,7 +646,12 @@ where
             // even while it's the one actively being read. Page turns
             // happen at human speed, so a manifest write per hit is cheap
             // enough not to need throttling.
-            page_cache::touch_last_accessed(pages, hash);
+            // Private mode (M5) serves the hit but leaves the manifest
+            // alone, like PDF's cached-page hit, which returns before it
+            // ever touches the manifest.
+            if !is_private {
+                page_cache::touch_last_accessed(pages, hash);
+            }
             let (bytes, out_mime) =
                 crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
             page_cache::page_dbg!(
@@ -656,7 +663,10 @@ where
             return Ok((bytes, out_mime));
         }
 
-        if on_miss == OnMiss::ReadSource {
+        // Private mode never primes (M5): priming writes every page plus a
+        // manifest recording `book_id` and `last_accessed`. Same path as a
+        // `ReadSource` miss — decode the one page, leave the cache as it was.
+        if on_miss == OnMiss::ReadSource || is_private {
             // Desktop: priming is `prepare_comic`'s and its background
             // `extract_comic_remaining` pass's job, not this call's — see
             // [`OnMiss`]. (The web adapter also lands here, deliberately,
@@ -2034,6 +2044,129 @@ mod tests {
         assert!(
             after > before,
             "a cache hit must move last_accessed forward: before={before} after={after}"
+        );
+    }
+
+    /// M5: a private cold read of a comic is served but never primes the
+    /// cache — no pages, no manifest (which records `book_id` and a
+    /// `last_accessed`), and no eviction hook, since nothing was written.
+    /// Matches the PDF arm. With the `is_private` check removed this primes
+    /// the whole archive, so the manifest and the hook assertions fail.
+    #[test]
+    fn a_private_cold_comic_read_is_served_without_touching_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50), encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+        let calls = std::cell::Cell::new(0);
+
+        let (bytes, mime) = page_image(
+            BookFormat::Cbz,
+            &path,
+            1,
+            None,
+            "bk",
+            Some("hash-private-cold"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            true,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
+
+        assert!(page_cache::read_manifest(&pages, "hash-private-cold").is_none());
+        let entries = pages.list("page-cache/hash-private-cold/").unwrap();
+        assert!(entries.is_empty(), "private read wrote: {entries:?}");
+        assert_eq!(calls.get(), 0, "nothing was written, nothing to evict");
+    }
+
+    /// M5: a book already cached by a non-private read still serves from
+    /// the cache in private mode (the source is deleted to prove it), and —
+    /// matching PDF's cached-page hit, which returns before touching the
+    /// manifest — the private hit does not bump `last_accessed`.
+    #[test]
+    fn a_private_comic_hit_serves_from_cache_without_bumping_last_accessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+        let prime = || {
+            page_image(
+                BookFormat::Cbz,
+                &path,
+                0,
+                None,
+                "bk",
+                Some("hash-private-warm"),
+                Some(&pages),
+                || {},
+                false,
+                OnMiss::Prime,
+            )
+        };
+        let primed = prime().unwrap();
+        let before = page_cache::read_manifest(&pages, "hash-private-warm")
+            .unwrap()
+            .last_accessed;
+        std::fs::remove_file(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let calls = std::cell::Cell::new(0);
+        let served = page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-private-warm"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            true,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        assert_eq!(served, primed);
+        let after = page_cache::read_manifest(&pages, "hash-private-warm")
+            .unwrap()
+            .last_accessed;
+        assert_eq!(after, before, "a private hit must not write the manifest");
+        assert_eq!(calls.get(), 0);
+    }
+
+    /// M5, desktop combination (`OnMiss::ReadSource` + private): a hit on an
+    /// already-primed book leaves the manifest alone. Without the private
+    /// check the hit path refreshes `last_accessed` regardless of `on_miss`.
+    #[test]
+    fn a_private_read_source_comic_hit_does_not_bump_last_accessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+        page_cache::ensure_cached(&pages, "bk", "hash-private-rs", &path, &BookFormat::Cbz)
+            .unwrap();
+        let before = page_cache::read_manifest(&pages, "hash-private-rs")
+            .unwrap()
+            .last_accessed;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-private-rs"),
+            Some(&pages),
+            || {},
+            true,
+            OnMiss::ReadSource,
+        )
+        .unwrap();
+
+        assert_eq!(
+            page_cache::read_manifest(&pages, "hash-private-rs")
+                .unwrap()
+                .last_accessed,
+            before
         );
     }
 
