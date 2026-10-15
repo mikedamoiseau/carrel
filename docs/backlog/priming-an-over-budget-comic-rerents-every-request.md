@@ -54,24 +54,31 @@ Two separable pieces:
   fast path, then `extract_comic_remaining` for every other page in the
   background), and its page reads use `OnMiss::ReadSource`, which never primes
   the cache, so no page request can trigger an extraction.
-- **Books over budget — FIXED (backlog-sweep M4).** Decide up front, from the archive's declared size,
-  whether priming can survive the configured cap, and take the direct-decode
-  path from the start instead of extract-then-evict. `ensure_cached` would
-  need to report or accept a size bound for this.
+- **Books over budget — FIXED (backlog-sweep M4).** Decide up front, from the
+  archive's declared size, whether priming can survive the configured cap, and
+  take the direct-decode path from the start instead of extract-then-evict.
 
-  Done, in the web adapter rather than in `ensure_cached`: on a cold miss
-  `web_server::api::comic_on_miss` compares the archive's declared page bytes
-  (`page_cache::comic_declared_size`: zip central directory for CBZ, unrar
-  `unpacked_size` for CBR, over the same entry list extraction writes) with
-  `page_cache_max_size_mb * 1 MiB` — the budget `run_eviction` enforces, where
-  0 is a zero-byte budget, not "unlimited" — and passes `OnMiss::ReadSource`
-  when the book cannot fit, so nothing is written. A warm book skips the check
-  (served from cache, no archive open; a read never evicts, so a budget lowered
-  afterwards takes effect at the next sweep). An unreadable declared size falls
-  back to priming. Only the CBZ size is covered by a test; no RAR fixture can be
-  built here. The size is *declared*: a lying archive is
-  still bounded by the read caps at extraction, and the post-prime sweep still
-  covers a book that fits on paper but not on disk.
+  Done in the web adapter, not in `ensure_cached` (whose signature is public
+  API and stays unchanged). On a cold miss `web_server::api::comic_on_miss`
+  compares the archive's declared page bytes (`page_cache::comic_declared_size`:
+  zip central directory for CBZ, unrar `unpacked_size` for CBR, over the same
+  entry list extraction writes) with `page_cache_max_size_mb * 1 MiB`, the
+  budget `run_eviction` enforces (0 is a zero-byte budget, not "unlimited"; a
+  book exactly at the budget fits). If it cannot fit it passes
+  `OnMiss::ReadSource`, so nothing is written.
+
+  - A warm book skips the check: it is served from cache with no archive open.
+    A read never evicts, so a budget lowered afterwards takes effect at the
+    next sweep, not on that read.
+  - An unreadable declared size falls back to priming.
+  - The size is *declared*: a lying archive is still bounded by the read caps
+    at extraction, and the post-prime sweep still covers a book that fits on
+    paper but not on disk.
+  - Only the CBZ size is covered by a test; no RAR fixture can be built here.
+  - Residual race: `comic_on_miss` sees a complete manifest and answers
+    `Prime`, then another book's eviction removes it before `page_image`
+    runs. That one request primes and is then evicted again. It is narrow and
+    self-heals: the next request is cold and takes the direct-decode path.
 
 ## FIXED (backlog-sweep M4): a narrow TOCTOU on the "did we extract" predicate
 

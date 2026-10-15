@@ -1537,7 +1537,7 @@ pub fn run_eviction(storage: &dyn Storage, max_size_mb: u64) -> CarrelResult<()>
 
     // Layer 2: Total size cap (disk-authoritative — the manifest
     // snapshot is not maintained on lazy PDF writes).
-    let max_size_bytes = max_size_mb * 1024 * 1024;
+    let max_size_bytes = max_size_mb.saturating_mul(1024 * 1024);
     let mut sizes: Vec<u64> = books
         .iter()
         .map(|b| book_disk_size_bytes(storage, &b.book_hash))
@@ -1763,6 +1763,19 @@ mod tests {
             read_manifest(&storage, "hash1").is_some(),
             "normal manifested book must be untouched"
         );
+    }
+
+    /// An absurd `page_cache_max_size_mb` must mean "effectively unlimited",
+    /// not an arithmetic overflow (a panic in debug builds, a wrapped tiny
+    /// budget in release that would evict everything).
+    #[test]
+    fn run_eviction_with_a_huge_budget_keeps_everything() {
+        let (_d, storage) = temp_storage();
+        create_fake_cache(&storage, "book1", "hash-huge", 2, 100, &now_iso());
+
+        run_eviction(&storage, u64::MAX).unwrap();
+
+        assert!(read_manifest(&storage, "hash-huge").is_some());
     }
 
     /// Regression: the orphan sweep must NOT wipe a manifest-less prefix that

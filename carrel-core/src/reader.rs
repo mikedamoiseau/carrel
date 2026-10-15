@@ -77,8 +77,8 @@
 //!
 //! A cache hit reads `pages` only — it never touches `file_path`, which is
 //! what lets a caller prove the cache is doing its job by deleting the
-//! source file between two reads of the same page. A miss primes the
-//! *entire* book into the cache (via
+//! source file between two reads of the same page. A miss with
+//! [`OnMiss::Prime`] primes the *entire* book into the cache (via
 //! [`crate::page_cache::ensure_cached`]) before serving the requested page,
 //! so every later read — including a different page — is a pure cache read.
 //! See [`page_image`]'s doc comment for why the whole-book prime, not the
@@ -445,13 +445,18 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 pub enum OnMiss {
     /// A miss primes the cache for the whole book — the entire archive for
     /// a comic, or an established manifest for a PDF — then serves the
-    /// requested page from it. What the web adapter passes: it has no other
-    /// event that could ever prime the cache.
+    /// requested page from it. What the web adapter passes by default: it
+    /// has no other event that could ever prime the cache. (The adapter
+    /// itself switches to [`OnMiss::ReadSource`] for a cold comic whose
+    /// declared size cannot fit the cache budget.)
     Prime,
     /// A miss reads just the requested page from the source and leaves
     /// priming to whoever else owns it. What the desktop passes: its own
     /// book-open command and background prerender pass already own priming,
-    /// so the page read must not duplicate — or race — that work.
+    /// so the page read must not duplicate — or race — that work. The web
+    /// adapter also passes it for a cold comic that cannot fit
+    /// `page_cache_max_size_mb`, where priming would only be evicted again
+    /// (see `web_server::api::comic_on_miss`).
     ReadSource,
 }
 
@@ -481,7 +486,11 @@ pub enum OnMiss {
 /// A cache that has just been primed can still fail to serve the page it
 /// was primed for: `page_cache_max_size_mb` can be smaller than this one
 /// comic's extracted size, in which case `on_extracted`'s eviction (see
-/// below) reclaims the book we *just* wrote before anyone reads it back; or
+/// below) reclaims the book we *just* wrote before anyone reads it back. The
+/// web adapter now avoids that by not priming a comic whose *declared* size
+/// exceeds the budget, so this arises there only when the declared size is
+/// understated or unreadable, or for another caller passing `Prime` with a
+/// small budget; or
 /// a concurrent extraction elsewhere in the cache can do the same (see the
 /// module docs' cross-surface-race note). Either way, a page cache that
 /// cannot serve degrades to a direct archive decode — the same fallback the
@@ -650,7 +659,8 @@ where
         if on_miss == OnMiss::ReadSource {
             // Desktop: priming is `prepare_comic`'s and its background
             // `extract_comic_remaining` pass's job, not this call's — see
-            // [`OnMiss`]. Read just the requested page straight from the
+            // [`OnMiss`]. (The web adapter also lands here, deliberately,
+            // for a cold comic too big for the cache budget.) Read just the requested page straight from the
             // archive and leave the cache exactly as it was: no lock, no
             // `ensure_cached`, no `on_extracted`. This is the same fallback
             // the pre-M3 desktop implementation always used on a miss.
@@ -724,7 +734,9 @@ where
         // (`get_page_count` shares `collect_page_names`' entry filter and
         // sort, so it agrees with what extraction would write) and is far
         // cheaper than extracting. The price: a cold *in-range* miss now
-        // reads the entry list twice (here, then in extraction). On a NAS
+        // reads the entry list twice (here, then in extraction), and on the
+        // web path a third time, since `comic_on_miss` reads the declared
+        // size from the same directory first. On a NAS
         // path — `file_path` stays the NAS path until a staged copy exists
         // (see `web_server::resolve_book_path`) — that is one extra
         // directory read (CBZ) or header walk (CBR), small next to the

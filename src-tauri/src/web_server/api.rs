@@ -1457,8 +1457,10 @@ async fn get_page_image(
         // page request reopened and reparsed the whole archive, while the
         // desktop reader had been reading from a warm cache all along.
         //
-        // A cache miss now extracts the *whole* archive (see
-        // `carrel_core::reader::page_image`'s doc comment for why) —
+        // A cache miss on a book that can fit the budget extracts the *whole*
+        // archive (see `carrel_core::reader::page_image`'s doc comment for
+        // why; a book that cannot fit is decoded directly instead, see
+        // `comic_on_miss`) —
         // proportional to the whole book rather than one page, and on this
         // project's real library that archive can live on a network mount.
         // Run it on the blocking pool (`spawn_blocking`), the same treatment
@@ -3214,11 +3216,12 @@ mod tests {
         );
     }
 
-    /// The bypass decision is made only on a cold miss. A book already
-    /// cached keeps being served from the cache even after the budget is
-    /// lowered below its size (and with the source gone, so no archive is
-    /// opened to decide anything); reads never evict, the next priming
-    /// sweep of some other book reclaims it.
+    /// End to end: a book already cached keeps being served from the cache
+    /// after the budget is lowered below its size, and a read never evicts
+    /// (the next priming sweep of some other book reclaims it). This is a
+    /// regression pin on the hit path only; that the bypass check itself is
+    /// skipped for a warm book is pinned by
+    /// `comic_on_miss_does_not_bypass_a_warm_book` below.
     #[tokio::test]
     async fn web_warm_comic_is_served_from_cache_after_the_budget_is_lowered() {
         let dir = tempfile::tempdir().unwrap();
@@ -3240,6 +3243,103 @@ mod tests {
             carrel_core::page_cache::complete_manifest(storage.as_ref(), "comic-hash-warm")
                 .is_some(),
             "a read must not evict"
+        );
+    }
+
+    fn cold_storage(dir: &std::path::Path) -> carrel_core::storage::LocalStorage {
+        carrel_core::storage::LocalStorage::new(dir.join("cache")).unwrap()
+    }
+
+    fn on_miss_for(
+        storage: &carrel_core::storage::LocalStorage,
+        hash: &str,
+        path: &std::path::Path,
+        budget_mb: u64,
+    ) -> carrel_core::reader::OnMiss {
+        comic_on_miss(
+            Some(storage as &dyn carrel_core::storage::Storage),
+            Some(hash),
+            &BookFormat::Cbz,
+            &path.to_string_lossy(),
+            budget_mb,
+        )
+    }
+
+    /// Cold and bigger than the budget: bypass. (Pins the positive case at
+    /// the unit level; the end-to-end one is above.)
+    #[test]
+    fn comic_on_miss_bypasses_a_cold_book_over_budget() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "over.cbz", 2 * 1024 * 1024);
+        assert_eq!(on_miss_for(&storage, "h", &cbz, 1), OnMiss::ReadSource);
+    }
+
+    /// Exactly the budget fits: `run_eviction` evicts only when the total is
+    /// strictly greater than the budget, so the bypass must be strictly
+    /// greater too. Fails if `>` becomes `>=`.
+    #[test]
+    fn comic_on_miss_primes_a_book_exactly_at_the_budget() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "exact.cbz", 1024 * 1024);
+        assert_eq!(on_miss_for(&storage, "h", &cbz, 1), OnMiss::Prime);
+        // One byte over flips it, so the test above is not vacuous.
+        let over = write_large_cbz(dir.path(), "over1.cbz", 1024 * 1024 + 1);
+        assert_eq!(on_miss_for(&storage, "h", &over, 1), OnMiss::ReadSource);
+    }
+
+    /// A zero budget is zero bytes (what `run_eviction` enforces), not
+    /// "unlimited": a non-empty comic cannot fit.
+    #[test]
+    fn comic_on_miss_with_a_zero_budget_bypasses_a_non_empty_book() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "tiny.cbz", 10);
+        assert_eq!(on_miss_for(&storage, "h", &cbz, 0), OnMiss::ReadSource);
+    }
+
+    /// An archive whose declared size cannot be read falls back to today's
+    /// behaviour (prime), and its own errors surface from there.
+    #[test]
+    fn comic_on_miss_primes_when_the_declared_size_is_unreadable() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let missing = dir.path().join("nope.cbz");
+        assert_eq!(on_miss_for(&storage, "h", &missing, 0), OnMiss::Prime);
+        let corrupt = dir.path().join("corrupt.cbz");
+        std::fs::write(&corrupt, b"not a zip").unwrap();
+        assert_eq!(on_miss_for(&storage, "h", &corrupt, 0), OnMiss::Prime);
+    }
+
+    /// A warm book (complete manifest) is never bypassed and the archive is
+    /// not consulted. The file is a real over-budget comic, so if the warm
+    /// short-circuit were removed the size check would run and answer
+    /// `ReadSource`; that is what makes `Prime` here prove the short-circuit.
+    #[test]
+    fn comic_on_miss_does_not_bypass_a_warm_book() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "warm.cbz", 2 * 1024 * 1024);
+        carrel_core::page_cache::ensure_cached(
+            &storage,
+            "bk",
+            "warm-hash",
+            &cbz.to_string_lossy(),
+            &BookFormat::Cbz,
+        )
+        .unwrap();
+        assert_eq!(on_miss_for(&storage, "warm-hash", &cbz, 1), OnMiss::Prime);
+        // Same book, same budget, cold hash: bypassed. Distinguishes the
+        // warm branch from a size check that happens to say "fits".
+        assert_eq!(
+            on_miss_for(&storage, "cold-hash", &cbz, 1),
+            OnMiss::ReadSource
         );
     }
 
