@@ -1153,6 +1153,10 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
 /// attribute value (`&amp;`, `&quot;`, `&lt;`, `&gt;`, `&nbsp;`) plus the
 /// numeric (`&#NN;`, `&#xNN;`) and `&apos;` forms. Single pass, so `&amp;nbsp;`
 /// decodes to the literal text `&nbsp;`. Anything unrecognised is kept as-is.
+///
+/// Not [`decode_entities`]: quick-xml's `unescape` knows only the XML
+/// entities (no `&nbsp;`, which ammonia emits for U+00A0) and rejects the
+/// whole string on an unknown one, where this must pass it through.
 fn decode_html_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;

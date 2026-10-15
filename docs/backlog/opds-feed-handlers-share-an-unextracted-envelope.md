@@ -155,8 +155,10 @@ in `, id`, the same tie-break `list_books_grid` already had, which is a
 narrower change than moving to the query-module path and leaves `list_books`'s
 signature and column list untouched. `/opds/new` shares `all_books`'s fix
 since it also reads through `list_books`. `collection_feed` orders by its own
-join (`bc.added_at DESC`) and was not touched — it still wants checking rather
-than assuming.
+join (`bc.added_at DESC`). **FIXED** in the backlog-sweep epic: every
+collection query (`get_books_in_collection`, `get_books_in_collection_grid`,
+`query_books_in_collection_grid`, manual and automated branches) now ends its
+`ORDER BY` in `, b.id`.
 
 ## Also noticed, separate and pre-existing
 

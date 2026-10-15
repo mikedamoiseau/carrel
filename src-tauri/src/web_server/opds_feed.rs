@@ -1569,7 +1569,7 @@ mod tests {
         ] {
             let parsed: AxumQ<PaginationQuery> = AxumQ::try_from_uri(&uri.parse().unwrap())
                 .unwrap_or_else(|e| panic!("{uri} must not be rejected: {e:?}"));
-            assert_eq!(parsed.0.page.unwrap_or(0), expected.unwrap_or(0), "{uri}");
+            assert_eq!(parsed.0.page, expected, "{uri}");
         }
     }
 

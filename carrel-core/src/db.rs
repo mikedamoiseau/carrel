@@ -1052,7 +1052,7 @@ pub fn query_books(conn: &Connection, query: &BookQuery) -> Result<Page<Book>> {
 /// books were added to the collection), which `BookSort` cannot express —
 /// running it through `book_sort_order_sql` would silently reorder every
 /// manual collection. So both branches keep their existing `ORDER BY`
-/// (the manual one gains only a `b.id` tie-break for same-second additions),
+/// (each gains only a `b.id` tie-break for same-second additions),
 /// and this returns a plain `Vec` rather than a `Page`: there
 /// is no paging here to report a total for. Collections are deliberately
 /// unpaginated (see `app.js`'s `loadBooks`, which cites the same decision).

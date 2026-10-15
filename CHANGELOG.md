@@ -13,9 +13,9 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 - **EPUB images with `&`, quotes, `%` or non-breaking spaces in their filename
   now show.** Such images were left as broken links in the reader (or, for a
-  `%`, a 404 in the web reader). Images whose filenames contain spaces or
-  non-ASCII characters are re-extracted once the next time their chapter is
-  opened.
+  `%`, a 404 in the web reader). Images whose filenames contain anything
+  other than letters, digits, `.`, `-` or `_` (spaces and accented letters
+  included) are re-extracted once the next time their chapter is opened.
 - **OPDS search with control characters in the query returns valid XML.**
   `/opds/search?q=%01` used to produce a feed strict OPDS clients rejected.
 - **`/opds/all?page=abc` no longer errors.** A malformed `page` now serves the

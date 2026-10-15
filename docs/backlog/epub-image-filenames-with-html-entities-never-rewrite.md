@@ -45,9 +45,11 @@ Two things to check when doing it:
 - It widens what reaches the caller's URL policy, so re-read
   `reader::attr_safe_url` — a filename containing `"` becomes reachable at the
   splice for the first time, which is the case that guard exists for.
-- The keys are hashed with `short_zip_path_hash(resolved_zip_path)`, so books
-  already imported keep working; nothing on disk is invalidated by decoding
-  earlier.
+- The keys are hashed with `short_zip_path_hash(resolved_zip_path)`. *As
+  shipped this no longer holds:* the fix also sanitizes the key's basename to
+  `[A-Za-z0-9._-]`, so any image whose name had another character gets a new
+  key and is re-extracted once; the old file stays in the book's image dir
+  until the book is removed (see banner).
 
 ## Not to be confused with (also fixed, see banner)
 
