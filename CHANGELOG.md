@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.2] - 2026-10-15
+
 ### Security
 - **`rustls` 0.23.38 → 0.23.45, clearing RUSTSEC-2026-0285.** `rustls`, the
   TLS stack under the app's outbound HTTPS requests (`reqwest`) and the
