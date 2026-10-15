@@ -4,8 +4,9 @@
 comic-page-reads review.
 
 > **Resolution.** Private mode now *serves* comics but records nothing, on
-> both surfaces together (the web PDF arm already behaved this way; desktop
-> PDF does not, see below):
+> both surfaces together. This is stricter than PDF, which on both surfaces
+> still bumps `last_accessed` on a private miss (deliberately, so eviction does
+> not treat the book as cold) and on desktop also prewarms; see below:
 >
 > - `carrel_core::reader::page_image`'s comic arm honours `is_private`: a
 >   private miss decodes the one page straight from the archive (never primes,

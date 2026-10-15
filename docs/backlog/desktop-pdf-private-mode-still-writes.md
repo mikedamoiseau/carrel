@@ -18,7 +18,13 @@ bar, so comics are now stricter than desktop PDF:
 - Private eviction still runs in `prepare_pdf` (harmless on its own, but it is
   only there because a manifest may have been written).
 
-The web PDF arm does not prewarm, so the inconsistency is desktop-only. Source
+The prewarm is desktop-only (the web PDF arm does not prewarm). The
+`last_accessed` bump on a private PDF miss is not: it lives in
+`page_cache::get_or_render_pdf_page` (`suppress_write`), shared by both
+surfaces, and is deliberate there — it keeps a privately read book from
+looking cold to eviction. Comics take the opposite choice (a private read
+never touches the manifest), so decide which rule should win rather than
+assume PDF is the reference. Source
 staging is no longer part of it: M5 gated staging on private mode for both
 formats on both surfaces.
 

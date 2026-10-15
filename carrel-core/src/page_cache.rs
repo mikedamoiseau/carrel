@@ -740,8 +740,8 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
 /// render targets that resume page rather than page 0, so on such a book
 /// nothing is at index 0 at all. That is what the listing fallback is for,
 /// and why it must not be deleted as redundant. The fallback is worth
-/// confining rather than defaulting to: `Storage::list` filters by prefix
-/// the local implementation now walks only the directory the prefix names,
+/// confining rather than defaulting to: `Storage::list` filters by prefix,
+/// and the local implementation now walks only the directory the prefix names,
 /// so the cost is one book's directory rather than the entire app cache.
 /// It is still a directory walk plus a stat per page on the book-open path,
 /// which [`complete_manifest`]'s doc comment above avoids for comics, so
