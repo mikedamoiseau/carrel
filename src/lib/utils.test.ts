@@ -3,7 +3,6 @@ import {
   formatDuration,
   formatDate,
   formatBytes,
-  filterBooks,
   sortBooks,
   groupBy,
   clamp,
@@ -83,7 +82,7 @@ describe("formatDate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// filterBooks
+// Shared book fixtures (used by the sortBooks tests)
 // ---------------------------------------------------------------------------
 const sampleBooks: BookLike[] = [
   { id: "1", title: "Dune", author: "Frank Herbert", format: "epub", added_at: 100 },
@@ -98,61 +97,6 @@ const progressMap: Record<string, number> = {
   "3": 100,  // finished
   "4": 100,  // finished
 };
-
-describe("filterBooks", () => {
-  it("returns all books with no filters", () => {
-    const result = filterBooks(sampleBooks, "", "all", "all", {});
-    expect(result).toHaveLength(4);
-  });
-
-  it("filters by title search (case-insensitive)", () => {
-    const result = filterBooks(sampleBooks, "dune", "all", "all", {});
-    expect(result).toHaveLength(1);
-    expect(result[0].title).toBe("Dune");
-  });
-
-  it("filters by author search", () => {
-    const result = filterBooks(sampleBooks, "gibson", "all", "all", {});
-    expect(result).toHaveLength(1);
-    expect(result[0].author).toBe("William Gibson");
-  });
-
-  it("filters by format", () => {
-    const result = filterBooks(sampleBooks, "", "epub", "all", {});
-    expect(result).toHaveLength(2);
-    expect(result.every((b) => b.format === "epub")).toBe(true);
-  });
-
-  it("filters by unread status", () => {
-    const result = filterBooks(sampleBooks, "", "all", "unread", progressMap);
-    expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("1");
-  });
-
-  it("filters by in_progress status", () => {
-    const result = filterBooks(sampleBooks, "", "all", "in_progress", progressMap);
-    expect(result).toHaveLength(1);
-    expect(result[0].id).toBe("2");
-  });
-
-  it("filters by finished status", () => {
-    const result = filterBooks(sampleBooks, "", "all", "finished", progressMap);
-    expect(result).toHaveLength(2);
-  });
-
-  it("combines search and format filter", () => {
-    const result = filterBooks(sampleBooks, "s", "epub", "all", {});
-    // "s" matches "Snow Crash" (epub) and "Dune" doesn't have "s" in title — wait
-    // "Dune" no, "Snow Crash" yes (epub), "Neuromancer" has "s" but is pdf
-    expect(result).toHaveLength(1);
-    expect(result[0].title).toBe("Snow Crash");
-  });
-
-  it("returns empty when no match", () => {
-    const result = filterBooks(sampleBooks, "nonexistent", "all", "all", {});
-    expect(result).toHaveLength(0);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // sortBooks

@@ -57,35 +57,6 @@ export interface BookLike {
   added_at: number;
 }
 
-/** Filter books by search query, format, and reading status. */
-export function filterBooks<T extends BookLike>(
-  books: T[],
-  search: string,
-  filterFormat: string,
-  filterStatus: string,
-  progressMap: Record<string, number>,
-): T[] {
-  return books.filter((book) => {
-    if (search) {
-      const q = search.toLowerCase();
-      if (
-        !book.title.toLowerCase().includes(q) &&
-        !book.author.toLowerCase().includes(q)
-      )
-        return false;
-    }
-    if (filterFormat !== "all" && book.format !== filterFormat) return false;
-    if (filterStatus !== "all") {
-      const pct = progressMap[book.id] ?? 0;
-      if (filterStatus === "unread" && pct !== 0) return false;
-      if (filterStatus === "in_progress" && (pct === 0 || pct >= 100))
-        return false;
-      if (filterStatus === "finished" && pct < 100) return false;
-    }
-    return true;
-  });
-}
-
 /**
  * Count how many of the given books carry each tag.
  *

@@ -755,8 +755,6 @@ pub fn restore_secondary_data(conn: &Connection, data: &SecondaryImport) -> Rest
     counts
 }
 
-const GRID_COLUMNS: &str = "id, title, author, cover_path, total_chapters, added_at, format, series, volume, rating, language, publish_year, is_imported, want_to_read";
-
 /// Grid columns prefixed with table alias `b.` for JOIN queries.
 const GRID_COLUMNS_B: &str = "b.id, b.title, b.author, b.cover_path, b.total_chapters, b.added_at, b.format, b.series, b.volume, b.rating, b.language, b.publish_year, b.is_imported, b.want_to_read";
 
@@ -783,18 +781,11 @@ fn row_to_grid_item(row: &rusqlite::Row) -> rusqlite::Result<BookGridItem> {
 }
 
 pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
-    // Fix D: `added_at` has second-granularity ties (concurrent/batch
-    // imports) — without a unique tiebreaker, offset pagination can slice a
-    // book onto two pages or skip it entirely when rows with the same
-    // timestamp sort differently between two requests. `id` is unique, so
-    // appending it makes this order total and deterministic.
-    let sql = format!(
-        "SELECT {} FROM books ORDER BY added_at DESC, id",
-        GRID_COLUMNS
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], row_to_grid_item)?;
-    rows.collect()
+    // Every book, newest first with `id` as the unique tie-break (Fix D: see
+    // `book_sort_order_sql`). A default query has no predicate, no limit and
+    // no offset, so it is the whole table in that order — and, unpaginated,
+    // it skips the extra COUNT scan.
+    Ok(query_books_grid(conn, &BookQuery::default())?.items)
 }
 
 // --- Query module: filter/sort/page a library in one place -----------------
@@ -810,12 +801,11 @@ pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
 // `plugins/runtime.rs`'s `find_books`, and — through
 // `query_books_in_collection_grid` below — `api.rs::get_collection_books`.
 //
-// No server-side copy remains. Three client-side ones do, all in the React
-// desktop app and none of them reachable from here: `Library.tsx` filters an
+// No server-side copy remains. Two client-side ones do, both in the React
+// desktop app and neither reachable from here: `Library.tsx` filters an
 // already-loaded grid and derives tag facet counts from the result, which is
-// why it was left alone deliberately; `BookPickerModal.tsx` filters a list the
-// modal was handed; and `lib/utils.ts`'s `filterBooks` is imported by nothing
-// but its own test.
+// why it was left alone deliberately; and `BookPickerModal.tsx` filters a list
+// the modal was handed.
 
 /// Sort order for [`query_books_grid`]/[`query_books`]. A closed enum (not a
 /// caller-supplied string) so the `ORDER BY` fragment is always chosen from a
@@ -2766,37 +2756,7 @@ pub fn get_books_in_collection_grid(
     conn: &Connection,
     collection_id: &str,
 ) -> Result<Vec<BookGridItem>> {
-    let mut type_stmt = conn.prepare("SELECT type FROM collections WHERE id = ?1")?;
-    let coll_type: String = type_stmt.query_row(params![collection_id], |row| row.get(0))?;
-
-    if coll_type == "manual" {
-        let sql = format!(
-            "SELECT {} FROM books b JOIN book_collections bc ON bc.book_id = b.id WHERE bc.collection_id = ?1 ORDER BY bc.added_at DESC, b.id",
-            GRID_COLUMNS_B
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![collection_id], row_to_grid_item)?;
-        return rows.collect();
-    }
-
-    let rules = get_collection_rules(conn, collection_id)?;
-    let (joins, where_str, param_values) = build_rule_query(&rules);
-
-    let sql = format!(
-        "SELECT DISTINCT {cols}
-         FROM books b
-         {joins}
-         {where_str}
-         ORDER BY b.added_at DESC, b.id",
-        cols = GRID_COLUMNS_B
-    );
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(param_values.iter()),
-        row_to_grid_item,
-    )?;
-    rows.collect()
+    query_books_in_collection_grid(conn, collection_id, &BookQuery::default())
 }
 
 /// Build JOIN, WHERE, and parameter lists from a set of collection rules.
@@ -8107,5 +8067,118 @@ mod tests {
             .map(|b| b.id)
             .collect();
         assert_eq!(full, want, "get_books_in_collection");
+    }
+
+    // --- M6: wrapper equivalence pins ---------------------------------------
+    //
+    // `list_books_grid` and `get_books_in_collection_grid` are `pub` API that
+    // Carrel Server consumes, so they stay; these pin that each returns exactly
+    // what the query module returns for a default query (same rows, same
+    // order, same fields). Regression pins for a refactor, not red-first tests.
+
+    /// `BookGridItem` has no `PartialEq`; its serialised form covers every field.
+    fn grid_json(items: &[BookGridItem]) -> serde_json::Value {
+        serde_json::to_value(items).unwrap()
+    }
+
+    /// Mixed library: a three-way `added_at` tie inserted in non-id order,
+    /// want_to_read on and off, series, tags, and a non-imported row.
+    fn seed_wrapper_equivalence_fixture(conn: &Connection) {
+        let rows = [
+            ("w-c", "Dune", "Frank Herbert", 500, Some("Dune"), true),
+            (
+                "w-a",
+                "Dune Messiah",
+                "Frank Herbert",
+                500,
+                Some("Dune"),
+                false,
+            ),
+            ("w-b", "Neuromancer", "William Gibson", 500, None, true),
+            (
+                "w-d",
+                "Children of Dune",
+                "Frank Herbert",
+                900,
+                Some("Dune"),
+                false,
+            ),
+            ("w-e", "Emma", "Jane Austen", 100, Some("Austen"), false),
+        ];
+        for (id, title, author, added_at, series, want) in rows {
+            insert_book(
+                conn,
+                &qbook(id, title, author, added_at, series, None, want),
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE books SET is_imported = 0 WHERE id = 'w-e'", [])
+            .unwrap();
+        get_or_create_tag(conn, "t-scifi", "scifi").unwrap();
+        for id in ["w-a", "w-b", "w-c"] {
+            add_tag_to_book(conn, id, "t-scifi").unwrap();
+        }
+    }
+
+    #[test]
+    fn list_books_grid_equals_default_query_books_grid() {
+        let (_dir, conn) = setup();
+        seed_wrapper_equivalence_fixture(&conn);
+
+        let wrapper = list_books_grid(&conn).unwrap();
+        let query = query_books_grid(&conn, &BookQuery::default()).unwrap();
+
+        assert_eq!(wrapper.len(), 5, "no row may be dropped, imported or not");
+        assert_eq!(
+            ids(&wrapper),
+            vec!["w-d", "w-a", "w-b", "w-c", "w-e"],
+            "added_at DESC, ties by id"
+        );
+        assert_eq!(grid_json(&wrapper), grid_json(&query.items));
+    }
+
+    #[test]
+    fn get_books_in_collection_grid_equals_default_query_for_manual_and_automated() {
+        let (_dir, conn) = setup();
+        seed_wrapper_equivalence_fixture(&conn);
+
+        // Manual: membership order, with a tie on bc.added_at (w-b / w-c).
+        insert_collection(
+            &conn,
+            &make_collection("wc-manual", "Manual", CollectionType::Manual),
+        )
+        .unwrap();
+        add_to_collection_at(&conn, "w-a", "wc-manual", 100);
+        add_to_collection_at(&conn, "w-c", "wc-manual", 300);
+        add_to_collection_at(&conn, "w-b", "wc-manual", 300);
+        add_to_collection_at(&conn, "w-e", "wc-manual", 900);
+
+        // Automated, field rules and a tag rule (the tag rule binds in a JOIN).
+        let mut auto = make_collection("wc-auto", "Auto", CollectionType::Automated);
+        auto.rules = vec![
+            make_rule("wc-auto", "series", "equals", "Dune"),
+            make_rule("wc-auto", "tag", "contains", "scifi"),
+            make_rule("wc-auto", "author", "contains", "Herbert"),
+        ];
+        insert_collection(&conn, &auto).unwrap();
+
+        // Automated with no rules: every book.
+        insert_collection(
+            &conn,
+            &make_collection("wc-open", "Open", CollectionType::Automated),
+        )
+        .unwrap();
+
+        let expected = [
+            ("wc-manual", vec!["w-e", "w-b", "w-c", "w-a"]),
+            ("wc-auto", vec!["w-a", "w-c"]),
+            ("wc-open", vec!["w-d", "w-a", "w-b", "w-c", "w-e"]),
+        ];
+        for (coll, want_ids) in expected {
+            let wrapper = get_books_in_collection_grid(&conn, coll).unwrap();
+            let query = query_books_in_collection_grid(&conn, coll, &BookQuery::default()).unwrap();
+            assert_eq!(ids(&wrapper), want_ids, "{coll}");
+            assert_eq!(grid_json(&wrapper), grid_json(&query), "{coll}");
+        }
     }
 }

@@ -5,7 +5,9 @@
 > SQL its callers assemble). Kept as a record of what the bug was and how it
 > was found. The two follow-ups at the end — collapsing
 > `get_books_in_collection_grid` and `list_books_grid` into the query module —
-> are **not** done.
+> are **done** (milestone 6 of the backlog-sweep epic): both stay as `pub`
+> entry points but now delegate to `query_books_in_collection_grid` and
+> `query_books_grid` with a default `BookQuery`.
 
 **Silent wrong results, pre-existing, user-facing.** Found during the review of
 milestone 4 of the library-query epic (PR #142), which added a second caller of

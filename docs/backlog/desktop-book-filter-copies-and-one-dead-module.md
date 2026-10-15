@@ -1,5 +1,13 @@
 # Three client-side book-filter copies, one of them dead
 
+> **PARTLY RESOLVED.** The dead copy, `filterBooks` in `src/lib/utils.ts`, and
+> its ten tests were deleted in milestone 6 of the backlog-sweep epic
+> (`git log -S filterBooks -- src/` showed it was added with its tests in the
+> first test-suite commit and never had a production caller, so nothing was
+> expected back). The other two copies, `Library.tsx` and
+> `BookPickerModal.tsx`, stay as decided below. The rest of this file is the
+> record as it stood before the deletion.
+
 Found while reviewing the library-query epic (PR #142), which consolidated
 every *server-side* copy of "case-insensitively match title or author" into
 `carrel_core::db::query_books*`. The client-side copies were out of that epic's
