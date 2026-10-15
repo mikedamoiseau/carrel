@@ -93,26 +93,6 @@ jobs:
       # carrel-core's unit tests (which carry the MOBI adapter smoke suite)
       # are not compiled by that invocation even with `--features mobi`.
       # Run them explicitly so regressions in carrel-core actually fail CI.
-      #
-      # The fetch step pulls the gitignored MOBI corpus from Project
-      # Gutenberg; without it the fixture-gated smoke tests skip silently
-      # and we lose the end-to-end coverage they exist to provide. The
-      # fetch script pins each file by SHA-256 and retries transient
-      # network failures, so a bad download either succeeds after a
-      # retry or fails the job loudly.
-      #
-      # Cache the downloaded fixtures so the happy path (URL + hash
-      # unchanged) doesn't hit Gutenberg on every CI run. The cache key
-      # includes the script hash, so any edit to URLs or pinned hashes
-      # invalidates the cache automatically.
-      - name: Cache MOBI test corpus
-        uses: actions/cache@v5
-        with:
-          path: src-tauri/test-fixtures
-          key: mobi-corpus-${{ hashFiles('scripts/fetch-mobi-test-corpus.sh') }}
-
-      - name: Fetch MOBI test corpus
-        run: ./scripts/fetch-mobi-test-corpus.sh
 
       - name: Run cargo test (carrel-core, --features mobi)
         # libmobi's C-side cleanup races across threads on Linux — when the

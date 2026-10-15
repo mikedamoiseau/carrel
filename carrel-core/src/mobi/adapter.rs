@@ -820,17 +820,15 @@ mod tests {
     /// surfacing at import time in the desktop app.
     ///
     /// Both MOBI variants are covered: legacy Mobipocket (`alice-legacy.mobi`,
-    /// file version 6) and KF8 / AZW3 (`alice.mobi`, file version 8). Run
-    /// `scripts/fetch-mobi-test-corpus.sh` to populate the fixtures before
-    /// running the test; without the fixtures the test is skipped.
+    /// file version 6) and KF8 / AZW3 (`alice.mobi`, file version 8). The
+    /// fixtures are vendored in `src-tauri/test-fixtures/`; if one is missing
+    /// the test is skipped.
     fn run_full_pipeline_smoke(fixture_name: &str, expected_file_version: usize) {
         use crate::search::search_chapters;
         use crate::storage::LocalStorage;
 
         let Some(path) = fixture(fixture_name) else {
-            eprintln!(
-                "skipping: {fixture_name} not present — run scripts/fetch-mobi-test-corpus.sh"
-            );
+            eprintln!("skipping: {fixture_name} not present in src-tauri/test-fixtures/");
             return;
         };
         let path_str = path.to_str().expect("fixture path is UTF-8");

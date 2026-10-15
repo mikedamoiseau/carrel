@@ -5,6 +5,11 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Old log files are cleaned up automatically.** Carrel keeps the 14 most
+  recent daily log files and deletes older ones, so the log folder no longer
+  grows without limit.
+
 ## [3.2.2] - 2026-10-15
 
 ### Security

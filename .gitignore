@@ -37,9 +37,6 @@ src-tauri/resources/*.dll
 # libmobi local build (produced by scripts/build-libmobi.sh)
 .libmobi-build/
 
-# Test fixtures (not part of the repo; downloaded by developers as needed)
-src-tauri/test-fixtures/
-
 # Dictionary artifact build output (scripts/build-dictionary-artifact.sh)
 build/
 
