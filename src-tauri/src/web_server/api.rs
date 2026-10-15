@@ -2871,6 +2871,54 @@ mod tests {
         );
     }
 
+    /// An image whose zip entry is literally named `a%2Fb&c.png` must come back
+    /// through the web chapter + image routes. Two pre-existing faults met
+    /// here: the entity-encoded `&amp;` never matched the entry, and, once
+    /// found, the `%2F` in the unencoded URL was percent-decoded by axum back
+    /// into `/`, so `get_epub_image` 404ed. The storage key's basename is now
+    /// sanitized, so no `%` ever reaches the URL.
+    ///
+    /// The image request decodes the URL's last segment the way axum's `Path`
+    /// extractor does (`urlencoding::decode`) before calling the handler.
+    #[tokio::test]
+    async fn web_chapter_image_with_percent_and_ampersand_in_name_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_named_image(
+            dir.path(),
+            "web-pct",
+            "a%2Fb&c.png",
+            "a%2Fb&amp;c.png",
+        );
+        seed_epub_book(&state, "bk-web-pct", &epub);
+
+        let resp = get_chapter_content(
+            State(state.clone()),
+            Path(("bk-web-pct".to_string(), 0usize)),
+        )
+        .await
+        .unwrap();
+        let html = body_string(resp).await;
+        let prefix = "/api/books/bk-web-pct/images/0/";
+        let start = html
+            .find(prefix)
+            .unwrap_or_else(|| panic!("not rewritten: {html}"));
+        let url = &html[start..];
+        let url = &url[..url.find('"').unwrap()];
+        assert!(!url.contains('%'), "a % reached the URL: {url}");
+
+        let segment = urlencoding::decode(&url[prefix.len()..])
+            .unwrap()
+            .into_owned();
+        let resp = get_epub_image(
+            State(state.clone()),
+            Path(("bk-web-pct".to_string(), 0usize, segment)),
+        )
+        .await
+        .expect("image route must find the extracted file");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// M4's acceptance criterion for the web adapter: a second TOC request is
     /// served from the cached archive rather than by reopening the book
     /// file. Before this milestone the route called the path-based
@@ -4959,13 +5007,11 @@ mod tests {
             serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
         // Ids, not just a count: `len() == 2` is satisfied by any
         // implementation that ignores the params, including one that returns
-        // the whole library rather than the collection. Sorted, because a
-        // manual collection orders by `bc.added_at DESC` with no `id`
-        // tie-break and these two are added within the same second — the
-        // membership order itself is pinned by the dedicated core test.
-        let mut got = ids_from(&json);
-        got.sort();
-        assert_eq!(got, vec!["abs-a", "abs-b"]);
+        // the whole library rather than the collection. These two are added
+        // within the same second, so their order is the `b.id` tie-break
+        // after `bc.added_at DESC`; the membership order itself is pinned by
+        // the dedicated core tests.
+        assert_eq!(ids_from(&json), vec!["abs-a", "abs-b"]);
     }
 
     #[tokio::test]

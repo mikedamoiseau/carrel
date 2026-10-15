@@ -232,14 +232,27 @@ async fn root_catalog() -> Response {
 
 #[derive(serde::Deserialize)]
 struct PaginationQuery {
-    /// Note the divergence from `SearchQuery::page`, which is a lenient
-    /// `String`: a malformed `?page=abc` still rejects this feed outright.
-    /// Left as it is deliberately — changing it is a behaviour change to a
-    /// handler the milestone that made search lenient did not touch — but it
-    /// is the weaker of the two conventions, and the note in `docs/backlog/`
-    /// on these handlers records it alongside the other reasons to revisit
-    /// them together.
+    /// Lenient, exactly like `SearchQuery::page`: axum's `Query` extraction is
+    /// all-or-nothing, so a bare `Option<usize>` would 400 the whole feed on a
+    /// malformed or empty value (`page=`, `page=abc`). Anything that is not a
+    /// page number reads as absent, which serves page 0.
+    #[serde(default, deserialize_with = "lenient_page")]
     page: Option<usize>,
+}
+
+/// The requested page, or `None` for absent and for anything that is not a
+/// page number (callers read `None` as page 0). The one parse both
+/// [`SearchQuery`] and [`PaginationQuery`] use.
+fn parse_page(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|p| p.parse::<usize>().ok())
+}
+
+fn lenient_page<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(parse_page(raw.as_deref()))
 }
 
 async fn all_books(
@@ -433,10 +446,7 @@ struct SearchQuery {
 impl SearchQuery {
     /// The requested page, or 0 for anything that is not a page number.
     fn page(&self) -> usize {
-        self.page
-            .as_deref()
-            .and_then(|p| p.parse::<usize>().ok())
-            .unwrap_or(0)
+        parse_page(self.page.as_deref()).unwrap_or(0)
     }
 }
 
@@ -1542,6 +1552,65 @@ mod tests {
             !xml.contains(r#"rel="next""#),
             "must not link onward: {xml}"
         );
+    }
+
+    /// `PaginationQuery` must be as lenient as `SearchQuery`: a malformed
+    /// `page` (a proxy or client appended junk) serves page 0, not a 400.
+    #[test]
+    fn pagination_query_tolerates_a_malformed_page() {
+        use axum::extract::Query as AxumQ;
+
+        for (uri, expected) in [
+            ("/opds/all", None),
+            ("/opds/all?page=2", Some(2)),
+            ("/opds/all?page=", None),
+            ("/opds/all?page=abc", None),
+            ("/opds/all?page=-1", None),
+        ] {
+            let parsed: AxumQ<PaginationQuery> = AxumQ::try_from_uri(&uri.parse().unwrap())
+                .unwrap_or_else(|e| panic!("{uri} must not be rejected: {e:?}"));
+            assert_eq!(parsed.0.page.unwrap_or(0), expected.unwrap_or(0), "{uri}");
+        }
+    }
+
+    /// Served end to end: `?page=abc` yields the first page's entries.
+    #[tokio::test]
+    async fn all_books_with_malformed_page_serves_page_zero() {
+        use axum::extract::Query as AxumQ;
+        let state = seeded_state(&[("b1", 100), ("b2", 200)]);
+        let Ok(AxumQ(params)) =
+            AxumQ::<PaginationQuery>::try_from_uri(&"/opds/all?page=abc".parse().unwrap())
+        else {
+            panic!("page=abc must not be rejected");
+        };
+        let resp = all_books(AxumState(state), AxumQuery(params), HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let xml = body_string(resp).await;
+        assert!(xml.contains("<entry>"), "page 0 must list books: {xml}");
+        assert!(
+            xml.contains(r#"<link rel="self" href="/opds/all""#),
+            "{xml}"
+        );
+    }
+
+    /// A control character in the search term (`?q=%01`) must not make the
+    /// feed ill-formed XML: XML 1.0 forbids C0 controls outright.
+    #[tokio::test]
+    async fn search_with_control_characters_is_well_formed_xml() {
+        let state = seeded_state_with_books(vec![search_test_book("m0", "Matched", "A", 1)]);
+        let xml = body_string(call_search(&state, Some("\u{1}x\u{b}"), None).await).await;
+
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("feed is not well-formed XML: {e}\n{xml}"),
+            }
+        }
+        assert!(!xml.contains('\u{1}') && !xml.contains('\u{b}'), "{xml}");
     }
 
     #[tokio::test]

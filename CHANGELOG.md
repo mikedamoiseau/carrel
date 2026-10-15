@@ -10,6 +10,21 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   recent daily log files and deletes older ones, so the log folder no longer
   grows without limit.
 
+### Fixed
+- **EPUB images with `&`, quotes, `%` or non-breaking spaces in their filename
+  now show.** Such images were left as broken links in the reader (or, for a
+  `%`, a 404 in the web reader). Images whose filenames contain spaces or
+  non-ASCII characters are re-extracted once the next time their chapter is
+  opened.
+- **OPDS search with control characters in the query returns valid XML.**
+  `/opds/search?q=%01` used to produce a feed strict OPDS clients rejected.
+- **`/opds/all?page=abc` no longer errors.** A malformed `page` now serves the
+  first page, as search already did.
+- **Collection book order is stable.** Books that tie on date (added to a
+  manual collection in the same second, or imported in the same second into an
+  automated one) now keep a consistent order instead of shuffling between
+  loads.
+
 ## [3.2.2] - 2026-10-15
 
 ### Security
