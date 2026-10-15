@@ -70,8 +70,13 @@ mkdir -p "${FIXTURES_DIR}"
 # Same verification, same result: PalmDB name, BOOK/MOBI, file-version 8, and
 # Carroll/Alice/Wonderland in the body, with the fixture-gated KF8 tests green.
 # `pg11.mobi` still matches its original pin.
+#
+# 2026-10-15: reissued again (Last-Modified 2026-10-01, now 255506 bytes).
+# Same verification, same result: PalmDB name, BOOK/MOBI, file-version 8, and
+# Carroll/Alice/Wonderland in the body, with the fixture-gated KF8 tests green.
+# `pg11.mobi` still matches its original pin.
 declare -a FILES=(
-  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|b3c9067848d28f8c0f36adbb198b306791884319e8b2f8ea7083f844d8876815"
+  "alice.mobi|https://www.gutenberg.org/cache/epub/11/pg11-images-kf8.mobi|d8211269aed55ded8302f289950936db8368b4d4d384c463b722034152f8f1d2"
   "alice-legacy.mobi|https://www.gutenberg.org/cache/epub/11/pg11.mobi|c6de8f83459904177eac2623aa653ef57483ed6968078c8fc3d3171f20e06408"
 )
 
