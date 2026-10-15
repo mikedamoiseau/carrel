@@ -10,7 +10,7 @@ The full text of every license referenced here is available at
 
 Rust crate dependencies are enumerated with their licenses in
 [`Cargo.lock`](./Cargo.lock); JavaScript dependencies in
-[`package-lock.json`](./package-lock.json). The entries below call out only
+[`pnpm-lock.yaml`](./pnpm-lock.yaml). The entries below call out only
 the components that affect distribution — native libraries that Carrel links
 to or ships in its release artifacts.
 
@@ -166,7 +166,7 @@ dependencies:
 ## JavaScript / TypeScript dependencies
 
 Frontend dependencies (React, Tailwind CSS, DOMPurify, etc.) are documented
-in `package.json` / `package-lock.json`. All ship under permissive licenses
+in `package.json` / `pnpm-lock.yaml`. All ship under permissive licenses
 (MIT, BSD-3-Clause, Apache-2.0). Tailwind CSS icon sets and fonts bundled
 in the app are MIT or SIL Open Font Licensed.
 
