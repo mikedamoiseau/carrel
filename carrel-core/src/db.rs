@@ -755,6 +755,8 @@ pub fn restore_secondary_data(conn: &Connection, data: &SecondaryImport) -> Rest
     counts
 }
 
+const GRID_COLUMNS: &str = "id, title, author, cover_path, total_chapters, added_at, format, series, volume, rating, language, publish_year, is_imported, want_to_read";
+
 /// Grid columns prefixed with table alias `b.` for JOIN queries.
 const GRID_COLUMNS_B: &str = "b.id, b.title, b.author, b.cover_path, b.total_chapters, b.added_at, b.format, b.series, b.volume, b.rating, b.language, b.publish_year, b.is_imported, b.want_to_read";
 
@@ -781,11 +783,18 @@ fn row_to_grid_item(row: &rusqlite::Row) -> rusqlite::Result<BookGridItem> {
 }
 
 pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
-    // Every book, newest first with `id` as the unique tie-break (Fix D: see
-    // `book_sort_order_sql`). A default query has no predicate, no limit and
-    // no offset, so it is the whole table in that order — and, unpaginated,
-    // it skips the extra COUNT scan.
-    Ok(query_books_grid(conn, &BookQuery::default())?.items)
+    // Fix D: `added_at` has second-granularity ties (concurrent/batch
+    // imports) — without a unique tiebreaker, offset pagination can slice a
+    // book onto two pages or skip it entirely when rows with the same
+    // timestamp sort differently between two requests. `id` is unique, so
+    // appending it makes this order total and deterministic.
+    let sql = format!(
+        "SELECT {} FROM books ORDER BY added_at DESC, id",
+        GRID_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_grid_item)?;
+    rows.collect()
 }
 
 // --- Query module: filter/sort/page a library in one place -----------------
@@ -2756,7 +2765,37 @@ pub fn get_books_in_collection_grid(
     conn: &Connection,
     collection_id: &str,
 ) -> Result<Vec<BookGridItem>> {
-    query_books_in_collection_grid(conn, collection_id, &BookQuery::default())
+    let mut type_stmt = conn.prepare("SELECT type FROM collections WHERE id = ?1")?;
+    let coll_type: String = type_stmt.query_row(params![collection_id], |row| row.get(0))?;
+
+    if coll_type == "manual" {
+        let sql = format!(
+            "SELECT {} FROM books b JOIN book_collections bc ON bc.book_id = b.id WHERE bc.collection_id = ?1 ORDER BY bc.added_at DESC, b.id",
+            GRID_COLUMNS_B
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![collection_id], row_to_grid_item)?;
+        return rows.collect();
+    }
+
+    let rules = get_collection_rules(conn, collection_id)?;
+    let (joins, where_str, param_values) = build_rule_query(&rules);
+
+    let sql = format!(
+        "SELECT DISTINCT {cols}
+         FROM books b
+         {joins}
+         {where_str}
+         ORDER BY b.added_at DESC, b.id",
+        cols = GRID_COLUMNS_B
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(param_values.iter()),
+        row_to_grid_item,
+    )?;
+    rows.collect()
 }
 
 /// Build JOIN, WHERE, and parameter lists from a set of collection rules.
@@ -8071,10 +8110,13 @@ mod tests {
 
     // --- M6: wrapper equivalence pins ---------------------------------------
     //
-    // `list_books_grid` and `get_books_in_collection_grid` are `pub` API that
-    // Carrel Server consumes, so they stay; these pin that each returns exactly
-    // what the query module returns for a default query (same rows, same
-    // order, same fields). Regression pins for a refactor, not red-first tests.
+    // `list_books_grid` and `get_books_in_collection_grid` keep their own SQL
+    // rather than delegating to the query module: delegating would register the
+    // `carrel_lower` UDF on every call, which expires the connection's cached
+    // statements and fails with SQLITE_BUSY if another statement on it is mid-
+    // step — a new failure mode for two `pub` functions Carrel Server consumes,
+    // for a default query that never uses the UDF. These cross-check that the
+    // two implementations still return the same rows, order and fields.
 
     /// `BookGridItem` has no `PartialEq`; its serialised form covers every field.
     fn grid_json(items: &[BookGridItem]) -> serde_json::Value {

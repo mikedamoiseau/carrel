@@ -1,7 +1,7 @@
 # Three client-side book-filter copies, one of them dead
 
 > **PARTLY RESOLVED.** The dead copy, `filterBooks` in `src/lib/utils.ts`, and
-> its ten tests were deleted in milestone 6 of the backlog-sweep epic
+> its tests (nine cases; the count below was always off by one) were deleted in milestone 6 of the backlog-sweep epic
 > (`git log -S filterBooks -- src/` showed it was added with its tests in the
 > first test-suite commit and never had a production caller, so nothing was
 > expected back). The other two copies, `Library.tsx` and

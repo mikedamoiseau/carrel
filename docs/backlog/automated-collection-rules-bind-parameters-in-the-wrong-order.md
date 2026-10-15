@@ -5,9 +5,15 @@
 > SQL its callers assemble). Kept as a record of what the bug was and how it
 > was found. The two follow-ups at the end — collapsing
 > `get_books_in_collection_grid` and `list_books_grid` into the query module —
-> are **done** (milestone 6 of the backlog-sweep epic): both stay as `pub`
-> entry points but now delegate to `query_books_in_collection_grid` and
-> `query_books_grid` with a default `BookQuery`.
+> were **tried and declined** in milestone 6 of the backlog-sweep epic. The
+> output is identical, but the query module registers the `carrel_lower` UDF on
+> every call; re-registering expires the connection's cached statements and
+> fails with `SQLITE_BUSY` if another statement on that connection is
+> mid-step. That is a new failure mode for two `pub` functions Carrel Server
+> consumes, for a default query that never uses the UDF. Both keep their own
+> SQL; `db.rs` tests now cross-check that each still matches its `query_*`
+> counterpart. Revisit if `query_books_generic` learns to register the UDF only
+> when the predicate or sort actually uses it.
 
 **Silent wrong results, pre-existing, user-facing.** Found during the review of
 milestone 4 of the library-query epic (PR #142), which added a second caller of
