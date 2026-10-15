@@ -1378,8 +1378,8 @@ mod tests {
     // ---- Crafted-PDF tests for the render-size bound ----
 
     /// Build a single-page PDF with the given `MediaBox` and a valid xref
-    /// table. Generated rather than checked in: `src-tauri/test-fixtures/` is
-    /// gitignored, so a committed fixture would never reach CI.
+    /// table. Generated rather than checked in, so each test picks its own
+    /// `MediaBox`.
     fn crafted_pdf(media_box: &str) -> Vec<u8> {
         let content = b"0 0 1 rg 0 0 10 10 re f\n";
         let bodies: Vec<Vec<u8>> = vec![

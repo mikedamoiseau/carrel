@@ -230,10 +230,8 @@ jobs:
     # tag-push time. Linux remains the authoritative MOBI smoke-test
     # home; this job only proves the Windows build pipeline (CMake
     # build of libmobi → bindgen → MSVC link → carrel-core unit tests)
-    # still works. Smoke tests gated on the MOBI corpus are not run
-    # here — they require the Project Gutenberg fetch script which
-    # hits the network from Windows runners and adds time without
-    # adding meaningful coverage over the Linux runner.
+    # still works. The MOBI corpus is vendored in src-tauri/test-fixtures/,
+    # so the fixture-gated smoke tests run here too.
     name: Rust Tests (Windows, --features mobi)
     runs-on: windows-latest
     steps:
@@ -378,7 +376,10 @@ jobs:
         run: |
           $env:LIBMOBI_INCLUDE_DIR = "$env:GITHUB_WORKSPACE\.libmobi-windows\include"
           $env:LIBMOBI_LIB_DIR = "$env:GITHUB_WORKSPACE\.libmobi-windows\lib"
-          cargo test -p carrel-core --features mobi
+          # --test-threads=1 for the same libmobi cleanup race the Linux
+          # job serialises against; now that the corpus is vendored the
+          # smoke tests open real MOBIs here as well.
+          cargo test -p carrel-core --features mobi -- --test-threads=1
 
   frontend-check:
     name: Frontend TypeScript Check

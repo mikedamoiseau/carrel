@@ -11,6 +11,8 @@ fixture-gated tests in `carrel-core/src/mobi/`.
 
 These are committed rather than downloaded because Project Gutenberg keeps
 regenerating the KF8 file (reissued repeatedly between July and October 2026),
-which changed its hash and broke CI each time. Do not re-fetch or replace them
+which changed its hash and broke CI each time. The `alice.mobi` committed here
+is the 2026-10-01 reissue (upstream Last-Modified, 255506 bytes), retrieved
+2026-10-15; `alice-legacy.mobi` is unchanged since it was first pinned. Do not re-fetch or replace them
 without verifying the new file is still KF8 / version 8 and that the MOBI tests
 pass.
