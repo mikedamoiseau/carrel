@@ -2790,8 +2790,9 @@ pub(crate) fn touch_staged_book(cache_dir: &std::path::Path, book: &Book) {
 
 /// Web serving-path entry point (M2): ensure a network-mounted book has a local
 /// staged copy, without a per-page `statfs` storm. Unlike the desktop reader,
-/// the web server has no single "open" event — this runs on *every* page
-/// request, so it must be cheap on the common (already-staged) path:
+/// the web server has no single "open" event — this runs on every non-private
+/// page request (the route skips it in private mode, M5), so it must be cheap
+/// on the common (already-staged) path:
 ///
 /// - Staged copy present → bump its LRU recency (`touch_staged_book`) and
 ///   return. A local existence check + mtime touch; no remote `statfs`, no
@@ -2859,11 +2860,9 @@ pub(crate) fn private_comic_manifest(
     if let Some(m) = page_cache::complete_manifest(storage, book_hash) {
         return Ok(m);
     }
-    let page_count = if *format == BookFormat::Cbz {
-        carrel_core::cbz::get_page_count(file_path)?
-    } else {
-        carrel_core::cbr::get_page_count(file_path)?
-    };
+    // No complete manifest: count from the archive directory, as
+    // `reader::page_count` does for any reader (it writes nothing).
+    let page_count = carrel_core::reader::page_count(format.clone(), file_path, None, None)?;
     let now = chrono::Utc::now().to_rfc3339();
     Ok(page_cache::CacheManifest {
         book_id: book_id.to_string(),
@@ -3062,8 +3061,10 @@ pub async fn prepare_pdf(
     // Mark the staged copy (if any) most-recently-used for eviction, then stage
     // a network-mounted source to local disk on open (background, non-blocking)
     // so page reads stop hitting the share at render time. After the format
-    // check so a wrong-format call can't launch a large copy.
-    stage_source_on_open(&state.cache_dir, &book, &file_path, state.is_private());
+    // check so a wrong-format call can't launch a large copy. Private mode
+    // (M5) skips both; the flag is read once for the whole command.
+    let is_private = state.is_private();
+    stage_source_on_open(&state.cache_dir, &book, &file_path, is_private);
     let book_hash = book
         .file_hash
         .as_deref()
@@ -3100,7 +3101,7 @@ pub async fn prepare_pdf(
     // costs a single render (vs. the 10 this milestone removed). Skipped in
     // private mode, where nothing is persisted anyway (the write is suppressed,
     // so it would neither cache nor spare the background pass).
-    if !state.is_private() && manifest.page_count > 0 {
+    if !is_private && manifest.page_count > 0 {
         let reserve = start_page.unwrap_or(0).min(manifest.page_count - 1);
         let _ = page_cache::get_or_render_pdf_page(&storage, book_hash, &file_path, reserve);
     }
@@ -3112,7 +3113,7 @@ pub async fn prepare_pdf(
     // background pass would persist the entire book to disk, defeating the
     // page-content write suppression the on-demand read path enforces —
     // eviction still runs so the cap holds.
-    if state.is_private() {
+    if is_private {
         let evict_storage = page_cache_storage(&app)?;
         tauri::async_runtime::spawn_blocking(move || {
             let _ = page_cache::run_eviction(&evict_storage, max_size_mb);

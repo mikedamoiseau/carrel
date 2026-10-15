@@ -1499,13 +1499,20 @@ async fn get_page_image(
             let file_hash = book.file_hash.clone();
             let (bytes, mime) = tokio::task::spawn_blocking(move || {
                 let evict_storage = pages_storage.clone();
-                let on_miss = comic_on_miss(
-                    pages_storage.as_deref(),
-                    file_hash.as_deref(),
-                    &format,
-                    &file_path,
-                    max_cache_size_mb,
-                );
+                // A private read never primes (core takes the direct-decode
+                // path whatever `on_miss` says), so skip `comic_on_miss`'s
+                // archive-directory read: on a NAS it is a wasted round trip.
+                let on_miss = if is_private {
+                    carrel_core::reader::OnMiss::ReadSource
+                } else {
+                    comic_on_miss(
+                        pages_storage.as_deref(),
+                        file_hash.as_deref(),
+                        &format,
+                        &file_path,
+                        max_cache_size_mb,
+                    )
+                };
                 carrel_core::reader::page_image(
                     format,
                     &file_path,

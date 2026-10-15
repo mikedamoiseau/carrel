@@ -3,8 +3,9 @@
 **Status:** FIXED (backlog-sweep M5). Noted 2026-08-26, during the M1
 comic-page-reads review.
 
-> **Resolution.** Private mode now *serves* comics but records nothing, the
-> same as PDF, on both surfaces together:
+> **Resolution.** Private mode now *serves* comics but records nothing, on
+> both surfaces together (the web PDF arm already behaved this way; desktop
+> PDF does not, see below):
 >
 > - `carrel_core::reader::page_image`'s comic arm honours `is_private`: a
 >   private miss decodes the one page straight from the archive (never primes,
@@ -25,8 +26,12 @@ comic-page-reads review.
 >   existing staged copy is still *read* (`resolve_book_path` only checks for
 >   it). This also covers PDF, which shares the staging calls.
 >
-> Not changed: desktop `prepare_pdf` still writes its zero-page manifest
-> unconditionally in private mode (pre-existing, outside this item).
+> Not changed (pre-existing, outside this item): desktop `prepare_pdf` still
+> prewarms in private mode, which creates a manifest or rewrites its
+> `last_accessed`, and a private PDF page miss still bumps `last_accessed`; a
+> comic background pass started before private mode was switched on is not
+> aborted. Comics are now stricter than desktop PDF. Tracked in
+> `desktop-pdf-private-mode-still-writes.md`.
 >
 > The text below is the original analysis, kept as written.
 
