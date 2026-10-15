@@ -137,7 +137,7 @@ This is added to Mike's `~/.zshrc`. If builds fail with `fatal error: 'new' file
 
 ## CI
 
-**The package manager is `pnpm`, not npm.** CI runs `pnpm install` and `pnpm run …`; `pnpm-lock.yaml` is the lockfile CI resolves against. A stale `package-lock.json` is also checked in and `package.json` has no `packageManager` field, so nothing stops `npm install` from succeeding locally with a *different* dependency tree than CI installed. Use pnpm.
+**The package manager is `pnpm`, not npm.** CI runs `pnpm install` and `pnpm run …`; `pnpm-lock.yaml` is the lockfile CI resolves against. `package.json` has no `packageManager` field, so nothing stops `npm install` from succeeding locally and resolving a *different* dependency tree than CI installed. Use pnpm.
 
 ### The full gate set
 
