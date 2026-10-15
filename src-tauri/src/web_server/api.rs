@@ -1282,6 +1282,42 @@ fn parse_width(query: Option<&str>) -> Option<u32> {
     found
 }
 
+/// How a comic page miss should be served: prime the cache, or decode
+/// straight from the archive.
+///
+/// A comic that cannot fit `max_cache_size_mb` is never primed: the inline
+/// eviction sweep that follows a priming write would evict the book it just
+/// wrote, so every request would pay a full extraction for nothing. "Cannot
+/// fit" mirrors what `run_eviction` enforces — the archive's declared page
+/// bytes against `max_cache_size_mb * 1 MiB`, where 0 means a zero-byte
+/// budget, not "unlimited".
+///
+/// Decided on a cold miss only: a book whose manifest is already complete is
+/// served from the cache with no archive open (and a read never evicts, so a
+/// budget lowered afterwards is honoured by the next sweep, not this read).
+/// An unreadable declared size falls through to priming, today's behaviour.
+fn comic_on_miss(
+    pages: Option<&dyn carrel_core::storage::Storage>,
+    hash: Option<&str>,
+    format: &BookFormat,
+    file_path: &str,
+    max_cache_size_mb: u64,
+) -> carrel_core::reader::OnMiss {
+    use carrel_core::reader::OnMiss;
+    let (Some(pages), Some(hash)) = (pages, hash) else {
+        return OnMiss::Prime;
+    };
+    if crate::page_cache::complete_manifest(pages, hash).is_some() {
+        return OnMiss::Prime;
+    }
+    match crate::page_cache::comic_declared_size(format, file_path) {
+        Ok(declared) if declared > max_cache_size_mb.saturating_mul(1024 * 1024) => {
+            OnMiss::ReadSource
+        }
+        _ => OnMiss::Prime,
+    }
+}
+
 async fn get_page_image(
     State(state): State<WebState>,
     Path((id, index)): Path<(String, u32)>,
@@ -1452,6 +1488,13 @@ async fn get_page_image(
             let file_hash = book.file_hash.clone();
             let (bytes, mime) = tokio::task::spawn_blocking(move || {
                 let evict_storage = pages_storage.clone();
+                let on_miss = comic_on_miss(
+                    pages_storage.as_deref(),
+                    file_hash.as_deref(),
+                    &format,
+                    &file_path,
+                    max_cache_size_mb,
+                );
                 carrel_core::reader::page_image(
                     format,
                     &file_path,
@@ -1490,9 +1533,10 @@ async fn get_page_image(
                     false,
                     // The web reader has no book-open event of its own — a
                     // miss must prime the whole archive itself, or a book
-                    // never gets cached at all. See
-                    // `carrel_core::reader::OnMiss`.
-                    carrel_core::reader::OnMiss::Prime,
+                    // never gets cached at all — unless the book cannot fit
+                    // the cache budget, in which case `comic_on_miss` picks a
+                    // direct decode. See `carrel_core::reader::OnMiss`.
+                    on_miss,
                 )
             })
             .await
@@ -3098,6 +3142,104 @@ mod tests {
             "at least one book must be evicted once the combined cache exceeds the \
              configured 1 MB budget; both present means eviction used a larger budget \
              than what was set"
+        );
+    }
+
+    async fn read_comic_page(state: &WebState, id: &str, index: u32) -> Vec<u8> {
+        let resp = get_page_image(
+            State(state.clone()),
+            Path((id.to_string(), index)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+        body_bytes(resp).await.to_vec()
+    }
+
+    /// A comic whose declared size exceeds the cache budget can never survive
+    /// the post-extraction sweep, so priming it only burns a full extraction
+    /// per request. It must be served by direct decode without touching the
+    /// page cache at all.
+    ///
+    /// "Nothing written" is read off the disk: `LocalStorage::delete` leaves
+    /// the book's directory behind, so a prime-then-evict (the old behaviour)
+    /// leaves `page-cache/{hash}/` on disk even though no manifest survives.
+    /// The directory's absence is what only the bypass can satisfy.
+    #[tokio::test]
+    async fn web_over_budget_comic_is_served_without_touching_the_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+        let cbz = write_large_cbz(dir.path(), "big.cbz", 2 * 1024 * 1024);
+        seed_comic_book(&state, "bk-big", &cbz, Some("comic-hash-big"));
+
+        let first = read_comic_page(&state, "bk-big", 0).await;
+        let second = read_comic_page(&state, "bk-big", 0).await;
+        assert_eq!(first.len(), 2 * 1024 * 1024, "page must be served in full");
+        assert_eq!(first, second);
+
+        assert!(
+            !state.cache_dir.join("page-cache/comic-hash-big").exists(),
+            "an over-budget comic must never be primed, not even transiently"
+        );
+        let storage = state.pages_storage().unwrap();
+        assert!(
+            carrel_core::page_cache::read_manifest(storage.as_ref(), "comic-hash-big").is_none()
+        );
+    }
+
+    /// The counterpart: a comic that fits the budget is still primed by its
+    /// first request (the bypass must not fire on anything that can fit).
+    #[tokio::test]
+    async fn web_in_budget_comic_is_still_primed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+        let cbz = write_large_cbz(dir.path(), "fits.cbz", 700 * 1024);
+        seed_comic_book(&state, "bk-fits", &cbz, Some("comic-hash-fits"));
+
+        read_comic_page(&state, "bk-fits", 0).await;
+
+        let storage = state.pages_storage().unwrap();
+        assert!(
+            carrel_core::page_cache::complete_manifest(storage.as_ref(), "comic-hash-fits")
+                .is_some(),
+            "an in-budget comic must be primed on its first request"
+        );
+    }
+
+    /// The bypass decision is made only on a cold miss. A book already
+    /// cached keeps being served from the cache even after the budget is
+    /// lowered below its size (and with the source gone, so no archive is
+    /// opened to decide anything); reads never evict, the next priming
+    /// sweep of some other book reclaims it.
+    #[tokio::test]
+    async fn web_warm_comic_is_served_from_cache_after_the_budget_is_lowered() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_large_cbz(dir.path(), "warm.cbz", 2 * 1024 * 1024);
+        seed_comic_book(&state, "bk-warm", &cbz, Some("comic-hash-warm"));
+
+        let first = read_comic_page(&state, "bk-warm", 0).await;
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+        std::fs::remove_file(&cbz).unwrap();
+
+        let second = read_comic_page(&state, "bk-warm", 0).await;
+        assert_eq!(first, second);
+        let storage = state.pages_storage().unwrap();
+        assert!(
+            carrel_core::page_cache::complete_manifest(storage.as_ref(), "comic-hash-warm")
+                .is_some(),
+            "a read must not evict"
         );
     }
 

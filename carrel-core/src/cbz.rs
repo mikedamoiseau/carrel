@@ -146,6 +146,22 @@ pub fn get_page_count(path: &str) -> CarrelResult<u32> {
     Ok(images.len() as u32)
 }
 
+/// Total uncompressed size the central directory *declares* for the page
+/// entries, summed over the same entry list extraction writes
+/// ([`collect_page_names`]'s filter). Reads the directory only, no entry data.
+pub(crate) fn declared_page_bytes(path: &str) -> CarrelResult<u64> {
+    let mut archive = open_archive(path)?;
+    let names = collect_image_names(&mut archive);
+    let mut total: u64 = 0;
+    for name in names {
+        let file = archive
+            .by_name(&name)
+            .map_err(|e| CarrelError::invalid(format!("Cannot read ZIP entry '{name}': {e}")))?;
+        total = total.saturating_add(file.size());
+    }
+    Ok(total)
+}
+
 /// Canonical sorted page-entry names for a CBZ, using the exact same
 /// filter/sort as [`get_page_image_bytes`]. The page cache relies on this
 /// so a page cached at index `i` is byte-identical to an on-demand read of
@@ -289,6 +305,32 @@ mod tests {
         let names = collect_image_names(&mut archive);
 
         assert_eq!(names, vec!["page01.jpg", "page02.png", "page03.jpg"]);
+    }
+
+    /// The declared size counts exactly the entries extraction would write:
+    /// page images only, not resource forks, directories or other files.
+    #[test]
+    fn declared_page_bytes_sums_only_page_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz_path = dir.path().join("sized.cbz");
+        {
+            let file = std::fs::File::create(&cbz_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("page01.jpg", options).unwrap();
+            zip.write_all(&[0u8; 1000]).unwrap();
+            zip.start_file("page02.png", options).unwrap();
+            zip.write_all(&[0u8; 234]).unwrap();
+            zip.start_file("__MACOSX/page01.jpg", options).unwrap();
+            zip.write_all(&[0u8; 5000]).unwrap();
+            zip.start_file("notes.txt", options).unwrap();
+            zip.write_all(&[0u8; 7000]).unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(
+            declared_page_bytes(cbz_path.to_str().unwrap()).unwrap(),
+            1234
+        );
     }
 
     #[test]

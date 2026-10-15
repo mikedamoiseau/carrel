@@ -710,14 +710,15 @@ where
         // adapter answers 400/500 instead of 404, the exact class of bug
         // `ensure_epub_cached` guards against above.
         ensure_file_exists(file_path)?;
-        // Whether `ensure_cached` is about to do real work, decided before
-        // it runs: it short-circuits on an already-complete manifest, and
-        // `complete_manifest` is the very test it uses to decide that (see
-        // its doc comment). This is what keeps F7 true — an out-of-range
-        // page of an *already cached* book must not fire the eviction hook,
-        // because nothing was written — while still letting the degrade path
-        // below fire it when an extraction really did happen.
-        let extracted = page_cache::complete_manifest(pages, hash).is_none();
+        // Whether the book is cold, as of now. Only the page-count pre-check
+        // below uses it (to avoid opening the archive for a warm book). It is
+        // NOT what decides the eviction hook: another book's inline eviction
+        // can land between this read and `ensure_cached`, so the hook follows
+        // the flag `ensure_cached_reporting` returns for what it actually did.
+        // That keeps F7 true — an out-of-range page of an *already cached*
+        // book must not fire the hook, because nothing was written — while
+        // still firing it when an extraction really happened.
+        let cold = page_cache::complete_manifest(pages, hash).is_none();
         // Cold: reject an index the archive cannot satisfy before paying for
         // an extraction. The page count is read from the archive's directory
         // (`get_page_count` shares `collect_page_names`' entry filter and
@@ -731,7 +732,7 @@ where
         // already answers it — and a count that cannot be read falls through
         // to the existing path, whose own errors are unchanged. Nothing was
         // written, so the eviction hook does not fire.
-        if extracted {
+        if cold {
             let count = if format == BookFormat::Cbz {
                 crate::cbz::get_page_count(file_path)
             } else {
@@ -769,17 +770,21 @@ where
         // (`pdf page cache unavailable…`): a permanently unwritable or full
         // cache otherwise degrades every comic page request forever with
         // nothing in the app log, and the user just sees slow pages.
-        if let Err(e) = page_cache::ensure_cached(pages, book_id, hash, file_path, &format) {
-            log::warn!("comic page cache unavailable for {hash}, decoding directly: {e}");
-            return direct_comic_page(
-                format,
-                file_path,
-                page_index,
-                target_width,
-                started,
-                std::time::Duration::ZERO,
-            );
-        }
+        let extracted =
+            match page_cache::ensure_cached_reporting(pages, book_id, hash, file_path, &format) {
+                Ok((_, extracted)) => extracted,
+                Err(e) => {
+                    log::warn!("comic page cache unavailable for {hash}, decoding directly: {e}");
+                    return direct_comic_page(
+                        format,
+                        file_path,
+                        page_index,
+                        target_width,
+                        started,
+                        std::time::Duration::ZERO,
+                    );
+                }
+            };
 
         // Read back before firing `on_extracted` (finding F1): the callback
         // is the caller's eviction hook, and an eviction pass can reclaim
@@ -1856,6 +1861,113 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
         assert_eq!(calls.get(), 0, "must not fire when nothing was extracted");
+    }
+
+    /// A `Storage` that evicts one book the moment `ensure_cached` reads
+    /// its manifest, to reproduce — deterministically — another request's
+    /// inline `run_eviction` landing between `page_image`'s completeness
+    /// pre-read and `ensure_cached`'s own check.
+    ///
+    /// The trigger counts manifest `get`s on an out-of-range read of a warm
+    /// book: (1) `get_cached_page`, (2) the re-check under the extraction
+    /// lock, (3) `complete_manifest`'s pre-read, (4) `ensure_cached`. The
+    /// fourth one is the race window.
+    struct EvictsOnFourthManifestRead {
+        inner: crate::storage::LocalStorage,
+        hash: String,
+        manifest_gets: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::storage::Storage for EvictsOnFourthManifestRead {
+        fn put(&self, key: &str, bytes: &[u8]) -> CarrelResult<()> {
+            self.inner.put(key, bytes)
+        }
+        fn get(&self, key: &str) -> CarrelResult<Vec<u8>> {
+            if key.ends_with("manifest.json") && key.contains(&self.hash) {
+                let n = self
+                    .manifest_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if n == 4 {
+                    page_cache::evict_book(&self.inner, &self.hash).unwrap();
+                }
+            }
+            self.inner.get(key)
+        }
+        fn exists(&self, key: &str) -> CarrelResult<bool> {
+            self.inner.exists(key)
+        }
+        fn delete(&self, key: &str) -> CarrelResult<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> CarrelResult<Vec<String>> {
+            self.inner.list(prefix)
+        }
+        fn size(&self, key: &str) -> CarrelResult<u64> {
+            self.inner.size(key)
+        }
+        fn local_path(&self, key: &str) -> CarrelResult<std::path::PathBuf> {
+            self.inner.local_path(key)
+        }
+    }
+
+    /// TOCTOU on the "did we extract" predicate: the book is complete when
+    /// `page_image` checks, but evicted before `ensure_cached` looks, so
+    /// `ensure_cached` really extracts. The eviction hook must fire for that
+    /// write — the hook decision follows what `ensure_cached` reports, not
+    /// the pre-read. (Out-of-range index on a warm book is the way to reach
+    /// the miss branch with a complete manifest.)
+    #[test]
+    fn hook_fires_when_the_book_is_evicted_between_the_check_and_ensure_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50)]);
+        let pages = EvictsOnFourthManifestRead {
+            inner: pages_storage(dir.path()),
+            hash: "hash-race".to_string(),
+            manifest_gets: std::sync::atomic::AtomicU32::new(0),
+        };
+        // Warm the book first; the wrapper's counter is reset afterwards.
+        page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-race"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        pages
+            .manifest_gets
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = page_image(
+            BookFormat::Cbz,
+            &path,
+            99,
+            None,
+            "bk",
+            Some("hash-race"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+        assert!(
+            page_cache::complete_manifest(&pages, "hash-race").is_some(),
+            "the race must have caused a real re-extraction"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "ensure_cached re-extracted, so the hook must fire"
+        );
     }
 
     /// F4 (M1 review): a cache hit must refresh `last_accessed`, or a comic

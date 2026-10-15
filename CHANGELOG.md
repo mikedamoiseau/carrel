@@ -11,6 +11,10 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   grows without limit.
 
 ### Fixed
+- **The web reader no longer re-extracts a comic that is larger than the page
+  cache limit on every page.** A comic bigger than the "page cache size"
+  setting was unpacked and then thrown away again for each page you turned;
+  it is now read straight from the file instead.
 - **EPUB images with `&`, quotes, `%` or non-breaking spaces in their filename
   now show.** Such images were left as broken links in the reader (or, for a
   `%`, a 404 in the web reader). Images whose filenames contain anything

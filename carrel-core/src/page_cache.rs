@@ -201,6 +201,22 @@ fn comic_page_names(format: &BookFormat, file_path: &str) -> CarrelResult<Vec<St
     }
 }
 
+/// Total uncompressed size a comic archive *declares* for the page entries
+/// extraction would write (CBZ: zip central directory; CBR: unrar headers).
+/// Reads the archive's directory only. A caller can compare it with the cache
+/// budget to tell, before extracting, that priming cannot survive eviction.
+/// Declared, not verified: a lying archive is bounded by the per-entry read
+/// caps at extraction time, not here. Errors for non-comic formats.
+pub fn comic_declared_size(format: &BookFormat, file_path: &str) -> CarrelResult<u64> {
+    match format {
+        BookFormat::Cbz => crate::cbz::declared_page_bytes(file_path),
+        BookFormat::Cbr => crate::cbr::declared_page_bytes(file_path),
+        other => Err(CarrelError::invalid(format!(
+            "comic_declared_size not supported for {other:?}"
+        ))),
+    }
+}
+
 /// Cache filename for the page at `idx`, deriving the (lowercased)
 /// extension from the source archive entry name.
 fn comic_page_filename(idx: usize, src_name: &str) -> String {
@@ -756,13 +772,34 @@ pub fn ensure_cached(
     file_path: &str,
     format: &BookFormat,
 ) -> CarrelResult<CacheManifest> {
+    ensure_cached_reporting(storage, book_id, book_hash, file_path, format).map(|(m, _)| m)
+}
+
+/// [`ensure_cached`], also reporting whether this call wrote a comic's pages
+/// (`true`) or found a complete cache entry and wrote nothing (`false`).
+///
+/// A caller that infers this from a manifest check made *before* calling
+/// `ensure_cached` can be wrong: another book's inline eviction may land in
+/// between, so the check says "complete" while the call re-extracts.
+/// Reporting it from inside the call, after the decision was actually made,
+/// closes that window. A PDF prewarm reports `false` — it caches no pages up
+/// front, and the only caller that cares (`reader::page_image`'s comic arm)
+/// never passes a PDF.
+pub(crate) fn ensure_cached_reporting(
+    storage: &dyn Storage,
+    book_id: &str,
+    book_hash: &str,
+    file_path: &str,
+    format: &BookFormat,
+) -> CarrelResult<(CacheManifest, bool)> {
     // PDF manifests intentionally keep `pages` empty (filenames are
     // derived from the page index), so the comic-style first/last
     // validation below would always report "corrupt" and evict a
     // healthy PDF cache. Delegate to `ensure_pdf_prewarmed`, which
     // has its own format-aware idempotency check.
     if matches!(format, BookFormat::Pdf) {
-        return ensure_pdf_prewarmed(storage, book_id, book_hash, file_path, 10);
+        return ensure_pdf_prewarmed(storage, book_id, book_hash, file_path, 10)
+            .map(|m| (m, false));
     }
 
     if let Some(mut manifest) = read_manifest(storage, book_hash) {
@@ -785,7 +822,7 @@ pub fn ensure_cached(
             );
             manifest.last_accessed = now_iso();
             let _ = write_manifest(storage, book_hash, &manifest);
-            return Ok(manifest);
+            return Ok((manifest, false));
         }
         page_dbg!(
             "ensure_cached: cache corrupted for {}, re-extracting",
@@ -805,7 +842,7 @@ pub fn ensure_cached(
         ))),
     };
     page_dbg!("ensure_cached: extraction took {:?}", start.elapsed());
-    result
+    result.map(|m| (m, true))
 }
 
 // ---------------------------------------------------------------------------

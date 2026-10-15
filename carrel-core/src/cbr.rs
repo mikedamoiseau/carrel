@@ -62,25 +62,42 @@ fn mime_for(name: &str) -> &'static str {
     }
 }
 
-/// Collect sorted image entry names from a RAR archive.
-fn collect_image_names(path: &str) -> CarrelResult<Vec<String>> {
+/// Collect sorted image entries (name, declared unpacked size) from a RAR
+/// archive.
+fn collect_image_entries(path: &str) -> CarrelResult<Vec<(String, u64)>> {
     let archive = unrar::Archive::new(path)
         .open_for_listing()
         .map_err(|e| rar_err("Cannot open RAR archive", e))?;
 
-    let mut names: Vec<String> = archive
+    let mut entries: Vec<(String, u64)> = archive
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.filename.to_string_lossy().to_string();
             if entry.is_directory() || name.starts_with("__MACOSX/") || !is_image(&name) {
                 return None;
             }
-            Some(name)
+            Some((name, entry.unpacked_size))
         })
         .collect();
 
-    names.sort();
-    Ok(names)
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+/// Collect sorted image entry names from a RAR archive.
+fn collect_image_names(path: &str) -> CarrelResult<Vec<String>> {
+    Ok(collect_image_entries(path)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// Total unpacked size the archive headers *declare* for the page entries —
+/// the same entry list extraction writes. Reads headers only.
+pub(crate) fn declared_page_bytes(path: &str) -> CarrelResult<u64> {
+    Ok(collect_image_entries(path)?
+        .into_iter()
+        .fold(0u64, |acc, (_, size)| acc.saturating_add(size)))
 }
 
 pub struct CbrMeta {

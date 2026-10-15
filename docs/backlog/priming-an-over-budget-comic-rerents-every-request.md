@@ -1,9 +1,10 @@
 # Priming a comic bigger than the cache budget re-extracts on every request
 
-**Status:** partly fixed (noted 2026-08-26, during the M3 round-5 review).
+**Status:** mostly fixed (noted 2026-08-26, during the M3 round-5 review).
 Fixed in the backlog-sweep epic, M3: out-of-range indices on a cold comic, and
-`LocalStorage::list`'s whole-root walk. Still open: the over-budget direct
-decode, the `extracted` TOCTOU, and full-disk cleanup of partial extractions.
+`LocalStorage::list`'s whole-root walk. Fixed in M4: the over-budget direct
+decode and the `extracted` TOCTOU. Still open: full-disk cleanup of partial
+extractions.
 
 ## What
 
@@ -53,12 +54,26 @@ Two separable pieces:
   fast path, then `extract_comic_remaining` for every other page in the
   background), and its page reads use `OnMiss::ReadSource`, which never primes
   the cache, so no page request can trigger an extraction.
-- **Books over budget.** Decide up front, from the archive's declared size,
+- **Books over budget — FIXED (backlog-sweep M4).** Decide up front, from the archive's declared size,
   whether priming can survive the configured cap, and take the direct-decode
   path from the start instead of extract-then-evict. `ensure_cached` would
   need to report or accept a size bound for this.
 
-## Also worth knowing: a narrow TOCTOU on the "did we extract" predicate
+  Done, in the web adapter rather than in `ensure_cached`: on a cold miss
+  `web_server::api::comic_on_miss` compares the archive's declared page bytes
+  (`page_cache::comic_declared_size`: zip central directory for CBZ, unrar
+  `unpacked_size` for CBR, over the same entry list extraction writes) with
+  `page_cache_max_size_mb * 1 MiB` — the budget `run_eviction` enforces, where
+  0 is a zero-byte budget, not "unlimited" — and passes `OnMiss::ReadSource`
+  when the book cannot fit, so nothing is written. A warm book skips the check
+  (served from cache, no archive open; a read never evicts, so a budget lowered
+  afterwards takes effect at the next sweep). An unreadable declared size falls
+  back to priming. Only the CBZ size is covered by a test; no RAR fixture can be
+  built here. The size is *declared*: a lying archive is
+  still bounded by the read caps at extraction, and the post-prime sweep still
+  covers a book that fits on paper but not on disk.
+
+## FIXED (backlog-sweep M4): a narrow TOCTOU on the "did we extract" predicate
 
 `extracted` is read from `page_cache::complete_manifest` immediately before
 `ensure_cached` runs. The per-hash extraction lock stops two callers
@@ -69,10 +84,15 @@ complete" while `ensure_cached` really does extract, and the sweep for that
 write is skipped until the next one.
 
 The window is two statements wide and the bytes are reclaimed by any later
-sweep, so it has not been worth a fix. The clean version is for
-`ensure_cached` to report whether it did real work, rather than having the
-caller infer it — that is a `page_cache` signature change and should happen
-with the work above, not on its own.
+sweep, so it was not worth a fix on its own.
+
+Fixed in M4 without changing `ensure_cached`'s public signature: a
+crate-private `ensure_cached_reporting` returns `(manifest, extracted_now)`,
+`ensure_cached` delegates to it and drops the flag, and `page_image` fires the
+eviction hook from the reported flag. The pre-read `complete_manifest` stays,
+but only to skip M3's page-count pre-check on a warm book.
+`hook_fires_when_the_book_is_evicted_between_the_check_and_ensure_cached`
+pins it with a storage that evicts in the window.
 
 ## Related: a partially-written extraction is not swept promptly (M3 round 6)
 
