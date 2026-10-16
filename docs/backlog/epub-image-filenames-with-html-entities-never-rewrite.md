@@ -1,7 +1,22 @@
 # EPUB images whose filename contains `&`, `"` or U+00A0 are never rewritten
 
-**Status:** open. Pre-existing — not introduced by the M5 URL-policy change,
-and verified byte-identical on both sides of that commit.
+> **FIXED** in the backlog-sweep epic (M2): `rewrite_img_srcs` now runs the
+> extracted `src` through `decode_html_attr` (`carrel-core/src/epub.rs`)
+> before resolving the zip entry; the entity-encoded original is still what
+> gets spliced back out. The storage-key basename is now sanitized
+> (`sanitize_key_basename`: ASCII alphanumerics and `.-_` kept, everything
+> else `_`), because decoding made `"`, `<`, `>` reachable in a filename and
+> those are illegal on Windows. The key is still `{hash}-{basename}` with the
+> hash over the resolved, decoded zip path, so names already in the safe set
+> keep their existing keys. Keys are recomputed on every chapter render, so a
+> book whose image names contained other characters (spaces, accents, ...) is
+> re-extracted once under its new key; the old files are left orphaned on
+> disk. The literal-`%` bug below is **incidentally fixed** by the same
+> sanitization (no `%` can reach a key or URL any more); pinned by
+> `web_chapter_image_with_percent_and_ampersand_in_name_is_served`.
+
+**Status (before the fix):** open. Pre-existing — not introduced by the M5
+URL-policy change, and verified byte-identical on both sides of that commit.
 
 `rewrite_img_srcs` (`carrel-core/src/epub.rs`) reads the `src` value out of the
 **ammonia-serialized** chapter with `extract_attr_value`, which returns the
@@ -30,11 +45,13 @@ Two things to check when doing it:
 - It widens what reaches the caller's URL policy, so re-read
   `reader::attr_safe_url` — a filename containing `"` becomes reachable at the
   splice for the first time, which is the case that guard exists for.
-- The keys are hashed with `short_zip_path_hash(resolved_zip_path)`, so books
-  already imported keep working; nothing on disk is invalidated by decoding
-  earlier.
+- The keys are hashed with `short_zip_path_hash(resolved_zip_path)`. *As
+  shipped this no longer holds:* the fix also sanitizes the key's basename to
+  `[A-Za-z0-9._-]`, so any image whose name had another character gets a new
+  key and is re-extracted once; the old file stays in the book's image dir
+  until the book is removed (see banner).
 
-## Not to be confused with
+## Not to be confused with (also fixed, see banner)
 
 A filename containing a literal `%`: that one *is* rewritten, and then
 `get_epub_image` 404s on it because axum percent-decodes the path segment back

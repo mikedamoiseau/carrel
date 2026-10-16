@@ -94,15 +94,14 @@ off as unavoidable, in a doc comment, having considered exactly two fixes.
 The third — cache the digest, not the source — came from the consuming
 project's session reading that comment and not accepting its premise.
 
-Still open: the `page` type mismatch between feeds, the whole-set-vs-per-page
-digest trade-off (the desktop deliberately keeps its own whole-set `ETag`
-rather than `RenderedFeed`'s narrower one, so an edit on a later page still
-invalidates earlier ones), the `xml_escape` control-character gap, and
-`collection_feed`'s own missing tie-break — it orders by `bc.added_at DESC`
-with no unique column, which is the same gap `list_books` just closed. That
-one is **latent rather than live**: `collection_feed` takes no page
-parameter, so nothing slices its order today. It would become live the moment
-that feed learns to paginate.
+Still open: the whole-set-vs-per-page digest trade-off (the desktop
+deliberately keeps its own whole-set `ETag` rather than `RenderedFeed`'s
+narrower one, so an edit on a later page still invalidates earlier ones).
+
+**Fixed in the backlog-sweep epic (M2):** the `page` type mismatch between
+feeds, the `xml_escape` control-character gap, and `collection_feed`'s missing
+tie-break (manual collections now order by `bc.added_at DESC, b.id`). Each is
+marked fixed in place below.
 
 The envelope itself is no longer duplicated in the sense this document was
 filed for, but the *conditional-request* half of it — build `pairs`, build
@@ -156,10 +155,16 @@ in `, id`, the same tie-break `list_books_grid` already had, which is a
 narrower change than moving to the query-module path and leaves `list_books`'s
 signature and column list untouched. `/opds/new` shares `all_books`'s fix
 since it also reads through `list_books`. `collection_feed` orders by its own
-join (`bc.added_at DESC`) and was not touched — it still wants checking rather
-than assuming.
+join (`bc.added_at DESC`). **FIXED** in the backlog-sweep epic: every
+collection query (`get_books_in_collection`, `get_books_in_collection_grid`,
+`query_books_in_collection_grid`, manual and automated branches) now ends its
+`ORDER BY` in `, b.id`.
 
 ## Also noticed, separate and pre-existing
+
+**FIXED (backlog-sweep M2):** `xml_escape` now drops C0 controls (other than
+tab, LF, CR) and U+FFFE/U+FFFF; `/opds/search?q=%01` returns well-formed XML.
+The original description follows.
 
 `xml_escape` escapes `&`, `<`, `>` and `"` but strips no C0 control
 characters, so `?q=%01` puts a raw control byte inside `<title>Search: …</title>`
@@ -179,7 +184,10 @@ next page" and emitted a `rel="next"` link back to page 0. `all_books` now
 uses `saturating_mul`/`saturating_add`, matching `search_books`, and has its
 own test at `usize::MAX`.
 
-**The two feeds disagree on how strict a `page` is.** `SearchQuery::page` is a
+**The two feeds disagree on how strict a `page` is — FIXED (backlog-sweep
+M2):** `PaginationQuery::page` now parses leniently through the same
+`parse_page` helper as `SearchQuery`, so `/opds/all?page=abc` serves page 0.
+The original description follows. `SearchQuery::page` is a
 lenient `String`, because a strictly-typed optional param turns one malformed
 value a proxy appended into a dead endpoint — the reasoning `api.rs`'s
 `BookQuery` documents on `want_to_read`. `PaginationQuery::page` is still

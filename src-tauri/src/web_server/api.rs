@@ -1282,6 +1282,42 @@ fn parse_width(query: Option<&str>) -> Option<u32> {
     found
 }
 
+/// How a comic page miss should be served: prime the cache, or decode
+/// straight from the archive.
+///
+/// A comic that cannot fit `max_cache_size_mb` is never primed: the inline
+/// eviction sweep that follows a priming write would evict the book it just
+/// wrote, so every request would pay a full extraction for nothing. "Cannot
+/// fit" mirrors what `run_eviction` enforces — the archive's declared page
+/// bytes against `max_cache_size_mb * 1 MiB`, where 0 means a zero-byte
+/// budget, not "unlimited".
+///
+/// Decided on a cold miss only: a book whose manifest is already complete is
+/// served from the cache with no archive open (and a read never evicts, so a
+/// budget lowered afterwards is honoured by the next sweep, not this read).
+/// An unreadable declared size falls through to priming, today's behaviour.
+fn comic_on_miss(
+    pages: Option<&dyn carrel_core::storage::Storage>,
+    hash: Option<&str>,
+    format: &BookFormat,
+    file_path: &str,
+    max_cache_size_mb: u64,
+) -> carrel_core::reader::OnMiss {
+    use carrel_core::reader::OnMiss;
+    let (Some(pages), Some(hash)) = (pages, hash) else {
+        return OnMiss::Prime;
+    };
+    if crate::page_cache::complete_manifest(pages, hash).is_some() {
+        return OnMiss::Prime;
+    }
+    match crate::page_cache::comic_declared_size(format, file_path) {
+        Ok(declared) if declared > max_cache_size_mb.saturating_mul(1024 * 1024) => {
+            OnMiss::ReadSource
+        }
+        _ => OnMiss::Prime,
+    }
+}
+
 async fn get_page_image(
     State(state): State<WebState>,
     Path((id, index)): Path<(String, u32)>,
@@ -1321,10 +1357,20 @@ async fn get_page_image(
     // it's cheap once staged (local check + LRU touch) and deduped while a copy
     // is in flight. Only the page-image formats below reach a per-page render
     // over the (possibly remote) file, so gate the trigger to them.
-    if matches!(
-        book.format,
-        BookFormat::Pdf | BookFormat::Cbz | BookFormat::Cbr
-    ) {
+    //
+    // Private mode (M5) skips it: staging creates, and the touch bumps, a file
+    // in the source cache whose mtime is a durable record that the book was
+    // read. `resolve_book_path` above still picks up a copy that already
+    // exists (existence check only, no write), so a private read of a staged
+    // book is served locally; an unstaged remote one is read in place.
+    // Read once per request and shared with the format arms below.
+    let is_private = state.is_private();
+    if !is_private
+        && matches!(
+            book.format,
+            BookFormat::Pdf | BookFormat::Cbz | BookFormat::Cbr
+        )
+    {
         crate::commands::ensure_web_source_staged(&state.cache_dir, &book, &file_path);
     }
 
@@ -1358,7 +1404,6 @@ async fn get_page_image(
             };
             let book_id = id.clone();
             let file_hash = book.file_hash.clone();
-            let is_private = state.is_private();
             let (bytes, mime) = tokio::task::spawn_blocking(move || {
                 let evict_storage = pages_storage.clone();
                 carrel_core::reader::page_image(
@@ -1421,8 +1466,10 @@ async fn get_page_image(
         // page request reopened and reparsed the whole archive, while the
         // desktop reader had been reading from a warm cache all along.
         //
-        // A cache miss now extracts the *whole* archive (see
-        // `carrel_core::reader::page_image`'s doc comment for why) —
+        // A cache miss on a book that can fit the budget extracts the *whole*
+        // archive (see `carrel_core::reader::page_image`'s doc comment for
+        // why; a book that cannot fit is decoded directly instead, see
+        // `comic_on_miss`) —
         // proportional to the whole book rather than one page, and on this
         // project's real library that archive can live on a network mount.
         // Run it on the blocking pool (`spawn_blocking`), the same treatment
@@ -1452,6 +1499,20 @@ async fn get_page_image(
             let file_hash = book.file_hash.clone();
             let (bytes, mime) = tokio::task::spawn_blocking(move || {
                 let evict_storage = pages_storage.clone();
+                // A private read never primes (core takes the direct-decode
+                // path whatever `on_miss` says), so skip `comic_on_miss`'s
+                // archive-directory read: on a NAS it is a wasted round trip.
+                let on_miss = if is_private {
+                    carrel_core::reader::OnMiss::ReadSource
+                } else {
+                    comic_on_miss(
+                        pages_storage.as_deref(),
+                        file_hash.as_deref(),
+                        &format,
+                        &file_path,
+                        max_cache_size_mb,
+                    )
+                };
                 carrel_core::reader::page_image(
                     format,
                     &file_path,
@@ -1482,17 +1543,13 @@ async fn get_page_image(
                             log::warn!("comic page-cache eviction failed: {e}");
                         }
                     },
-                    // Comics do not yet consult private mode (tracked in
-                    // `docs/backlog/comic-cache-ignores-private-mode.md`) —
-                    // hardcoded rather than wired to `state.is_private()`
-                    // so fixing that gap later is a deliberate, reviewed
-                    // change, not an accidental side effect of this one.
-                    false,
+                    is_private,
                     // The web reader has no book-open event of its own — a
                     // miss must prime the whole archive itself, or a book
-                    // never gets cached at all. See
-                    // `carrel_core::reader::OnMiss`.
-                    carrel_core::reader::OnMiss::Prime,
+                    // never gets cached at all — unless the book cannot fit
+                    // the cache budget, in which case `comic_on_miss` picks a
+                    // direct decode. See `carrel_core::reader::OnMiss`.
+                    on_miss,
                 )
             })
             .await
@@ -2871,6 +2928,54 @@ mod tests {
         );
     }
 
+    /// An image whose zip entry is literally named `a%2Fb&c.png` must come back
+    /// through the web chapter + image routes. Two pre-existing faults met
+    /// here: the entity-encoded `&amp;` never matched the entry, and, once
+    /// found, the `%2F` in the unencoded URL was percent-decoded by axum back
+    /// into `/`, so `get_epub_image` 404ed. The storage key's basename is now
+    /// sanitized, so no `%` ever reaches the URL.
+    ///
+    /// The image request decodes the URL's last segment the way axum's `Path`
+    /// extractor does (`urlencoding::decode`) before calling the handler.
+    #[tokio::test]
+    async fn web_chapter_image_with_percent_and_ampersand_in_name_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dictionary_test_state(dir.path().to_path_buf());
+        let epub = crate::test_epub::write_epub_with_named_image(
+            dir.path(),
+            "web-pct",
+            "a%2Fb&c.png",
+            "a%2Fb&amp;c.png",
+        );
+        seed_epub_book(&state, "bk-web-pct", &epub);
+
+        let resp = get_chapter_content(
+            State(state.clone()),
+            Path(("bk-web-pct".to_string(), 0usize)),
+        )
+        .await
+        .unwrap();
+        let html = body_string(resp).await;
+        let prefix = "/api/books/bk-web-pct/images/0/";
+        let start = html
+            .find(prefix)
+            .unwrap_or_else(|| panic!("not rewritten: {html}"));
+        let url = &html[start..];
+        let url = &url[..url.find('"').unwrap()];
+        assert!(!url.contains('%'), "a % reached the URL: {url}");
+
+        let segment = urlencoding::decode(&url[prefix.len()..])
+            .unwrap()
+            .into_owned();
+        let resp = get_epub_image(
+            State(state.clone()),
+            Path(("bk-web-pct".to_string(), 0usize, segment)),
+        )
+        .await
+        .expect("image route must find the extracted file");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// M4's acceptance criterion for the web adapter: a second TOC request is
     /// served from the cached archive rather than by reopening the book
     /// file. Before this milestone the route called the path-based
@@ -3050,6 +3155,294 @@ mod tests {
             "at least one book must be evicted once the combined cache exceeds the \
              configured 1 MB budget; both present means eviction used a larger budget \
              than what was set"
+        );
+    }
+
+    async fn read_comic_page(state: &WebState, id: &str, index: u32) -> Vec<u8> {
+        let resp = get_page_image(
+            State(state.clone()),
+            Path((id.to_string(), index)),
+            axum::extract::RawQuery(None),
+        )
+        .await
+        .unwrap();
+        body_bytes(resp).await.to_vec()
+    }
+
+    /// A comic whose declared size exceeds the cache budget can never survive
+    /// the post-extraction sweep, so priming it only burns a full extraction
+    /// per request. It must be served by direct decode without touching the
+    /// page cache at all.
+    ///
+    /// "Nothing written" is read off the disk: `LocalStorage::delete` leaves
+    /// the book's directory behind, so a prime-then-evict (the old behaviour)
+    /// leaves `page-cache/{hash}/` on disk even though no manifest survives.
+    /// The directory's absence is what only the bypass can satisfy.
+    #[tokio::test]
+    async fn web_over_budget_comic_is_served_without_touching_the_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+        let cbz = write_large_cbz(dir.path(), "big.cbz", 2 * 1024 * 1024);
+        seed_comic_book(&state, "bk-big", &cbz, Some("comic-hash-big"));
+
+        let first = read_comic_page(&state, "bk-big", 0).await;
+        let second = read_comic_page(&state, "bk-big", 0).await;
+        assert_eq!(first.len(), 2 * 1024 * 1024, "page must be served in full");
+        assert_eq!(first, second);
+
+        assert!(
+            !state.cache_dir.join("page-cache/comic-hash-big").exists(),
+            "an over-budget comic must never be primed, not even transiently"
+        );
+        let storage = state.pages_storage().unwrap();
+        assert!(
+            carrel_core::page_cache::read_manifest(storage.as_ref(), "comic-hash-big").is_none()
+        );
+    }
+
+    /// M5: with private mode on, a cold comic page is served but nothing is
+    /// recorded in the page cache — no page files, no manifest. Read off the
+    /// disk: priming creates `page-cache/{hash}/`. Pins that the route wires
+    /// `state.is_private()` rather than a hardcoded `false`.
+    #[tokio::test]
+    async fn web_comic_private_mode_cold_read_writes_no_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        state
+            .private_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-comic-private", &cbz, Some("comic-hash-private"));
+
+        let bytes = read_comic_page(&state, "bk-comic-private", 0).await;
+        assert!(!bytes.is_empty(), "private mode must still serve the page");
+
+        assert!(
+            !state
+                .cache_dir
+                .join("page-cache/comic-hash-private")
+                .exists(),
+            "a private comic read must not create a page-cache entry"
+        );
+    }
+
+    /// Backdated staged copy of `comic.cbz` for `hash` under `state`'s
+    /// source cache, plus its fixed old mtime.
+    fn seed_backdated_staged_copy(
+        state: &WebState,
+        src: &std::path::Path,
+        hash: &str,
+    ) -> (std::path::PathBuf, std::time::SystemTime) {
+        let staged = carrel_core::source_cache::stage(&state.cache_dir, src, hash, "cbz").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        (staged, old)
+    }
+
+    /// M5: the source-staging touch is a durable on-disk record that the book
+    /// was read (the copy's mtime), so a private page request must leave an
+    /// existing staged copy's mtime alone. Reading *from* the copy is fine.
+    #[tokio::test]
+    async fn web_private_mode_page_read_does_not_touch_the_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        state
+            .private_mode
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(
+            &state,
+            "bk-staged-private",
+            &cbz,
+            Some("staged-hash-private"),
+        );
+        let (staged, old) = seed_backdated_staged_copy(&state, &cbz, "staged-hash-private");
+
+        let bytes = read_comic_page(&state, "bk-staged-private", 0).await;
+        assert!(!bytes.is_empty());
+
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().modified().unwrap(),
+            old,
+            "private mode must not bump the staged copy's mtime"
+        );
+    }
+
+    /// Control for the test above: with private mode off the same request
+    /// does bump the staged copy (unchanged behaviour), so the private test
+    /// cannot pass merely because the touch never happens on this route.
+    #[tokio::test]
+    async fn web_non_private_page_read_still_touches_the_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_cbz(dir.path(), "comic.cbz");
+        seed_comic_book(&state, "bk-staged-public", &cbz, Some("staged-hash-public"));
+        let (staged, old) = seed_backdated_staged_copy(&state, &cbz, "staged-hash-public");
+
+        read_comic_page(&state, "bk-staged-public", 0).await;
+
+        assert!(
+            std::fs::metadata(&staged).unwrap().modified().unwrap() > old,
+            "a non-private read keeps bumping the staged copy's LRU mtime"
+        );
+    }
+
+    /// The counterpart: a comic that fits the budget is still primed by its
+    /// first request (the bypass must not fire on anything that can fit).
+    #[tokio::test]
+    async fn web_in_budget_comic_is_still_primed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+        let cbz = write_large_cbz(dir.path(), "fits.cbz", 700 * 1024);
+        seed_comic_book(&state, "bk-fits", &cbz, Some("comic-hash-fits"));
+
+        read_comic_page(&state, "bk-fits", 0).await;
+
+        let storage = state.pages_storage().unwrap();
+        assert!(
+            carrel_core::page_cache::complete_manifest(storage.as_ref(), "comic-hash-fits")
+                .is_some(),
+            "an in-budget comic must be primed on its first request"
+        );
+    }
+
+    /// End to end: a book already cached keeps being served from the cache
+    /// after the budget is lowered below its size, and a read never evicts
+    /// (the next priming sweep of some other book reclaims it). This is a
+    /// regression pin on the hit path only; that the bypass check itself is
+    /// skipped for a warm book is pinned by
+    /// `comic_on_miss_does_not_bypass_a_warm_book` below.
+    #[tokio::test]
+    async fn web_warm_comic_is_served_from_cache_after_the_budget_is_lowered() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = comic_test_state(dir.path());
+        let cbz = write_large_cbz(dir.path(), "warm.cbz", 2 * 1024 * 1024);
+        seed_comic_book(&state, "bk-warm", &cbz, Some("comic-hash-warm"));
+
+        let first = read_comic_page(&state, "bk-warm", 0).await;
+        {
+            let conn = state.conn().unwrap();
+            db::set_setting(&conn, "page_cache_max_size_mb", "1").unwrap();
+        }
+        std::fs::remove_file(&cbz).unwrap();
+
+        let second = read_comic_page(&state, "bk-warm", 0).await;
+        assert_eq!(first, second);
+        let storage = state.pages_storage().unwrap();
+        assert!(
+            carrel_core::page_cache::complete_manifest(storage.as_ref(), "comic-hash-warm")
+                .is_some(),
+            "a read must not evict"
+        );
+    }
+
+    fn cold_storage(dir: &std::path::Path) -> carrel_core::storage::LocalStorage {
+        carrel_core::storage::LocalStorage::new(dir.join("cache")).unwrap()
+    }
+
+    fn on_miss_for(
+        storage: &carrel_core::storage::LocalStorage,
+        hash: &str,
+        path: &std::path::Path,
+        budget_mb: u64,
+    ) -> carrel_core::reader::OnMiss {
+        comic_on_miss(
+            Some(storage as &dyn carrel_core::storage::Storage),
+            Some(hash),
+            &BookFormat::Cbz,
+            &path.to_string_lossy(),
+            budget_mb,
+        )
+    }
+
+    /// Cold and bigger than the budget: bypass. (Pins the positive case at
+    /// the unit level; the end-to-end one is above.)
+    #[test]
+    fn comic_on_miss_bypasses_a_cold_book_over_budget() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "over.cbz", 2 * 1024 * 1024);
+        assert_eq!(on_miss_for(&storage, "h", &cbz, 1), OnMiss::ReadSource);
+    }
+
+    /// Exactly the budget fits: `run_eviction` evicts only when the total is
+    /// strictly greater than the budget, so the bypass must be strictly
+    /// greater too. Fails if `>` becomes `>=`.
+    #[test]
+    fn comic_on_miss_primes_a_book_exactly_at_the_budget() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "exact.cbz", 1024 * 1024);
+        assert_eq!(on_miss_for(&storage, "h", &cbz, 1), OnMiss::Prime);
+        // One byte over flips it, so the test above is not vacuous.
+        let over = write_large_cbz(dir.path(), "over1.cbz", 1024 * 1024 + 1);
+        assert_eq!(on_miss_for(&storage, "h", &over, 1), OnMiss::ReadSource);
+    }
+
+    /// A zero budget is zero bytes (what `run_eviction` enforces), not
+    /// "unlimited": a non-empty comic cannot fit.
+    #[test]
+    fn comic_on_miss_with_a_zero_budget_bypasses_a_non_empty_book() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "tiny.cbz", 10);
+        assert_eq!(on_miss_for(&storage, "h", &cbz, 0), OnMiss::ReadSource);
+    }
+
+    /// An archive whose declared size cannot be read falls back to today's
+    /// behaviour (prime), and its own errors surface from there.
+    #[test]
+    fn comic_on_miss_primes_when_the_declared_size_is_unreadable() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let missing = dir.path().join("nope.cbz");
+        assert_eq!(on_miss_for(&storage, "h", &missing, 0), OnMiss::Prime);
+        let corrupt = dir.path().join("corrupt.cbz");
+        std::fs::write(&corrupt, b"not a zip").unwrap();
+        assert_eq!(on_miss_for(&storage, "h", &corrupt, 0), OnMiss::Prime);
+    }
+
+    /// A warm book (complete manifest) is never bypassed and the archive is
+    /// not consulted. The file is a real over-budget comic, so if the warm
+    /// short-circuit were removed the size check would run and answer
+    /// `ReadSource`; that is what makes `Prime` here prove the short-circuit.
+    #[test]
+    fn comic_on_miss_does_not_bypass_a_warm_book() {
+        use carrel_core::reader::OnMiss;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = cold_storage(dir.path());
+        let cbz = write_large_cbz(dir.path(), "warm.cbz", 2 * 1024 * 1024);
+        carrel_core::page_cache::ensure_cached(
+            &storage,
+            "bk",
+            "warm-hash",
+            &cbz.to_string_lossy(),
+            &BookFormat::Cbz,
+        )
+        .unwrap();
+        assert_eq!(on_miss_for(&storage, "warm-hash", &cbz, 1), OnMiss::Prime);
+        // Same book, same budget, cold hash: bypassed. Distinguishes the
+        // warm branch from a size check that happens to say "fits".
+        assert_eq!(
+            on_miss_for(&storage, "cold-hash", &cbz, 1),
+            OnMiss::ReadSource
         );
     }
 
@@ -4959,13 +5352,11 @@ mod tests {
             serde_json::from_str(&body_string(resp.into_response()).await).unwrap();
         // Ids, not just a count: `len() == 2` is satisfied by any
         // implementation that ignores the params, including one that returns
-        // the whole library rather than the collection. Sorted, because a
-        // manual collection orders by `bc.added_at DESC` with no `id`
-        // tie-break and these two are added within the same second — the
-        // membership order itself is pinned by the dedicated core test.
-        let mut got = ids_from(&json);
-        got.sort();
-        assert_eq!(got, vec!["abs-a", "abs-b"]);
+        // the whole library rather than the collection. These two are added
+        // within the same second, so their order is the `b.id` tie-break
+        // after `bc.added_at DESC`; the membership order itself is pinned by
+        // the dedicated core tests.
+        assert_eq!(ids_from(&json), vec!["abs-a", "abs-b"]);
     }
 
     #[tokio::test]

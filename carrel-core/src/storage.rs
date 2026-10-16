@@ -240,8 +240,17 @@ impl Storage for LocalStorage {
                 "list prefix contains traversal segment: {prefix}"
             )));
         }
+        // Walk only the deepest directory the prefix names in full — the
+        // part up to and including its last `/` — rather than the whole
+        // root, then apply the same starts-with filter. Keys stay relative
+        // to `self.root`, so the output is identical to a whole-root walk.
+        let start = match scoped_start(&self.root, prefix)? {
+            Scope::Dir(dir) => dir,
+            Scope::NoMatch => return Ok(Vec::new()),
+            Scope::WholeRoot => self.root.clone(),
+        };
         let mut out = Vec::new();
-        walk(&self.root, &self.root, &mut out)?;
+        walk(&self.root, &start, &mut out)?;
         if !prefix.is_empty() {
             out.retain(|k| k.starts_with(prefix));
         }
@@ -315,6 +324,64 @@ where
     }
 
     Ok(())
+}
+
+enum Scope {
+    /// Walk this directory.
+    Dir(PathBuf),
+    /// The prefix names a directory that does not exist (or is a file).
+    NoMatch,
+    /// Not safely scopable; walk the whole root and filter, as before.
+    WholeRoot,
+}
+
+/// Resolve the directory part of `prefix` (up to its last `/`) to a walk
+/// start, or decide it cannot be scoped without changing what `list` returns.
+///
+/// Two things make a naive `root.join(segments)` wrong, so both are handled
+/// conservatively:
+/// - A segment that is not exactly one `Component::Normal` (`C:` or `a:b` on
+///   Windows, `.`, an empty segment from `a//`) can replace or escape the
+///   path, so those fall back to the whole-root walk.
+/// - On a case-insensitive filesystem (macOS, Windows) `read_dir` on
+///   `PAGE-CACHE/` succeeds and yields keys in the caller's spelling, where
+///   the whole-root walk yields the on-disk spelling and so would never match
+///   a differently-cased prefix. Each segment is therefore checked against an
+///   exact-name entry in its parent's listing; a mismatch matches nothing.
+///   This reads one directory per segment, still far cheaper than the cache.
+fn scoped_start(root: &Path, prefix: &str) -> CarrelResult<Scope> {
+    let Some(i) = prefix.rfind('/') else {
+        return Ok(Scope::WholeRoot);
+    };
+    let mut cur = root.to_path_buf();
+    for segment in prefix[..i].split('/') {
+        let mut comps = Path::new(segment).components();
+        let normal = matches!(
+            (comps.next(), comps.next()),
+            (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(segment)
+        );
+        if !normal {
+            return Ok(Scope::WholeRoot);
+        }
+        let entries = match fs::read_dir(&cur) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Scope::NoMatch),
+            Err(e) => return Err(e.into()),
+        };
+        let mut found = None;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() == std::ffi::OsStr::new(segment) {
+                found = Some(entry.path());
+                break;
+            }
+        }
+        match found {
+            Some(path) if path.is_dir() => cur = path,
+            _ => return Ok(Scope::NoMatch),
+        }
+    }
+    Ok(Scope::Dir(cur))
 }
 
 fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) -> CarrelResult<()> {
@@ -505,6 +572,93 @@ mod tests {
     fn list_empty_storage_returns_empty_vec() {
         let (_d, storage) = temp_storage();
         assert!(storage.list("").unwrap().is_empty());
+    }
+
+    /// The pre-scoping algorithm, kept as the oracle: walk the whole root,
+    /// then filter. `list` must return exactly this for every prefix.
+    fn list_by_whole_root_walk(storage: &LocalStorage, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(storage.root(), storage.root(), &mut out).unwrap();
+        out.retain(|k| k.starts_with(prefix));
+        out
+    }
+
+    #[test]
+    fn scoped_list_matches_the_whole_root_walk_for_every_prefix_shape() {
+        let (_d, storage) = temp_storage();
+        // Names that share prefixes at every level: `a/b` is a file while
+        // `a/bc` is a directory, `ab` is a sibling directory of `a`.
+        for key in ["top", "a/b", "a/bc/x", "a/bc/deep/z", "a/c", "ab/y"] {
+            storage.put(key, b"").unwrap();
+        }
+        for prefix in [
+            "", "a", "a/", "a/b", "a/b/", "a/bc", "a/bc/", "a/bc/d", "ab", "ab/", "t", "top",
+            "top/", "nope/", "a/nope/", "a//", "x/y/z",
+            // Segments that are not a single normal path component. On
+            // unix `C:` is an ordinary name, so there these only guard
+            // equality; on Windows they are what a naive join would escape by.
+            "C:/", "a/C:/", "C:/x", "a/./", "./a/",
+        ] {
+            let mut got = storage.list(prefix).unwrap();
+            let mut want = list_by_whole_root_walk(&storage, prefix);
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "prefix {prefix:?}");
+        }
+        // Guard against a vacuous oracle: the interesting prefixes are non-empty.
+        assert_eq!(storage.list("a/bc/").unwrap().len(), 2);
+        assert_eq!(storage.list("a/b").unwrap().len(), 3);
+    }
+
+    /// On a case-insensitive filesystem (macOS APFS, Windows) a differently
+    /// cased prefix must match nothing, exactly as the whole-root walk does
+    /// (its keys carry the on-disk spelling). Through `evict_book` a wrongly
+    /// matching prefix could delete another prefix's files. This fails
+    /// without the fix on macOS and passes trivially on case-sensitive Linux.
+    #[test]
+    fn scoped_list_is_case_exact_like_the_whole_root_walk() {
+        let (_d, storage) = temp_storage();
+        storage.put("page-cache/abc/0", b"").unwrap();
+        for prefix in [
+            "PAGE-CACHE/",
+            "page-cache/ABC/",
+            "Page-Cache/abc/",
+            "page-cache/abc/",
+        ] {
+            let mut got = storage.list(prefix).unwrap();
+            let mut want = list_by_whole_root_walk(&storage, prefix);
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "prefix {prefix:?}");
+        }
+        assert!(storage.list("PAGE-CACHE/").unwrap().is_empty());
+        assert_eq!(storage.list("page-cache/abc/").unwrap().len(), 1);
+    }
+
+    /// Proves the walk is scoped, not just that the filter is right: a
+    /// sibling directory the process cannot read would make a whole-root
+    /// walk fail, so listing a different book's prefix succeeding shows the
+    /// sibling was never entered.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_list_never_enters_unrelated_sibling_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_d, storage) = temp_storage();
+        storage.put("page-cache/abc/0", b"").unwrap();
+        storage.put("page-cache/other/0", b"").unwrap();
+        let locked = storage.root().join("page-cache/other");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let unreadable = fs::read_dir(&locked).is_err();
+        let result = storage.list("page-cache/abc/");
+        // Restore so TempDir can clean up, before any assertion can panic.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !unreadable {
+            return; // running as root: permissions do not bite, test is moot
+        }
+        assert_eq!(result.unwrap(), vec!["page-cache/abc/0".to_string()]);
     }
 
     // --- put_path ---

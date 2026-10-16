@@ -60,17 +60,30 @@ impl FeedKind {
     }
 }
 
-/// Escape XML 1.0 entities (`& < > "`).
+/// Escape XML 1.0 entities (`& < > "`) and drop the characters XML 1.0
+/// cannot represent at all: C0 controls other than tab, LF and CR, plus
+/// U+FFFE and U+FFFF (a lone surrogate cannot occur in a Rust `str`). A
+/// reference like `&#1;` would not help — it is equally forbidden — so they are
+/// removed rather than escaped.
 ///
 /// Single-quote (`'`) is intentionally not escaped because the
 /// rendered XML uses only double-quoted attribute values. Mirrors the
 /// existing behaviour of every consumer that has shipped against this
 /// helper.
 pub fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' | '\n' | '\r' => out.push(c),
+            '\u{0}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}' => {}
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Derive an OPDS acquisition extension + MIME from a MOBI-family
@@ -656,6 +669,22 @@ mod tests {
         assert_eq!(xml_escape("foo & bar"), "foo &amp; bar");
         assert_eq!(xml_escape("<script>"), "&lt;script&gt;");
         assert_eq!(xml_escape("\"quoted\""), "&quot;quoted&quot;");
+    }
+
+    /// XML 1.0 cannot carry C0 controls (bar tab/LF/CR) or U+FFFE/U+FFFF,
+    /// not even as character references, so they are dropped.
+    #[test]
+    fn xml_escape_drops_characters_xml_cannot_represent() {
+        assert_eq!(
+            xml_escape("a\u{0}b\u{1}c\u{8}d\u{b}e\u{c}f\u{1f}g"),
+            "abcdefg"
+        );
+        assert_eq!(xml_escape("x\u{fffe}y\u{ffff}z"), "xyz");
+        // Allowed whitespace and ordinary non-ASCII survive.
+        assert_eq!(
+            xml_escape("t\tn\nr\ré\u{a0}\u{7f}"),
+            "t\tn\nr\ré\u{a0}\u{7f}"
+        );
     }
 
     #[test]

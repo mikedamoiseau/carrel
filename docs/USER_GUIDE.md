@@ -339,6 +339,7 @@ Open the toggle in the header (the eye icon, next to the language switcher) to p
 - Reading-time stats and streaks
 - The recently-read / "Continue Reading" list
 - Reading entries in the activity log (deliberate library actions, like importing or deleting a book, are still logged)
+- Cached comic pages and the local copy of a network-mounted book — a comic you open is read straight from its file instead of being extracted into the page cache, and a PDF or comic on a network share is not copied to this computer (pages already cached or copied earlier are still used). Comic pages may therefore load a little slower
 
 **Still saved:**
 

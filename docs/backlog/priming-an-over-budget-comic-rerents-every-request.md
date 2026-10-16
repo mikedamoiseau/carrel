@@ -1,6 +1,10 @@
 # Priming a comic bigger than the cache budget re-extracts on every request
 
-**Status:** open (noted 2026-08-26, during the M3 round-5 review).
+**Status:** mostly fixed (noted 2026-08-26, during the M3 round-5 review).
+Fixed in the backlog-sweep epic, M3: out-of-range indices on a cold comic, and
+`LocalStorage::list`'s whole-root walk. Fixed in M4: the over-budget direct
+decode and the `extracted` TOCTOU. Still open: full-disk cleanup of partial
+extractions.
 
 ## What
 
@@ -32,7 +36,7 @@ Disk filling silently is worse than repeated work, hence the current choice.
 Don't extract at all for a request that cannot be served from the result.
 Two separable pieces:
 
-- **Out-of-range indices.** `GET /books/{id}/pages/999` on a cold 800 MB
+- **Out-of-range indices — FIXED (backlog-sweep M3).** `GET /books/{id}/pages/999` on a cold 800 MB
   comic currently extracts the whole archive before discovering the index is
   invalid. A page count read from the archive's directory (`cbz::get_page_count`
   reads the zip central directory; `cbr` lists entries) is orders of magnitude
@@ -40,12 +44,43 @@ Two separable pieces:
   this would invert `out_of_range_page_on_a_cold_book_still_fires_on_extracted`
   — with no extraction there is correctly nothing to sweep — so that test
   encodes today's rule, not a permanent one.
-- **Books over budget.** Decide up front, from the archive's declared size,
-  whether priming can survive the configured cap, and take the direct-decode
-  path from the start instead of extract-then-evict. `ensure_cached` would
-  need to report or accept a size bound for this.
 
-## Also worth knowing: a narrow TOCTOU on the "did we extract" predicate
+  Done: `page_image` now reads the page count (`cbz`/`cbr::get_page_count`,
+  which share `collect_image_names` with extraction, so the counts agree) on a
+  cold miss only and returns the usual `NotFound` before extracting; that test
+  became `out_of_range_page_on_a_cold_book_is_rejected_without_extracting`.
+  The desktop does not have this bug, for two other reasons: `prepare_comic`
+  extracts the whole book on open by design (page 0 and the resume page on the
+  fast path, then `extract_comic_remaining` for every other page in the
+  background), and its page reads use `OnMiss::ReadSource`, which never primes
+  the cache, so no page request can trigger an extraction.
+- **Books over budget — FIXED (backlog-sweep M4).** Decide up front, from the
+  archive's declared size, whether priming can survive the configured cap, and
+  take the direct-decode path from the start instead of extract-then-evict.
+
+  Done in the web adapter, not in `ensure_cached` (whose signature is public
+  API and stays unchanged). On a cold miss `web_server::api::comic_on_miss`
+  compares the archive's declared page bytes (`page_cache::comic_declared_size`:
+  zip central directory for CBZ, unrar `unpacked_size` for CBR, over the same
+  entry list extraction writes) with `page_cache_max_size_mb * 1 MiB`, the
+  budget `run_eviction` enforces (0 is a zero-byte budget, not "unlimited"; a
+  book exactly at the budget fits). If it cannot fit it passes
+  `OnMiss::ReadSource`, so nothing is written.
+
+  - A warm book skips the check: it is served from cache with no archive open.
+    A read never evicts, so a budget lowered afterwards takes effect at the
+    next sweep, not on that read.
+  - An unreadable declared size falls back to priming.
+  - The size is *declared*: a lying archive is still bounded by the read caps
+    at extraction, and the post-prime sweep still covers a book that fits on
+    paper but not on disk.
+  - Only the CBZ size is covered by a test; no RAR fixture can be built here.
+  - Residual race: `comic_on_miss` sees a complete manifest and answers
+    `Prime`, then another book's eviction removes it before `page_image`
+    runs. That one request primes and is then evicted again. It is narrow and
+    self-heals: the next request is cold and takes the direct-decode path.
+
+## FIXED (backlog-sweep M4): a narrow TOCTOU on the "did we extract" predicate
 
 `extracted` is read from `page_cache::complete_manifest` immediately before
 `ensure_cached` runs. The per-hash extraction lock stops two callers
@@ -56,10 +91,15 @@ complete" while `ensure_cached` really does extract, and the sweep for that
 write is skipped until the next one.
 
 The window is two statements wide and the bytes are reclaimed by any later
-sweep, so it has not been worth a fix. The clean version is for
-`ensure_cached` to report whether it did real work, rather than having the
-caller infer it — that is a `page_cache` signature change and should happen
-with the work above, not on its own.
+sweep, so it was not worth a fix on its own.
+
+Fixed in M4 without changing `ensure_cached`'s public signature: a
+crate-private `ensure_cached_reporting` returns `(manifest, extracted_now)`,
+`ensure_cached` delegates to it and drops the flag, and `page_image` fires the
+eviction hook from the reported flag. The pre-read `complete_manifest` stays,
+but only to skip M3's page-count pre-check on a warm book.
+`hook_fires_when_the_book_is_evicted_between_the_check_and_ensure_cached`
+pins it with a storage that evicts in the window.
 
 ## Related: a partially-written extraction is not swept promptly (M3 round 6)
 
@@ -76,8 +116,9 @@ list before writing anything, so a corrupt CBZ or an unopenable CBR fails
 having written nothing at all. Firing there gave an unauthenticated LAN
 client a full-cache eviction walk per request against a single broken comic.
 Telling the two cases apart cheaply is not possible in that spot either:
-`Storage::list` walks the whole storage root, so probing on every error would
-cost more than the sweep it was guarding.
+`Storage::list` walked the whole storage root at the time, so probing on every
+error would cost more than the sweep it was guarding. (Since the backlog-sweep
+M3 it walks only the prefix's directory, so that probe is now cheap.)
 
 **Resolved in round 7, and the reasoning above was wrong twice over.**
 
@@ -102,7 +143,14 @@ no manifest *and* no writer in flight would close it, but distinguishing
 "abandoned" from "in flight" is what that pass avoids today, and it would need
 an explicit in-flight marker to do safely.
 
-## Still open: `ensure_cached`'s corrupt-manifest branch walks the cache per request (M3 round 9)
+## FIXED (backlog-sweep M3): `ensure_cached`'s corrupt-manifest branch walked the cache per request (M3 round 9)
+
+`LocalStorage::list` now walks only the deepest directory the prefix names in
+full (`page-cache/{hash}/` walks that one directory), so `evict_book` and the
+per-book listings no longer cost a whole-cache walk. The unguarded `let _`
+retry on a persistently failing delete still repeats per request, but each
+repeat is now one book's directory rather than the whole cache. The original
+write-up follows.
 
 `extract_comic_full`'s cleanup is now guarded on a write having landed, so a
 corrupt archive no longer costs a whole-cache walk per request. The sibling

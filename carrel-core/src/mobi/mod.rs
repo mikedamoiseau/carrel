@@ -511,7 +511,7 @@ mod tests {
 
     fn fixture(name: &str) -> Option<PathBuf> {
         // The workspace layout puts fixtures in src-tauri/test-fixtures/
-        // (gitignored). carrel-core is built from the workspace root, so
+        // (vendored). carrel-core is built from the workspace root, so
         // CARGO_MANIFEST_DIR points to carrel-core/.
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")

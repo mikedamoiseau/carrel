@@ -13,8 +13,10 @@ fn is_image(name: &str) -> bool {
         || lower.ends_with(".gif")
 }
 
-fn collect_image_names(archive: &mut ZipArchive<std::fs::File>) -> Vec<String> {
-    let mut names: Vec<String> = (0..archive.len())
+/// Page entries (name, declared uncompressed size), sorted by name. The one
+/// place the page filter lives, so counts, extraction and sizes agree.
+fn collect_image_entries(archive: &mut ZipArchive<std::fs::File>) -> Vec<(String, u64)> {
+    let mut entries: Vec<(String, u64)> = (0..archive.len())
         .filter_map(|i| {
             let file = archive.by_index(i).ok()?;
             let name = file.name().to_string();
@@ -22,11 +24,18 @@ fn collect_image_names(archive: &mut ZipArchive<std::fs::File>) -> Vec<String> {
             if name.starts_with("__MACOSX/") || name.ends_with('/') || !is_image(&name) {
                 return None;
             }
-            Some(name)
+            Some((name, file.size()))
         })
         .collect();
-    names.sort();
-    names
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+fn collect_image_names(archive: &mut ZipArchive<std::fs::File>) -> Vec<String> {
+    collect_image_entries(archive)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn open_archive(path: &str) -> CarrelResult<ZipArchive<std::fs::File>> {
@@ -144,6 +153,18 @@ pub fn get_page_count(path: &str) -> CarrelResult<u32> {
     let mut archive = open_archive(path)?;
     let images = collect_image_names(&mut archive);
     Ok(images.len() as u32)
+}
+
+/// Total uncompressed size the central directory *declares* for the page
+/// entries, summed over the same entry list extraction writes
+/// ([`collect_page_names`]'s filter). One pass over the directory (the sizes
+/// come from the same `by_index` walk that lists the names), no entry data
+/// read.
+pub(crate) fn declared_page_bytes(path: &str) -> CarrelResult<u64> {
+    let mut archive = open_archive(path)?;
+    Ok(collect_image_entries(&mut archive)
+        .into_iter()
+        .fold(0u64, |acc, (_, size)| acc.saturating_add(size)))
 }
 
 /// Canonical sorted page-entry names for a CBZ, using the exact same
@@ -289,6 +310,32 @@ mod tests {
         let names = collect_image_names(&mut archive);
 
         assert_eq!(names, vec!["page01.jpg", "page02.png", "page03.jpg"]);
+    }
+
+    /// The declared size counts exactly the entries extraction would write:
+    /// page images only, not resource forks, directories or other files.
+    #[test]
+    fn declared_page_bytes_sums_only_page_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz_path = dir.path().join("sized.cbz");
+        {
+            let file = std::fs::File::create(&cbz_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("page01.jpg", options).unwrap();
+            zip.write_all(&[0u8; 1000]).unwrap();
+            zip.start_file("page02.png", options).unwrap();
+            zip.write_all(&[0u8; 234]).unwrap();
+            zip.start_file("__MACOSX/page01.jpg", options).unwrap();
+            zip.write_all(&[0u8; 5000]).unwrap();
+            zip.start_file("notes.txt", options).unwrap();
+            zip.write_all(&[0u8; 7000]).unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(
+            declared_page_bytes(cbz_path.to_str().unwrap()).unwrap(),
+            1234
+        );
     }
 
     #[test]

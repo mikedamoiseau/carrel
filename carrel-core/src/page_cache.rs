@@ -201,6 +201,22 @@ fn comic_page_names(format: &BookFormat, file_path: &str) -> CarrelResult<Vec<St
     }
 }
 
+/// Total uncompressed size a comic archive *declares* for the page entries
+/// extraction would write (CBZ: zip central directory; CBR: unrar headers).
+/// Reads the archive's directory only. A caller can compare it with the cache
+/// budget to tell, before extracting, that priming cannot survive eviction.
+/// Declared, not verified: a lying archive is bounded by the per-entry read
+/// caps at extraction time, not here. Errors for non-comic formats.
+pub fn comic_declared_size(format: &BookFormat, file_path: &str) -> CarrelResult<u64> {
+    match format {
+        BookFormat::Cbz => crate::cbz::declared_page_bytes(file_path),
+        BookFormat::Cbr => crate::cbr::declared_page_bytes(file_path),
+        other => Err(CarrelError::invalid(format!(
+            "comic_declared_size not supported for {other:?}"
+        ))),
+    }
+}
+
 /// Cache filename for the page at `idx`, deriving the (lowercased)
 /// extension from the source archive entry name.
 fn comic_page_filename(idx: usize, src_name: &str) -> String {
@@ -372,11 +388,13 @@ fn extract_comic_full(
     // Counted through `extract_comic_subset`'s existing per-page callback,
     // which fires immediately after each successful `put`. A failure with
     // this still at zero wrote nothing, and must not pay for a cleanup:
-    // `evict_book` lists the book's prefix, and `LocalStorage::list` walks
-    // the *whole* cache root before filtering. Without this guard a corrupt
-    // comic — or a permanently unwritable cache, where the very first `put`
-    // fails — would walk the entire cache on every request, and the web
-    // route's PIN is optional (M3 review round 8).
+    // `evict_book` lists the book's prefix (a per-book directory walk since
+    // `LocalStorage::list` was scoped to its prefix) and issues deletes.
+    // Without this guard a corrupt comic — or a permanently unwritable
+    // cache, where the very first `put` fails — would pay that listing plus
+    // delete attempts on every request, and the web route's PIN is optional
+    // (M3 review round 8). Before the listing was scoped the cost was a
+    // whole-cache walk.
     let mut written = 0usize;
     let extracted = (|| {
         let total_size =
@@ -394,8 +412,8 @@ fn extract_comic_full(
         // deliberate trade (M3 review round 9): this also skips reclaiming
         // any pre-existing manifest-less residue for the same hash, which a
         // cleanup here would have swept. Recovering someone else's residue
-        // is not worth one whole-cache walk per failed request on a route an
-        // unauthenticated LAN client can loop — and that residue is already
+        // is not worth a listing and delete attempts per failed request on a
+        // route an unauthenticated LAN client can loop — and that residue is already
         // outside the size budget either way.
         Err(e) if written == 0 => Err(e),
         Err(e) => {
@@ -722,11 +740,12 @@ pub fn complete_manifest(storage: &dyn Storage, book_hash: &str) -> Option<Cache
 /// render targets that resume page rather than page 0, so on such a book
 /// nothing is at index 0 at all. That is what the listing fallback is for,
 /// and why it must not be deleted as redundant. The fallback is worth
-/// confining rather than defaulting to: `Storage::list` filters by prefix
-/// but the local implementation walks the whole storage root to build the
-/// list first, and that root is the entire app cache — exactly the
-/// "whole-cache stat storm on the book-open path" that
-/// [`complete_manifest`]'s doc comment above avoids for comics.
+/// confining rather than defaulting to: `Storage::list` filters by prefix,
+/// and the local implementation now walks only the directory the prefix names,
+/// so the cost is one book's directory rather than the entire app cache.
+/// It is still a directory walk plus a stat per page on the book-open path,
+/// which [`complete_manifest`]'s doc comment above avoids for comics, so
+/// the fallback stays confined to the case that needs it.
 pub fn pdf_manifest_page_count(storage: &dyn Storage, book_hash: &str) -> Option<u32> {
     let manifest = read_manifest(storage, book_hash)?;
     if manifest.format != BookFormat::Pdf || manifest.page_count == 0 {
@@ -753,13 +772,34 @@ pub fn ensure_cached(
     file_path: &str,
     format: &BookFormat,
 ) -> CarrelResult<CacheManifest> {
+    ensure_cached_reporting(storage, book_id, book_hash, file_path, format).map(|(m, _)| m)
+}
+
+/// [`ensure_cached`], also reporting whether this call wrote a comic's pages
+/// (`true`) or found a complete cache entry and wrote nothing (`false`).
+///
+/// A caller that infers this from a manifest check made *before* calling
+/// `ensure_cached` can be wrong: another book's inline eviction may land in
+/// between, so the check says "complete" while the call re-extracts.
+/// Reporting it from inside the call, after the decision was actually made,
+/// closes that window. A PDF prewarm reports `false` — it caches no pages up
+/// front, and the only caller that cares (`reader::page_image`'s comic arm)
+/// never passes a PDF.
+pub(crate) fn ensure_cached_reporting(
+    storage: &dyn Storage,
+    book_id: &str,
+    book_hash: &str,
+    file_path: &str,
+    format: &BookFormat,
+) -> CarrelResult<(CacheManifest, bool)> {
     // PDF manifests intentionally keep `pages` empty (filenames are
     // derived from the page index), so the comic-style first/last
     // validation below would always report "corrupt" and evict a
     // healthy PDF cache. Delegate to `ensure_pdf_prewarmed`, which
     // has its own format-aware idempotency check.
     if matches!(format, BookFormat::Pdf) {
-        return ensure_pdf_prewarmed(storage, book_id, book_hash, file_path, 10);
+        return ensure_pdf_prewarmed(storage, book_id, book_hash, file_path, 10)
+            .map(|m| (m, false));
     }
 
     if let Some(mut manifest) = read_manifest(storage, book_hash) {
@@ -782,7 +822,7 @@ pub fn ensure_cached(
             );
             manifest.last_accessed = now_iso();
             let _ = write_manifest(storage, book_hash, &manifest);
-            return Ok(manifest);
+            return Ok((manifest, false));
         }
         page_dbg!(
             "ensure_cached: cache corrupted for {}, re-extracting",
@@ -802,7 +842,7 @@ pub fn ensure_cached(
         ))),
     };
     page_dbg!("ensure_cached: extraction took {:?}", start.elapsed());
-    result
+    result.map(|m| (m, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,7 +1537,7 @@ pub fn run_eviction(storage: &dyn Storage, max_size_mb: u64) -> CarrelResult<()>
 
     // Layer 2: Total size cap (disk-authoritative — the manifest
     // snapshot is not maintained on lazy PDF writes).
-    let max_size_bytes = max_size_mb * 1024 * 1024;
+    let max_size_bytes = max_size_mb.saturating_mul(1024 * 1024);
     let mut sizes: Vec<u64> = books
         .iter()
         .map(|b| book_disk_size_bytes(storage, &b.book_hash))
@@ -1723,6 +1763,19 @@ mod tests {
             read_manifest(&storage, "hash1").is_some(),
             "normal manifested book must be untouched"
         );
+    }
+
+    /// An absurd `page_cache_max_size_mb` must mean "effectively unlimited",
+    /// not an arithmetic overflow (a panic in debug builds, a wrapped tiny
+    /// budget in release that would evict everything).
+    #[test]
+    fn run_eviction_with_a_huge_budget_keeps_everything() {
+        let (_d, storage) = temp_storage();
+        create_fake_cache(&storage, "book1", "hash-huge", 2, 100, &now_iso());
+
+        run_eviction(&storage, u64::MAX).unwrap();
+
+        assert!(read_manifest(&storage, "hash-huge").is_some());
     }
 
     /// Regression: the orphan sweep must NOT wipe a manifest-less prefix that
@@ -2008,11 +2061,11 @@ mod tests {
     }
 
     /// M3 review round 8: a failure that wrote nothing must not pay for a
-    /// cleanup. `evict_book` lists the book's prefix, and
-    /// `LocalStorage::list` walks the whole cache root before filtering, so
-    /// cleaning up after a write that never landed would walk the entire
-    /// cache on every request — on a route an unauthenticated LAN client can
-    /// loop.
+    /// cleanup. `evict_book` lists the book's prefix (one per-book directory
+    /// walk now that `LocalStorage::list` is prefix-scoped; it used to be a
+    /// whole-cache walk), so cleaning up after a write that never landed
+    /// would still cost a listing plus delete attempts on every request — on
+    /// a route an unauthenticated LAN client can loop.
     ///
     /// Observed as the `list` count, because the visible outcome (an empty
     /// prefix) is the same whether or not the cleanup ran.

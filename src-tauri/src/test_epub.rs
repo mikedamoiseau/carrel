@@ -11,6 +11,18 @@ pub(crate) fn write_epub_with_image_chapter(
     dir: &std::path::Path,
     name: &str,
 ) -> std::path::PathBuf {
+    write_epub_with_named_image(dir, name, "img.png", "img.png")
+}
+
+/// [`write_epub_with_image_chapter`] with a caller-chosen image: `entry` is the
+/// zip entry name and `src` the (already HTML-escaped) `<img src>` text that
+/// refers to it.
+pub(crate) fn write_epub_with_named_image(
+    dir: &std::path::Path,
+    name: &str,
+    entry: &str,
+    src: &str,
+) -> std::path::PathBuf {
     let path = dir.join(format!("{name}.epub"));
     let file = std::fs::File::create(&path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
@@ -55,13 +67,13 @@ pub(crate) fn write_epub_with_image_chapter(
     zip.start_file("ch0.xhtml", options).unwrap();
     std::io::Write::write_all(
         &mut zip,
-        br#"<html><body><p>Hello</p><img src="img.png" alt="a"/></body></html>"#,
+        format!(r#"<html><body><p>Hello</p><img src="{src}" alt="a"/></body></html>"#).as_bytes(),
     )
     .unwrap();
 
     // Smallest thing the rewrite will accept as an image payload; the bytes
     // are never decoded on this path, only extracted to storage.
-    zip.start_file("img.png", options).unwrap();
+    zip.start_file(entry, options).unwrap();
     std::io::Write::write_all(&mut zip, b"\x89PNG\r\n\x1a\n").unwrap();
 
     zip.finish().unwrap();

@@ -5,6 +5,40 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Old log files are cleaned up automatically.** Carrel keeps the 14 most
+  recent daily log files and deletes older ones, so the log folder no longer
+  grows without limit.
+
+### Fixed
+- **"Don't track this session" now covers comics and network-mounted books.**
+  With it on, opening a CBZ/CBR no longer extracts its pages into the page
+  cache or records it there (pages are read straight from the file, in the
+  desktop app and the web reader alike), and opening a PDF or comic from a
+  network share no longer copies it to this computer or refreshes an existing
+  copy. Pages and copies saved earlier are still used.
+- **The web reader no longer re-extracts a comic that is larger than the page
+  cache limit on every page.** A comic bigger than the "page cache size"
+  setting was unpacked and then thrown away again for each page you turned;
+  it is now read straight from the file instead.
+- **EPUB images with `&`, quotes, `%` or non-breaking spaces in their filename
+  now show.** Such images were left as broken links in the reader (or, for a
+  `%`, a 404 in the web reader). Images whose filenames contain anything
+  other than letters, digits, `.`, `-` or `_` (spaces and accented letters
+  included) are re-extracted once the next time their chapter is opened.
+- **OPDS search with control characters in the query returns valid XML.**
+  `/opds/search?q=%01` used to produce a feed strict OPDS clients rejected.
+- **`/opds/all?page=abc` no longer errors.** A malformed `page` now serves the
+  first page, as search already did.
+- **Collection book order is stable.** Books that tie on date (added to a
+  manual collection in the same second, or imported in the same second into an
+  automated one) now keep a consistent order instead of shuffling between
+  loads.
+- **A bogus page number on a big comic no longer extracts the whole comic.**
+  Requesting a page past the end of a not-yet-cached CBZ/CBR through the web
+  reader used to unpack the entire archive before answering "not found"; it
+  now answers from the archive's page count.
+
 ## [3.2.2] - 2026-10-15
 
 ### Security

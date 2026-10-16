@@ -20,6 +20,20 @@ pub fn resolve_filter(env: Option<String>) -> String {
     }
 }
 
+/// Daily log files kept on disk; the appender prunes the oldest on startup and
+/// at each rollover, touching only files whose name starts with `carrel.log`.
+const MAX_LOG_FILES: usize = 14;
+
+fn build_log_appender(
+    dir: &std::path::Path,
+) -> Result<tracing_appender::rolling::RollingFileAppender, tracing_appender::rolling::InitError> {
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("carrel.log")
+        .max_log_files(MAX_LOG_FILES)
+        .build(dir)
+}
+
 /// Initialize the global tracing subscriber.
 ///
 /// - Dev (`cfg!(debug_assertions)`): human-readable `fmt` layer to stderr;
@@ -34,10 +48,20 @@ pub fn init_tracing(log_dir: Option<PathBuf>) -> Option<WorkerGuard> {
     let filter = EnvFilter::try_new(resolve_filter(std::env::var("CARREL_LOG").ok()))
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    match (cfg!(debug_assertions), log_dir) {
+    // A log dir we cannot open (read-only, bad permissions) falls back to
+    // stderr rather than aborting startup, like the ignored create_dir_all.
+    let file_appender = match (cfg!(debug_assertions), log_dir) {
         (false, Some(dir)) => {
             let _ = std::fs::create_dir_all(&dir);
-            let appender = tracing_appender::rolling::daily(&dir, "carrel.log");
+            build_log_appender(&dir)
+                .map_err(|e| eprintln!("carrel: cannot open log file in {}: {e}", dir.display()))
+                .ok()
+        }
+        _ => None,
+    };
+
+    match file_appender {
+        Some(appender) => {
             let (non_blocking, guard) = tracing_appender::non_blocking(appender);
             let _ = tracing_subscriber::registry()
                 .with(filter)
@@ -45,7 +69,7 @@ pub fn init_tracing(log_dir: Option<PathBuf>) -> Option<WorkerGuard> {
                 .try_init();
             Some(guard)
         }
-        _ => {
+        None => {
             let _ = tracing_subscriber::registry()
                 .with(filter)
                 .with(fmt::layer().with_writer(std::io::stderr))
@@ -72,6 +96,37 @@ mod tests {
         assert_eq!(
             resolve_filter(Some("carrel_core=debug,info".to_string())),
             "carrel_core=debug,info"
+        );
+    }
+
+    #[test]
+    fn log_appender_keeps_only_the_14_newest_daily_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // 20 old daily files, created oldest-first (the appender orders by
+        // creation time), plus a file that is not ours.
+        for day in 1..=20 {
+            std::fs::write(dir.path().join(format!("carrel.log.2026-01-{day:02}")), "x").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::write(dir.path().join("other.txt"), "keep me").unwrap();
+
+        let _appender = build_log_appender(dir.path()).unwrap();
+
+        let mut logs: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("carrel.log."))
+            .collect();
+        logs.sort();
+        // 13 survivors + today's freshly opened file = 14.
+        assert_eq!(logs.len(), 14, "{logs:?}");
+        assert!(!logs.contains(&"carrel.log.2026-01-01".to_string()));
+        assert!(!logs.contains(&"carrel.log.2026-01-07".to_string()));
+        assert!(logs.contains(&"carrel.log.2026-01-08".to_string()));
+        assert!(logs.contains(&"carrel.log.2026-01-20".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+            "keep me"
         );
     }
 

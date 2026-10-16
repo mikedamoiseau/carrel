@@ -1149,6 +1149,54 @@ fn extract_attr_value(tag: &str, attr: &str) -> Option<String> {
     }
 }
 
+/// Decode the character references ammonia/html5ever leave in a serialized
+/// attribute value (`&amp;`, `&quot;`, `&lt;`, `&gt;`, `&nbsp;`) plus the
+/// numeric (`&#NN;`, `&#xNN;`) and `&apos;` forms. Single pass, so `&amp;nbsp;`
+/// decodes to the literal text `&nbsp;`. Anything unrecognised is kept as-is.
+///
+/// Not [`decode_entities`]: quick-xml's `unescape` knows only the XML
+/// entities (no `&nbsp;`, which ammonia emits for U+00A0) and rejects the
+/// whole string on an unknown one, where this must pass it through.
+fn decode_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let decoded = after.find(';').filter(|&e| e <= 10).and_then(|e| {
+            let name = &after[..e];
+            let ch = match name {
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "nbsp" => Some('\u{a0}'),
+                _ => name.strip_prefix('#').and_then(|n| {
+                    let code = match n.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => n.parse().ok(),
+                    };
+                    code.and_then(char::from_u32)
+                }),
+            };
+            ch.map(|c| (c, e + 1))
+        });
+        match decoded {
+            Some((c, used)) => {
+                out.push(c);
+                rest = &after[used..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Replace a specific attribute value within a tag string.
 fn replace_attr_value(tag: &str, attr: &str, old_val: &str, new_val: &str) -> String {
     let dq_old = format!("{attr}=\"{old_val}\"");
@@ -1180,6 +1228,26 @@ fn find_tag_end(from_tag: &str) -> usize {
         }
     }
     from_tag.len()
+}
+
+/// Basename for a storage key: ASCII alphanumerics and `.`, `-`, `_` are kept,
+/// every other character becomes `_`. A zip entry can be named anything, but the
+/// key is a filesystem name (Windows forbids `" < > : | ? * \\`) and ends up
+/// unencoded in web URLs (`%`, `#`, spaces), so only the portable subset
+/// survives. Collisions between two names that sanitize alike are prevented by
+/// the resolved-path hash that precedes the basename in the key. A name that is
+/// already in the safe set — the common case — comes through unchanged, so its
+/// key is the one earlier versions produced.
+fn sanitize_key_basename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// 16 hex chars (64 bits) of SHA-256 over a resolved zip path — enough to
@@ -1286,7 +1354,11 @@ fn rewrite_img_srcs(
 
         let rewritten = match extract_attr_value(tag, "src") {
             None => tag.to_string(),
-            Some(src) => {
+            Some(raw_src) => {
+                // `raw_src` is entity-encoded exactly as it sits in the tag
+                // (needed to splice the replacement back in); `src` is the
+                // real path, which is what zip entries and keys are named by.
+                let src = decode_html_attr(&raw_src);
                 // Leave external or already-resolved URLs alone.
                 let is_external = src.starts_with("http://")
                     || src.starts_with("https://")
@@ -1320,8 +1392,11 @@ fn rewrite_img_srcs(
                         // `dir_b/cover.png`) cannot collide on the same
                         // storage key. Keeping the basename in the key
                         // preserves debuggability.
-                        let key =
-                            format!("{key_prefix}/{}-{basename}", short_zip_path_hash(&resolved));
+                        let key = format!(
+                            "{key_prefix}/{}-{}",
+                            short_zip_path_hash(&resolved),
+                            sanitize_key_basename(basename)
+                        );
 
                         // Extract through storage if not already cached.
                         let written = if storage.exists(&key).unwrap_or(false) {
@@ -1336,7 +1411,7 @@ fn rewrite_img_srcs(
                             match storage.local_path(&key) {
                                 Ok(p) => {
                                     let url = crate::reader::attr_safe_url(image_url(&key, &p));
-                                    replace_attr_value(tag, "src", &src, &url)
+                                    replace_attr_value(tag, "src", &raw_src, &url)
                                 }
                                 Err(_) => tag.to_string(),
                             }
@@ -2351,6 +2426,184 @@ pub(crate) mod tests {
             !cleaned.contains(r#"src='"#),
             "single-quoted attribute survived clean(): {cleaned}"
         );
+    }
+
+    /// Pins what ammonia emits in attribute values (observed: `&amp;`, `&quot;`,
+    /// `&lt;`, `&gt;`, `&nbsp;`; `'` stays raw; numeric refs in the input are
+    /// already resolved) and that the decoder inverts it, including the
+    /// single-pass case where `&amp;nbsp;` must stay a literal `&nbsp;`.
+    #[test]
+    fn test_decode_html_attr_inverts_ammonia_output() {
+        let cleaned =
+            clean("<img src=\"a b&amp;c&quot;d&#39;e&lt;f&gt;g\u{a0}h&#x41;&amp;nbsp;.png\">");
+        assert_eq!(
+            cleaned,
+            "<img src=\"a b&amp;c&quot;d'e&lt;f&gt;g&nbsp;hA&amp;nbsp;.png\">"
+        );
+        let src = extract_attr_value(&cleaned, "src").unwrap();
+        assert_eq!(decode_html_attr(&src), "a b&c\"d'e<f>g\u{a0}hA&nbsp;.png");
+        // Hand-written forms a non-ammonia source could carry.
+        assert_eq!(decode_html_attr("&#39;&apos;&#x27;&#65;&#x41;"), "'''AA");
+        // Unknown / malformed references pass through untouched.
+        assert_eq!(decode_html_attr("a&b;c&"), "a&b;c&");
+        assert_eq!(decode_html_attr("plain.png"), "plain.png");
+    }
+
+    /// An image whose zip entry name contains characters ammonia entity-encodes
+    /// in attribute values (`&`, `"`, U+00A0, `<`, `>`) must still be found.
+    /// The html is run through real `ammonia::clean`, as the chapter path does.
+    #[test]
+    fn test_rewrite_img_srcs_decodes_entities_in_filenames() {
+        let names = [
+            "a b&c.png",
+            "q\"uote.png",
+            "lt<gt>.png",
+            "nb\u{a0}sp.png",
+            "ap'os.png",
+        ];
+        for name in names {
+            let tmp = tempfile::tempdir().unwrap();
+            let entry = format!("OEBPS/images/{name}");
+            let zip_path =
+                create_test_zip_with_images(tmp.path(), "t.zip", &[(entry.as_str(), b"AAAA")]);
+            let file = std::fs::File::open(&zip_path).unwrap();
+            let mut archive = ZipArchive::new(file).unwrap();
+            let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+            // Build the markup the way the chapter pipeline does: raw -> ammonia.
+            let raw = format!(
+                "<p>x</p><img src=\"../images/{}\" alt=\"k\">",
+                name.replace('&', "&amp;").replace('"', "&quot;")
+            );
+            let cleaned = clean(&raw);
+            let result = rewrite_img_srcs_to_asset_urls(
+                &cleaned,
+                &mut archive,
+                "OEBPS/Text/",
+                &storage,
+                "b/0",
+            );
+
+            use crate::storage::Storage;
+            assert_eq!(
+                storage.list("b/0/").unwrap().len(),
+                1,
+                "image {name:?} was not extracted; cleaned={cleaned} result={result}"
+            );
+            assert!(
+                result.contains("asset://localhost/"),
+                "image {name:?} not rewritten: {result}"
+            );
+            // Exactly one src attribute and the tag still closes: no break-out.
+            assert_eq!(result.matches(" src=").count(), 1, "{result}");
+            assert!(result.contains(" alt=\"k\""), "{result}");
+            assert!(result.ends_with('>'), "{result}");
+        }
+    }
+
+    /// The storage key (and so the URL a policy builds from it) carries a
+    /// sanitized basename: whatever the zip entry is called, only
+    /// `[A-Za-z0-9._/-]` reaches the filesystem and the `src`. `"`, `<`, `>`
+    /// and `?` are illegal in Windows filenames, `%` and spaces mangle URLs.
+    #[test]
+    fn test_rewrite_img_srcs_key_and_url_are_filesystem_and_url_safe() {
+        let safe = |t: &str| {
+            t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        };
+        let names = [
+            "a b&c.png",
+            "q\"uote.png",
+            "lt<gt>.png",
+            "nb\u{a0}sp.png",
+            "ap'os.png",
+            "50%.png",
+            "a%2Fb.png",
+            "caf\u{e9}.png",
+            "back\\slash.png",
+            "col:on|pipe*star.png",
+        ];
+        for name in names {
+            let tmp = tempfile::tempdir().unwrap();
+            let entry = format!("OEBPS/images/{name}");
+            let zip_path =
+                create_test_zip_with_images(tmp.path(), "t.zip", &[(entry.as_str(), b"AAAA")]);
+            let file = std::fs::File::open(&zip_path).unwrap();
+            let mut archive = ZipArchive::new(file).unwrap();
+            let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+
+            let raw = format!(
+                "<img src=\"../images/{}\">",
+                name.replace('&', "&amp;").replace('"', "&quot;")
+            );
+            let result = rewrite_img_srcs(
+                &clean(&raw),
+                &mut archive,
+                "OEBPS/Text/",
+                &storage,
+                "b/0",
+                &|key: &str, _p: &std::path::Path| format!("/img/{key}"),
+            );
+
+            use crate::storage::Storage;
+            let keys = storage.list("b/0/").unwrap();
+            assert_eq!(keys.len(), 1, "{name:?}: not extracted: {result}");
+            assert!(safe(&keys[0]), "{name:?}: unsafe key {:?}", keys[0]);
+            let src = extract_attr_value(&result, "src").unwrap();
+            assert!(src.starts_with("/img/b/0/"), "{name:?}: {result}");
+            assert!(safe(&src), "{name:?}: unsafe url {src:?}");
+        }
+    }
+
+    /// A filename with `"` reaches the splice after decoding; whatever the
+    /// policy returns must stay inside the attribute.
+    #[test]
+    fn test_rewrite_img_srcs_quote_in_decoded_filename_cannot_break_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = create_test_zip_with_images(
+            tmp.path(),
+            "t.zip",
+            &[("x\" onerror=\"alert(1).png", b"AAAA")],
+        );
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+        let cleaned = clean(r#"<img src="x&quot; onerror=&quot;alert(1).png">"#);
+        let result = rewrite_img_srcs(
+            &cleaned,
+            &mut archive,
+            "",
+            &storage,
+            "b/0",
+            // A policy that echoes the key (sanitized, so no `"` of its own).
+            &|key: &str, _p: &std::path::Path| format!("/img/{key}"),
+        );
+        assert!(result.contains("/img/b/0/"), "not rewritten: {result}");
+        assert_eq!(result.matches('"').count(), 2, "attribute broken: {result}");
+        // The only `="` is the one opening src; the payload's is percent-encoded.
+        assert_eq!(result.matches("=\"").count(), 1, "injected attr: {result}");
+    }
+
+    /// Filenames with nothing to decode keep exactly the key they had before
+    /// entity decoding existed, so already-extracted images are still found.
+    #[test]
+    fn test_rewrite_img_srcs_key_unchanged_for_plain_filenames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path =
+            create_test_zip_with_images(tmp.path(), "t.zip", &[("OEBPS/images/p.png", b"AAAA")]);
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let storage = crate::storage::LocalStorage::new(tmp.path().join("images")).unwrap();
+        rewrite_img_srcs_to_asset_urls(
+            r#"<img src="../images/p.png">"#,
+            &mut archive,
+            "OEBPS/Text/",
+            &storage,
+            "b/0",
+        );
+        use crate::storage::Storage;
+        let expected = format!("b/0/{}-p.png", short_zip_path_hash("OEBPS/images/p.png"));
+        assert_eq!(storage.list("b/0/").unwrap(), vec![expected]);
     }
 
     /// The guard from [`crate::reader::attr_safe_url`], proved end-to-end

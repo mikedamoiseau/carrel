@@ -77,8 +77,8 @@
 //!
 //! A cache hit reads `pages` only — it never touches `file_path`, which is
 //! what lets a caller prove the cache is doing its job by deleting the
-//! source file between two reads of the same page. A miss primes the
-//! *entire* book into the cache (via
+//! source file between two reads of the same page. A miss with
+//! [`OnMiss::Prime`] primes the *entire* book into the cache (via
 //! [`crate::page_cache::ensure_cached`]) before serving the requested page,
 //! so every later read — including a different page — is a pure cache read.
 //! See [`page_image`]'s doc comment for why the whole-book prime, not the
@@ -445,13 +445,18 @@ fn extraction_lock(hash: &str) -> Arc<Mutex<()>> {
 pub enum OnMiss {
     /// A miss primes the cache for the whole book — the entire archive for
     /// a comic, or an established manifest for a PDF — then serves the
-    /// requested page from it. What the web adapter passes: it has no other
-    /// event that could ever prime the cache.
+    /// requested page from it. What the web adapter passes by default: it
+    /// has no other event that could ever prime the cache. (The adapter
+    /// itself switches to [`OnMiss::ReadSource`] for a cold comic whose
+    /// declared size cannot fit the cache budget.)
     Prime,
     /// A miss reads just the requested page from the source and leaves
     /// priming to whoever else owns it. What the desktop passes: its own
     /// book-open command and background prerender pass already own priming,
-    /// so the page read must not duplicate — or race — that work.
+    /// so the page read must not duplicate — or race — that work. The web
+    /// adapter also passes it for a cold comic that cannot fit
+    /// `page_cache_max_size_mb`, where priming would only be evicted again
+    /// (see `web_server::api::comic_on_miss`).
     ReadSource,
 }
 
@@ -481,7 +486,11 @@ pub enum OnMiss {
 /// A cache that has just been primed can still fail to serve the page it
 /// was primed for: `page_cache_max_size_mb` can be smaller than this one
 /// comic's extracted size, in which case `on_extracted`'s eviction (see
-/// below) reclaims the book we *just* wrote before anyone reads it back; or
+/// below) reclaims the book we *just* wrote before anyone reads it back. The
+/// web adapter now avoids that by not priming a comic whose *declared* size
+/// exceeds the budget, so this arises there only when the declared size is
+/// understated or unreadable, or for another caller passing `Prime` with a
+/// small budget; or
 /// a concurrent extraction elsewhere in the cache can do the same (see the
 /// module docs' cross-surface-race note). Either way, a page cache that
 /// cannot serve degrades to a direct archive decode — the same fallback the
@@ -511,10 +520,11 @@ pub enum OnMiss {
 /// Whether the page then read back successfully is deliberately not part of
 /// the condition (M3 review round 4). `ensure_cached` has no size cap of its
 /// own, so this callback is the only thing bounding what it wrote against
-/// the caller's budget, and a request that goes on to fail — an
-/// out-of-range index, a failed read-back, a resize error — has still put a
-/// whole archive on disk. It fires on those paths too, including ones that
-/// return `Err`.
+/// the caller's budget, and a request that goes on to fail — a failed
+/// read-back, a resize error — has still put a whole archive on disk. (An
+/// out-of-range index on a cold comic no longer gets that far: it is
+/// rejected from the archive's page count before anything is extracted.)
+/// It fires on those paths too, including ones that return `Err`.
 ///
 /// A *failed* `ensure_cached` does not fire it, because that function
 /// cleans up after itself: a failure part-way through removes what it had
@@ -565,9 +575,11 @@ pub enum OnMiss {
 /// [`page_cache::get_or_render_pdf_page_with_eviction`]'s `suppress_write`,
 /// matching `commands::get_pdf_page_bytes`'s desktop behaviour, and for one
 /// with no entry yet it declines to create it at all.
-/// Comics ignore it: there is no equivalent write-suppression path for
-/// CBZ/CBR yet (tracked in
-/// `docs/backlog/comic-cache-ignores-private-mode.md`).
+/// For a comic (M5) a private read never primes: a miss is decoded straight
+/// from the archive (as with [`OnMiss::ReadSource`]), no manifest or page is
+/// written and `on_extracted` does not fire. A page already cached by a
+/// non-private read is still served, and, like PDF's cached-page hit, the
+/// private hit does not refresh `last_accessed`.
 ///
 /// `on_miss` (M3) is what makes this one function usable by both surfaces
 /// despite their different book-open behaviour — see [`OnMiss`]'s doc
@@ -634,7 +646,12 @@ where
             // even while it's the one actively being read. Page turns
             // happen at human speed, so a manifest write per hit is cheap
             // enough not to need throttling.
-            page_cache::touch_last_accessed(pages, hash);
+            // Private mode (M5) serves the hit but leaves the manifest
+            // alone, like PDF's cached-page hit, which returns before it
+            // ever touches the manifest.
+            if !is_private {
+                page_cache::touch_last_accessed(pages, hash);
+            }
             let (bytes, out_mime) =
                 crate::image_util::maybe_resize_to_jpeg(data, mime, target_width)?;
             page_cache::page_dbg!(
@@ -646,10 +663,14 @@ where
             return Ok((bytes, out_mime));
         }
 
-        if on_miss == OnMiss::ReadSource {
+        // Private mode never primes (M5): priming writes every page plus a
+        // manifest recording `book_id` and `last_accessed`. Same path as a
+        // `ReadSource` miss — decode the one page, leave the cache as it was.
+        if on_miss == OnMiss::ReadSource || is_private {
             // Desktop: priming is `prepare_comic`'s and its background
             // `extract_comic_remaining` pass's job, not this call's — see
-            // [`OnMiss`]. Read just the requested page straight from the
+            // [`OnMiss`]. (The web adapter also lands here, deliberately,
+            // for a cold comic too big for the cache budget.) Read just the requested page straight from the
             // archive and leave the cache exactly as it was: no lock, no
             // `ensure_cached`, no `on_extracted`. This is the same fallback
             // the pre-M3 desktop implementation always used on a miss.
@@ -709,14 +730,44 @@ where
         // adapter answers 400/500 instead of 404, the exact class of bug
         // `ensure_epub_cached` guards against above.
         ensure_file_exists(file_path)?;
-        // Whether `ensure_cached` is about to do real work, decided before
-        // it runs: it short-circuits on an already-complete manifest, and
-        // `complete_manifest` is the very test it uses to decide that (see
-        // its doc comment). This is what keeps F7 true — an out-of-range
-        // page of an *already cached* book must not fire the eviction hook,
-        // because nothing was written — while still letting the degrade path
-        // below fire it when an extraction really did happen.
-        let extracted = page_cache::complete_manifest(pages, hash).is_none();
+        // Whether the book is cold, as of now. Only the page-count pre-check
+        // below uses it (to avoid opening the archive for a warm book). It is
+        // NOT what decides the eviction hook: another book's inline eviction
+        // can land between this read and `ensure_cached`, so the hook follows
+        // the flag `ensure_cached_reporting` returns for what it actually did.
+        // That keeps F7 true — an out-of-range page of an *already cached*
+        // book must not fire the hook, because nothing was written — while
+        // still firing it when an extraction really happened.
+        let cold = page_cache::complete_manifest(pages, hash).is_none();
+        // Cold: reject an index the archive cannot satisfy before paying for
+        // an extraction. The page count is read from the archive's directory
+        // (`get_page_count` shares `collect_page_names`' entry filter and
+        // sort, so it agrees with what extraction would write) and is far
+        // cheaper than extracting. The price: a cold *in-range* miss now
+        // reads the entry list twice (here, then in extraction), and on the
+        // web path a third time, since `comic_on_miss` reads the declared
+        // size from the same directory first. On a NAS
+        // path — `file_path` stays the NAS path until a staged copy exists
+        // (see `web_server::resolve_book_path`) — that is one extra
+        // directory read (CBZ) or header walk (CBR), small next to the
+        // extraction it precedes. A warm book skips this — its manifest
+        // already answers it — and a count that cannot be read falls through
+        // to the existing path, whose own errors are unchanged. Nothing was
+        // written, so the eviction hook does not fire.
+        if cold {
+            let count = if format == BookFormat::Cbz {
+                crate::cbz::get_page_count(file_path)
+            } else {
+                crate::cbr::get_page_count(file_path)
+            };
+            if let Ok(total) = count {
+                if page_index >= total {
+                    return Err(CarrelError::not_found(format!(
+                        "Page index {page_index} out of range (total pages: {total})"
+                    )));
+                }
+            }
+        }
         // A failing `ensure_cached` degrades to a direct decode rather than
         // failing the request (M3 review round 6). Its errors are not all
         // about the archive: a full disk, an unwritable `Storage`, a failed
@@ -741,17 +792,21 @@ where
         // (`pdf page cache unavailable…`): a permanently unwritable or full
         // cache otherwise degrades every comic page request forever with
         // nothing in the app log, and the user just sees slow pages.
-        if let Err(e) = page_cache::ensure_cached(pages, book_id, hash, file_path, &format) {
-            log::warn!("comic page cache unavailable for {hash}, decoding directly: {e}");
-            return direct_comic_page(
-                format,
-                file_path,
-                page_index,
-                target_width,
-                started,
-                std::time::Duration::ZERO,
-            );
-        }
+        let extracted =
+            match page_cache::ensure_cached_reporting(pages, book_id, hash, file_path, &format) {
+                Ok((_, extracted)) => extracted,
+                Err(e) => {
+                    log::warn!("comic page cache unavailable for {hash}, decoding directly: {e}");
+                    return direct_comic_page(
+                        format,
+                        file_path,
+                        page_index,
+                        target_width,
+                        started,
+                        std::time::Duration::ZERO,
+                    );
+                }
+            };
 
         // Read back before firing `on_extracted` (finding F1): the callback
         // is the caller's eviction hook, and an eviction pass can reclaim
@@ -806,13 +861,14 @@ where
         // it backwards: `ensure_cached` has no size cap of its own, so if it
         // just wrote a whole archive to disk, this callback is the only thing
         // bounding that write against `page_cache_max_size_mb` — and the
-        // read-back failing is no reason to leave it unbounded. The reachable
-        // case is an out-of-range page of a cold book: extract 800 MB, fail
-        // the read-back, degrade, error — with the archive on disk and, until
-        // this fix, nothing sweeping it. Firing before the direct decode
-        // rather than after, so a decode that also fails still sweeps; the
-        // decode reads the archive, not the cache, so eviction cannot take
-        // its bytes away.
+        // read-back failing is no reason to leave it unbounded. The case that
+        // motivated it was an out-of-range page of a cold book, which the
+        // page-count pre-check above now rejects before extracting; what
+        // still reaches here is a book evicted between extract and read-back
+        // or an unreadable page, with the archive on disk. Firing before the
+        // direct decode rather than after, so a decode that also fails still
+        // sweeps; the decode reads the archive, not the cache, so eviction
+        // cannot take its bytes away.
         // Timed and subtracted for the same reason the success path above
         // does it: the web adapter runs `run_eviction` inline in this
         // callback, and the desktop `[page-load]` lines this number is
@@ -1685,27 +1741,21 @@ mod tests {
         );
     }
 
-    /// M3 review round 4: the mirror of F7 below. An out-of-range page of a
-    /// *cold* book DOES fire the eviction hook, because `ensure_cached` just
-    /// wrote the whole archive to disk before the read-back failed, and this
-    /// callback is the only thing that bounds that write against
-    /// `page_cache_max_size_mb` — `ensure_cached` has no size cap of its own.
-    ///
-    /// Without it, `GET /books/{id}/pages/999` on a cold 800 MB comic
-    /// extracts the archive, errors, and leaves it on disk unswept; repeated
-    /// across books that grows the cache past its budget with nothing
-    /// reclaiming it. Together with F7 this pins the actual rule: fire iff an
-    /// extraction really happened, regardless of whether the read-back after
-    /// it succeeded.
+    /// An out-of-range page of a *cold* comic is rejected from the archive's
+    /// page count, before anything is extracted. Previously the miss primed
+    /// the whole archive (800 MB for a big comic) and only then found the
+    /// index invalid, so `GET /books/{id}/pages/999` cost a full extraction.
+    /// With no extraction there is nothing written and so nothing to sweep:
+    /// the eviction hook must not fire, and the cache must hold nothing for
+    /// this hash. (This inverts the M3 round-4 rule, which only existed
+    /// because the extraction had already happened.)
     #[test]
-    fn out_of_range_page_on_a_cold_book_still_fires_on_extracted() {
+    fn out_of_range_page_on_a_cold_book_is_rejected_without_extracting() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_cbz(dir.path(), &[encode_jpeg(10, 10), encode_jpeg(10, 10)]);
         let pages = pages_storage(dir.path());
         let calls = std::cell::Cell::new(0);
 
-        // Cold: nothing cached yet, so the miss primes the whole archive and
-        // only then discovers the page index is out of range.
         let err = page_image(
             BookFormat::Cbz,
             &path,
@@ -1722,14 +1772,70 @@ mod tests {
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
 
         assert!(
-            page_cache::complete_manifest(&pages, "hash-cold-oor").is_some(),
-            "the archive really was extracted, or this test proves nothing"
+            pages.list("").unwrap().is_empty(),
+            "nothing may be written to the cache for a rejected index"
         );
+        assert_eq!(calls.get(), 0, "no extraction, so nothing to sweep");
+    }
+
+    /// The pre-check's page count must come from the same entry filter that
+    /// extraction uses, or a valid page of a cold comic would be rejected.
+    /// This archive carries a directory entry, `ComicInfo.xml`, and
+    /// `__MACOSX/` junk (including a fake image) around two real pages: the
+    /// last real page must still be served cold, and the first index past it
+    /// rejected without extraction.
+    #[test]
+    fn cold_range_check_agrees_with_extraction_on_archives_with_non_page_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("junk.cbz");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.add_directory("pages/", opts).unwrap();
+            zip.start_file("ComicInfo.xml", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"<ComicInfo/>").unwrap();
+            zip.start_file("__MACOSX/pages/._p1.jpg", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"junk").unwrap();
+            for name in ["pages/p1.jpg", "pages/p2.jpg"] {
+                zip.start_file(name, opts).unwrap();
+                std::io::Write::write_all(&mut zip, &encode_jpeg(10, 10)).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let path = path.to_string_lossy().into_owned();
+        let pages = pages_storage(dir.path());
+
+        let read = |idx: u32, hash: &str| {
+            page_image(
+                BookFormat::Cbz,
+                &path,
+                idx,
+                None,
+                "bk",
+                Some(hash),
+                Some(&pages),
+                || {},
+                false,
+                OnMiss::Prime,
+            )
+        };
+
+        let err = read(2, "hash-junk-oor").unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+        assert!(
+            page_cache::complete_manifest(&pages, "hash-junk-oor").is_none(),
+            "index 2 is past the two real pages and must not extract"
+        );
+
+        let (bytes, _) = read(1, "hash-junk-last").expect("last real page must be served cold");
+        assert!(!bytes.is_empty());
         assert_eq!(
-            calls.get(),
-            1,
-            "a real extraction must fire the eviction hook even though the \
-             read-back failed — nothing else bounds what it just wrote"
+            page_cache::complete_manifest(&pages, "hash-junk-last")
+                .unwrap()
+                .page_count,
+            2,
+            "extraction and the pre-check must agree on the page count"
         );
     }
 
@@ -1777,6 +1883,113 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
         assert_eq!(calls.get(), 0, "must not fire when nothing was extracted");
+    }
+
+    /// A `Storage` that evicts one book the moment `ensure_cached` reads
+    /// its manifest, to reproduce — deterministically — another request's
+    /// inline `run_eviction` landing between `page_image`'s completeness
+    /// pre-read and `ensure_cached`'s own check.
+    ///
+    /// The trigger counts manifest `get`s on an out-of-range read of a warm
+    /// book: (1) `get_cached_page`, (2) the re-check under the extraction
+    /// lock, (3) `complete_manifest`'s pre-read, (4) `ensure_cached`. The
+    /// fourth one is the race window.
+    struct EvictsOnFourthManifestRead {
+        inner: crate::storage::LocalStorage,
+        hash: String,
+        manifest_gets: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::storage::Storage for EvictsOnFourthManifestRead {
+        fn put(&self, key: &str, bytes: &[u8]) -> CarrelResult<()> {
+            self.inner.put(key, bytes)
+        }
+        fn get(&self, key: &str) -> CarrelResult<Vec<u8>> {
+            if key.ends_with("manifest.json") && key.contains(&self.hash) {
+                let n = self
+                    .manifest_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if n == 4 {
+                    page_cache::evict_book(&self.inner, &self.hash).unwrap();
+                }
+            }
+            self.inner.get(key)
+        }
+        fn exists(&self, key: &str) -> CarrelResult<bool> {
+            self.inner.exists(key)
+        }
+        fn delete(&self, key: &str) -> CarrelResult<()> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> CarrelResult<Vec<String>> {
+            self.inner.list(prefix)
+        }
+        fn size(&self, key: &str) -> CarrelResult<u64> {
+            self.inner.size(key)
+        }
+        fn local_path(&self, key: &str) -> CarrelResult<std::path::PathBuf> {
+            self.inner.local_path(key)
+        }
+    }
+
+    /// TOCTOU on the "did we extract" predicate: the book is complete when
+    /// `page_image` checks, but evicted before `ensure_cached` looks, so
+    /// `ensure_cached` really extracts. The eviction hook must fire for that
+    /// write — the hook decision follows what `ensure_cached` reports, not
+    /// the pre-read. (Out-of-range index on a warm book is the way to reach
+    /// the miss branch with a complete manifest.)
+    #[test]
+    fn hook_fires_when_the_book_is_evicted_between_the_check_and_ensure_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50)]);
+        let pages = EvictsOnFourthManifestRead {
+            inner: pages_storage(dir.path()),
+            hash: "hash-race".to_string(),
+            manifest_gets: std::sync::atomic::AtomicU32::new(0),
+        };
+        // Warm the book first; the wrapper's counter is reset afterwards.
+        page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-race"),
+            Some(&pages),
+            || {},
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        pages
+            .manifest_gets
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = page_image(
+            BookFormat::Cbz,
+            &path,
+            99,
+            None,
+            "bk",
+            Some("hash-race"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            false,
+            OnMiss::Prime,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), "NotFound", "unexpected error: {err}");
+        assert!(
+            page_cache::complete_manifest(&pages, "hash-race").is_some(),
+            "the race must have caused a real re-extraction"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "ensure_cached re-extracted, so the hook must fire"
+        );
     }
 
     /// F4 (M1 review): a cache hit must refresh `last_accessed`, or a comic
@@ -1831,6 +2044,129 @@ mod tests {
         assert!(
             after > before,
             "a cache hit must move last_accessed forward: before={before} after={after}"
+        );
+    }
+
+    /// M5: a private cold read of a comic is served but never primes the
+    /// cache — no pages, no manifest (which records `book_id` and a
+    /// `last_accessed`), and no eviction hook, since nothing was written.
+    /// Matches the PDF arm. With the `is_private` check removed this primes
+    /// the whole archive, so the manifest and the hook assertions fail.
+    #[test]
+    fn a_private_cold_comic_read_is_served_without_touching_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50), encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+        let calls = std::cell::Cell::new(0);
+
+        let (bytes, mime) = page_image(
+            BookFormat::Cbz,
+            &path,
+            1,
+            None,
+            "bk",
+            Some("hash-private-cold"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            true,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(mime, "image/jpeg");
+
+        assert!(page_cache::read_manifest(&pages, "hash-private-cold").is_none());
+        let entries = pages.list("page-cache/hash-private-cold/").unwrap();
+        assert!(entries.is_empty(), "private read wrote: {entries:?}");
+        assert_eq!(calls.get(), 0, "nothing was written, nothing to evict");
+    }
+
+    /// M5: a book already cached by a non-private read still serves from
+    /// the cache in private mode (the source is deleted to prove it), and —
+    /// matching PDF's cached-page hit, which returns before touching the
+    /// manifest — the private hit does not bump `last_accessed`.
+    #[test]
+    fn a_private_comic_hit_serves_from_cache_without_bumping_last_accessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+        let prime = || {
+            page_image(
+                BookFormat::Cbz,
+                &path,
+                0,
+                None,
+                "bk",
+                Some("hash-private-warm"),
+                Some(&pages),
+                || {},
+                false,
+                OnMiss::Prime,
+            )
+        };
+        let primed = prime().unwrap();
+        let before = page_cache::read_manifest(&pages, "hash-private-warm")
+            .unwrap()
+            .last_accessed;
+        std::fs::remove_file(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let calls = std::cell::Cell::new(0);
+        let served = page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-private-warm"),
+            Some(&pages),
+            || calls.set(calls.get() + 1),
+            true,
+            OnMiss::Prime,
+        )
+        .unwrap();
+        assert_eq!(served, primed);
+        let after = page_cache::read_manifest(&pages, "hash-private-warm")
+            .unwrap()
+            .last_accessed;
+        assert_eq!(after, before, "a private hit must not write the manifest");
+        assert_eq!(calls.get(), 0);
+    }
+
+    /// M5, desktop combination (`OnMiss::ReadSource` + private): a hit on an
+    /// already-primed book leaves the manifest alone. Without the private
+    /// check the hit path refreshes `last_accessed` regardless of `on_miss`.
+    #[test]
+    fn a_private_read_source_comic_hit_does_not_bump_last_accessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_cbz(dir.path(), &[encode_jpeg(50, 50)]);
+        let pages = pages_storage(dir.path());
+        page_cache::ensure_cached(&pages, "bk", "hash-private-rs", &path, &BookFormat::Cbz)
+            .unwrap();
+        let before = page_cache::read_manifest(&pages, "hash-private-rs")
+            .unwrap()
+            .last_accessed;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        page_image(
+            BookFormat::Cbz,
+            &path,
+            0,
+            None,
+            "bk",
+            Some("hash-private-rs"),
+            Some(&pages),
+            || {},
+            true,
+            OnMiss::ReadSource,
+        )
+        .unwrap();
+
+        assert_eq!(
+            page_cache::read_manifest(&pages, "hash-private-rs")
+                .unwrap()
+                .last_accessed,
+            before
         );
     }
 

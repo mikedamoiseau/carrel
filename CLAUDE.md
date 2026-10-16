@@ -20,11 +20,11 @@ cd src-tauri && cargo test --features mobi                  # carrel, libmobi-ga
 cargo test -p carrel-core --features mobi -- --test-threads=1   # carrel-core (workspace root)
 ```
 
-The middle one is easy to miss and is not redundant: `src-tauri/src/commands.rs` and `web_server/api.rs` carry paired `#[cfg(feature = "mobi")]` / `#[cfg(not(feature = "mobi"))]` test arms, so the default run and the `--features mobi` run assert *different* things. The `--test-threads=1` on the carrel-core run mirrors CI's Linux job, which serialises it because libmobi's C-side cleanup races across threads there — parallel drops can double-free shared internal state and SIGABRT *after* a passing test (see the comment on that step in `ci.yml`). CI's Windows job omits the flag; keeping it locally is harmless and matches the strictest job.
+The middle one is easy to miss and is not redundant: `src-tauri/src/commands.rs` and `web_server/api.rs` carry paired `#[cfg(feature = "mobi")]` / `#[cfg(not(feature = "mobi"))]` test arms, so the default run and the `--features mobi` run assert *different* things. The `--test-threads=1` on the carrel-core run mirrors CI, which serialises it because libmobi's C-side cleanup races across threads — parallel drops can double-free shared internal state and SIGABRT *after* a passing test (see the comment on that step in `ci.yml`). The Linux and Windows jobs both pass the flag.
 
 `pnpm run test:e2e` runs against a seeded harness (`src-tauri/examples/web_e2e_server.rs`); Playwright manages the server's lifecycle (build, start, health-check, teardown), so no manual setup is needed. First run in a fresh clone needs `pnpm exec playwright install --with-deps chromium`.
 
-MOBI tests require a public-domain test corpus under `src-tauri/test-fixtures/` (gitignored). Populate once with `./scripts/fetch-mobi-test-corpus.sh`. Fixture-gated tests skip with a clear message when fixtures are absent, so fresh clones stay green without the corpus.
+MOBI test fixtures (two public-domain Project Gutenberg files) are vendored under `src-tauri/test-fixtures/`; see its README for provenance. Nothing to download. The fixture-gated tests still skip with a message if a file is missing.
 
 ## Architecture
 

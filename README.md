@@ -293,19 +293,10 @@ cargo fmt --all --check
 
 ### MOBI test fixtures
 
-MOBI / AZW / AZW3 tests are gated on a public-domain test corpus that is
-**not** checked into the repository — the fixtures live under
-`src-tauri/test-fixtures/` (gitignored). Populate them once before running
-the MOBI tests:
-
-```bash
-./scripts/fetch-mobi-test-corpus.sh
-```
-
-The script downloads Alice's Adventures in Wonderland from Project
-Gutenberg in both legacy Mobipocket (v6) and KF8 (v8 / AZW3) form. Tests
-that require a fixture skip with a clear message when it is absent, so the
-suite stays green on fresh clones.
+MOBI / AZW / AZW3 tests use a small public-domain corpus (Alice's
+Adventures in Wonderland from Project Gutenberg, in legacy Mobipocket v6 and
+KF8 form) that is committed under `src-tauri/test-fixtures/`; nothing needs
+to be downloaded. See `src-tauri/test-fixtures/README.md` for provenance.
 
 ## Project structure
 

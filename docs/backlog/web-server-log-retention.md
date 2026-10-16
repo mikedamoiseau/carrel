@@ -1,6 +1,13 @@
 # Cap the error log a LAN client can grow
 
-**Status:** open (noted 2026-08-21, during the LAN-hardening epic, PR #136).
+> **PARTLY FIXED** in the backlog-sweep epic: `observability.rs` now builds the
+> appender with `tracing_appender::rolling::Builder` and keeps at most **14
+> daily files** (`carrel.log.<date>`); older ones are deleted at startup and at
+> each rollover. This is a count cap only. A single noisy day is **still
+> unbounded**, and source-side rate-limiting (collapsing repeated warnings from
+> one client) was **not** done. Kept as a record.
+
+**Status:** noted 2026-08-21, during the LAN-hardening epic, PR #136.
 
 ## What
 
