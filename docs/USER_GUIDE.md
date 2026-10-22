@@ -967,6 +967,8 @@ On a phone or tablet the main sections — Library, Collections, and Reading Sta
 
 **Switching profiles.** If you have more than one profile, the header shows which one you're reading and lets you switch to another — so you can move between, say, *Books* and *Magazines* from the couch instead of going to the computer. There is a single active profile shared by everything: switching here also switches the desktop app and any other browser or OPDS client. A profile you've protected with a password is listed but greyed out, since Carrel never sends that password over the network — unlock it once in the desktop app and it becomes selectable remotely until Carrel restarts. Books you saved for offline reading belong to the profile you saved them under, and reappear when you switch back.
 
+**When a book can't be opened.** If the web reader can't load a book — most often a comic or PDF whose file is on a network drive that isn't connected to the computer running Carrel — it shows the error message below a header with a **back arrow (←)**. Tap the arrow to leave: from the reader it returns you to the book's detail page, and from a book detail page that fails to load it returns you to the library. This matters most when the web interface is installed on a phone or tablet's home screen, where there is no browser back button. To get the book working again, reconnect the drive (or fix the file's location) on the computer running Carrel, then open the book again.
+
 The web interface works entirely on your local network. No internet connection needed, no data leaves your WiFi.
 
 ### Access from outside your network
