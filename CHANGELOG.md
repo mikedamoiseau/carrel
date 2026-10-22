@@ -5,6 +5,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **Updated `ammonia`, `rustls-webpki` and `webpki-roots`.** Certificate
+  checks no longer trust intermediates that have since been distrusted
+  (RUSTSEC-2026-0381, RUSTSEC-2026-0382). The `ammonia` fix
+  (RUSTSEC-2026-0373) only matters when inline styles are allowed, which
+  Carrel's EPUB sanitizer never does; it is updated to keep the audit clean.
+  Three new `zip` advisories cover extracting a whole archive to disk, which
+  Carrel never does; they are recorded as accepted until the `zip` 9 upgrade.
+
 ### Changed
 - **Old log files are cleaned up automatically.** Carrel keeps the 14 most
   recent daily log files and deletes older ones, so the log folder no longer
