@@ -66,4 +66,33 @@ ignore = [
     # suppaftp >= 10.0.2. Re-check on every opendal release; drop this entry
     # and keep the path bounds (they are correct independently of suppaftp).
     "RUSTSEC-2026-0271",
+
+    # zip 2.4.2: three advisories, all in whole-archive extraction —
+    # SUID/SGID bits preserved (RUSTSEC-2026-0367), symlinks with targets
+    # outside the destination (RUSTSEC-2026-0368), and Unix permissions
+    # applied through such symlinks (RUSTSEC-2026-0369, 9.1 critical). The
+    # affected functions are `ZipArchive::extract` and
+    # `ZipStreamReader::extract`. Fixed in zip 9.0.0.
+    #
+    # We never call either. Every read in `carrel-core` (epub, cbz,
+    # page_cache) and `src-tauri` goes entry by entry through
+    # `by_index` / `by_name` / `by_index_raw` into a capped `Read::take`, and
+    # writes go to paths we build ourselves (cache keys, sanitized
+    # basenames), never to an entry's own name or mode. No other crate in the
+    # tree depends on zip. Check: `grep -rnE "\.extract\(|ZipStreamReader"
+    # carrel-core/src src-tauri/src` finds nothing.
+    #
+    # Not upgraded yet because 9.x is not a drop-in: `ZipFile::name()` now
+    # returns `ZipResult<Cow<str>>` and decodes any valid-UTF-8 name as UTF-8
+    # even without the UTF-8 flag (2.x read unflagged names as CP437), which
+    # can reorder a comic's pages under an existing page cache; and
+    # `ZipArchive` appears in carrel-core's public API
+    # (`epub::validate_archive`), which Carrel Server consumes. See
+    # docs/backlog/zip-9-upgrade.md.
+    #
+    # Exit condition: the zip 9 upgrade lands. Also drop this entry at once
+    # if anything starts calling `extract`.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
