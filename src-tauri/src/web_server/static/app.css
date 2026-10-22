@@ -465,7 +465,7 @@ body:not(:has(.header))::before {
    swipe drag-follow sets will-change inline for its own short window. */
 .reader-stage.zoom-active img#page-img { will-change: transform; }
 .reader-page.fit-width .reader-stage img#page-img { width: 100%; max-width: 100%; height: auto; max-height: none; }
-.reader-page-error, .reader-error { color: var(--error); text-align: center; padding: 24px; }
+.reader-page-error, .reader-error, .view-error { color: var(--error); text-align: center; padding: 24px; }
 
 /* Item 12: the incoming page for an animated commit — an absolutely
    positioned overlay so the outgoing (still visible, static) page stays put

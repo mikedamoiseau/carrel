@@ -1348,8 +1348,18 @@
   // stats, collections use `.empty` on their existing content element
   // instead — see showLibraryLoadError/showStats/showCollections). Reuses
   // the reader loader's pre-existing bare `class="error"` convention.
-  function renderViewError(message) {
-    app().innerHTML = `<div class="error">${esc(message)}</div>`;
+  // `onBack` is the view's own back action: these views replace the whole
+  // page, and an installed (standalone) app has no browser back button, so
+  // without it a failed load is a dead end. The `.header` also carries the
+  // status-bar inset — headerless, the message sat under the fixed accent
+  // strip (body:not(:has(.header))::before) and the screen looked empty.
+  function renderViewError(message, onBack) {
+    app().innerHTML = `
+      <div class="header">
+        <button class="back-btn" id="back-btn" aria-label="Back">&larr;</button>
+      </div>
+      <div class="error view-error">${esc(message)}</div>`;
+    $("#back-btn").addEventListener("click", onBack);
   }
 
   // ── Loading Skeletons (Item 10) ────────────────
@@ -2953,13 +2963,13 @@
       resp = await api("/api/books/" + id);
     } catch (e) {
       if (!hashTargetsDetail(id)) return;
-      renderViewError(apiFailureToastMessage(e));
+      renderViewError(apiFailureToastMessage(e), goHome);
       showToast(apiFailureToastMessage(e));
       return;
     }
     if (!resp || !hashTargetsDetail(id)) return;
     if (!resp.ok) {
-      renderViewError(`Couldn't load this book (HTTP ${resp.status})`);
+      renderViewError(`Couldn't load this book (HTTP ${resp.status})`, goHome);
       showToast(httpErrorToastMessage(resp.status));
       return;
     }
@@ -2967,7 +2977,7 @@
     try {
       book = await resp.json();
     } catch (e) {
-      renderViewError("Couldn't load this book (unexpected response)");
+      renderViewError("Couldn't load this book (unexpected response)", goHome);
       showToast("Unexpected response");
       return;
     }
@@ -3345,13 +3355,13 @@
         resp = await api("/api/books/" + id);
       } catch (e) {
         if (!hashTargetsReader(id)) return;
-        renderViewError(apiFailureToastMessage(e));
+        renderViewError(apiFailureToastMessage(e), () => navigate("#/book/" + id));
         showToast(apiFailureToastMessage(e));
         return;
       }
       if (!resp || !hashTargetsReader(id)) return;
       if (!resp.ok) {
-        renderViewError(`Couldn't load this book (HTTP ${resp.status})`);
+        renderViewError(`Couldn't load this book (HTTP ${resp.status})`, () => navigate("#/book/" + id));
         showToast(httpErrorToastMessage(resp.status));
         return;
       }
@@ -3359,7 +3369,7 @@
       try {
         book = await resp.json();
       } catch (e) {
-        renderViewError("Couldn't load this book (unexpected response)");
+        renderViewError("Couldn't load this book (unexpected response)", () => navigate("#/book/" + id));
         showToast("Unexpected response");
         return;
       }
@@ -3381,13 +3391,13 @@
           countResp = await api(`/api/books/${id}/page-count`);
         } catch (e) {
           if (!hashTargetsReader(id)) return;
-          renderViewError(apiFailureToastMessage(e));
+          renderViewError(apiFailureToastMessage(e), () => navigate("#/book/" + id));
           showToast(apiFailureToastMessage(e));
           return;
         }
         if (!countResp || !hashTargetsReader(id)) return;
         if (!countResp.ok) {
-          renderViewError(`Couldn't load page count (HTTP ${countResp.status})`);
+          renderViewError(`Couldn't load page count (HTTP ${countResp.status})`, () => navigate("#/book/" + id));
           showToast(httpErrorToastMessage(countResp.status));
           return;
         }
@@ -3395,7 +3405,7 @@
         try {
           countBody = await countResp.json();
         } catch (e) {
-          renderViewError("Couldn't load page count (unexpected response)");
+          renderViewError("Couldn't load page count (unexpected response)", () => navigate("#/book/" + id));
           showToast("Unexpected response");
           return;
         }
