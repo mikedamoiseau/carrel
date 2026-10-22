@@ -11,6 +11,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   grows without limit.
 
 ### Fixed
+- **A book that can't be opened in the web UI no longer leaves an empty
+  screen.** When a comic or PDF's file can't be read (for example, its
+  network drive isn't connected on the Mac), the web reader showed a single
+  line of text hidden under the iPad status bar and no way to leave, so an
+  installed home-screen app had to be force-quit. The error now appears
+  below a header with a back button (to the book page from the reader, to the
+  library from a book page that fails to load).
 - **"Don't track this session" now covers comics and network-mounted books.**
   With it on, opening a CBZ/CBR no longer extracts its pages into the page
   cache or records it there (pages are read straight from the file, in the
