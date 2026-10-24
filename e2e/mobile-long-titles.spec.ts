@@ -31,6 +31,19 @@ async function lengthenTitles(page: Page) {
   });
 }
 
+// Opens a view and returns its header title. Earlier specs leave reading
+// progress on the harness's shared DB, so the reader may open on the resume
+// prompt first; dismiss it the way the other reader specs do.
+async function openHeaderTitle(page: Page, hash: string) {
+  await page.goto("/" + hash);
+  const title = page.locator(".header .nav-book-title");
+  const restart = page.locator("#resume-restart-btn");
+  await expect(restart.or(title)).toBeVisible({ timeout: 15_000 });
+  if (await restart.isVisible()) await restart.click();
+  await expect(title).toHaveText(longTitle(24));
+  return title;
+}
+
 test.describe("Long titles at phone width", () => {
   test("library cards show the whole title", async ({ page }) => {
     await lengthenTitles(page);
@@ -70,9 +83,7 @@ test.describe("Long titles at phone width", () => {
     test(`${name} header title is not squeezed into a sliver at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 844 });
       await lengthenTitles(page);
-      await page.goto("/" + hash);
-      const title = page.locator(".header .nav-book-title");
-      await expect(title).toHaveText(longTitle(24));
+      const title = await openHeaderTitle(page, hash);
 
       // The title gets a usable share of the header, so it wraps by word,
       // not by letter: no more than three lines.
@@ -90,9 +101,7 @@ test.describe("Long titles at phone width", () => {
   test("phone landscape keeps a one-row header when the title fits", async ({ page }) => {
     await page.setViewportSize({ width: 568, height: 320 });
     await lengthenTitles(page);
-    await page.goto("/#/book/e2e-book-130/0/read");
-    const title = page.locator(".header .nav-book-title");
-    await expect(title).toHaveText(longTitle(24));
+    const title = await openHeaderTitle(page, "#/book/e2e-book-130/0/read");
 
     const box = await title.boundingBox();
     const icons = await page.locator(".header .nav-icons").boundingBox();
