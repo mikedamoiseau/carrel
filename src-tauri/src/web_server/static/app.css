@@ -341,7 +341,9 @@ body:not(:has(.header))::before {
 .cover-placeholder { width: 100%; aspect-ratio: 2/3; background: var(--surface); border: 1px solid var(--warm-border); display: flex; align-items: center; justify-content: center; padding: 12px; text-align: center; }
 .cover-placeholder span { font-family: "Playfair Display", Georgia, serif; font-size: 0.85rem; color: var(--ink-muted); line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
 .card .info { padding: 10px; }
-.card .title { font-size: 0.85rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The whole title wraps rather than ellipsizing: magazine issues share a long
+   prefix ("Tout Comprendre Junior - Hors-série N°…") and differ only at the end. */
+.card .title { font-size: 0.85rem; font-weight: 600; overflow-wrap: break-word; }
 .card .author { font-size: 0.75rem; color: var(--ink-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .card .format { font-size: 0.65rem; color: var(--accent); text-transform: uppercase; margin-top: 4px; font-weight: 600; letter-spacing: 0.03em; }
 
@@ -907,6 +909,11 @@ body:not(:has(.header))::before {
      letting the row overflow the body horizontally. */
   .header { flex-wrap: wrap; }
   .header input[type="search"] { order: 1; flex-basis: 100%; }
+  /* A zero flex-basis let the reader/detail title shrink to whatever the back
+     button and nav icons left over (a sliver on the widest phones, where they
+     all fit on one row), so it broke one letter per line. A real basis pushes
+     the icons onto a second row instead. */
+  .header h1.nav-book-title { flex-basis: 60%; }
   .shelf-card { flex-basis: 100px; }
   .detail-badges { justify-content: center; }
   .series-nav-buttons { justify-content: center; }

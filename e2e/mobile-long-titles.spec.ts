@@ -1,0 +1,66 @@
+import { test, expect, type Page } from "@playwright/test";
+
+// Magazine titles are long ("Tout Comprendre Junior - Hors-série N°24 -
+// Novembre 2026") and the distinguishing part is at the end. On a phone:
+//   - library cards cut the title to one ellipsized line, so issues of the
+//     same magazine were indistinguishable;
+//   - the detail header gave the title whatever width the back button, the
+//     profile switcher and the nav icons left over — a few pixels — and
+//     `overflow-wrap: anywhere` then broke it one letter per line.
+//
+// Titles are lengthened by patching the real API responses, so the SW must not
+// own these fetches (an SW-controlled page bypasses page.route()).
+test.use({ serviceWorkers: "block", viewport: { width: 390, height: 844 } });
+
+const longTitle = (n: number) => `Tout Comprendre Junior - Hors-série N°${n} - Novembre 2026`;
+
+async function lengthenTitles(page: Page) {
+  await page.route(/\/api\/books\?/, async (route) => {
+    const resp = await route.fetch();
+    const books = await resp.json();
+    books.forEach((b: { title: string }, i: number) => (b.title = longTitle(i + 1)));
+    await route.fulfill({ response: resp, json: books });
+  });
+  await page.route(/\/api\/books\/e2e-book-001$/, async (route) => {
+    const resp = await route.fetch();
+    const book = await resp.json();
+    book.title = longTitle(24);
+    await route.fulfill({ response: resp, json: book });
+  });
+}
+
+test.describe("Long titles at phone width", () => {
+  test("library cards show the whole title", async ({ page }) => {
+    await lengthenTitles(page);
+    await page.goto("/");
+    const title = page.locator(".grid .card .title").first();
+    await expect(title).toHaveText(longTitle(1));
+
+    // Nothing clipped: the box holds all of its text in both directions.
+    const clipped = await title.evaluate(
+      (el) => el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight,
+    );
+    expect(clipped).toBe(false);
+  });
+
+  // 390 wraps the icon cluster below the title; at 430 (the widest iPhones)
+  // back button + nav icons fit on one row with a zero-width title, which is
+  // exactly the case that left the title a sliver.
+  for (const width of [390, 430]) {
+    test(`detail header title is not squeezed into a sliver at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 844 });
+      await lengthenTitles(page);
+      await page.goto("/#/book/e2e-book-001");
+      const title = page.locator(".header .nav-book-title");
+      await expect(title).toHaveText(longTitle(24));
+
+      // The title gets a usable share of the header, so it wraps by word,
+      // not by letter: no more than three lines.
+      const header = await page.locator("#app .header").boundingBox();
+      const box = await title.boundingBox();
+      expect(box!.width).toBeGreaterThan(header!.width / 2);
+      const lineHeight = await title.evaluate((el) => parseFloat(getComputedStyle(el).lineHeight));
+      expect(box!.height).toBeLessThanOrEqual(lineHeight * 3 + 1);
+    });
+  }
+});
