@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.3] - 2026-10-24
+
 ### Security
 - **Updated `ammonia`, `rustls-webpki` and `webpki-roots`.** Certificate
   checks no longer trust intermediates that have since been distrusted
@@ -13,6 +15,13 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   Carrel's EPUB sanitizer never does; it is updated to keep the audit clean.
   Three new `zip` advisories cover extracting a whole archive to disk, which
   Carrel never does; they are recorded as accepted until the `zip` 9 upgrade.
+
+### Added
+- **`carrel-core::page_cache::comic_declared_size`.** Returns the total
+  uncompressed size a CBZ/CBR archive declares for its pages, read from the
+  archive's directory without extracting anything. The web reader uses it to
+  skip caching a comic that could never fit in the page cache. Additive; no
+  existing carrel-core signature changed.
 
 ### Changed
 - **Old log files are cleaned up automatically.** Carrel keeps the 14 most
