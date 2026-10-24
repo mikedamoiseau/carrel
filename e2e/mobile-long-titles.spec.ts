@@ -15,13 +15,15 @@ test.use({ serviceWorkers: "block", viewport: { width: 390, height: 844 } });
 const longTitle = (n: number) => `Tout Comprendre Junior - Hors-série N°${n} - Novembre 2026`;
 
 async function lengthenTitles(page: Page) {
-  await page.route(/\/api\/books\?/, async (route) => {
+  // Library grid, shelves (want-to-read / recently added) and the
+  // continue-reading shelf all return a flat array of books.
+  await page.route(/\/api\/books(\/continue-reading)?\?/, async (route) => {
     const resp = await route.fetch();
     const books = await resp.json();
     books.forEach((b: { title: string }, i: number) => (b.title = longTitle(i + 1)));
     await route.fulfill({ response: resp, json: books });
   });
-  await page.route(/\/api\/books\/e2e-book-001$/, async (route) => {
+  await page.route(/\/api\/books\/e2e-book-(001|130)$/, async (route) => {
     const resp = await route.fetch();
     const book = await resp.json();
     book.title = longTitle(24);
@@ -43,14 +45,32 @@ test.describe("Long titles at phone width", () => {
     expect(clipped).toBe(false);
   });
 
+  test("library shelves show the whole title", async ({ page }) => {
+    await lengthenTitles(page);
+    await page.goto("/");
+    const title = page.locator(".shelf-card .shelf-title").first();
+    await expect(title).toContainText("Tout Comprendre Junior - Hors-série N°");
+
+    const clipped = await title.evaluate(
+      (el) => el.scrollWidth > el.clientWidth || el.scrollHeight > el.clientHeight,
+    );
+    expect(clipped).toBe(false);
+  });
+
   // 390 wraps the icon cluster below the title; at 430 (the widest iPhones)
   // back button + nav icons fit on one row with a zero-width title, which is
   // exactly the case that left the title a sliver.
-  for (const width of [390, 430]) {
-    test(`detail header title is not squeezed into a sliver at ${width}px`, async ({ page }) => {
+  // The reader renders the same header; e2e-book-130 is the one book whose
+  // file exists, so its reader opens instead of erroring.
+  const pages = [
+    { name: "detail", hash: "#/book/e2e-book-001" },
+    { name: "reader", hash: "#/book/e2e-book-130/0/read" },
+  ];
+  for (const { name, hash } of pages) for (const width of [390, 430]) {
+    test(`${name} header title is not squeezed into a sliver at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 844 });
       await lengthenTitles(page);
-      await page.goto("/#/book/e2e-book-001");
+      await page.goto("/" + hash);
       const title = page.locator(".header .nav-book-title");
       await expect(title).toHaveText(longTitle(24));
 
