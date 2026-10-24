@@ -910,13 +910,13 @@ body:not(:has(.header))::before {
      letting the row overflow the body horizontally. */
   .header { flex-wrap: wrap; }
   .header input[type="search"] { order: 1; flex-basis: 100%; }
-  /* A zero flex-basis let the reader/detail title shrink to whatever the back
-     button and nav icons left over (a sliver on the widest phones, where they
-     all fit on one row), so it broke one letter per line. A basis no icon
-     cluster can share a row with (60% plus the back button leaves under 40%,
-     less than the theme/collections/stats icons need) always pushes the icons
-     onto a second row instead. */
-  .header h1.nav-book-title { flex-basis: 60%; }
+  /* The reader/detail title used to shrink to whatever the back button and
+     nav icons left over (a sliver on the widest phones, where they all fit on
+     one row), so it broke one letter per line. A minimum width also sets
+     where the wrapped header breaks its line: when the title can't get 8em
+     beside the icons, the icons move to a second row; when it can (phone
+     landscape, few icons), the header stays one row. */
+  .header h1.nav-book-title { min-width: 8em; }
   .shelf-card { flex-basis: 100px; }
   .detail-badges { justify-content: center; }
   .series-nav-buttons { justify-content: center; }

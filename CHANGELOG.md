@@ -10,7 +10,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   show a book's whole title instead of cutting it to one line, so issues of
   the same magazine can be told apart. On phones, the title at the top of the
   book and reader pages no longer gets squeezed into a narrow column with one
-  letter per line; the icons move to a second row instead.
+  letter per line; when there is not enough room, the icons move to a second
+  row instead.
 
 ## [3.2.3] - 2026-10-24
 

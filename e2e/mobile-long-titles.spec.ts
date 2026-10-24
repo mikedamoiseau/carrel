@@ -83,4 +83,21 @@ test.describe("Long titles at phone width", () => {
       expect(box!.height).toBeLessThanOrEqual(lineHeight * 3 + 1);
     });
   }
+
+  // Phone landscape: there is room for the title beside the icons, so the
+  // header must stay one row — a second row would come out of the reader's
+  // fixed-height stage.
+  test("phone landscape keeps a one-row header when the title fits", async ({ page }) => {
+    await page.setViewportSize({ width: 568, height: 320 });
+    await lengthenTitles(page);
+    await page.goto("/#/book/e2e-book-130/0/read");
+    const title = page.locator(".header .nav-book-title");
+    await expect(title).toHaveText(longTitle(24));
+
+    const box = await title.boundingBox();
+    const icons = await page.locator(".header .nav-icons").boundingBox();
+    expect(icons!.y).toBeLessThan(box!.y + box!.height);
+    const fontSize = await title.evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
+    expect(box!.width).toBeGreaterThanOrEqual(fontSize * 8 - 1);
+  });
 });
