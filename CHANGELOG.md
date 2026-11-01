@@ -5,7 +5,7 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [3.2.4] - 2026-10-26
+## [3.2.4] - 2026-11-01
 
 ### Fixed
 - **Long titles in the web UI.** Library cards and the library shelves now
