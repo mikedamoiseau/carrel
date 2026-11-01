@@ -5,7 +5,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [3.2.4] - 2026-10-26
+## [3.2.4] - 2026-11-01
+
+### Security
+- **Four new `zstd` advisories recorded as accepted.** They cover a reused
+  decompression context, legacy frames, the seekable API and WebAssembly
+  builds, none of which Carrel uses: `zstd` only comes in through the `zip`
+  library, which reads each compressed entry with a fresh decoder. They stay
+  listed until the `zip` 9 upgrade (RUSTSEC-2026-0391, RUSTSEC-2026-0398,
+  RUSTSEC-2026-0403, RUSTSEC-2026-0410).
 
 ### Fixed
 - **Long titles in the web UI.** Library cards and the library shelves now

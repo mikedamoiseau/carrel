@@ -95,4 +95,35 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+
+    # zstd 0.13.3 / zstd-safe 7.2.4 / zstd-sys 2.0.16: four advisories
+    # (fixed in zstd 0.14.3, zstd-safe 8.2.0, zstd-sys 2.1.2). zstd reaches
+    # the tree only through zip 2.4.2's default `zstd` feature, which zip
+    # pins to `zstd = "0.13"`, so no upgrade is possible short of zip itself.
+    # Nothing in carrel-core or src-tauri uses zstd directly. Check:
+    # `grep -rn zstd carrel-core/src src-tauri/src` finds nothing.
+    #
+    # The only zstd code zip runs is reading a zstd-compressed entry, via
+    # `zstd::Decoder::with_buffer` (zip-2.4.2 src/compression.rs:245) — the
+    # read decoder, built on a fresh context per entry. None of the four is
+    # on that path:
+    #   RUSTSEC-2026-0391  data leaks between streams on a context reused via
+    #                      `with_context`; zip never reuses one (zstd-0.13.3
+    #                      src/stream/raw.rs:146 creates it).
+    #   RUSTSEC-2026-0403  uninitialized memory from a failed legacy-frame
+    #                      decode; affects `stream::write::Decoder` only, and
+    #                      zip builds zstd with `default-features = false`, so
+    #                      legacy support is not compiled in.
+    #   RUSTSEC-2026-0398  `Seekable::decompress`; the `seekable` feature is
+    #                      off.
+    #   RUSTSEC-2026-0410  wasm32 allocator shim; we build no wasm target.
+    #
+    # Exit condition: a zip upgrade that pulls zstd >= 0.14.3 (see
+    # docs/backlog/zip-9-upgrade.md). Drop at once if anything starts using
+    # zstd directly, enables its `legacy`/`seekable` features, or targets
+    # wasm32.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0410",
 ]
