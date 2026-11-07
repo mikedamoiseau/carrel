@@ -422,18 +422,21 @@ test.describe("web UI Kids mode with offline copies", () => {
     expect(await deviceState(page)).toMatchObject(BOTH_KEPT);
   });
 
-  test("a Kids boot that can't read its Kids status still keeps the hidden copy", async ({
+  test("a Kids boot that can't read its Kids status locks and still keeps the hidden copy", async ({
     page,
   }) => {
     await saveBookOffline(page, KIDS_ID);
     await saveBookOffline(page, HIDDEN_ID);
     await page.goto("/#/");
     await turnOnKidsMode(page);
-    // The session is still a kid's, so the boot gets the Kids list, but the
-    // page can't learn that it's in Kids mode.
+    // The page can't learn whether the session is still a kid's, so the
+    // device it remembers as a kid's is locked.
     await page.route("**/api/kids/status", (route) => route.fulfill({ status: 500 }));
     await reloadControlled(page);
-    await expect(page.locator(".grid .card .title")).toHaveText([KIDS_TITLE]);
+    await expect(
+      page.locator(".resume-prompt", { hasText: "Kids mode is on for this device." }),
+    ).toBeVisible();
+    await expect(page.locator(".grid .card")).toHaveCount(0);
     await page.waitForLoadState("networkidle");
     expect(await deviceState(page)).toMatchObject(BOTH_KEPT);
   });

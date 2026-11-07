@@ -45,6 +45,21 @@ async function logIn(page: Page) {
 
 const badge = (page: Page) => page.locator(".header .kids-badge");
 
+// What a device that remembers Kids mode shows when it can't be put back in.
+const lockScreen = (page: Page) =>
+  page.locator(".resume-prompt", { hasText: "Kids mode is on for this device." });
+
+async function rememberKidsDevice(page: Page) {
+  await page.evaluate(() => localStorage.setItem("carrel-kids-device", "1"));
+}
+
+async function expectNoBookTitles(page: Page) {
+  await expect(page.locator(".grid .card")).toHaveCount(0);
+  for (const title of [...KIDS_TITLES, ...ADULT_TITLES]) {
+    await expect(page.locator("body")).not.toContainText(title);
+  }
+}
+
 async function turnOnKidsMode(page: Page) {
   await page.getByRole("button", { name: "Kids mode", exact: true }).click();
   await page.getByRole("button", { name: "Turn on Kids mode" }).click();
@@ -190,7 +205,7 @@ test.describe("web UI Kids mode", () => {
     expect(kids).toBe(true);
   });
 
-  test("a failed re-entry after a re-login leaves no Kids chrome over the parent's session", async ({
+  test("a failed re-entry after a re-login locks the device until a parent's code", async ({
     page,
     context,
   }) => {
@@ -206,14 +221,88 @@ test.describe("web UI Kids mode", () => {
       refused++;
       return route.fulfill({ status: 500 });
     });
-    await logIn(page);
+    await page.locator("#pin").fill(PIN);
+    await page.locator("#login-btn").click();
 
+    // The new session is a parent's, but the device is the kid's: neither the
+    // whole library nor Kids chrome claiming that session is a kid's.
+    await expect(lockScreen(page)).toBeVisible();
     expect(refused).toBe(1);
-    // The new session is a parent's (unfiltered: Book 004 is listed), and
-    // the page says so instead of keeping the old Kids chrome.
-    await expect(page.locator(".grid .card .title", { hasText: "Book 004" })).toBeVisible();
+    await expectNoBookTitles(page);
     await expect(page.locator(".kids-badge")).toHaveCount(0);
+    await expect(page.locator("#profile-switcher-btn")).toHaveCount(0);
+
+    // The server can check the parents' code, so that is the way out.
+    await expect(page.getByRole("button", { name: "Forget Kids mode on this device" })).toHaveCount(0);
+    await page.unroute("**/api/kids/enter");
+    await leaveWith(page, "0000");
+    await expect(page.getByText("Incorrect code")).toBeVisible();
+    await expect(lockScreen(page)).toBeVisible();
+    await page.getByLabel("Parents' code").fill(CODE);
+    await page.getByRole("button", { name: "Leave", exact: true }).click();
+    await expect(page.locator(".grid .card .title", { hasText: "Book 004" })).toBeVisible();
+    await expect(lockScreen(page)).toHaveCount(0);
     await expect(page.locator("#profile-switcher-btn")).toBeVisible();
+    expect(await page.evaluate(() => localStorage.getItem("carrel-kids-device"))).toBeNull();
+  });
+
+  test("a device that remembers Kids mode stays locked while the server has no web PIN", async ({
+    page,
+  }) => {
+    await rememberKidsDevice(page);
+    // After a restart that couldn't read the PIN, the server is open to all.
+    await page.route("**/api/kids/status", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ kids: false, code_set: true, pin_configured: false }),
+      }),
+    );
+    await page.reload();
+    await expect(lockScreen(page)).toBeVisible();
+    await expect(
+      page.getByText("A parent can set a web PIN and a parents' code in the Carrel desktop app."),
+    ).toBeVisible();
+    await expectNoBookTitles(page);
+    // With no PIN nothing can check a parent, so there is no way out here.
+    await expect(page.getByRole("button", { name: "Forget Kids mode on this device" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Leave Kids mode" })).toHaveCount(0);
+    // A URL doesn't get past it either.
+    await page.evaluate(() => { location.hash = "#/library?series=Adult%20Series"; });
+    await expect(lockScreen(page)).toBeVisible();
+    await expectNoBookTitles(page);
+
+    // Once the server can hold Kids mode again, Try again puts the device back in.
+    await page.unroute("**/api/kids/status");
+    await page.getByRole("button", { name: "Try again" }).click();
+    await expect(badge(page)).toBeVisible();
+    await expectKidsGrid(page);
+  });
+
+  test("a device that remembers Kids mode is locked when its status can't be read; forgetting needs the web PIN", async ({
+    page,
+  }) => {
+    await rememberKidsDevice(page);
+    await page.route("**/api/kids/status", (route) => route.fulfill({ status: 500 }));
+    await page.reload();
+    await expect(lockScreen(page)).toBeVisible();
+    await expectNoBookTitles(page);
+    await expect(page.getByRole("button", { name: "Leave Kids mode" })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "Forget Kids mode on this device" }).click();
+    await page.getByLabel("Web PIN").fill("0000");
+    await page.getByRole("button", { name: "Forget", exact: true }).click();
+    await expect(page.getByText("Invalid PIN")).toBeVisible();
+    await expect(lockScreen(page)).toBeVisible();
+
+    await page.getByLabel("Web PIN").fill(PIN);
+    await page.getByRole("button", { name: "Forget", exact: true }).click();
+    await expect(page.locator("#profile-switcher-btn")).toBeVisible();
+    await expect(lockScreen(page)).toHaveCount(0);
+    await expect(page.locator(".kids-badge")).toHaveCount(0);
+    expect(await page.evaluate(() => localStorage.getItem("carrel-kids-device"))).toBeNull();
+    await page.evaluate(() => { location.hash = "#/library?series=Adult%20Series"; });
+    await expect(page.locator(".grid .card .title")).toHaveText(ADULT_TITLES);
   });
 
   test("the reader chrome shows the badge, not the household controls", async ({ page }) => {

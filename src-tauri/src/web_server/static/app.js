@@ -1532,6 +1532,9 @@
         return showOfflineLibrary(gen);
       }
     }
+    // A device that remembers Kids mode but couldn't be put back into it
+    // shows the lock screen and nothing else (see loadKidsStatus).
+    if (kidsLock) return showKidsLock();
     // Kids mode: stats and vocabulary are household data, which the server
     // refuses a Kids session, so their URLs land on the library instead.
     // replaceState rather than navigate(), so Back doesn't bounce off it.
@@ -8148,7 +8151,17 @@
   // server's session flag is what enforces. Offline there's no server, so
   // the flag is what hides the saved copies a parent didn't mark
   // (kidsFilterOfflineRows).
+  //
+  // When the device remembers Kids mode but this session can't be put back
+  // into it (no web PIN, no parents' code, a status it can't read, a refused
+  // enter), `kidsLock` is set and route() draws the lock screen instead of
+  // the library: { canVerifyCode } when the server said it has a PIN and a
+  // code, so leaving goes through the parents' code; otherwise { canForget }
+  // offers forgetting Kids mode here behind a fresh web-PIN login, unless the
+  // server said it has no PIN, when nothing can check a parent and the lock
+  // stays.
   let kidsMode = false;
+  let kidsLock = null;
   const KIDS_DEVICE_KEY = "carrel-kids-device";
   const KIDS_NO_PIN_TEXT = "Kids mode needs a web PIN. Set one in the desktop app first.";
   const KIDS_ICON_PATH =
@@ -8248,26 +8261,36 @@
   /// leaves `kidsMode` as it was: drawing the Kids chrome over a session the
   /// server isn't confining would label the whole library kid-safe.
   async function loadKidsStatus() {
-    // Only a device that remembers Kids mode has a failure worth showing: a
-    // parent just logged in on it and expects it back in Kids mode.
-    const fail = (message) => { if (kidsDeviceRemembered()) showToast(message); };
+    kidsLock = null;
+    // Only a device that remembers Kids mode has a failure worth acting on:
+    // a parent logged in on it to hand it back to the kid, so a session that
+    // can't be put back into Kids mode gets the lock screen, not the library.
+    // `known` is the last status read, if any.
+    const lock = (known) => {
+      if (!kidsDeviceRemembered()) return;
+      kidsLock = {
+        canVerifyCode: !!known && !!known.pin_configured && !!known.code_set,
+        canForget: !known || !!known.pin_configured,
+      };
+    };
     let status;
     try {
       const resp = await api("/api/kids/status");
       if (!resp) return;
-      if (!resp.ok) return fail(httpErrorToastMessage(resp.status));
+      if (!resp.ok) return lock(null);
       status = await resp.json();
       // Settled from the status already, so a failed enter below can't leave
       // an earlier session's Kids mode drawn over this one.
       kidsMode = !!status.kids;
-      if (!status.kids && kidsDeviceRemembered() && status.pin_configured && status.code_set) {
+      if (!status.kids && kidsDeviceRemembered()) {
+        if (!status.pin_configured || !status.code_set) return lock(status);
         const entered = await kidsWrite("POST", "/api/kids/enter");
         if (!entered) return;
-        if (!entered.ok) return fail(kidsEnterErrorText(entered.status));
+        if (!entered.ok) return lock(status);
         status = await entered.json();
       }
     } catch (e) {
-      return fail(apiFailureToastMessage(e));
+      return lock(status);
     }
     kidsMode = !!status.kids;
     // The server says this session is a kid's, so make sure the device
@@ -8494,6 +8517,19 @@
       err.textContent = "";
       let resp;
       try {
+        // From the lock screen this session isn't in Kids mode, and only a
+        // Kids session's exit checks the code (any other gets a no-op 200),
+        // so it goes in first.
+        if (!kidsMode) {
+          const entered = await kidsWrite("POST", "/api/kids/enter");
+          if (!entered) return;
+          if (!entered.ok) {
+            err.textContent = kidsEnterErrorText(entered.status);
+            submit.disabled = false;
+            return;
+          }
+          kidsMode = true;
+        }
         resp = await kidsWrite("POST", "/api/kids/exit", { code: input.value });
       } catch (e) {
         err.textContent = apiFailureToastMessage(e);
@@ -8510,18 +8546,112 @@
         input.select();
         return;
       }
-      safeStorageRemove(KIDS_DEVICE_KEY);
-      kidsMode = false;
-      await syncKidsMarker();
-      // Re-check the profile scope the way doLogin does, which also lifts an
-      // earlier failure to confirm it.
-      const scope = await syncOfflineScopeWithServer();
-      if (scope === "unknown") await markOfflineProfileUnknown();
-      else if (scope === "changed") await verifyOfflineIntegrity();
-      rerouteForKidsChange();
+      await forgetKidsDevice();
     }
     submit.onclick = leave;
     bindKidsField(input, leave);
+  }
+
+  /// This device stops remembering Kids mode: where leaving with the
+  /// parents' code and forgetting with the web PIN both end.
+  async function forgetKidsDevice() {
+    safeStorageRemove(KIDS_DEVICE_KEY);
+    kidsMode = false;
+    kidsLock = null;
+    await syncKidsMarker();
+    // Re-check the profile scope the way doLogin does, which also lifts an
+    // earlier failure to confirm it.
+    const scope = await syncOfflineScopeWithServer();
+    if (scope === "unknown") await markOfflineProfileUnknown();
+    else if (scope === "changed") await verifyOfflineIntegrity();
+    rerouteForKidsChange();
+  }
+
+  const KIDS_LOCK_NOTE = "A parent can set a web PIN and a parents' code in the Carrel desktop app.";
+
+  /// What a device that remembers Kids mode shows when this session couldn't
+  /// be put back into it (`kidsLock`): no library, no header, only a way out
+  /// for a parent, and Try again for when the server can hold Kids mode.
+  function showKidsLock() {
+    currentView = "kids-lock";
+    document.title = "Carrel";
+    flushProgressSave();
+    readerState = null;
+    resumePromptActive = false;
+    const lock = kidsLock;
+    app().innerHTML = `
+      <div class="resume-prompt">
+        <div class="resume-prompt-panel">
+          <h2>Kids mode is on for this device.</h2>
+          <p>Ask a parent.</p>
+          ${lock.canVerifyCode ? "" : `<p>${esc(KIDS_LOCK_NOTE)}</p>`}
+          <div class="resume-actions">
+            ${lock.canVerifyCode ? '<button class="btn-primary" id="kids-lock-leave">Leave Kids mode</button>' : ""}
+            ${!lock.canVerifyCode && lock.canForget ? '<button class="btn-secondary" id="kids-lock-forget">Forget Kids mode on this device</button>' : ""}
+            <button class="btn-secondary" id="kids-lock-retry">Try again</button>
+          </div>
+        </div>
+      </div>`;
+    const leave = $("#kids-lock-leave");
+    if (leave) leave.onclick = showKidsExitDialog;
+    const forget = $("#kids-lock-forget");
+    if (forget) forget.onclick = showKidsForgetDialog;
+    const retry = $("#kids-lock-retry");
+    retry.onclick = async () => {
+      retry.disabled = true;
+      await loadKidsStatus();
+      // A 401 put the PIN screen up; a profile move is reloading the page.
+      if (!authenticated || reloadPending) return;
+      rerouteForKidsChange();
+    };
+  }
+
+  /// The lock screen's way out when the server can't check the parents'
+  /// code: a fresh login with the web PIN, as on the PIN screen.
+  function showKidsForgetDialog() {
+    openKidsDialog(`
+      <h2 id="kids-dialog-title">Forget Kids mode on this device</h2>
+      <p>Enter the web PIN to show the whole library here again.</p>
+      <label for="kids-forget-pin">Web PIN</label>
+      <input type="password" id="kids-forget-pin" maxlength="8" autocomplete="off">
+      <div class="kids-error" id="kids-error" role="alert"></div>
+      <div class="kids-actions">
+        <button class="btn-primary" id="kids-forget-submit">Forget</button>
+        <button class="btn-secondary" id="kids-close">Cancel</button>
+      </div>`);
+    const input = $("#kids-forget-pin");
+    const err = $("#kids-error");
+    const submit = $("#kids-forget-submit");
+    async function forget() {
+      if (submit.disabled || !input.value) return;
+      submit.disabled = true;
+      err.textContent = "";
+      let resp;
+      try {
+        resp = await apiWrite("/api/auth", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ pin: input.value }),
+        });
+      } catch (e) {
+        if (e instanceof ProfileMovedError) return;
+        err.textContent = "Connection error";
+        submit.disabled = false;
+        return;
+      }
+      submit.disabled = false;
+      // Same wording as the PIN screen.
+      if (!resp.ok) {
+        err.textContent = resp.status === 429 ? "Too many attempts. Try again later." : "Invalid PIN";
+        input.select();
+        return;
+      }
+      authenticated = true;
+      await forgetKidsDevice();
+    }
+    submit.onclick = forget;
+    bindKidsField(input, forget);
   }
 
   /// The parent's Kids mode panel: set or change the parents' code, and turn
