@@ -199,6 +199,7 @@
     "missingFileTitle": "Fichier introuvable",
     "missingFileMessage": "Le fichier de ce livre est introuvable. Il a peut-\u00eatre \u00e9t\u00e9 d\u00e9plac\u00e9 ou supprim\u00e9.",
     "removeFromLibrary": "Retirer de la biblioth\u00e8que",
+    "bookNotFound": "Livre introuvable",
     "preparingPages": "Pr\u00e9paration des pages...",
     "preparingPagesDetail": "Extraction des pages pour une lecture plus rapide",
     "preparingPagesProgress": "Pr\u00e9paration des pages {{loaded}} / {{total}}",
@@ -1106,6 +1107,7 @@
     "hidden": "Masqué en mode enfants",
     "markSeries": "Marquer la série comme adaptée aux enfants",
     "unmarkSeries": "Retirer la série du mode enfants",
-    "emptyLibrary": "Rien ici pour le moment."
+    "emptyLibrary": "Rien ici pour le moment.",
+    "statusUnknown": "Impossible de vérifier le mode enfants."
   }
 }

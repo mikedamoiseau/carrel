@@ -94,7 +94,11 @@ function AppShell() {
   const { addToast } = useToast();
   const { t } = useTranslation();
   const authErrorShown = useRef(false);
-  const { enabled: kidsMode } = useKidsMode();
+  const kids = useKidsMode();
+  const kidsMode = kids.enabled;
+  // Fail closed: until the backend has said Kids mode is off, a kid's
+  // session could be the one looking, so the admin controls stay hidden.
+  const adminHidden = kids.enabled || !kids.checked;
   const { checked: lockGateChecked, lockedProfile, clearLockedProfile } = useStartupLockGate();
 
   useEffect(() => {
@@ -161,7 +165,9 @@ function AppShell() {
   // brief unstyled flash of it — until we know whether the active profile
   // needs unlocking. No `onCancel`: there's no other profile to fall back
   // to at boot (see `useStartupLockGate`'s doc comment).
-  if (!lockGateChecked) {
+  // The Kids mode read gates the first render the same way, so the admin
+  // controls never flash up before it's known whether to hide them.
+  if (!lockGateChecked || (!kids.checked && !kids.failed)) {
     return <div className="h-screen bg-paper" />;
   }
   if (lockedProfile) {
@@ -177,6 +183,21 @@ function AppShell() {
       {/* App-wide private-mode strip — always on top, survives into the reader */}
       <PrivateModeBar />
       {kidsMode && <KidsModeBanner />}
+      {kids.failed && (
+        <div
+          role="alert"
+          className="shrink-0 h-8 px-4 flex items-center justify-center gap-3 bg-warm-subtle text-ink text-xs font-medium"
+        >
+          <span>{t("kids.statusUnknown")}</span>
+          <button
+            type="button"
+            onClick={() => { void kids.refresh(); }}
+            className="underline underline-offset-2 hover:no-underline focus-visible:ring-2 focus-visible:ring-accent rounded"
+          >
+            {t("common.retry")}
+          </button>
+        </div>
+      )}
       {/* Top nav — minimal wordmark header, hidden in reader (reader has its own header) */}
       {!inReader && (
         <nav className="shrink-0 h-12 px-6 flex items-center border-b border-warm-border bg-surface">
@@ -186,9 +207,9 @@ function AppShell() {
           >
             Carrel
           </Link>
-          {!kidsMode && <ProfileSwitcher onSwitch={handleProfileSwitch} />}
+          {!adminHidden && <ProfileSwitcher onSwitch={handleProfileSwitch} />}
           <div className="flex-1" />
-          {!kidsMode && (
+          {!adminHidden && (
           <button
             onClick={() => setStatsOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -199,7 +220,7 @@ function AppShell() {
             </svg>
           </button>
           )}
-          {(vocabState.enabled || vocabState.count > 0) && (
+          {!adminHidden && (vocabState.enabled || vocabState.count > 0) && (
             <button
               onClick={() => setVocabularyOpen(true)}
               className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -213,7 +234,7 @@ function AppShell() {
               </svg>
             </button>
           )}
-          {!kidsMode && (
+          {!adminHidden && (
           <button
             onClick={() => setCatalogOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -225,7 +246,7 @@ function AppShell() {
             </svg>
           </button>
           )}
-          {!kidsMode && <PrivateModeToggle />}
+          {!adminHidden && <PrivateModeToggle />}
           <LanguageSwitcher />
           {/* damoiseau.xyz path is mid-migration from folio to carrel; this is the post-migration URL */}
           <a
@@ -248,7 +269,7 @@ function AppShell() {
               <circle cx="10" cy="14" r="0.9" fill="currentColor" />
             </svg>
           </a>
-          {!kidsMode && (
+          {!adminHidden && (
           <button
             onClick={() => setSettingsOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -284,7 +305,7 @@ function AppShell() {
               <ReaderErrorBoundary>
                 <Suspense fallback={<ReaderSkeleton />}>
                   <Reader
-                    onOpenSettings={kidsMode ? undefined : () => setSettingsOpen(true)}
+                    onOpenSettings={adminHidden ? undefined : () => setSettingsOpen(true)}
                     settingsOpen={settingsOpen}
                   />
                 </Suspense>

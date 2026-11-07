@@ -56,8 +56,10 @@ interface CollectionsSidebarProps {
   onSelect: (id: string | null) => void;
   onSelectSeries: (name: string | null) => void;
   onCreate: (data: CreateCollectionData) => void | Promise<void>;
-  onEdit: (id: string, data: CreateCollectionData) => void | Promise<void>;
-  onDelete: (id: string) => void;
+  /** Omitted (Kids mode): rows have no edit button. */
+  onEdit?: (id: string, data: CreateCollectionData) => void | Promise<void>;
+  /** Omitted (Kids mode): rows have no delete button. */
+  onDelete?: (id: string) => void;
   onDropBook: (bookId: string, collectionId: string) => void;
 }
 
@@ -152,8 +154,8 @@ function CollectionRow({
   collection: Collection;
   isActive: boolean;
   onSelect: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
+  onEdit?: () => void;
+  onDelete?: () => void;
   onDropBook: (bookId: string, collectionId: string) => void;
   isManual: boolean;
 }) {
@@ -183,7 +185,7 @@ function CollectionRow({
 
   const showDropHighlight = isManual && dragging && isHovered;
 
-  if (confirmDelete) {
+  if (confirmDelete && onDelete) {
     return (
       <div className="px-3 py-2 flex items-center gap-2 bg-accent-light border-l-2 border-accent">
         <span className="flex-1 text-xs text-ink-muted">{t("collections.deleteConfirm", { name: collection.name })}</span>
@@ -293,6 +295,7 @@ function CollectionRow({
         )}
       </div>
       {/* Edit button */}
+      {onEdit && (
       <button
         className="opacity-0 group-hover:opacity-100 p-0.5 text-ink-muted hover:text-accent transition-all"
         aria-label={t("collections.editLabel", { name: collection.name })}
@@ -303,7 +306,9 @@ function CollectionRow({
           <path d="M13.586 3.586a2 2 0 112.828 2.828l-9.5 9.5-3.5 1 1-3.5 9.172-9.828z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
+      )}
       {/* Delete button */}
+      {onDelete && (
       <button
         className="opacity-0 group-hover:opacity-100 p-0.5 text-ink-muted hover:text-accent transition-all"
         aria-label={t("collections.deleteLabel", { name: collection.name })}
@@ -322,6 +327,7 @@ function CollectionRow({
           />
         </svg>
       </button>
+      )}
     {copyFeedback && createPortal(
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2 bg-ink/90 text-white text-sm rounded-lg shadow-lg animate-fade-in">
         {copyFeedback}
@@ -850,7 +856,7 @@ export default function CollectionsSidebar({
   };
 
   const handleEdit = async (data: CreateCollectionData) => {
-    if (formMode?.mode !== "edit") return;
+    if (formMode?.mode !== "edit" || !onEdit) return;
     await onEdit(formMode.collection.id, data);
     setFormMode(null);
   };
@@ -970,8 +976,8 @@ export default function CollectionsSidebar({
                       isActive={activeCollectionId === collection.id}
                       isManual={collection.type === "manual"}
                       onSelect={() => onSelect(collection.id)}
-                      onEdit={() => setFormMode({ mode: "edit", collection })}
-                      onDelete={() => onDelete(collection.id)}
+                      onEdit={onEdit ? () => setFormMode({ mode: "edit", collection }) : undefined}
+                      onDelete={onDelete ? () => onDelete(collection.id) : undefined}
                       onDropBook={onDropBook}
                     />
                   ))}

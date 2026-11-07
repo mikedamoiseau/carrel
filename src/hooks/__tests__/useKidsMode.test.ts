@@ -37,6 +37,34 @@ describe("useKidsMode", () => {
     expect(result.current.codeSet).toBe(false);
   });
 
+  it("is unchecked until the first read resolves", async () => {
+    let resolve!: (s: { enabled: boolean; codeSet: boolean }) => void;
+    invoke.mockReturnValue(new Promise((r) => { resolve = r; }));
+    const { result } = renderHook(() => useKidsMode());
+    expect(result.current.checked).toBe(false);
+    expect(result.current.failed).toBe(false);
+    await act(async () => { resolve({ enabled: false, codeSet: true }); });
+    expect(result.current.checked).toBe(true);
+    expect(result.current.failed).toBe(false);
+  });
+
+  it("a failed first read stays unchecked and failed until a refresh succeeds", async () => {
+    invoke.mockRejectedValue(new Error("no backend"));
+    const { result } = renderHook(() => useKidsMode());
+    await waitFor(() => expect(result.current.failed).toBe(true));
+    expect(result.current.checked).toBe(false);
+
+    await act(async () => { await result.current.refresh(); });
+    expect(result.current.checked).toBe(false);
+    expect(result.current.failed).toBe(true);
+
+    invoke.mockResolvedValue({ enabled: true, codeSet: true });
+    await act(async () => { await result.current.refresh(); });
+    expect(result.current.checked).toBe(true);
+    expect(result.current.failed).toBe(false);
+    expect(result.current.enabled).toBe(true);
+  });
+
   it("flips on the kids-mode-changed event", async () => {
     invoke.mockResolvedValue({ enabled: false, codeSet: true });
     const { result } = renderHook(() => useKidsMode());

@@ -4,8 +4,9 @@ import { useFocusTrap } from "../lib/useFocusTrap";
 interface MissingFileDialogProps {
   /** Dismiss the dialog without removing the book. */
   onCancel: () => void;
-  /** Remove the book from the library, then navigate away. */
-  onRemove: () => void;
+  /** Remove the book from the library, then navigate away. Omitted (Kids
+   *  mode): the dialog offers only Cancel. */
+  onRemove?: () => void;
 }
 
 /**
@@ -51,12 +52,14 @@ export default function MissingFileDialog({
             >
               {t("common.cancel")}
             </button>
-            <button
-              onClick={onRemove}
-              className="px-4 py-2 text-sm bg-red-600 text-white rounded-xl hover:bg-red-700 transition-colors font-medium"
-            >
-              {t("reader.removeFromLibrary")}
-            </button>
+            {onRemove && (
+              <button
+                onClick={onRemove}
+                className="px-4 py-2 text-sm bg-red-600 text-white rounded-xl hover:bg-red-700 transition-colors font-medium"
+              >
+                {t("reader.removeFromLibrary")}
+              </button>
+            )}
           </div>
         </div>
       </div>

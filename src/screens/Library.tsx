@@ -208,7 +208,9 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   const [highlightSearchOpen, setHighlightSearchOpen] = useState(false);
   const [collections, setCollections] = useState<Collection[]>([]);
   const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
-  const { enabled: kidsMode } = useKidsMode();
+  const kidsStatus = useKidsMode();
+  // Until the backend has answered, treat it as Kids mode: hide, don't flash.
+  const kidsMode = kidsStatus.enabled || !kidsStatus.checked;
   // The drag-drop listener is registered once; read the flag through a ref so
   // it never acts on a stale value.
   const kidsModeRef = useRef(kidsMode);
@@ -1003,7 +1005,8 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             onChangeSelectedTagIds={setFilterTagIds}
           />
 
-          {scanProgress ? (
+          {/* Enrichment edits metadata and names every book it scans. */}
+          {kidsMode ? null : scanProgress ? (
             <div className="flex items-center gap-2 text-xs text-ink-muted">
               <svg className="animate-spin w-3.5 h-3.5 text-accent" viewBox="0 0 24 24" fill="none">
                 <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
@@ -1032,7 +1035,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             </button>
           )}
           {/* Highlight search */}
-          {hasBooks && (
+          {hasBooks && !kidsMode && (
             <button
               type="button"
               onClick={() => setHighlightSearchOpen(true)}
@@ -1897,7 +1900,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             setError(friendlyError(err, t));
           }
         }}
-        onEdit={async (id: string, data: CreateCollectionData) => {
+        onEdit={kidsMode ? undefined : async (id: string, data: CreateCollectionData) => {
           try {
             await invoke("update_collection", {
               id,
@@ -1916,7 +1919,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             setError(friendlyError(err, t));
           }
         }}
-        onDelete={async (id: string) => {
+        onDelete={kidsMode ? undefined : async (id: string) => {
           try {
             await invoke("delete_collection", { id });
             const updated = await invoke<Collection[]>("get_collections");
@@ -1946,6 +1949,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
       {fileNotAvailableBookId && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-red-900/90 text-white px-4 py-3 rounded-xl shadow-lg flex items-center gap-3 text-sm">
           <span>{t("bookCard.fileNotAvailable")}</span>
+          {!kidsMode && (
           <button
             onClick={() => {
               const bookId = fileNotAvailableBookId;
@@ -1956,6 +1960,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
           >
             {t("common.remove")}
           </button>
+          )}
           <button
             onClick={() => setFileNotAvailableBookId(null)}
             className="text-white/60 hover:text-white"

@@ -196,7 +196,9 @@ export default function ReaderPane({
   // panes need it for the volatile-resume gate below); only the primary
   // pane renders the actual toggle control (see the header, further down).
   const { enabled: isPrivate } = usePrivateMode();
-  const { enabled: kidsMode } = useKidsMode();
+  const kidsStatus = useKidsMode();
+  // Until the backend has answered, treat it as Kids mode: hide, don't flash.
+  const kidsMode = kidsStatus.enabled || !kidsStatus.checked;
 
   const [bookTitle, setBookTitle] = useState("");
   const [bookFormat, setBookFormat] = useState<"epub" | "cbz" | "cbr" | "pdf" | "mobi">("epub");
@@ -444,9 +446,14 @@ export default function ReaderPane({
 
     async function init() {
       try {
-        const bookInfo = await invoke<Book>("get_book", { bookId });
+        const bookInfo = await invoke<Book | null>("get_book", { bookId });
 
         if (cancelled) return;
+        // No such book, or one Kids mode hides.
+        if (!bookInfo) {
+          setError(t("reader.bookNotFound"));
+          return;
+        }
 
         setBookTitle(bookInfo.title);
         setBookFormat(bookInfo.format);
@@ -2223,7 +2230,7 @@ export default function ReaderPane({
           setMissingFileDialog(false);
           navigate("/");
         }}
-        onRemove={async () => {
+        onRemove={kidsMode ? undefined : async () => {
           try {
             await invoke("remove_book", { bookId });
           } catch {

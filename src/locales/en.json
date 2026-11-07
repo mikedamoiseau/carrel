@@ -200,6 +200,7 @@
     "missingFileTitle": "File Not Found",
     "missingFileMessage": "This book\u2019s file could not be found. It may have been moved or deleted.",
     "removeFromLibrary": "Remove from library",
+    "bookNotFound": "Book not found",
     "preparingPages": "Preparing pages...",
     "preparingPagesDetail": "Extracting pages for faster reading",
     "preparingPagesProgress": "Preparing pages {{loaded}} / {{total}}",
@@ -1134,6 +1135,7 @@
     "hidden": "Hidden in Kids mode",
     "markSeries": "Mark series OK for kids",
     "unmarkSeries": "Unmark series for kids",
-    "emptyLibrary": "Nothing here yet."
+    "emptyLibrary": "Nothing here yet.",
+    "statusUnknown": "Couldn't check Kids mode."
   }
 }

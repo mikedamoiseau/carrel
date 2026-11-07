@@ -52,6 +52,12 @@ describe("MissingFileDialog", () => {
     expect(onRemove).not.toHaveBeenCalled();
   });
 
+  it("offers only Cancel when no onRemove is given (Kids mode)", () => {
+    render(<MissingFileDialog onCancel={() => {}} />);
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Remove from library" })).toBeNull();
+  });
+
   it("fires onRemove when the remove button is clicked", () => {
     const onCancel = vi.fn();
     const onRemove = vi.fn();
