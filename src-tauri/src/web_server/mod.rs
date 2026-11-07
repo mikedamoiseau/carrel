@@ -6059,6 +6059,56 @@ mod tests {
         let _ = tx.send(());
     }
 
+    /// An automated collection's rule values can name a hidden series or
+    /// title, so a Kids session gets the collection without its rules.
+    #[tokio::test]
+    async fn kids_collections_carry_no_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        {
+            let conn = state.conn().unwrap();
+            crate::db::insert_collection(
+                &conn,
+                &crate::models::Collection {
+                    r#type: crate::models::CollectionType::Automated,
+                    rules: vec![crate::models::CollectionRule {
+                        id: "rule-1".into(),
+                        collection_id: "coll-auto".into(),
+                        field: "filename".into(),
+                        operator: "contains".into(),
+                        value: "album".into(),
+                    }],
+                    ..kids_test_collection("coll-auto", "Albums")
+                },
+            )
+            .unwrap();
+        }
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+        let adult = login_token(port).await;
+        let auto = |body: &str| -> serde_json::Value {
+            let list: serde_json::Value = serde_json::from_str(body).unwrap();
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "coll-auto")
+                .cloned()
+                .expect("the automated collection is listed")
+        };
+
+        // Control: a parent sees the rule.
+        let (_, body) = send_as(reqwest::Method::GET, port, "/api/collections", &adult).await;
+        assert_eq!(auto(&body)["rules"][0]["value"], "album");
+
+        let (status, body) = send_as(reqwest::Method::GET, port, "/api/collections", &kids).await;
+        assert_eq!(status, 200, "{body}");
+        let item = auto(&body);
+        assert_eq!(item["rules"], serde_json::json!([]));
+        assert_eq!(item["bookCount"], 2, "the visible Tintin albums");
+
+        let _ = tx.send(());
+    }
+
     #[tokio::test]
     async fn kids_session_refuses_household_routes() {
         use reqwest::Method;

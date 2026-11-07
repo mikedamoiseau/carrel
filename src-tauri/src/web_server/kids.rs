@@ -202,7 +202,16 @@ async fn collections(
 ) -> Result<Json<Vec<api::CollectionWithCount>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let collections = db::list_collections_kids(&conn).map_err(carrel_status)?;
-    Ok(Json(collections.into_iter().map(Into::into).collect()))
+    // An automated collection's rule values can name a hidden series or title.
+    Ok(Json(
+        collections
+            .into_iter()
+            .map(|(mut c, count)| {
+                c.rules.clear();
+                (c, count).into()
+            })
+            .collect(),
+    ))
 }
 
 async fn collection_books(

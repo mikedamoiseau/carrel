@@ -183,6 +183,9 @@ pub fn routes(state: WebState) -> Router<WebState> {
         .route("/auth", axum::routing::post(login))
         .route("/books", get(list_books))
         .route("/books/continue-reading", get(continue_reading))
+        // Every method on the `/books/{id}…` templates below is reachable
+        // from a Kids session for a visible book (see `kids::BOOK_ROUTES`).
+        // Don't add an admin method to one of them without updating that gate.
         .route("/books/{id}", get(get_book))
         .route("/books/{id}/cover", get(get_cover))
         .route("/books/{id}/chapters", get(get_chapters))
