@@ -22,6 +22,7 @@ pub mod events;
 pub mod http_retry;
 pub mod image_util;
 pub mod isbn;
+pub mod kids;
 #[cfg(feature = "mobi")]
 pub mod mobi;
 pub mod models;

@@ -278,6 +278,16 @@ fn run_schema(conn: &Connection) -> Result<()> {
             created_at     INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_vocabulary_due ON vocabulary(next_due_at);
+
+        CREATE TABLE IF NOT EXISTS kids_series (
+            series     TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS kids_book_overrides (
+            book_id    TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+            allowed    INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
     ",
     )?;
 
