@@ -190,6 +190,32 @@ test.describe("web UI Kids mode", () => {
     expect(kids).toBe(true);
   });
 
+  test("a failed re-entry after a re-login leaves no Kids chrome over the parent's session", async ({
+    page,
+    context,
+  }) => {
+    await turnOnKidsMode(page);
+    // The session ends under a page that is still drawing Kids mode, so its
+    // next request (no reload) gets a 401 and the PIN screen.
+    await context.clearCookies();
+    await page.evaluate(() => { location.hash = "#/library?sort=title"; });
+    await expect(page.locator("#pin")).toBeVisible();
+
+    let refused = 0;
+    await page.route("**/api/kids/enter", (route) => {
+      refused++;
+      return route.fulfill({ status: 500 });
+    });
+    await logIn(page);
+
+    expect(refused).toBe(1);
+    // The new session is a parent's (unfiltered: Book 004 is listed), and
+    // the page says so instead of keeping the old Kids chrome.
+    await expect(page.locator(".grid .card .title", { hasText: "Book 004" })).toBeVisible();
+    await expect(page.locator(".kids-badge")).toHaveCount(0);
+    await expect(page.locator("#profile-switcher-btn")).toBeVisible();
+  });
+
   test("the reader chrome shows the badge, not the household controls", async ({ page }) => {
     expect(
       await apiStatus(page, "PUT", `/api/kids/books/${READER_BOOK_ID}`, { override: "allowed" }),

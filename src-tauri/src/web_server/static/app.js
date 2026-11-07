@@ -1768,6 +1768,9 @@
           return;
         }
         authenticated = true;
+        // A brand-new session is never in Kids mode until an enter succeeds,
+        // whatever the page was drawing before its old session ended.
+        kidsMode = false;
         // A PIN-gated boot 401s out of init() into this login, so the profile
         // list and the offline scope are still unresolved here — resolve them
         // before the first render, or the header would have no switcher and
@@ -8142,6 +8145,9 @@
       if (!resp) return;
       if (!resp.ok) return fail(httpErrorToastMessage(resp.status));
       status = await resp.json();
+      // Settled from the status already, so a failed enter below can't leave
+      // an earlier session's Kids mode drawn over this one.
+      kidsMode = !!status.kids;
       if (!status.kids && kidsDeviceRemembered() && status.pin_configured && status.code_set) {
         const entered = await kidsWrite("POST", "/api/kids/enter");
         if (!entered) return;
