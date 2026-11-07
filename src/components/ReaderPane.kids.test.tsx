@@ -15,6 +15,8 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (cmd === "get_book") return Promise.resolve(book);
     if (cmd === "get_toc") return Promise.reject(new Error("Book file not found: /Volumes/nas/a.epub"));
     if (cmd === "get_private_mode") return Promise.resolve(false);
+    // An array, as the backend answers: the reader keeps it in state.
+    if (cmd === "get_chapter_word_counts") return Promise.resolve([]);
     return Promise.resolve(null);
   }),
   convertFileSrc: (s: string) => s,
