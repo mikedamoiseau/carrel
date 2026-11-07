@@ -1133,6 +1133,7 @@
     "visible": "Visible in Kids mode",
     "hidden": "Hidden in Kids mode",
     "markSeries": "Mark series OK for kids",
-    "unmarkSeries": "Unmark series for kids"
+    "unmarkSeries": "Unmark series for kids",
+    "emptyLibrary": "Nothing here yet."
   }
 }

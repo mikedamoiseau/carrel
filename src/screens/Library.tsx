@@ -209,6 +209,10 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
   const { enabled: kidsMode } = useKidsMode();
+  // The drag-drop listener is registered once; read the flag through a ref so
+  // it never acts on a stale value.
+  const kidsModeRef = useRef(kidsMode);
+  kidsModeRef.current = kidsMode;
   const [activeSeries, setActiveSeries] = useState<string | null>(null);
   const [seriesList, setSeriesList] = useState<Array<{ name: string; count: number }>>([]);
 
@@ -535,6 +539,11 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
     getCurrentWebview()
       .onDragDropEvent(async (event) => {
         const { type } = event.payload;
+        // Import is an admin action: no overlay and no import in Kids mode.
+        if (kidsModeRef.current) {
+          setDragging(false);
+          return;
+        }
         if (type === "enter") {
           setDragging(true);
         } else if (type === "leave") {
@@ -1178,7 +1187,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
         </div>
       )}
 
-      <OnboardingWizard onImport={handleImport} onImportFolder={handleImportFolder} />
+      {!kidsMode && <OnboardingWizard onImport={handleImport} onImportFolder={handleImportFolder} />}
 
       {/* Content area */}
       <div ref={setContentNode} className="flex-1 overflow-y-auto p-6">
@@ -1197,6 +1206,10 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             >
               {t("library.backToAllBooks")}
             </button>
+          </div>
+        ) : !hasBooks && kidsMode ? (
+          <div className="flex flex-col items-center justify-center h-full text-center">
+            <p className="text-base font-medium text-ink">{t("kids.emptyLibrary")}</p>
           </div>
         ) : !hasBooks ? (
           <EmptyState onImport={handleImport} onImportFolder={handleImportFolder} />

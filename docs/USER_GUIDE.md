@@ -645,7 +645,7 @@ You can lock a profile behind a password, from **Settings → Profile lock**. Th
 
 ### Kids mode
 
-Kids mode shows only the books you have marked OK for kids, so a child can use the library on the desktop app or in the web UI without seeing the rest of it. Books you haven't marked don't appear in the library, search, series, collections, "Continue reading" or "Want to read", and can't be opened. Settings, import, editing and deleting books, profile switching and the other admin controls are hidden too.
+Kids mode shows only the books you have marked OK for kids, so a child can use the library on the desktop app or in the web UI without seeing the rest of it. Books you haven't marked don't appear in the library, search, series, collections, "Continue reading" or "Want to read", and can't be opened. Settings, import (including dropping files onto the window), editing and deleting books, profile switching and the other admin controls are hidden too. An empty library shows a plain "Nothing here yet." message with no import buttons.
 
 **Marking what is OK for kids.** Nothing is marked by default, and new imports stay hidden until you mark them. Marks are kept per library (profile). With Kids mode off:
 

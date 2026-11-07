@@ -1105,6 +1105,7 @@
     "visible": "Visible en mode enfants",
     "hidden": "Masqué en mode enfants",
     "markSeries": "Marquer la série comme adaptée aux enfants",
-    "unmarkSeries": "Retirer la série du mode enfants"
+    "unmarkSeries": "Retirer la série du mode enfants",
+    "emptyLibrary": "Rien ici pour le moment."
   }
 }
