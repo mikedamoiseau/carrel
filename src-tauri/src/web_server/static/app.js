@@ -863,6 +863,12 @@
   // cover-only change with no drift detection). Refresh writes are ok-gated
   // so a transient 401/503 can never poison a valid cached entry.
   async function reconcileOfflineBooks(liveBooks) {
+    // In Kids mode the live list leaves out every book a parent didn't mark,
+    // and those offline copies must stay on the device, hidden (see
+    // kidsFilterOfflineRows), so nothing is reconciled at all. The device
+    // flag counts too: a Kids boot whose status read failed has
+    // `kidsMode` false but was still served the Kids list.
+    if (kidsMode || kidsDeviceRemembered()) return;
     if (!offlineSupported()) return;
     let rows;
     try { rows = await idbGetAll("books"); } catch (e) { return; }
@@ -906,7 +912,7 @@
   let offlineBookIdsGen = 0;
   async function refreshOfflineBookIds() {
     const gen = ++offlineBookIdsGen;
-    const ids = (await getAllOfflineManifests()).map((r) => r.id);
+    const ids = (await kidsFilterOfflineRows(await getAllOfflineManifests())).map((r) => r.id);
     if (gen !== offlineBookIdsGen) return; // a save/unsave superseded this snapshot
     offlineBookIds = new Set(ids);
   }
@@ -2978,7 +2984,7 @@
     // with a visible message + toast instead of leaving it spinning forever.
     let resp;
     try {
-      resp = await api("/api/books/" + id);
+      resp = await kidsGuardedBookApi(id);
     } catch (e) {
       if (!hashTargetsDetail(id)) return;
       renderViewError(apiFailureToastMessage(e), goHome);
@@ -3370,7 +3376,7 @@
       // + toast instead of leaving it spinning forever.
       let resp;
       try {
-        resp = await api("/api/books/" + id);
+        resp = await kidsGuardedBookApi(id);
       } catch (e) {
         if (!hashTargetsReader(id)) return;
         renderViewError(apiFailureToastMessage(e), () => navigate("#/book/" + id));
@@ -8112,14 +8118,17 @@
   // ── Kids mode ──────────────────────────────────
   // A lock on this device. While it's on, the server answers this session
   // with only the books a parent marked OK for kids and refuses stats,
-  // vocabulary, profiles and the rest, so `kidsMode` here only decides which
-  // chrome to draw. Entering is free; leaving needs the parents' code.
+  // vocabulary, profile switching and the rest, so `kidsMode` here only
+  // decides which chrome to draw. Entering is free; leaving needs the
+  // parents' code.
   //
   // Web sessions are in-memory on the server with a 24 h TTL, so the device
   // also remembers it was in Kids mode (KIDS_DEVICE_KEY = "1"): the next time
   // a parent logs in on it, loadKidsStatus() puts the new session straight
   // back into Kids mode. Online, that flag is only a convenience; the
-  // server's session flag is what enforces.
+  // server's session flag is what enforces. Offline there's no server, so
+  // the flag is what hides the saved copies a parent didn't mark
+  // (kidsFilterOfflineRows).
   let kidsMode = false;
   const KIDS_DEVICE_KEY = "carrel-kids-device";
   const KIDS_NO_PIN_TEXT = "Kids mode needs a web PIN. Set one in the desktop app first.";
@@ -8128,6 +8137,49 @@
 
   function kidsDeviceRemembered() {
     return safeStorageGet(KIDS_DEVICE_KEY) === "1";
+  }
+
+  // The ids of the books a kid may see, kept in this profile's offline
+  // database (the `meta` store), so the offline library can hide the rest
+  // with no server to ask.
+  const KIDS_VISIBLE_IDS_KEY = "kids-visible-ids";
+
+  /// Stores the server's kid-visible ids for the offline library. Runs
+  /// whenever this session is (back) in Kids mode. Best-effort: a failed read
+  /// keeps the last stored list.
+  async function refreshKidsVisibleIds() {
+    if (!offlineSupported()) return;
+    try {
+      const resp = await api("/api/kids/visible-ids");
+      // A reply from another profile mustn't land in this profile's database.
+      if (!resp || !resp.ok || reloadPending) return;
+      const { ids } = await resp.json();
+      if (Array.isArray(ids)) await idbPut("meta", { key: KIDS_VISIBLE_IDS_KEY, ids });
+    } catch (e) { /* keep the last list */ }
+  }
+
+  /// The offline rows this device may show: all of them, unless it remembers
+  /// being in Kids mode, and then only the stored kid-visible ones. With no
+  /// stored list, none.
+  async function kidsFilterOfflineRows(rows) {
+    if (!kidsDeviceRemembered() || !rows.length) return rows;
+    let stored;
+    try { stored = await idbGet("meta", KIDS_VISIBLE_IDS_KEY); } catch (e) { stored = undefined; }
+    const visible = new Set(stored && Array.isArray(stored.ids) ? stored.ids : []);
+    return rows.filter((r) => visible.has(r.id));
+  }
+
+  /// api() for a book's own record, which the detail and reader views fetch
+  /// before anything else. In Kids mode a copy saved here that a parent
+  /// didn't mark gets the 404 the server gives a hidden book: once the network
+  /// drops, the service worker would answer with the saved copy, and a page
+  /// that booted online isn't in offline mode, so route()'s guard didn't run.
+  async function kidsGuardedBookApi(id) {
+    if (kidsDeviceRemembered()) {
+      const row = await getOfflineManifest(id);
+      if (row && !(await kidsFilterOfflineRows([row])).length) return new Response(null, { status: 404 });
+    }
+    return api("/api/books/" + id);
   }
 
   /// Asks the server whether this session is in Kids mode, after putting it
@@ -8159,8 +8211,11 @@
     }
     kidsMode = !!status.kids;
     // The server says this session is a kid's, so make sure the device
-    // remembers it too.
-    if (kidsMode) safeStorageSet(KIDS_DEVICE_KEY, "1");
+    // remembers it too, and what it may show offline.
+    if (kidsMode) {
+      safeStorageSet(KIDS_DEVICE_KEY, "1");
+      await refreshKidsVisibleIds();
+    }
   }
 
   /// apiWrite for the Kids routes, with a JSON body. Resolves to the
@@ -8301,8 +8356,8 @@
       }
       safeStorageRemove(KIDS_DEVICE_KEY);
       kidsMode = false;
-      // A boot in Kids mode couldn't load the profile list (the server
-      // refuses it to a Kids session), so catch up the way doLogin does.
+      // Re-check the profile scope the way doLogin does, which also lifts an
+      // earlier failure to confirm it.
       const scope = await syncOfflineScopeWithServer();
       if (scope === "unknown") await markOfflineProfileUnknown();
       else if (scope === "changed") await verifyOfflineIntegrity();
@@ -8392,6 +8447,7 @@
       // that turns Kids mode on at some later login.
       safeStorageSet(KIDS_DEVICE_KEY, "1");
       kidsMode = true;
+      await refreshKidsVisibleIds();
       rerouteForKidsChange();
     }
 
@@ -8683,6 +8739,9 @@
   // The offline library: the normal grid, fed from IndexedDB manifest rows
   // (newest save first), with a banner + Retry. Covers and content load
   // through the M2 service-worker cache fallback. No login gate offline.
+  // Callers pass the rows through kidsFilterOfflineRows first, so in Kids
+  // mode the grid and the route guard's `offlineBookIds` both leave out the
+  // books a parent didn't mark.
   function renderOfflineLibrary(rows) {
     offlineMode = true;
     currentView = "library";
@@ -8699,13 +8758,14 @@
         total_chapters: r.totalChapters,
       }));
     app().innerHTML = `
-      <div class="header"><h1>Carrel</h1></div>
+      <div class="header"><h1>Carrel</h1>${kidsDeviceRemembered() ? kidsBadgeHtml() : ""}</div>
       <div class="offline-banner" role="status">
         <span>Offline — showing downloaded books</span>
         <button class="btn-secondary" id="offline-retry-btn">Retry</button>
       </div>
       <div id="library-content">${gridHtml(books)}</div>`;
     bindGridCardHandlers();
+    bindKidsControls();
     const retry = $("#offline-retry-btn");
     if (retry) retry.onclick = init;
   }
@@ -8726,7 +8786,7 @@
       test = await fetch("/api/books", { credentials: "same-origin" });
     } catch (e) {
       if (superseded()) return;
-      const rows = await getAllOfflineManifests();
+      const rows = await kidsFilterOfflineRows(await getAllOfflineManifests());
       if (superseded()) return;
       if (rows.length) renderOfflineLibrary(rows);
       else { offlineMode = false; renderOfflineState(); }
@@ -8764,7 +8824,7 @@
       // Rendered rather than just returned, so a navigation that lands here
       // does not change the URL and leave the previous view up with no word
       // of why.
-      const rows = await getAllOfflineManifests();
+      const rows = await kidsFilterOfflineRows(await getAllOfflineManifests());
       if (superseded()) return;
       if (rows.length) renderOfflineLibrary(rows);
       else renderOfflineState();
@@ -8809,7 +8869,7 @@
       // spec decision: the content is already on this device).
       if (offlineSupported()) {
         try {
-          const saved = await getAllOfflineManifests();
+          const saved = await kidsFilterOfflineRows(await getAllOfflineManifests());
           if (saved.length) {
             offlineMode = true;
             authenticated = true;

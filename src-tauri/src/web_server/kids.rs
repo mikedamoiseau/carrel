@@ -88,7 +88,9 @@ const REFUSED: &str = "Not available in Kids mode";
 /// disagree about which handler a URL reaches. The policy:
 /// - **Pass:** health, login, the public shell assets, `GET` dictionary
 ///   routes, and `GET /api/kids/status`, `POST /api/kids/exit`,
-///   `GET /api/kids/visible-ids`.
+///   `GET /api/kids/visible-ids`. Also `GET /api/profiles`: the web UI keeps
+///   offline copies per profile and won't touch them until it knows which
+///   profile is active. Switching (`POST /api/profile`) stays refused.
 /// - **Pass if the book is visible:** [`BOOK_ROUTES`]. A hidden or missing
 ///   book is `404 "Book not found"`, so its existence isn't revealed.
 /// - **Served here, filtered:** the six book lists, by the same code as the
@@ -157,7 +159,8 @@ fn passes(method: &Method, route: &str) -> bool {
         || (method == Method::GET
             && (route.starts_with("/api/dictionary/")
                 || route == "/api/kids/status"
-                || route == "/api/kids/visible-ids"))
+                || route == "/api/kids/visible-ids"
+                || route == "/api/profiles"))
         || (method == Method::POST && route == "/api/kids/exit")
 }
 

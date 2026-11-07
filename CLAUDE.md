@@ -61,6 +61,7 @@ identifier and change it only together with a migration.
 | `CARREL_E2E_KIDS` | `src-tauri/examples/web_e2e_server.rs`, `playwright.config.ts` | boot the Kids mode e2e server (port 7811) as the plain harness, with no PIN and no series, so every `e2e/kids-*.spec.ts` fails at login |
 | `carrel-core`, `CarrelError`, `CarrelResult`, `CarrelEvent` | `carrel-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
 | `carrel-offline` IndexedDB database | `static/app.js` | orphan every offline-saved book's blobs (separate from the Cache Storage entry above) |
+| `kids-visible-ids` key in the `meta` store of each profile's `carrel-offline` IndexedDB database (record `{key, ids}`) | `static/app.js` | make every device in web Kids mode show no offline-saved books while offline, until it next reaches the server in Kids mode (a missing list hides them all) |
 | `21c2cdba-327a-5023-94aa-a2fbf307774c` | `tauri.conf.json` `bundle.windows.wix.upgradeCode` | make every Windows MSI install **side-by-side** with the user's existing install instead of upgrading it in place |
 | `com.mike.carrel.kids-code` | `carrel-core/src/kids.rs` (keychain service name) | orphan the stored parents' code, locking parents out of kids-mode settings |
 | `carrel-opds-auth` | `src-tauri/src/commands.rs` (keychain service name) | orphan every stored OPDS catalog credential rather than migrating it |

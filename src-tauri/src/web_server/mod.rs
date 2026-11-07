@@ -6064,7 +6064,6 @@ mod tests {
             (Method::GET, "/api/vocabulary"),
             (Method::POST, "/api/vocabulary"),
             (Method::GET, "/api/vocabulary/due"),
-            (Method::GET, "/api/profiles"),
             (Method::POST, "/api/profile"),
             (Method::GET, "/api/data-export"),
             (Method::GET, "/api/audit/login-history"),
@@ -6081,6 +6080,45 @@ mod tests {
                 "{method} {path}"
             );
         }
+
+        let _ = tx.send(());
+    }
+
+    /// The web UI keeps offline copies per profile and turns offline off
+    /// until it knows which profile is active, so a Kids session may read the
+    /// profile list. Switching stays refused.
+    #[tokio::test]
+    async fn kids_session_lists_profiles_but_cannot_switch() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeProfileHost::new();
+        let state = WebState {
+            profile_host: Some(host.clone()),
+            ..kids_test_state(dir.path())
+        };
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        let (status, body) = send_as(Method::GET, port, "/api/profiles", &kids).await;
+        assert_eq!(status, 200, "{body}");
+        let active: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&body)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p["active"] == true)
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(active, ["default"]);
+
+        let (status, body) = kids_api(
+            Method::POST,
+            port,
+            "/api/profile",
+            Some(&kids),
+            Some(serde_json::json!({"name": "magazines"})),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (403, KIDS_REFUSAL));
+        assert_eq!(host.active(), "default");
 
         let _ = tx.send(());
     }
