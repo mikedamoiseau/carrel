@@ -6137,4 +6137,428 @@ mod tests {
 
         let _ = tx.send(());
     }
+
+    // ── /api/kids/* routes ───────────────────────────────────────────────
+
+    const PARENT_CODE: &str = "2468";
+
+    fn set_parent_code(state: &WebState, code: &str) {
+        let phc =
+            carrel_core::profile_lock::hash_password(&secrecy::SecretString::from(code)).unwrap();
+        state.kids.code_store.store(&phc).unwrap();
+    }
+
+    /// `method path` as `token` with an optional JSON body.
+    async fn kids_api(
+        method: reqwest::Method,
+        port: u16,
+        path: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (u16, String) {
+        let mut req =
+            reqwest::Client::new().request(method, format!("http://127.0.0.1:{port}{path}"));
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    fn json_of(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("not json ({e}): {body}"))
+    }
+
+    #[tokio::test]
+    async fn kids_status_reports_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+
+        let (status, body) = kids_api(
+            reqwest::Method::GET,
+            port,
+            "/api/kids/status",
+            Some(&adult),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_of(&body),
+            serde_json::json!({"kids": false, "code_set": false, "pin_configured": true})
+        );
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_enter_without_pin_is_403() {
+        use reqwest::Method;
+        let (port, tx) = serve(test_state()).await;
+        let (status, body) = kids_api(Method::POST, port, "/api/kids/enter", None, None).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (403, "Kids mode requires a configured web PIN.")
+        );
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_enter_without_code_is_409() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+        let (status, body) =
+            kids_api(Method::POST, port, "/api/kids/enter", Some(&adult), None).await;
+        assert_eq!((status, body.as_str()), (409, "Set a parents' code first"));
+        assert!(!state.kids.is_kids(&adult));
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_enter_then_status_reports_kids() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        set_parent_code(&state, PARENT_CODE);
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+
+        let (status, body) =
+            kids_api(Method::POST, port, "/api/kids/enter", Some(&adult), None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json_of(&body)["kids"], true);
+        let (status, body) =
+            kids_api(Method::GET, port, "/api/kids/status", Some(&adult), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            json_of(&body),
+            serde_json::json!({"kids": true, "code_set": true, "pin_configured": true})
+        );
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_exit_wrong_code_is_403_not_401() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        set_parent_code(&state, PARENT_CODE);
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        let (status, body) = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&kids),
+            Some(serde_json::json!({"code": "0000"})),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (403, "Incorrect code"));
+        assert!(state.kids.is_kids(&kids));
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_exit_rate_limit_is_per_session() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        set_parent_code(&state, PARENT_CODE);
+        let (port, tx) = serve(state.clone()).await;
+        let t1 = kids_token(&state, port).await;
+        let t2 = kids_token(&state, port).await;
+
+        for _ in 0..5 {
+            let (status, _) = kids_api(
+                Method::POST,
+                port,
+                "/api/kids/exit",
+                Some(&t1),
+                Some(serde_json::json!({"code": "0000"})),
+            )
+            .await;
+            assert_eq!(status, 403);
+        }
+        let (status, body) = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&t1),
+            Some(serde_json::json!({"code": PARENT_CODE})),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (429, "Too many attempts. Try again later.")
+        );
+        assert!(state.kids.is_kids(&t1));
+
+        let (status, body) = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&t2),
+            Some(serde_json::json!({"code": PARENT_CODE})),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert!(!state.kids.is_kids(&t2));
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_exit_right_code_leaves() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        set_parent_code(&state, PARENT_CODE);
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        let (_, body) = send_as(Method::GET, port, "/api/books", &kids).await;
+        assert!(!body.contains(HIDDEN_BOOK));
+        let (status, body) = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&kids),
+            Some(serde_json::json!({"code": PARENT_CODE})),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json_of(&body)["kids"], false);
+        let (_, body) = kids_api(Method::GET, port, "/api/kids/status", Some(&kids), None).await;
+        assert_eq!(json_of(&body)["kids"], false);
+        let (_, body) = send_as(Method::GET, port, "/api/books", &kids).await;
+        assert!(body.contains(HIDDEN_BOOK), "{body}");
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_exit_from_adult_session_is_noop_200() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+        let (status, body) = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&adult),
+            Some(serde_json::json!({"code": "0000"})),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(json_of(&body)["kids"], false);
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_session_cannot_manage() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+        let book = format!("/api/kids/books/{VISIBLE_BOOK}");
+        for (method, path, body) in [
+            (
+                Method::PUT,
+                "/api/kids/code".to_string(),
+                serde_json::json!({"code": "1234"}),
+            ),
+            (
+                Method::GET,
+                "/api/kids/series".to_string(),
+                serde_json::json!({}),
+            ),
+            (
+                Method::PUT,
+                "/api/kids/series".to_string(),
+                serde_json::json!({"series": "Tintin", "allowed": false}),
+            ),
+            (Method::GET, book.clone(), serde_json::json!({})),
+            (
+                Method::PUT,
+                book,
+                serde_json::json!({"override": "blocked"}),
+            ),
+        ] {
+            let (status, text) =
+                kids_api(method.clone(), port, &path, Some(&kids), Some(body)).await;
+            assert_eq!(
+                (status, text.as_str()),
+                (403, KIDS_REFUSAL),
+                "{method} {path}"
+            );
+        }
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_set_code_rejects_non_digits() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+        let (status, body) = kids_api(
+            Method::PUT,
+            port,
+            "/api/kids/code",
+            Some(&adult),
+            Some(serde_json::json!({"code": "12a4"})),
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (400, "Parents' code must be 4 to 12 digits")
+        );
+        assert!(state.kids.code_store.load().unwrap().is_none());
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_parent_can_reset_code_without_old_code() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        set_parent_code(&state, PARENT_CODE);
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+        let kids = kids_token(&state, port).await;
+
+        let (status, body) = kids_api(
+            Method::PUT,
+            port,
+            "/api/kids/code",
+            Some(&adult),
+            Some(serde_json::json!({"code": "97531"})),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let wrong = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&kids),
+            Some(serde_json::json!({"code": PARENT_CODE})),
+        )
+        .await;
+        assert_eq!(wrong.0, 403);
+        let (status, _) = kids_api(
+            Method::POST,
+            port,
+            "/api/kids/exit",
+            Some(&kids),
+            Some(serde_json::json!({"code": "97531"})),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_parent_marks_series_and_book() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let adult = login_token(port).await;
+
+        let (status, body) =
+            kids_api(Method::GET, port, "/api/kids/series", Some(&adult), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(json_of(&body), serde_json::json!({"series": ["Tintin"]}));
+
+        let hidden = format!("/api/kids/books/{HIDDEN_BOOK}");
+        let (_, body) = kids_api(Method::GET, port, &hidden, Some(&adult), None).await;
+        assert_eq!(
+            json_of(&body),
+            serde_json::json!({"override": "follow", "series_allowed": false, "visible": false})
+        );
+        let (status, _) = kids_api(
+            Method::PUT,
+            port,
+            "/api/kids/series",
+            Some(&adult),
+            Some(serde_json::json!({"series": HIDDEN_SERIES, "allowed": true})),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (_, body) = kids_api(Method::GET, port, &hidden, Some(&adult), None).await;
+        assert_eq!(
+            json_of(&body),
+            serde_json::json!({"override": "follow", "series_allowed": true, "visible": true})
+        );
+        let (status, _) = kids_api(
+            Method::PUT,
+            port,
+            &hidden,
+            Some(&adult),
+            Some(serde_json::json!({"override": "blocked"})),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (_, body) = kids_api(Method::GET, port, &hidden, Some(&adult), None).await;
+        assert_eq!(
+            json_of(&body),
+            serde_json::json!({"override": "blocked", "series_allowed": true, "visible": false})
+        );
+
+        let (status, _) = kids_api(
+            Method::GET,
+            port,
+            "/api/kids/books/nope",
+            Some(&adult),
+            None,
+        )
+        .await;
+        assert_eq!(status, 404);
+        let (status, _) = kids_api(
+            Method::PUT,
+            port,
+            "/api/kids/books/nope",
+            Some(&adult),
+            Some(serde_json::json!({"override": "allowed"})),
+        )
+        .await;
+        assert_eq!(status, 404);
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_visible_ids_in_kids_session() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+        let (status, body) = kids_api(
+            Method::GET,
+            port,
+            "/api/kids/visible-ids",
+            Some(&kids),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let mut ids: Vec<String> = serde_json::from_value(json_of(&body)["ids"].clone()).unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![VISIBLE_BOOK.to_string(), format!("{VISIBLE_BOOK}2")]
+        );
+        let _ = tx.send(());
+    }
 }

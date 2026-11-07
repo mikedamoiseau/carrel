@@ -46,7 +46,10 @@ const EXPORT_SETTINGS_DENYLIST: &[&str] = &["backup_config", "enrichment_provide
 ///
 /// Poisoned mutex → fail closed (500), never open access, mirroring
 /// `auth_middleware` itself.
-fn require_configured_pin(state: &WebState, what: &str) -> Result<(), (StatusCode, String)> {
+pub(super) fn require_configured_pin(
+    state: &WebState,
+    what: &str,
+) -> Result<(), (StatusCode, String)> {
     let has_pin = match state.pin_hash.lock() {
         Ok(guard) => guard.is_some(),
         Err(_) => {
@@ -176,6 +179,7 @@ async fn data_export(State(state): State<WebState>) -> Result<Response, (StatusC
 pub fn routes(state: WebState) -> Router<WebState> {
     Router::new()
         .route("/health", get(health))
+        .merge(super::kids::routes())
         .route("/auth", axum::routing::post(login))
         .route("/books", get(list_books))
         .route("/books/continue-reading", get(continue_reading))

@@ -11,9 +11,12 @@ use axum::{
     http::{Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json, RequestExt,
+    routing::{get, post, put},
+    Extension, Json, RequestExt, Router,
 };
-use carrel_core::kids::KidsCodeStore;
+use carrel_core::kids::{KidsCodeStore, KidsOverride};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 
 use super::auth::{RateLimiter, SessionToken};
 use super::{api, carrel_status, web_ui, WebState};
@@ -214,4 +217,219 @@ async fn reading_progress(
     Ok(Json(
         db::get_all_reading_progress_kids(&conn).map_err(carrel_status)?,
     ))
+}
+
+// ── /api/kids/* ──────────────────────────────────────────────────────────────
+//
+// The gate lets a Kids session reach only `status`, `exit` and `visible-ids`
+// here; every other route below is a parent's, and is refused to a Kids
+// session by the gate rather than by anything in these handlers.
+
+pub fn routes() -> Router<WebState> {
+    Router::new()
+        .route("/kids/status", get(kids_status))
+        .route("/kids/enter", post(enter))
+        .route("/kids/exit", post(exit))
+        .route("/kids/code", put(set_code))
+        .route("/kids/series", get(list_series).put(set_series))
+        .route("/kids/books/{id}", get(get_book_mark).put(set_book_mark))
+        .route("/kids/visible-ids", get(visible_ids))
+}
+
+type ApiError = (StatusCode, String);
+
+#[derive(Serialize)]
+struct KidsStatus {
+    kids: bool,
+    code_set: bool,
+    pin_configured: bool,
+}
+
+fn status_for(state: &WebState, token: Option<&str>) -> Result<KidsStatus, ApiError> {
+    let pin_configured = state
+        .pin_hash
+        .lock()
+        .map_err(|_| internal_error())?
+        .is_some();
+    let code_set = state
+        .kids
+        .code_store
+        .load()
+        .map_err(carrel_status)?
+        .is_some();
+    Ok(KidsStatus {
+        kids: token.is_some_and(|t| state.kids.is_kids(t)),
+        code_set,
+        pin_configured,
+    })
+}
+
+fn internal_error() -> ApiError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
+}
+
+fn token_of(token: &Option<Extension<SessionToken>>) -> Option<&str> {
+    token.as_ref().map(|Extension(t)| t.0.as_str())
+}
+
+async fn kids_status(
+    State(state): State<WebState>,
+    token: Option<Extension<SessionToken>>,
+) -> Result<Json<KidsStatus>, ApiError> {
+    Ok(Json(status_for(&state, token_of(&token))?))
+}
+
+async fn enter(
+    State(state): State<WebState>,
+    token: Option<Extension<SessionToken>>,
+) -> Result<Json<KidsStatus>, ApiError> {
+    // First: with no PIN there is no session token, so nothing could be put
+    // in Kids mode, nor taken out again.
+    api::require_configured_pin(&state, "Kids mode")?;
+    let token = token_of(&token)
+        .ok_or((StatusCode::UNAUTHORIZED, "Not logged in".to_string()))?
+        .to_owned();
+    if state
+        .kids
+        .code_store
+        .load()
+        .map_err(carrel_status)?
+        .is_none()
+    {
+        return Err((StatusCode::CONFLICT, "Set a parents' code first".into()));
+    }
+    state
+        .kids
+        .sessions
+        .lock()
+        .map_err(|_| internal_error())?
+        .insert(token.clone());
+    Ok(Json(status_for(&state, Some(&token))?))
+}
+
+#[derive(Deserialize)]
+struct CodeBody {
+    code: String,
+}
+
+async fn exit(
+    State(state): State<WebState>,
+    token: Option<Extension<SessionToken>>,
+    Json(body): Json<CodeBody>,
+) -> Result<Json<KidsStatus>, ApiError> {
+    let token = token_of(&token).map(str::to_owned);
+    let Some(token) = token.filter(|t| state.kids.is_kids(t)) else {
+        return Ok(Json(status_for(&state, None)?));
+    };
+    if !state.kids.exit_limiter.attempt(&token) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many attempts. Try again later.".into(),
+        ));
+    }
+    let phc = state
+        .kids
+        .code_store
+        .load()
+        .map_err(carrel_status)?
+        .ok_or((StatusCode::CONFLICT, "Set a parents' code first".into()))?;
+    let code = SecretString::from(body.code);
+    let ok = tokio::task::spawn_blocking(move || {
+        carrel_core::profile_lock::verify_password(&code, &phc)
+    })
+    .await
+    .map_err(|_| internal_error())?
+    .map_err(carrel_status)?;
+    // A wrong code is 403, never 401: the web UI reads 401 as "logged out".
+    if !ok {
+        return Err((StatusCode::FORBIDDEN, "Incorrect code".into()));
+    }
+    state.kids.exit_limiter.clear(&token);
+    state
+        .kids
+        .sessions
+        .lock()
+        .map_err(|_| internal_error())?
+        .remove(&token);
+    Ok(Json(status_for(&state, Some(&token))?))
+}
+
+/// Sets or replaces the parents' code with no old code required: it is the
+/// forgotten-code recovery path, and the gate makes it reachable only from a
+/// session that is not in Kids mode.
+async fn set_code(
+    State(state): State<WebState>,
+    Json(body): Json<CodeBody>,
+) -> Result<StatusCode, ApiError> {
+    carrel_core::kids::validate_code(&body.code).map_err(carrel_status)?;
+    let code = SecretString::from(body.code);
+    let phc = tokio::task::spawn_blocking(move || carrel_core::profile_lock::hash_password(&code))
+        .await
+        .map_err(|_| internal_error())?
+        .map_err(carrel_status)?;
+    state.kids.code_store.store(&phc).map_err(carrel_status)?;
+    Ok(StatusCode::OK)
+}
+
+async fn list_series(State(state): State<WebState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let conn = state.conn().map_err(carrel_status)?;
+    let series = carrel_core::kids::list_allowed_series(&conn).map_err(carrel_status)?;
+    Ok(Json(serde_json::json!({ "series": series })))
+}
+
+#[derive(Deserialize)]
+struct SeriesBody {
+    series: String,
+    allowed: bool,
+}
+
+async fn set_series(
+    State(state): State<WebState>,
+    Json(body): Json<SeriesBody>,
+) -> Result<StatusCode, ApiError> {
+    let conn = state.conn().map_err(carrel_status)?;
+    carrel_core::kids::set_series_allowed(&conn, &body.series, body.allowed)
+        .map_err(carrel_status)?;
+    Ok(StatusCode::OK)
+}
+
+async fn get_book_mark(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Result<Json<carrel_core::kids::KidsBookMark>, ApiError> {
+    let conn = state.conn().map_err(carrel_status)?;
+    carrel_core::kids::get_book_mark(&conn, &id)
+        .map_err(carrel_status)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "Book not found".into()))
+}
+
+#[derive(Deserialize)]
+struct OverrideBody {
+    r#override: KidsOverride,
+}
+
+async fn set_book_mark(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Json(body): Json<OverrideBody>,
+) -> Result<Json<carrel_core::kids::KidsBookMark>, ApiError> {
+    let conn = state.conn().map_err(carrel_status)?;
+    if carrel_core::kids::get_book_mark(&conn, &id)
+        .map_err(carrel_status)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, "Book not found".into()));
+    }
+    carrel_core::kids::set_book_override(&conn, &id, body.r#override).map_err(carrel_status)?;
+    get_book_mark(State(state), Path(id)).await
+}
+
+async fn visible_ids(State(state): State<WebState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let conn = state.conn().map_err(carrel_status)?;
+    let ids = carrel_core::kids::visible_book_ids(&conn).map_err(carrel_status)?;
+    Ok(Json(serde_json::json!({ "ids": ids })))
 }
