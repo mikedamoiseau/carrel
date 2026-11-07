@@ -1113,5 +1113,26 @@
     "continueHighlights": "Highlights and bookmarks — they stay in their lists",
     "continueLibrary": "The book stays in your library",
     "restartNote": "Resets to off every time you open Carrel — it never carries over between sessions."
+  },
+
+  "kids": {
+    "badge": "Kids mode",
+    "leave": "Leave Kids mode",
+    "codeLabel": "Parents' code",
+    "leaveConfirm": "Leave",
+    "turnOn": "Turn on Kids mode",
+    "setCode": "Set parents' code",
+    "changeCode": "Change parents' code",
+    "settingsTitle": "Kids mode",
+    "settingsDescription": "Show only the books and series you have marked OK for kids. Leaving Kids mode needs the parents' code.",
+    "codeInvalid": "Parents' code must be 4 to 12 digits",
+    "codeSaved": "Parents' code saved",
+    "followSeries": "Follow series",
+    "okForKids": "OK for kids",
+    "notForKids": "Not for kids",
+    "visible": "Visible in Kids mode",
+    "hidden": "Hidden in Kids mode",
+    "markSeries": "Mark series OK for kids",
+    "unmarkSeries": "Unmark series for kids"
   }
 }

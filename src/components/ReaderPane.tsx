@@ -24,6 +24,7 @@ import PrivateModeToggle from "./PrivateModeToggle";
 import OverflowMenu from "./OverflowMenu";
 import ReaderSkeleton from "./ReaderSkeleton";
 import { usePrivateMode } from "../hooks/usePrivateMode";
+import { useKidsMode } from "../hooks/useKidsMode";
 import { getVolatilePosition, setVolatilePosition } from "../lib/volatileResume";
 import { sanitizeChapterHtml } from "../lib/sanitizeHtml";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -97,7 +98,7 @@ const PDF_PRERENDER_SETTLE_MS = 4000;
 
 interface ReaderPaneProps {
   bookId: string;
-  onOpenSettings: () => void;
+  onOpenSettings?: () => void;
   settingsOpen?: boolean;
   /** True when two panes are mounted side-by-side. Defaults to false. */
   splitMode?: boolean;
@@ -195,6 +196,7 @@ export default function ReaderPane({
   // panes need it for the volatile-resume gate below); only the primary
   // pane renders the actual toggle control (see the header, further down).
   const { enabled: isPrivate } = usePrivateMode();
+  const { enabled: kidsMode } = useKidsMode();
 
   const [bookTitle, setBookTitle] = useState("");
   const [bookFormat, setBookFormat] = useState<"epub" | "cbz" | "cbr" | "pdf" | "mobi">("epub");
@@ -2696,12 +2698,13 @@ export default function ReaderPane({
               flag), so only the primary pane renders it; the companion
               pane would otherwise show a second, redundant control for
               the same state. */}
-          {isPrimary && <PrivateModeToggle />}
+          {isPrimary && !kidsMode && <PrivateModeToggle />}
 
           {/* Language switcher */}
           <LanguageSwitcher />
 
-          {/* Settings button */}
+          {/* Settings button — absent in Kids mode */}
+          {onOpenSettings && (
           <button
             onClick={onOpenSettings}
             className={`p-1.5 transition-colors rounded-lg focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 ${settingsOpen ? "text-accent bg-accent-light" : "text-ink-muted hover:text-ink hover:bg-warm-subtle"}`}
@@ -2720,6 +2723,7 @@ export default function ReaderPane({
               />
             </svg>
           </button>
+          )}
         </header>
 
         {/* Book search panel */}

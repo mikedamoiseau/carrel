@@ -1085,5 +1085,26 @@
     "continueHighlights": "Surlignages et signets \u2014 ils restent dans leurs listes",
     "continueLibrary": "Le livre reste dans votre biblioth\u00e8que",
     "restartNote": "Revient \u00e0 d\u00e9sactiv\u00e9 \u00e0 chaque ouverture de Carrel \u2014 ne se reporte jamais d'une session \u00e0 l'autre."
+  },
+
+  "kids": {
+    "badge": "Mode enfants",
+    "leave": "Quitter le mode enfants",
+    "codeLabel": "Code parental",
+    "leaveConfirm": "Quitter",
+    "turnOn": "Activer le mode enfants",
+    "setCode": "Définir le code parental",
+    "changeCode": "Modifier le code parental",
+    "settingsTitle": "Mode enfants",
+    "settingsDescription": "N'affiche que les livres et séries que vous avez marqués comme adaptés aux enfants. Pour quitter le mode enfants, il faut le code parental.",
+    "codeInvalid": "Le code parental doit comporter de 4 à 12 chiffres",
+    "codeSaved": "Code parental enregistré",
+    "followSeries": "Suivre la série",
+    "okForKids": "Adapté aux enfants",
+    "notForKids": "Pas pour les enfants",
+    "visible": "Visible en mode enfants",
+    "hidden": "Masqué en mode enfants",
+    "markSeries": "Marquer la série comme adaptée aux enfants",
+    "unmarkSeries": "Retirer la série du mode enfants"
   }
 }

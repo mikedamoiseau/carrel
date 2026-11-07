@@ -29,6 +29,8 @@ import ActivityLog from "./ActivityLog";
 import ConfirmDialog from "./ConfirmDialog";
 import SavedThemesList from "./SavedThemesList";
 import PluginsPanel from "./PluginsPanel";
+import KidsModeSettings from "./KidsModeSettings";
+import { useKidsMode } from "../hooks/useKidsMode";
 import { emit } from "@tauri-apps/api/event";
 import { releaseNotes, appVersion as buildVersion } from "virtual:release-notes";
 import {
@@ -377,6 +379,7 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
   const { restart: restartOnboarding } = useOnboardingContext();
   const { mode, setMode, customColors, setCustomColors, fontSize, setFontSize, fontFamily, setFontFamily, scrollMode, setScrollMode, typography, setTypography, customCss, setCustomCss, dualPage, setDualPage, mangaMode, setMangaMode, pageAnimation, setPageAnimation, loadTheme } =
     useTheme();
+  const { enabled: kidsMode } = useKidsMode();
   const [openSection, setOpenSection] = useState<string | null>("appearance");
   const toggleSection = (id: string) => setOpenSection((prev) => (prev === id ? null : id));
   const [settingsQuery, setSettingsQuery] = useState("");
@@ -2543,6 +2546,12 @@ export default function SettingsPanel({ open, onClose }: SettingsPanelProps) {
               )}
             </div>
           </Accordion>
+
+          {!kidsMode && (
+            <Accordion title={t("kids.settingsTitle")} open={openSection === "kids"} onToggle={() => toggleSection("kids")} query={settingsQuery} keywords="kids children parents code">
+              <KidsModeSettings />
+            </Accordion>
+          )}
 
           <Accordion title={t("settings.profileLockSection")} open={openSection === "profileLock"} onToggle={() => toggleSection("profileLock")} query={settingsQuery} keywords={t("settings.searchTermsProfileLock")}>
             <div className="space-y-2">

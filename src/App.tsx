@@ -16,6 +16,8 @@ import CatalogBrowser from "./components/CatalogBrowser";
 import LanguageSwitcher from "./components/LanguageSwitcher";
 import PrivateModeToggle from "./components/PrivateModeToggle";
 import PrivateModeBar from "./components/PrivateModeBar";
+import KidsModeBanner from "./components/KidsModeBanner";
+import { useKidsMode } from "./hooks/useKidsMode";
 import ImportStatusBar from "./components/ImportStatusBar";
 import AnalyticsConsentDialog from "./components/AnalyticsConsentDialog";
 import UpdateCheckHost from "./components/UpdateCheckHost";
@@ -92,6 +94,7 @@ function AppShell() {
   const { addToast } = useToast();
   const { t } = useTranslation();
   const authErrorShown = useRef(false);
+  const { enabled: kidsMode } = useKidsMode();
   const { checked: lockGateChecked, lockedProfile, clearLockedProfile } = useStartupLockGate();
 
   useEffect(() => {
@@ -114,6 +117,21 @@ function AppShell() {
   // or the desktop keeps showing the previous profile's library.
   useEffect(() => {
     const unlisten = listen<string>("profile-changed", () => { handleProfileSwitch(); });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [handleProfileSwitch]);
+
+  // Entering or leaving Kids mode changes what the library may show, so reset
+  // exactly as for a profile switch, and drop any admin overlay left open.
+  useEffect(() => {
+    const unlisten = listen<boolean>("kids-mode-changed", (event) => {
+      if (event.payload) {
+        setSettingsOpen(false);
+        setStatsOpen(false);
+        setVocabularyOpen(false);
+        setCatalogOpen(false);
+      }
+      handleProfileSwitch();
+    });
     return () => { unlisten.then((fn) => fn()); };
   }, [handleProfileSwitch]);
 
@@ -158,6 +176,7 @@ function AppShell() {
     <div className="flex flex-col h-screen bg-paper text-ink">
       {/* App-wide private-mode strip — always on top, survives into the reader */}
       <PrivateModeBar />
+      {kidsMode && <KidsModeBanner />}
       {/* Top nav — minimal wordmark header, hidden in reader (reader has its own header) */}
       {!inReader && (
         <nav className="shrink-0 h-12 px-6 flex items-center border-b border-warm-border bg-surface">
@@ -167,8 +186,9 @@ function AppShell() {
           >
             Carrel
           </Link>
-          <ProfileSwitcher onSwitch={handleProfileSwitch} />
+          {!kidsMode && <ProfileSwitcher onSwitch={handleProfileSwitch} />}
           <div className="flex-1" />
+          {!kidsMode && (
           <button
             onClick={() => setStatsOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -178,6 +198,7 @@ function AppShell() {
               <path d="M3 17V9h3v8H3zM8.5 17V5h3v12h-3zM14 17V1h3v16h-3z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
             </svg>
           </button>
+          )}
           {(vocabState.enabled || vocabState.count > 0) && (
             <button
               onClick={() => setVocabularyOpen(true)}
@@ -192,6 +213,7 @@ function AppShell() {
               </svg>
             </button>
           )}
+          {!kidsMode && (
           <button
             onClick={() => setCatalogOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -202,7 +224,8 @@ function AppShell() {
               <path d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </button>
-          <PrivateModeToggle />
+          )}
+          {!kidsMode && <PrivateModeToggle />}
           <LanguageSwitcher />
           {/* damoiseau.xyz path is mid-migration from folio to carrel; this is the post-migration URL */}
           <a
@@ -225,6 +248,7 @@ function AppShell() {
               <circle cx="10" cy="14" r="0.9" fill="currentColor" />
             </svg>
           </a>
+          {!kidsMode && (
           <button
             onClick={() => setSettingsOpen(true)}
             className="p-2 text-ink-muted hover:text-ink transition-colors duration-150 rounded-lg hover:bg-warm-subtle focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2"
@@ -243,6 +267,7 @@ function AppShell() {
               />
             </svg>
           </button>
+          )}
         </nav>
       )}
 
@@ -259,7 +284,7 @@ function AppShell() {
               <ReaderErrorBoundary>
                 <Suspense fallback={<ReaderSkeleton />}>
                   <Reader
-                    onOpenSettings={() => setSettingsOpen(true)}
+                    onOpenSettings={kidsMode ? undefined : () => setSettingsOpen(true)}
                     settingsOpen={settingsOpen}
                   />
                 </Suspense>

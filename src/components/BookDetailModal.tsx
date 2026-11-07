@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { Book } from "../types";
 import { formatDuration, formatDate } from "../lib/utils";
 import WantToReadToggle from "./WantToReadToggle";
+import KidsMarkControl from "./KidsMarkControl";
 
 interface BookReadingStats {
   totalReadingTimeSecs: number;
@@ -281,6 +282,13 @@ export default function BookDetailModal({ book, onClose, onOpen, onEdit, onScan,
               </button>
             )}
             {onScan && <ScanButton bookId={book.id} onScan={onScan} />}
+          </div>
+        )}
+        {/* Kids mode marking — admin only: tied to the editable variant, which
+            the library omits (no onEdit) while Kids mode is on. */}
+        {onEdit && (
+          <div className="px-5 pb-4">
+            <KidsMarkControl bookId={book.id} />
           </div>
         )}
       </div>

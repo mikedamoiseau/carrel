@@ -10,6 +10,8 @@ import VirtualizedBookGrid from "../components/VirtualizedBookGrid";
 import BulkEditDialog from "../components/BulkEditDialog";
 import EmptyState from "../components/EmptyState";
 import ImportButton from "../components/ImportButton";
+import KidsSeriesToggle from "../components/KidsSeriesToggle";
+import { useKidsMode } from "../hooks/useKidsMode";
 import CollectionsSidebar, {
   Collection,
   CreateCollectionData,
@@ -206,6 +208,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
   const [highlightSearchOpen, setHighlightSearchOpen] = useState(false);
   const [collections, setCollections] = useState<Collection[]>([]);
   const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
+  const { enabled: kidsMode } = useKidsMode();
   const [activeSeries, setActiveSeries] = useState<string | null>(null);
   const [seriesList, setSeriesList] = useState<Array<{ name: string; count: number }>>([]);
 
@@ -1038,7 +1041,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             </button>
           )}
           {/* Bulk select toggle (#60) */}
-          {hasBooks && (
+          {hasBooks && !kidsMode && (
             <button
               type="button"
               onClick={() => {
@@ -1060,7 +1063,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
               </svg>
             </button>
           )}
-          <ImportButton
+          {!kidsMode && <ImportButton
             onImportFiles={handleImport}
             onImportFolder={handleImportFolder}
             onImportUrl={handleImportUrl}
@@ -1070,7 +1073,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
                 ? { current: importCtx.progress.current, total: importCtx.progress.total }
                 : null
             }
-          />
+          />}
         </div>
       )}
 
@@ -1408,6 +1411,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             </div>
           )}
 
+          {activeSeries && !kidsMode && <KidsSeriesToggle series={activeSeries} />}
           {activeSeries && seriesViewMode === "stacked" ? (
             <button
               type="button"
@@ -1514,7 +1518,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
                               onClick: () => {
                                 if (selectMode) { toggleSelected(book.id); } else { openBook(book.id); }
                               },
-                              onDelete: selectMode ? undefined : handleRemoveBook,
+                              onDelete: selectMode || kidsMode ? undefined : handleRemoveBook,
                               onInfo: handleShowBookDetail,
                               onWantToReadChange: selectMode ? undefined : handleWantToReadChange,
                               onWantToReadError: handleWantToReadError,
@@ -1579,7 +1583,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
                                     openBook(book.id);
                                   }
                                 },
-                                onDelete: selectMode ? undefined : handleRemoveBook,
+                                onDelete: selectMode || kidsMode ? undefined : handleRemoveBook,
                                 onInfo: handleShowBookDetail,
                                 onWantToReadChange: selectMode ? undefined : handleWantToReadChange,
                                 onWantToReadError: handleWantToReadError,
@@ -1642,7 +1646,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
                                 openBook(book.id);
                               }
                             },
-                            onDelete: selectMode ? undefined : handleRemoveBook,
+                            onDelete: selectMode || kidsMode ? undefined : handleRemoveBook,
                             onInfo: handleShowBookDetail,
                             onWantToReadChange: selectMode ? undefined : handleWantToReadChange,
                             onWantToReadError: handleWantToReadError,
@@ -1687,7 +1691,7 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
                           openBook(book.id);
                         }
                       },
-                      onDelete: selectMode ? undefined : handleRemoveBook,
+                      onDelete: selectMode || kidsMode ? undefined : handleRemoveBook,
                       onInfo: handleShowBookDetail,
                       onWantToReadChange: selectMode ? undefined : handleWantToReadChange,
                       onWantToReadError: handleWantToReadError,
@@ -1806,10 +1810,10 @@ export default function Library({ catalogImportedBookIds }: LibraryProps = {}) {
             setDetailBook(null);
             openBook(id);
           }}
-          onEdit={handleEditBook}
+          onEdit={kidsMode ? undefined : handleEditBook}
           onWantToReadChange={selectMode ? undefined : handleWantToReadChange}
           onWantToReadError={handleWantToReadError}
-          onScan={async (id) => {
+          onScan={kidsMode ? undefined : async (id) => {
             setScanningBookId(id);
             try {
               const updatedBook = await invoke<Book>("scan_single_book", { bookId: id });

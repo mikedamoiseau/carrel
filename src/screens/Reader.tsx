@@ -12,7 +12,8 @@ import {
 } from "../lib/splitView";
 
 interface ReaderProps {
-  onOpenSettings: () => void;
+  /** Omitted in Kids mode, which hides the settings button. */
+  onOpenSettings?: () => void;
   settingsOpen?: boolean;
 }
 
