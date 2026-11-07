@@ -827,6 +827,38 @@ body:not(:has(.header))::before {
    above — `.tab` sets `display: flex` itself. */
 .tab[hidden] { display: none; }
 
+/* ── Kids mode ──────────────────────────────────── */
+/* The parent's Kids mode button, and in Kids mode the badge + Leave button,
+   sit in both the header cluster and the tab bar. On a tab-bar view at
+   narrow/touch widths the tab bar's copy is the one shown, the same either/or
+   as the nav icons. The tab-bar button looks like a tab without being one
+   (see kidsModeButtonHtml). */
+.tab-bar .kids-mode-btn { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; background: none; border: none; cursor: pointer; color: var(--ink-muted); font: inherit; }
+.kids-badge { display: flex; align-items: center; gap: 8px; }
+.kids-badge-label { background: var(--accent-light); color: var(--accent); font-size: 0.75rem; font-weight: 600; padding: 3px 10px; border-radius: 10px; white-space: nowrap; }
+.kids-leave-btn { background: none; border: 1px solid var(--warm-border); border-radius: var(--radius); color: var(--ink); font: inherit; font-size: 0.8rem; padding: 4px 10px; cursor: pointer; white-space: nowrap; }
+.kids-leave-btn:hover { background: var(--warm-subtle); }
+/* In the tab bar the badge takes a tab's slot: the label where the icon goes,
+   the button as the tab label, and the button's hit box stretched over the
+   whole slot so the target is as big as any tab. */
+.tab-bar .kids-badge { flex: 1; position: relative; flex-direction: column; justify-content: center; gap: 4px; }
+.tab-bar .kids-leave-btn { border: none; padding: 0; font-size: 0.7rem; font-weight: 600; color: var(--ink-muted); }
+.tab-bar .kids-leave-btn::after { content: ""; position: absolute; inset: 0; }
+.kids-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5); display: flex; align-items: center; justify-content: center; padding: var(--gap); z-index: 100; }
+.kids-dialog { background: var(--surface); border: 1px solid var(--warm-border); border-radius: 12px; padding: 24px 28px; max-width: 360px; width: 100%; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 12px 32px var(--shadow); }
+.kids-dialog h2 { font-size: 1.1rem; color: var(--accent); }
+.kids-dialog p { color: var(--ink-muted); font-size: 0.9rem; }
+.kids-dialog label { font-size: 0.85rem; font-weight: 600; color: var(--ink); }
+.kids-dialog input { padding: 10px 12px; font-size: 1rem; border: 1px solid var(--warm-border); border-radius: var(--radius); background: var(--paper); color: var(--ink); letter-spacing: 4px; }
+.kids-dialog button { padding: 10px 20px; border-radius: var(--radius); font-weight: 600; font-size: 0.9rem; cursor: pointer; border: none; }
+.kids-error { color: var(--error); font-size: 0.85rem; }
+.kids-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+@media (max-width: 600px), (hover: none) and (pointer: coarse) {
+  #app:has(.tab-bar) .header .kids-badge,
+  #app:has(.tab-bar) .header .kids-mode-btn { display: none; }
+  .header .kids-leave-btn { min-height: 44px; }
+}
+
 /* Narrow OR touch (comma = OR): phones, narrow windows, and coarse-pointer
    tablets in landscape. Desktop (wide + fine pointer) falls through to the
    default above with the tab bar hidden and the header cluster intact. */

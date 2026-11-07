@@ -11,7 +11,13 @@ import { defineConfig } from "@playwright/test";
 // builds+runs the example, polls `/api/health` until ready, and (outside
 // CI, where `reuseExistingServer` is true) leaves an already-running
 // instance alone so repeated local runs don't pay the cargo build cost.
+//
+// A second instance on KIDS_PORT runs the same harness with
+// `CARREL_E2E_KIDS=1` (a web PIN and two kids-test series) for the Kids mode
+// specs, which point their own `baseURL` at it. The default instance stays
+// exactly as before, since the other specs assume no PIN and no series.
 const PORT = 7810;
+const KIDS_PORT = 7811;
 
 export default defineConfig({
   testDir: "./e2e",
@@ -44,12 +50,22 @@ export default defineConfig({
       use: { browserName: "chromium", channel: "chromium" },
     },
   ],
-  webServer: {
-    command: "cargo run --quiet --example web_e2e_server",
-    cwd: "src-tauri",
-    url: `http://127.0.0.1:${PORT}/api/health`,
-    reuseExistingServer: !process.env.CI,
-    timeout: 180_000,
-    env: { CARREL_E2E_PORT: String(PORT) },
-  },
+  webServer: [
+    {
+      command: "cargo run --quiet --example web_e2e_server",
+      cwd: "src-tauri",
+      url: `http://127.0.0.1:${PORT}/api/health`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+      env: { CARREL_E2E_PORT: String(PORT) },
+    },
+    {
+      command: "cargo run --quiet --example web_e2e_server",
+      cwd: "src-tauri",
+      url: `http://127.0.0.1:${KIDS_PORT}/api/health`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+      env: { CARREL_E2E_PORT: String(KIDS_PORT), CARREL_E2E_KIDS: "1" },
+    },
+  ],
 });

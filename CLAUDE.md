@@ -56,7 +56,9 @@ identifier and change it only together with a migration.
 | `carrel_session` cookie, `x-carrel-profile` header | `web_server/` + `static/` | break offline-cached `app.js`/`sw.js`, which still send and read the old names |
 | `carrel-shell-*`, `carrel-offline-book-*`, `carrel-offline-scope` | `static/sw.js`, `static/app.js` | orphan every offline-saved book on every user's device |
 | `carrel-*` / `carrel_*` localStorage keys | `src/context/ThemeContext.tsx`, `src/screens/Library.tsx`, `static/app.js`, … | reset every user's theme, typography, filters, and onboarding state |
+| `carrel-kids-device` localStorage key (value `"1"`) | `static/app.js` | make every device in web Kids mode forget it: the next parent login after its session ends lands in the full library instead of back in Kids mode |
 | `CARREL_APTABASE_KEY`, `CARREL_LOG`, `CARREL_DEBUG_PAGES`, `CARREL_E2E_PORT` | `build.rs`, `analytics.rs`, CI | break the GitHub Actions repo variable and existing local/CI env |
+| `CARREL_E2E_KIDS` | `src-tauri/examples/web_e2e_server.rs`, `playwright.config.ts` | boot the Kids mode e2e server (port 7811) as the plain harness, with no PIN and no series, so every `e2e/kids-*.spec.ts` fails at login |
 | `carrel-core`, `CarrelError`, `CarrelResult`, `CarrelEvent` | `carrel-core/` and every caller | break Carrel Server, which consumes this crate as a git dependency pinned to a release tag |
 | `carrel-offline` IndexedDB database | `static/app.js` | orphan every offline-saved book's blobs (separate from the Cache Storage entry above) |
 | `21c2cdba-327a-5023-94aa-a2fbf307774c` | `tauri.conf.json` `bundle.windows.wix.upgradeCode` | make every Windows MSI install **side-by-side** with the user's existing install instead of upgrading it in place |

@@ -33,12 +33,15 @@
   // all cookies") — unguarded, that would abort this whole IIFE and
   // permanently blank the page. Mirrors the try/catch already used by
   // index.html's bootstrap script; every localStorage call site in this file
-  // goes through these two helpers.
+  // goes through these helpers.
   function safeStorageGet(key) {
     try { return localStorage.getItem(key); } catch (e) { return null; }
   }
   function safeStorageSet(key, value) {
     try { localStorage.setItem(key, value); } catch (e) { /* best-effort */ }
+  }
+  function safeStorageRemove(key) {
+    try { localStorage.removeItem(key); } catch (e) { /* best-effort */ }
   }
 
   // Web reader typography (font size / line spacing / font family / column
@@ -1481,6 +1484,8 @@
     // survive a navigation — it would block the next view and swallow
     // shortcuts on it.
     closeShortcutsOverlay();
+    // Same for the Kids mode dialogs.
+    closeKidsDialog();
     // Same document.body-survival hazard: a Define result card would float
     // over the next view (Backspace-goBack reaches here without the Esc
     // branch's popover check, and browser back skips keydown entirely).
@@ -1514,6 +1519,13 @@
         if (bm) showToast("That book isn't available offline");
         return showOfflineLibrary(gen);
       }
+    }
+    // Kids mode: stats and vocabulary are household data, which the server
+    // refuses a Kids session, so their URLs land on the library instead.
+    // replaceState rather than navigate(), so Back doesn't bounce off it.
+    if (kidsMode && (hash === "#/stats" || hash.startsWith("#/vocab"))) {
+      history.replaceState(null, "", "#/library");
+      return showLibrary(parseLibraryParams("#/library"));
     }
     if (hash === "#" || hash === "#/" || hash.startsWith("#/library")) {
       return showLibrary(parseLibraryParams(hash));
@@ -1764,6 +1776,9 @@
         // Same reasoning as init() below.
         if (loginScope === "unknown") await markOfflineProfileUnknown();
         else if (loginScope === "changed") await verifyOfflineIntegrity();
+        // A device that was in Kids mode goes back into it here, before the
+        // first render — the parent typed the PIN, the kid gets the device.
+        await loadKidsStatus();
         route();
       } catch(e) { err.textContent = "Connection error"; btn.disabled = false; }
     }
@@ -2009,7 +2024,7 @@
             <option value="last_read">Last Read</option>
             <option value="rating">Rating</option>
           </select>
-          ${navIconsHtml("")}
+          ${navIconsHtml("library")}
         </div>
         <div class="filter-bar" id="filter-bar"></div>
         <div id="library-content">${skeletonGridHtml()}</div>
@@ -5855,7 +5870,9 @@
   // server-side too (defense in depth), so this is purely to avoid offering
   // a button that would silently no-op.
   function vocabularyAvailable() {
-    return !!(dictStatus && dictStatus.vocabulary);
+    // Never in Kids mode: the server refuses vocabulary to a Kids session
+    // (saved words quote the books they came from).
+    return !kidsMode && !!(dictStatus && dictStatus.vocabulary);
   }
 
   // Scroll events are dispatched asynchronously: a programmatic
@@ -8089,6 +8106,294 @@
     return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>';
   }
 
+  // ── Kids mode ──────────────────────────────────
+  // A lock on this device. While it's on, the server answers this session
+  // with only the books a parent marked OK for kids and refuses stats,
+  // vocabulary, profiles and the rest, so `kidsMode` here only decides which
+  // chrome to draw. Entering is free; leaving needs the parents' code.
+  //
+  // Web sessions are in-memory on the server with a 24 h TTL, so the device
+  // also remembers it was in Kids mode (KIDS_DEVICE_KEY = "1"): the next time
+  // a parent logs in on it, loadKidsStatus() puts the new session straight
+  // back into Kids mode. Online, that flag is only a convenience; the
+  // server's session flag is what enforces.
+  let kidsMode = false;
+  const KIDS_DEVICE_KEY = "carrel-kids-device";
+  const KIDS_NO_PIN_TEXT = "Kids mode needs a web PIN. Set one in the desktop app first.";
+  const KIDS_ICON_PATH =
+    '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01M15 9h.01"/>';
+
+  function kidsDeviceRemembered() {
+    return safeStorageGet(KIDS_DEVICE_KEY) === "1";
+  }
+
+  /// Asks the server whether this session is in Kids mode, after putting it
+  /// back in if this device remembers being there. Runs on every online boot
+  /// and login, before the first render. Never throws. A status it can't read
+  /// leaves `kidsMode` as it was: drawing the Kids chrome over a session the
+  /// server isn't confining would label the whole library kid-safe.
+  async function loadKidsStatus() {
+    // Only a device that remembers Kids mode has a failure worth showing: a
+    // parent just logged in on it and expects it back in Kids mode.
+    const fail = (message) => { if (kidsDeviceRemembered()) showToast(message); };
+    let status;
+    try {
+      const resp = await api("/api/kids/status");
+      if (!resp) return;
+      if (!resp.ok) return fail(httpErrorToastMessage(resp.status));
+      status = await resp.json();
+      if (!status.kids && kidsDeviceRemembered() && status.pin_configured && status.code_set) {
+        const entered = await kidsWrite("POST", "/api/kids/enter");
+        if (!entered) return;
+        if (!entered.ok) return fail(kidsEnterErrorText(entered.status));
+        status = await entered.json();
+      }
+    } catch (e) {
+      return fail(apiFailureToastMessage(e));
+    }
+    kidsMode = !!status.kids;
+    // The server says this session is a kid's, so make sure the device
+    // remembers it too.
+    if (kidsMode) safeStorageSet(KIDS_DEVICE_KEY, "1");
+  }
+
+  /// apiWrite for the Kids routes, with a JSON body. Resolves to the
+  /// Response, or to null when there's nothing left for the caller to do:
+  /// logged out (the PIN screen is up) or the profile moved (the page is
+  /// reloading). Throws only for a network failure.
+  async function kidsWrite(method, path, body) {
+    let resp;
+    try {
+      resp = await apiWrite(path, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (e) {
+      if (e instanceof ProfileMovedError) return null;
+      throw new ApiNetworkError(e && e.message ? e.message : String(e));
+    }
+    if (resp.status === 401) {
+      authenticated = false;
+      closeKidsDialog();
+      showLogin();
+      return null;
+    }
+    return resp;
+  }
+
+  function kidsEnterErrorText(status) {
+    if (status === 403) return KIDS_NO_PIN_TEXT;
+    if (status === 409) return "Set a parents' code first";
+    return httpErrorToastMessage(status);
+  }
+
+  // Entering or leaving changes the header and tab bar, which showLibrary
+  // keeps across a re-route of the same view (it only re-syncs the
+  // controls) — so clear the view and route into a fresh one.
+  function rerouteForKidsChange() {
+    closeKidsDialog();
+    app().innerHTML = "";
+    route();
+  }
+
+  function kidsBadgeHtml() {
+    return `<div class="kids-badge">
+      <span class="kids-badge-label">Kids mode</span>
+      <button type="button" class="kids-leave-btn">Leave Kids mode</button>
+    </div>`;
+  }
+
+  /// The parent's way into showKidsPanel(): an icon in the header cluster, or
+  /// a tab in the tab bar, which replaces the header one at narrow/touch
+  /// widths (see app.css) the way the tab bar replaces the nav icons. Not a
+  /// `.tab`, so bindTabBar() doesn't bind it as a destination.
+  function kidsModeButtonHtml(inTabBar) {
+    return inTabBar
+      ? `<button type="button" class="kids-mode-btn" aria-label="Kids mode">
+          ${navIconSvg(22, KIDS_ICON_PATH)}
+          <span class="tab-label">Kids mode</span>
+        </button>`
+      : `<button type="button" class="nav-icon kids-mode-btn" title="Kids mode" aria-label="Kids mode">
+          ${navIconSvg(20, KIDS_ICON_PATH)}
+        </button>`;
+  }
+
+  function bindKidsControls() {
+    $$(".kids-mode-btn").forEach((b) => { b.onclick = showKidsPanel; });
+    $$(".kids-leave-btn").forEach((b) => { b.onclick = showKidsExitDialog; });
+  }
+
+  // The two dialogs share one overlay on document.body, like the shortcuts
+  // overlay, so the view underneath stays as it was; route() closes it.
+  function openKidsDialog(inner) {
+    closeKidsDialog();
+    const div = document.createElement("div");
+    div.className = "kids-overlay";
+    div.id = "kids-overlay";
+    div.innerHTML = `<div class="kids-dialog" role="dialog" aria-labelledby="kids-dialog-title">${inner}</div>`;
+    document.body.appendChild(div);
+    div.addEventListener("click", (e) => { if (e.target === div) closeKidsDialog(); });
+    const close = div.querySelector("#kids-close");
+    if (close) close.onclick = closeKidsDialog;
+    (div.querySelector("input") || close).focus();
+  }
+
+  function closeKidsDialog() {
+    const div = $("#kids-overlay");
+    if (div) div.remove();
+  }
+
+  // Enter runs the field's action and Esc closes the dialog. Both are
+  // handled on the field itself: the global shortcut dispatcher ignores
+  // keys typed into an input.
+  function bindKidsField(input, onEnter) {
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); onEnter(); }
+      else if (e.key === "Escape") { e.preventDefault(); closeKidsDialog(); }
+    };
+  }
+
+  const KIDS_CODE_FIELD = `
+    <label for="kids-code">Parents' code</label>
+    <input type="password" id="kids-code" inputmode="numeric" autocomplete="off" maxlength="12">`;
+
+  function showKidsExitDialog() {
+    openKidsDialog(`
+      <h2 id="kids-dialog-title">Leave Kids mode</h2>
+      ${KIDS_CODE_FIELD}
+      <div class="kids-error" id="kids-error" role="alert"></div>
+      <div class="kids-actions">
+        <button class="btn-primary" id="kids-leave-submit">Leave</button>
+        <button class="btn-secondary" id="kids-close">Cancel</button>
+      </div>`);
+    const input = $("#kids-code");
+    const err = $("#kids-error");
+    const submit = $("#kids-leave-submit");
+    async function leave() {
+      if (submit.disabled || !input.value) return;
+      submit.disabled = true;
+      err.textContent = "";
+      let resp;
+      try {
+        resp = await kidsWrite("POST", "/api/kids/exit", { code: input.value });
+      } catch (e) {
+        err.textContent = apiFailureToastMessage(e);
+        submit.disabled = false;
+        return;
+      }
+      if (!resp) return;
+      submit.disabled = false;
+      if (!resp.ok) {
+        err.textContent =
+          resp.status === 403 ? "Incorrect code"
+          : resp.status === 429 ? "Too many attempts. Try again later."
+          : httpErrorToastMessage(resp.status);
+        input.select();
+        return;
+      }
+      safeStorageRemove(KIDS_DEVICE_KEY);
+      kidsMode = false;
+      // A boot in Kids mode couldn't load the profile list (the server
+      // refuses it to a Kids session), so catch up the way doLogin does.
+      const scope = await syncOfflineScopeWithServer();
+      if (scope === "unknown") await markOfflineProfileUnknown();
+      else if (scope === "changed") await verifyOfflineIntegrity();
+      rerouteForKidsChange();
+    }
+    submit.onclick = leave;
+    bindKidsField(input, leave);
+  }
+
+  /// The parent's Kids mode panel: set or change the parents' code, and turn
+  /// Kids mode on for this device.
+  async function showKidsPanel() {
+    let status;
+    try {
+      const resp = await api("/api/kids/status");
+      if (!resp) return;
+      if (!resp.ok) { showToast(httpErrorToastMessage(resp.status)); return; }
+      status = await resp.json();
+    } catch (e) {
+      showToast(apiFailureToastMessage(e));
+      return;
+    }
+    if (!status.pin_configured) {
+      openKidsDialog(`
+        <h2 id="kids-dialog-title">Kids mode</h2>
+        <p>${esc(KIDS_NO_PIN_TEXT)}</p>
+        <div class="kids-actions">
+          <button class="btn-secondary" id="kids-close">Close</button>
+        </div>`);
+      return;
+    }
+    openKidsDialog(`
+      <h2 id="kids-dialog-title">Kids mode</h2>
+      ${KIDS_CODE_FIELD}
+      <button class="btn-secondary" id="kids-code-save">${status.code_set ? "Change parents' code" : "Set parents' code"}</button>
+      <div class="kids-error" id="kids-error" role="alert"></div>
+      <div class="kids-actions">
+        <button class="btn-primary" id="kids-enter-btn">Turn on Kids mode</button>
+        <button class="btn-secondary" id="kids-close">Close</button>
+      </div>`);
+    const input = $("#kids-code");
+    const err = $("#kids-error");
+    const save = $("#kids-code-save");
+    const enter = $("#kids-enter-btn");
+
+    async function saveCode() {
+      if (save.disabled) return;
+      save.disabled = true;
+      err.textContent = "";
+      let resp;
+      try {
+        resp = await kidsWrite("PUT", "/api/kids/code", { code: input.value });
+      } catch (e) {
+        err.textContent = apiFailureToastMessage(e);
+        save.disabled = false;
+        return;
+      }
+      if (!resp) return;
+      save.disabled = false;
+      if (!resp.ok) {
+        err.textContent = resp.status === 400
+          ? "Parents' code must be 4 to 12 digits"
+          : httpErrorToastMessage(resp.status);
+        return;
+      }
+      input.value = "";
+      save.textContent = "Change parents' code";
+      showToast("Parents' code saved");
+    }
+
+    async function turnOn() {
+      if (enter.disabled) return;
+      enter.disabled = true;
+      err.textContent = "";
+      let resp;
+      try {
+        resp = await kidsWrite("POST", "/api/kids/enter");
+      } catch (e) {
+        err.textContent = apiFailureToastMessage(e);
+        enter.disabled = false;
+        return;
+      }
+      if (!resp) return;
+      enter.disabled = false;
+      if (!resp.ok) { err.textContent = kidsEnterErrorText(resp.status); return; }
+      // Only after the server agreed: a refused enter must not leave a flag
+      // that turns Kids mode on at some later login.
+      safeStorageSet(KIDS_DEVICE_KEY, "1");
+      kidsMode = true;
+      rerouteForKidsChange();
+    }
+
+    save.onclick = saveCode;
+    enter.onclick = turnOn;
+    bindKidsField(input, saveCode);
+  }
+
   // ── Profile switcher (remote profile switching) ────────────────
   // One active profile is shared by the desktop app and every web/OPDS client,
   // so switching here moves all of them. A locked profile is listed but not
@@ -8265,18 +8570,24 @@
     const folderColor = activePage === "collections" ? "active" : "";
     const chartColor = activePage === "stats" ? "active" : "";
     const vocabColor = activePage === "vocabulary" ? "active" : "";
+    // Kids mode drops the household entries (profiles, stats, vocabulary),
+    // which the server refuses a Kids session anyway, for the Kids badge.
+    // The parent's Kids mode button is a library-level switch, so it's only
+    // on the top-level views (activePage set): a book's header has no width
+    // to spare on a phone.
     return `<div class="nav-icons">
-      ${profileSwitcherHtml()}
+      ${kidsMode ? "" : profileSwitcherHtml()}
       ${themeToggleHtml()}
       <button class="nav-icon ${folderColor}" title="Collections" aria-label="Collections" data-nav="collections">
         ${navIconSvg(20, NAV_ICON_PATH.collections)}
       </button>
-      <button class="nav-icon ${chartColor}" title="Reading Stats" aria-label="Reading Stats" data-nav="stats">
+      ${kidsMode ? kidsBadgeHtml() : `<button class="nav-icon ${chartColor}" title="Reading Stats" aria-label="Reading Stats" data-nav="stats">
         ${navIconSvg(20, NAV_ICON_PATH.stats)}
       </button>
       <button class="nav-icon ${vocabColor}" title="Vocabulary" aria-label="Vocabulary" data-nav="vocabulary"${vocabularyAvailable() ? "" : " hidden"}>
         ${navIconSvg(20, NAV_ICON_PATH.vocabulary)}
       </button>
+      ${activePage ? kidsModeButtonHtml(false) : ""}`}
     </div>`;
   }
 
@@ -8287,6 +8598,7 @@
     const themeBtn = $("#theme-toggle-btn");
     if (themeBtn) themeBtn.onclick = cycleTheme;
     bindProfileSwitcher();
+    bindKidsControls();
   }
 
   // Item A (app-feel Tier 1): fixed bottom tab bar for primary navigation on
@@ -8308,8 +8620,9 @@
     return `<nav class="tab-bar" aria-label="Primary">
       ${tab("library", "Library", navIconSvg(22, NAV_ICON_PATH.library))}
       ${tab("collections", "Collections", navIconSvg(22, NAV_ICON_PATH.collections))}
-      ${tab("stats", "Stats", navIconSvg(22, NAV_ICON_PATH.stats))}
+      ${kidsMode ? kidsBadgeHtml() : `${tab("stats", "Stats", navIconSvg(22, NAV_ICON_PATH.stats))}
       ${tab("vocabulary", "Words", navIconSvg(22, NAV_ICON_PATH.vocabulary), !vocabularyAvailable())}
+      ${kidsModeButtonHtml(true)}`}
     </nav>`;
   }
 
@@ -8317,6 +8630,7 @@
     $$(".tab-bar .tab").forEach(t => {
       t.onclick = () => navigate(t.dataset.tab === "library" ? "#/" : "#/" + t.dataset.tab);
     });
+    bindKidsControls();
   }
 
   // Item 9 (PWA): feature-detected registration — service workers only
@@ -8457,6 +8771,9 @@
     // scope has already been moved to the profile the imminent reload lands
     // in, which is where boot would put it anyway. Nothing below should run.
     if (superseded() || reloadPending) return;
+    // Same as init(): a device that booted offline learns its Kids mode here.
+    await loadKidsStatus();
+    if (superseded() || reloadPending) return;
     offlineMode = false;
     route();
   }
@@ -8530,6 +8847,9 @@
     } else if (bootScope === "changed") {
       await verifyOfflineIntegrity();
     }
+    // Kids mode decides what the first render draws, so it's settled first
+    // (and a device that remembers it goes back in here — see loadKidsStatus).
+    await loadKidsStatus();
     // Reconnected (or a normal online launch): flush any progress queued
     // while offline. Fire-and-forget — it serializes per book via saveChains
     // and never blocks the first render.

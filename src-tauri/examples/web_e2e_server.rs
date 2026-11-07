@@ -49,6 +49,17 @@
 //!   relative `file_path`; that's fine since nothing beyond the grid/
 //!   detail metadata is exercised for them (a missing cover 404s and the
 //!   client falls back to its placeholder).
+//!
+//! ## Kids mode variant (`CARREL_E2E_KIDS=1`)
+//!
+//! For the Kids mode specs (`e2e/kids-*.spec.ts`, port 7811 in
+//! `playwright.config.ts`). With the variable unset none of this applies, and
+//! every other spec relies on that: no PIN, no series anywhere.
+//! - The web PIN is `2468`, since web Kids mode needs one.
+//! - `Book 001`..`Book 003` are in series `Kids Series` and `Book 004`..
+//!   `Book 006` in `Adult Series`; every other book stays in none.
+//! - The parents' code lives in a `MemoryKidsCodeStore` (as in the default
+//!   run), never the OS keychain, and starts unset.
 
 use carrel_lib::db;
 use carrel_lib::models::{Book, BookFormat, ReadingProgress};
@@ -320,13 +331,26 @@ fn new_book(n: u32, cbz_path: &Path, epub_path: &Path) -> Book {
     }
 }
 
+/// The Kids mode variant's series for book `n` (see the module docs).
+fn kids_series(n: u32) -> Option<String> {
+    match n {
+        1..=3 => Some("Kids Series".to_string()),
+        4..=6 => Some("Adult Series".to_string()),
+        _ => None,
+    }
+}
+
 fn seed(
     conn: &rusqlite::Connection,
     cbz_path: &Path,
     epub_path: &Path,
+    kids: bool,
 ) -> Result<(), Box<dyn Error>> {
     for n in 1..=TOTAL_BOOKS {
-        let book = new_book(n, cbz_path, epub_path);
+        let mut book = new_book(n, cbz_path, epub_path);
+        if kids {
+            book.series = kids_series(n);
+        }
         let added_at = book.added_at;
         db::insert_book(conn, &book)?;
 
@@ -460,10 +484,12 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     let epub_path = tempdir.path().join("test-book.epub");
     build_test_epub(&epub_path)?;
 
+    let kids = std::env::var("CARREL_E2E_KIDS").as_deref() == Ok("1");
+
     let pool = db::create_pool(&db_path)?;
     {
         let conn = pool.get()?;
-        seed(&conn, &cbz_path, &epub_path)?;
+        seed(&conn, &cbz_path, &epub_path, kids)?;
         // M2: enable the dictionary so /api/dictionary/status reports
         // {installed: true, enabled: true} — see the artifact seed below.
         db::set_setting(&conn, "dictionary_enabled", "true")?;
@@ -487,7 +513,7 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         pool: Arc::new(Mutex::new(pool)),
         data_dir,
         cache_dir,
-        pin_hash: Arc::new(Mutex::new(None)),
+        pin_hash: Arc::new(Mutex::new(kids.then(|| auth::hash_pin("2468")))),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         login_limiter: Arc::new(auth::RateLimiter::new(5, 300)),
         // The harness serves one (unlocked, lock-free) "default" profile —
