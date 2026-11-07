@@ -228,6 +228,7 @@ pub fn run() {
                 kids_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     kids_mode::read_kids_state(&kids_data_dir).enabled,
                 )),
+                kids_exit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             });
 
             // Usage analytics (opt-in): fire one anonymous `app_started` per

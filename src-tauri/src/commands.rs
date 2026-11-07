@@ -164,6 +164,9 @@ pub struct AppState {
     /// `{data_dir}/kids_mode.json` at startup; `enter_kids_mode` /
     /// `exit_kids_mode` are the only mutators and persist before flipping.
     pub kids_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Serialises `exit_kids_mode`'s read -> verify -> write so concurrent
+    /// guesses cannot all act on the same stale failure count. Leaf lock.
+    pub kids_exit_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -2516,6 +2519,7 @@ pub async fn exit_kids_mode<R: tauri::Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
 ) -> CarrelResult<KidsModeStatus> {
+    let _exit_guard = state.kids_exit_lock.lock().await;
     let mut device = crate::kids_mode::read_kids_state(&state.data_dir);
     let now = unix_now();
     if crate::kids_mode::is_locked(&device, now) {
@@ -9862,6 +9866,32 @@ mod tests {
         assert!(state.is_kids_mode());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_wrong_codes_still_trip_the_lock() {
+        let (app, dir) = mock_app_with_state();
+        {
+            let state = app.handle().state::<AppState>();
+            kids_with_code(&app, &state).await;
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let h = app.handle().clone();
+            tasks.push(tokio::spawn(async move {
+                let state = h.state::<AppState>();
+                exit_kids_mode("0000".to_string(), h.clone(), state).await
+            }));
+        }
+        for t in tasks {
+            assert!(t.await.unwrap().is_err());
+        }
+        let state = app.handle().state::<AppState>();
+        let err = exit_kids_mode("1234".to_string(), app.handle().clone(), state.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CarrelError::RateLimited(_)), "got {err:?}");
+        assert!(crate::kids_mode::read_kids_state(dir.path()).locked_until > 0);
+    }
+
     #[tokio::test]
     async fn exit_right_code_turns_it_off() {
         let (app, dir) = mock_app_with_state();
@@ -12229,6 +12259,7 @@ mod tests {
             update_check: crate::update::UpdateCheckState::new(),
             kids_code_store: std::sync::Arc::new(carrel_core::kids::MemoryKidsCodeStore::default()),
             kids_mode: std::sync::Arc::new(AtomicBool::new(false)),
+            kids_exit_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         });
         (app, dir)
     }
