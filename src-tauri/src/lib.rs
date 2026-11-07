@@ -3,6 +3,7 @@ pub mod analytics;
 mod ci_workflow_test;
 pub mod commands;
 pub mod ipc_metrics;
+pub mod kids_mode;
 pub mod observability;
 pub mod page_wire;
 pub mod plugin_host;
@@ -177,6 +178,7 @@ pub fn run() {
                 unlocked_profiles.insert("default".to_string());
             }
 
+            let kids_data_dir = data_dir.clone();
             app.manage(AppState {
                 shared_active_pool: std::sync::Arc::new(std::sync::Mutex::new(pool.clone())),
                 shared_active_profile_name: std::sync::Arc::new(std::sync::Mutex::new(
@@ -223,6 +225,9 @@ pub fn run() {
                 startup_update_check_taken: std::sync::atomic::AtomicBool::new(false),
                 update_check: crate::update::UpdateCheckState::new(),
                 kids_code_store: carrel_core::kids::production_code_store(),
+                kids_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    kids_mode::read_kids_state(&kids_data_dir).enabled,
+                )),
             });
 
             // Usage analytics (opt-in): fire one anonymous `app_started` per
@@ -473,6 +478,14 @@ pub fn run() {
             commands::save_reading_progress,
             commands::set_private_mode,
             commands::get_private_mode,
+            commands::get_kids_mode,
+            commands::enter_kids_mode,
+            commands::exit_kids_mode,
+            commands::set_kids_code,
+            commands::get_kids_series,
+            commands::set_kids_series,
+            commands::get_kids_book_mark,
+            commands::set_kids_book_override,
             commands::get_bookmarks,
             commands::add_bookmark,
             commands::remove_bookmark,

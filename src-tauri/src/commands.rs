@@ -160,9 +160,18 @@ pub struct AppState {
     /// production). App-global, and cloned into every `WebState`'s
     /// `KidsWebState` so web and desktop check the same code.
     pub kids_code_store: std::sync::Arc<dyn carrel_core::kids::KidsCodeStore>,
+    /// Desktop Kids mode (app-global, not per profile). Initialised from
+    /// `{data_dir}/kids_mode.json` at startup; `enter_kids_mode` /
+    /// `exit_kids_mode` are the only mutators and persist before flipping.
+    pub kids_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
+    /// Whether desktop Kids mode is on.
+    pub fn is_kids_mode(&self) -> bool {
+        self.kids_mode.load(Ordering::SeqCst)
+    }
+
     /// Returns the DB pool for the active profile, gated by the soft-lock
     /// session state (A-M2, spec D-6/SB-7). The active profile's DB is the
     /// single chokepoint every data-bearing IPC command flows through, so
@@ -1463,7 +1472,11 @@ pub async fn get_library(state: State<'_, AppState>) -> CarrelResult<Vec<Book>> 
 pub async fn get_library_grid(state: State<'_, AppState>) -> CarrelResult<Vec<BookGridItem>> {
     let _t = state.ipc_metrics.time("get_library_grid");
     let conn = state.active_db()?.get()?;
-    let mut items = db::list_books_grid(&conn)?;
+    let mut items = if state.is_kids_mode() {
+        db::list_books_grid_kids(&conn)?
+    } else {
+        db::list_books_grid(&conn)?
+    };
     if let Ok(storage) = state.covers_storage() {
         apply_grid_thumbnails(&*storage, &mut items);
     }
@@ -1602,6 +1615,9 @@ pub async fn remove_book<R: tauri::Runtime>(
 #[tauri::command]
 pub async fn get_book(book_id: String, state: State<'_, AppState>) -> CarrelResult<Option<Book>> {
     let conn = state.active_db()?.get()?;
+    if state.is_kids_mode() && !carrel_core::kids::is_book_visible(&conn, &book_id)? {
+        return Ok(None);
+    }
     Ok(db::get_book(&conn, &book_id)?)
 }
 
@@ -1845,7 +1861,11 @@ pub async fn get_recently_read(
     state: State<'_, AppState>,
 ) -> CarrelResult<Vec<Book>> {
     let conn = state.active_db()?.get()?;
-    Ok(db::get_recently_read_books(&conn, limit.unwrap_or(5))?)
+    let limit = limit.unwrap_or(5);
+    if state.is_kids_mode() {
+        return Ok(db::get_recently_read_books_kids(&conn, limit)?);
+    }
+    Ok(db::get_recently_read_books(&conn, limit)?)
 }
 
 // --- Reading ---
@@ -2432,6 +2452,145 @@ pub async fn set_private_mode<R: tauri::Runtime>(
 #[tauri::command]
 pub async fn get_private_mode(state: State<'_, AppState>) -> CarrelResult<bool> {
     Ok(state.is_private())
+}
+
+// --- Kids mode (desktop) ---
+
+/// Kids-mode status for the frontend: `{ enabled, codeSet }`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KidsModeStatus {
+    pub enabled: bool,
+    pub code_set: bool,
+}
+
+fn kids_status(state: &AppState) -> CarrelResult<KidsModeStatus> {
+    Ok(KidsModeStatus {
+        enabled: state.is_kids_mode(),
+        code_set: state.kids_code_store.load()?.is_some(),
+    })
+}
+
+/// Management commands are unavailable while Kids mode is on.
+fn refuse_in_kids_mode(state: &AppState) -> CarrelResult<()> {
+    if state.is_kids_mode() {
+        return Err(CarrelError::PermissionDenied(
+            "Not available in Kids mode".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[tauri::command]
+pub async fn get_kids_mode(state: State<'_, AppState>) -> CarrelResult<KidsModeStatus> {
+    kids_status(&state)
+}
+
+#[tauri::command]
+pub async fn enter_kids_mode<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> CarrelResult<KidsModeStatus> {
+    if state.kids_code_store.load()?.is_none() {
+        return Err(CarrelError::invalid("Set a parents' code first"));
+    }
+    let mut device = crate::kids_mode::read_kids_state(&state.data_dir);
+    device.enabled = true;
+    crate::kids_mode::write_kids_state(&state.data_dir, &device)?;
+    state.kids_mode.store(true, Ordering::SeqCst);
+    let status = kids_status(&state)?;
+    let _ = app.emit("kids-mode-changed", &status.enabled);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn exit_kids_mode<R: tauri::Runtime>(
+    code: String,
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> CarrelResult<KidsModeStatus> {
+    let mut device = crate::kids_mode::read_kids_state(&state.data_dir);
+    let now = unix_now();
+    if crate::kids_mode::is_locked(&device, now) {
+        return Err(CarrelError::RateLimited(
+            "Too many attempts. Try again later.".into(),
+        ));
+    }
+    // No stored code (only reachable via a corrupted state file): nothing to
+    // verify against, so leaving must stay possible.
+    if let Some(phc) = state.kids_code_store.load()? {
+        if !verify_password_blocking(SecretString::from(code), phc).await? {
+            crate::kids_mode::write_kids_state(
+                &state.data_dir,
+                &crate::kids_mode::register_failure(&device, now),
+            )?;
+            return Err(CarrelError::invalid("Incorrect code"));
+        }
+    }
+    device = crate::kids_mode::KidsDeviceState::default();
+    crate::kids_mode::write_kids_state(&state.data_dir, &device)?;
+    state.kids_mode.store(false, Ordering::SeqCst);
+    let status = kids_status(&state)?;
+    let _ = app.emit("kids-mode-changed", &status.enabled);
+    Ok(status)
+}
+
+/// Sets or replaces the parents' code. Needs no old code (forgotten-code
+/// recovery) but is refused while Kids mode is on.
+#[tauri::command]
+pub async fn set_kids_code(code: String, state: State<'_, AppState>) -> CarrelResult<()> {
+    refuse_in_kids_mode(&state)?;
+    carrel_core::kids::validate_code(&code)?;
+    let phc = hash_password_blocking(SecretString::from(code)).await?;
+    state.kids_code_store.store(&phc)
+}
+
+#[tauri::command]
+pub async fn get_kids_series(state: State<'_, AppState>) -> CarrelResult<Vec<String>> {
+    refuse_in_kids_mode(&state)?;
+    let conn = state.active_db()?.get()?;
+    Ok(carrel_core::kids::list_allowed_series(&conn)?)
+}
+
+#[tauri::command]
+pub async fn set_kids_series(
+    series: String,
+    allowed: bool,
+    state: State<'_, AppState>,
+) -> CarrelResult<()> {
+    refuse_in_kids_mode(&state)?;
+    let conn = state.active_db()?.get()?;
+    Ok(carrel_core::kids::set_series_allowed(
+        &conn, &series, allowed,
+    )?)
+}
+
+#[tauri::command]
+pub async fn get_kids_book_mark(
+    book_id: String,
+    state: State<'_, AppState>,
+) -> CarrelResult<Option<carrel_core::kids::KidsBookMark>> {
+    refuse_in_kids_mode(&state)?;
+    let conn = state.active_db()?.get()?;
+    Ok(carrel_core::kids::get_book_mark(&conn, &book_id)?)
+}
+
+#[tauri::command]
+pub async fn set_kids_book_override(
+    book_id: String,
+    mode: carrel_core::kids::KidsOverride,
+    state: State<'_, AppState>,
+) -> CarrelResult<()> {
+    refuse_in_kids_mode(&state)?;
+    let conn = state.active_db()?.get()?;
+    Ok(carrel_core::kids::set_book_override(&conn, &book_id, mode)?)
 }
 
 // --- Bookmarks ---
@@ -3756,6 +3915,12 @@ pub async fn update_collection(
 #[tauri::command]
 pub async fn get_collections(state: State<'_, AppState>) -> CarrelResult<Vec<Collection>> {
     let conn = state.active_db()?.get()?;
+    if state.is_kids_mode() {
+        return Ok(db::list_collections_kids(&conn)?
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect());
+    }
     Ok(db::list_collections(&conn)?)
 }
 
@@ -3827,7 +3992,11 @@ pub async fn get_books_in_collection_grid(
     state: State<'_, AppState>,
 ) -> CarrelResult<Vec<BookGridItem>> {
     let conn = state.active_db()?.get()?;
-    let mut items = db::get_books_in_collection_grid(&conn, &collection_id)?;
+    let mut items = if state.is_kids_mode() {
+        db::get_books_in_collection_grid_kids(&conn, &collection_id)?
+    } else {
+        db::get_books_in_collection_grid(&conn, &collection_id)?
+    };
     if let Ok(storage) = state.covers_storage() {
         apply_grid_thumbnails(&*storage, &mut items);
     }
@@ -8171,6 +8340,9 @@ pub async fn preview_collection_rules(
 pub async fn get_collection_suggestions(
     state: State<'_, AppState>,
 ) -> CarrelResult<Vec<CollectionSuggestion>> {
+    if state.is_kids_mode() {
+        return Ok(Vec::new());
+    }
     let conn = state.active_db()?.get()?;
     let collections = db::list_collections(&conn)?;
     Ok(db::get_collection_suggestions(&conn, &collections)?)
@@ -9549,6 +9721,200 @@ mod tests {
             .await
             .unwrap();
         assert!(!state.is_private());
+    }
+
+    // --- Kids mode (desktop) ---
+
+    fn kids_book(id: &str, series: Option<&str>) -> Book {
+        Book {
+            id: id.to_string(),
+            title: format!("Title {id}"),
+            author: "Author".to_string(),
+            file_path: format!("/tmp/{id}.epub"),
+            cover_path: None,
+            total_chapters: 1,
+            added_at: 1700000000,
+            format: crate::models::BookFormat::Epub,
+            file_hash: None,
+            description: None,
+            genres: None,
+            rating: None,
+            isbn: None,
+            openlibrary_key: None,
+            enrichment_status: None,
+            series: series.map(str::to_string),
+            volume: None,
+            language: None,
+            publisher: None,
+            publish_year: None,
+            is_imported: true,
+            want_to_read: false,
+        }
+    }
+
+    /// Books A (series Tintin) and B (no series); only A becomes kids-visible.
+    fn seed_kids_books(state: &AppState) {
+        let conn = state.active_db().unwrap().get().unwrap();
+        db::insert_book(&conn, &kids_book("A", Some("Tintin"))).unwrap();
+        db::insert_book(&conn, &kids_book("B", None)).unwrap();
+        carrel_core::kids::set_series_allowed(&conn, "Tintin", true).unwrap();
+    }
+
+    async fn kids_with_code(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        state: &State<'_, AppState>,
+    ) {
+        set_kids_code("1234".to_string(), state.clone())
+            .await
+            .unwrap();
+        enter_kids_mode(app.handle().clone(), state.clone())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn kids_grid_hides_unmarked() {
+        let (app, _dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        seed_kids_books(&state);
+        assert_eq!(get_library_grid(state.clone()).await.unwrap().len(), 2);
+
+        kids_with_code(&app, &state).await;
+        let ids: Vec<String> = get_library_grid(state.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec!["A".to_string()]);
+        assert!(get_collection_suggestions(state.clone())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn kids_get_book_hidden_is_none() {
+        let (app, _dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        seed_kids_books(&state);
+        assert!(get_book("B".to_string(), state.clone())
+            .await
+            .unwrap()
+            .is_some());
+
+        kids_with_code(&app, &state).await;
+        assert!(get_book("B".to_string(), state.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_book("A".to_string(), state.clone())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn enter_requires_code() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        let err = enter_kids_mode(app.handle().clone(), state.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Set a parents' code first"));
+        assert!(!state.is_kids_mode());
+        assert!(!crate::kids_mode::kids_state_path(dir.path()).exists());
+
+        set_kids_code("1234".to_string(), state.clone())
+            .await
+            .unwrap();
+        let status = enter_kids_mode(app.handle().clone(), state.clone())
+            .await
+            .unwrap();
+        assert!(status.enabled && status.code_set);
+        assert!(crate::kids_mode::read_kids_state(dir.path()).enabled);
+    }
+
+    #[tokio::test]
+    async fn exit_wrong_code_failure_survives_reload() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        kids_with_code(&app, &state).await;
+
+        let err = exit_kids_mode("0000".to_string(), app.handle().clone(), state.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Incorrect code"));
+        assert!(state.is_kids_mode());
+        let on_disk = crate::kids_mode::read_kids_state(dir.path());
+        assert!(on_disk.enabled);
+        assert_eq!(on_disk.failed_attempts, 1);
+
+        // Five failures lock; even the right code is then refused.
+        for _ in 0..4 {
+            let _ = exit_kids_mode("0000".to_string(), app.handle().clone(), state.clone()).await;
+        }
+        let err = exit_kids_mode("1234".to_string(), app.handle().clone(), state.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CarrelError::RateLimited(_)));
+        assert!(crate::kids_mode::read_kids_state(dir.path()).locked_until > 0);
+        assert!(state.is_kids_mode());
+    }
+
+    #[tokio::test]
+    async fn exit_right_code_turns_it_off() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        kids_with_code(&app, &state).await;
+        let status = exit_kids_mode("1234".to_string(), app.handle().clone(), state.clone())
+            .await
+            .unwrap();
+        assert!(!status.enabled);
+        assert!(!state.is_kids_mode());
+        assert!(!crate::kids_mode::read_kids_state(dir.path()).enabled);
+    }
+
+    #[tokio::test]
+    async fn management_refused_in_kids_mode() {
+        let (app, _dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        seed_kids_books(&state);
+        kids_with_code(&app, &state).await;
+
+        fn denied<T>(r: CarrelResult<T>) -> bool {
+            matches!(r, Err(CarrelError::PermissionDenied(m)) if m == "Not available in Kids mode")
+        }
+        assert!(denied(set_kids_code("9999".into(), state.clone()).await));
+        assert!(denied(get_kids_series(state.clone()).await));
+        assert!(denied(
+            set_kids_series("Tintin".into(), false, state.clone()).await
+        ));
+        assert!(denied(get_kids_book_mark("A".into(), state.clone()).await));
+        assert!(denied(
+            set_kids_book_override(
+                "B".into(),
+                carrel_core::kids::KidsOverride::Allowed,
+                state.clone()
+            )
+            .await
+        ));
+        // get_kids_mode stays available.
+        assert!(get_kids_mode(state.clone()).await.unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn kids_flag_survives_profile_switch() {
+        let (app, dir) = mock_app_with_state();
+        let state = app.handle().state::<AppState>();
+        add_profile(&state, dir.path(), "alice");
+        kids_with_code(&app, &state).await;
+
+        switch_active_profile_with(app.handle(), &state, "alice".to_string(), |_| Ok(false))
+            .await
+            .unwrap();
+        assert!(state.is_kids_mode());
+        assert!(crate::kids_mode::read_kids_state(dir.path()).enabled);
     }
 
     #[tokio::test]
@@ -11862,6 +12228,7 @@ mod tests {
             startup_update_check_taken: std::sync::atomic::AtomicBool::new(false),
             update_check: crate::update::UpdateCheckState::new(),
             kids_code_store: std::sync::Arc::new(carrel_core::kids::MemoryKidsCodeStore::default()),
+            kids_mode: std::sync::Arc::new(AtomicBool::new(false)),
         });
         (app, dir)
     }

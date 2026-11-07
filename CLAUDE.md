@@ -68,6 +68,7 @@ identifier and change it only together with a migration.
 | `carrel-opds-auth` | `src-tauri/src/commands.rs` (keychain service name) | orphan every stored OPDS catalog credential rather than migrating it |
 | `{profile.len()}:{profile}{catalog_url}` | `src-tauri/src/commands.rs` (keychain account encoding) | orphan every stored OPDS catalog credential rather than migrating it — the length prefix exists so a profile name containing a colon can't collide with a different profile/URL pair |
 | `opds_auth` | `src-tauri/src/commands.rs` (per-profile settings key) | orphan every stored OPDS catalog credential's metadata (which catalog, which kind, the username) rather than migrating it |
+| `kids_mode.json` | `src-tauri/src/kids_mode.rs` (`{data_dir}/kids_mode.json`) | reset the desktop Kids-mode flag and the parents'-code lockout counter, so a relaunch (or a renamed file) silently drops a child back into the full library |
 
 The WiX upgrade code deserves a note, since it is the one entry that is a bare
 UUID rather than a readable string. Tauri derives it by default from
