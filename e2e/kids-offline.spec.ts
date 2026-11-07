@@ -1,4 +1,10 @@
-import { test, expect, type BrowserContext, type Page } from "@playwright/test";
+import {
+  test,
+  expect,
+  type APIRequestContext,
+  type BrowserContext,
+  type Page,
+} from "@playwright/test";
 import { openDetailMenu } from "./detail-actions";
 
 // Offline copies in web Kids mode (spec Decision 9): a book a parent saved
@@ -161,6 +167,82 @@ async function bootOffline(page: Page, context: BrowserContext) {
   await reloadControlled(page);
 }
 
+// What a request for `url` gets inside the page, as a script or a typed URL
+// would: through the service worker, or a network error (status 0).
+function fetchFromPage(page: Page, url: string) {
+  return page.evaluate(async (u) => {
+    try {
+      const resp = await fetch(u, { credentials: "same-origin" });
+      const body = new Uint8Array(await resp.arrayBuffer());
+      return { status: resp.status, bytes: body.byteLength, text: new TextDecoder().decode(body) };
+    } catch (e) {
+      return { status: 0, bytes: 0, text: "" };
+    }
+  }, url);
+}
+
+// A parent's session of its own, as if on another device.
+async function parentApi(request: APIRequestContext) {
+  const login = await request.post("/api/auth", { data: { pin: PIN } });
+  expect(login.ok()).toBe(true);
+  const { token } = await login.json();
+  return (method: string, path: string, data?: unknown) =>
+    request.fetch(path, { method, data, headers: { Authorization: `Bearer ${token}` } });
+}
+
+// The reading position queued offline for `bookId`, written or read straight
+// in the default profile's `progressQueue` store.
+function queueProgress(page: Page, bookId: string, chapterIndex: number, baseline: number | null) {
+  return page.evaluate(
+    async ({ bookId, chapterIndex, baseline }) => {
+      const db = await new Promise<IDBDatabase>((res, rej) => {
+        const req = indexedDB.open("carrel-offline");
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+      });
+      await new Promise<void>((res, rej) => {
+        const tx = db.transaction("progressQueue", "readwrite");
+        tx.objectStore("progressQueue").put({
+          bookId,
+          chapterIndex,
+          scrollPosition: 0,
+          queuedAt: Date.now(),
+          baselineLastReadAt: baseline,
+          revision: 1,
+        });
+        tx.oncomplete = () => res();
+        tx.onerror = () => rej(tx.error);
+      });
+      db.close();
+    },
+    { bookId, chapterIndex, baseline },
+  );
+}
+
+function queuedProgress(page: Page, bookId: string) {
+  return page.evaluate(async (id) => {
+    const db = await new Promise<IDBDatabase>((res, rej) => {
+      const req = indexedDB.open("carrel-offline");
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    const row = await new Promise<{ chapterIndex: number } | undefined>((res, rej) => {
+      const r = db.transaction("progressQueue", "readonly").objectStore("progressQueue").get(id);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    db.close();
+    return row ? row.chapterIndex : null;
+  }, bookId);
+}
+
+function serverProgress(page: Page, bookId: string) {
+  return page.evaluate(async (id) => {
+    const p = await (await fetch(`/api/books/${id}/progress`, { credentials: "same-origin" })).json();
+    return p ? { chapter: p.chapter_index as number, lastReadAt: p.last_read_at as number } : null;
+  }, bookId);
+}
+
 test.describe("web UI Kids mode with offline copies", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
@@ -175,6 +257,156 @@ test.describe("web UI Kids mode with offline copies", () => {
     await context.setOffline(false);
     await apiStatus(page, "POST", "/api/kids/exit", { code: CODE });
     await apiStatus(page, "PUT", `/api/kids/books/${KIDS_ID}`, { override: "follow" });
+    await apiStatus(page, "PUT", `/api/kids/books/${HIDDEN_ID}`, { override: "follow" });
+  });
+
+  test("offline in Kids mode, the worker won't answer for a hidden copy", async ({
+    page,
+    context,
+  }) => {
+    await saveBothThenKidsBoot(page);
+    await bootOffline(page, context);
+    await expectOfflineLibrary(page, [KIDS_TITLE]);
+    const hiddenUrls = [
+      `/api/books/${HIDDEN_ID}`,
+      `/api/books/${HIDDEN_ID}/page-count`,
+      `/api/books/${HIDDEN_ID}/pages/0`,
+    ];
+    const visibleUrls = [`/api/books/${KIDS_ID}`, `/api/books/${KIDS_ID}/chapters/0`];
+
+    // A script's request, or the URL typed into the address bar: no saved body.
+    for (const url of hiddenUrls) {
+      expect(await fetchFromPage(page, url), url).toEqual({ status: 0, bytes: 0, text: "" });
+    }
+    await page.goto(hiddenUrls[0]).catch(() => {});
+    expect(await page.content()).not.toContain(HIDDEN_TITLE);
+    // Control: the kid's own copy still answers.
+    await page.goto("/");
+    await expectOfflineLibrary(page, [KIDS_TITLE]);
+    for (const url of visibleUrls) {
+      const got = await fetchFromPage(page, url);
+      expect([got.status, got.bytes > 0], url).toEqual([200, true]);
+    }
+    expect((await fetchFromPage(page, visibleUrls[0])).text).toContain(KIDS_TITLE);
+
+    // Once the parent leaves Kids mode, the hidden copy answers offline again,
+    // with no reload in between…
+    await context.setOffline(false);
+    await reloadControlled(page);
+    await leaveWith(page, CODE);
+    await expect(page.locator(".kids-badge")).toHaveCount(0);
+    await context.setOffline(true);
+    for (const url of hiddenUrls) {
+      const got = await fetchFromPage(page, url);
+      expect([got.status, got.bytes > 0], url).toEqual([200, true]);
+    }
+    expect((await fetchFromPage(page, hiddenUrls[0])).text).toContain(HIDDEN_TITLE);
+    // …and the offline library lists it.
+    await reloadControlled(page);
+    await expectOfflineLibrary(page, [HIDDEN_TITLE, KIDS_TITLE]);
+  });
+
+  test("a worker marker the browser dropped is back by the next boot", async ({
+    page,
+    context,
+  }) => {
+    await saveBothThenKidsBoot(page);
+    // Cache Storage can be evicted entry by entry under storage pressure.
+    await page.evaluate(() => caches.delete("carrel-offline-kids"));
+    await bootOffline(page, context);
+    await expectOfflineLibrary(page, [KIDS_TITLE]);
+    expect(await fetchFromPage(page, `/api/books/${HIDDEN_ID}`)).toEqual({ status: 0, bytes: 0, text: "" });
+  });
+
+  test("a saved copy a parent marks while the kid's page is open opens at once", async ({
+    page,
+    context,
+    request,
+  }) => {
+    await saveBothThenKidsBoot(page);
+    const asParent = await parentApi(request);
+    expect((await asParent("PUT", `/api/kids/books/${HIDDEN_ID}`, { override: "allowed" })).status()).toBe(200);
+    // The kid's page still holds the list from before the mark.
+    await page.evaluate((id) => { location.hash = `#/book/${id}`; }, HIDDEN_ID);
+    await expect(page.locator(".header .nav-book-title")).toHaveText(HIDDEN_TITLE);
+
+    // Offline, this reload reopens the book from its saved copy…
+    await bootOffline(page, context);
+    await expect(page.locator(".header .nav-book-title")).toHaveText(HIDDEN_TITLE);
+    // …and the offline library lists it.
+    await page.goto("/#/");
+    await expectOfflineLibrary(page, [HIDDEN_TITLE, KIDS_TITLE]);
+  });
+
+  test("a book a parent marks while the kid's page is open can be saved and read offline", async ({
+    page,
+    context,
+    request,
+  }) => {
+    await page.goto("/#/");
+    await turnOnKidsMode(page);
+    const asParent = await parentApi(request);
+    expect((await asParent("PUT", `/api/kids/books/${HIDDEN_ID}`, { override: "allowed" })).status()).toBe(200);
+
+    await saveBookOffline(page, HIDDEN_ID);
+    await expect(page.locator(".header .nav-book-title")).toHaveText(HIDDEN_TITLE);
+
+    // Offline, this reload reopens the book from its saved copy…
+    await bootOffline(page, context);
+    await expect(page.locator(".header .nav-book-title")).toHaveText(HIDDEN_TITLE);
+    // …and the offline library lists it.
+    await page.goto("/#/");
+    await expectOfflineLibrary(page, [HIDDEN_TITLE]);
+  });
+
+  test("a save the kid walks away from still lists the book offline", async ({
+    page,
+    context,
+    request,
+  }) => {
+    await page.goto("/#/");
+    await turnOnKidsMode(page);
+    const asParent = await parentApi(request);
+    expect((await asParent("PUT", `/api/kids/books/${HIDDEN_ID}`, { override: "allowed" })).status()).toBe(200);
+
+    // Hold the save's last page until the kid has left the book's page.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await context.route(`**/api/books/${HIDDEN_ID}/pages/1*`, async (route) => {
+      await held;
+      await route.continue();
+    });
+    await page.goto(`/#/book/${HIDDEN_ID}`);
+    await openDetailMenu(page);
+    await page.locator("#offline-save-btn").click();
+    await page.evaluate(() => { location.hash = "#/library"; });
+    await expect(page.locator(".grid .card").first()).toBeVisible();
+    release();
+    await expect(page.locator(".toast", { hasText: "Saved for offline reading" })).toBeVisible({
+      timeout: 30_000,
+    });
+
+    await bootOffline(page, context);
+    await expectOfflineLibrary(page, [HIDDEN_TITLE]);
+  });
+
+  test("a Kids boot keeps a parent's queued position for a hidden book", async ({ page }) => {
+    // The parent read Book 130 offline, and that position is still queued.
+    const before = await serverProgress(page, HIDDEN_ID);
+    await queueProgress(page, HIDDEN_ID, 1, before ? before.lastReadAt : null);
+    await turnOnKidsMode(page);
+    // This boot replays the queue, and the Kids session gets 404 for the book.
+    await reloadControlled(page);
+    await expect(badge(page)).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    expect(await queuedProgress(page, HIDDEN_ID)).toBe(1);
+
+    // Once the parent leaves, the next boot replays it.
+    await leaveWith(page, CODE);
+    await expect(page.locator(".kids-badge")).toHaveCount(0);
+    await reloadControlled(page);
+    await expect.poll(() => queuedProgress(page, HIDDEN_ID)).toBeNull();
+    expect((await serverProgress(page, HIDDEN_ID))?.chapter).toBe(1);
   });
 
   test("Kids mode keeps unmarked offline copies but hides them", async ({ page, context }) => {

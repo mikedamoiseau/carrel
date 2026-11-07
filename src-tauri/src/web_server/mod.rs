@@ -4651,6 +4651,8 @@ mod tests {
             r#"const OFFLINE_SCOPE_CACHE = "carrel-offline-scope";"#,
             r#"const OFFLINE_SCOPE_URL = "/__offline_scope";"#,
             r#"const OFFLINE_CACHE_PREFIX = "carrel-offline-book-";"#,
+            r#"const KIDS_MARKER_CACHE = "carrel-offline-kids";"#,
+            r#"const KIDS_MARKER_URL = "/__offline_kids";"#,
         ] {
             assert!(APP_JS.contains(decl), "app.js must declare `{decl}`");
             assert!(SW_JS.contains(decl), "sw.js must declare `{decl}`");
@@ -4662,6 +4664,12 @@ mod tests {
         assert!(
             SW_JS.contains("key !== OFFLINE_SCOPE_CACHE"),
             "sw.js's activate purge must spare the offline scope marker cache"
+        );
+        // Likewise the Kids marker, or a SW update would serve a device in
+        // Kids mode every saved copy until app.js next republished it.
+        assert!(
+            SW_JS.contains("key !== KIDS_MARKER_CACHE"),
+            "sw.js's activate purge must spare the Kids marker cache"
         );
     }
 

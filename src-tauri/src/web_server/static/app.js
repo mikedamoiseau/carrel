@@ -1049,7 +1049,13 @@
       showLogin();
       return;
     }
-    if (resp.status === 404) { await idbDelete("progressQueue", row.bookId).catch(() => {}); return; }
+    // In Kids mode a 404 may only mean a parent didn't mark this book, so
+    // the position is kept for when the device leaves Kids mode.
+    if (resp.status === 404) {
+      if (kidsMode || kidsDeviceRemembered()) return;
+      await idbDelete("progressQueue", row.bookId).catch(() => {});
+      return;
+    }
     if (!resp.ok) return;                    // 5xx — keep, retry next trigger
     let server = null;
     try { server = await resp.json(); } catch (e) { return; } // malformed — keep
@@ -3220,6 +3226,11 @@
         await saveBookOffline(book, ({ done, total }) => {
           prog.textContent = ` ${done} / ${total}`;
         });
+        // In Kids mode the save got through, so the server lets the kid see
+        // this book; the stored list may not know yet, and it's what the
+        // offline library and the worker go by. Even if the kid has left
+        // this page.
+        if (kidsDeviceRemembered()) await refreshKidsVisibleIds();
         showToast("Saved for offline reading");
         if (hashTargetsDetail(id)) showDetail(id); // re-render into the saved state
       } catch (e) {
@@ -8144,18 +8155,51 @@
   // with no server to ask.
   const KIDS_VISIBLE_IDS_KEY = "kids-visible-ids";
 
-  /// Stores the server's kid-visible ids for the offline library. Runs
-  /// whenever this session is (back) in Kids mode. Best-effort: a failed read
-  /// keeps the last stored list.
+  // The service worker's copy of that list, beside its scope marker. The
+  // worker can't read localStorage, so while this device is in Kids mode it
+  // serves saved copies only for the ids in here; with no marker it serves
+  // them all. Both constants must mirror sw.js.
+  const KIDS_MARKER_CACHE = "carrel-offline-kids";
+  const KIDS_MARKER_URL = "/__offline_kids";
+
+  /// Stores the server's kid-visible ids for the offline library, and hands
+  /// the stored list on to the service worker. Runs whenever this session is
+  /// (back) in Kids mode. Best-effort: a failed read keeps the last list.
   async function refreshKidsVisibleIds() {
-    if (!offlineSupported()) return;
     try {
+      if (!offlineSupported()) return;
       const resp = await api("/api/kids/visible-ids");
       // A reply from another profile mustn't land in this profile's database.
       if (!resp || !resp.ok || reloadPending) return;
       const { ids } = await resp.json();
       if (Array.isArray(ids)) await idbPut("meta", { key: KIDS_VISIBLE_IDS_KEY, ids });
-    } catch (e) { /* keep the last list */ }
+    } catch (e) {
+      /* keep the last list */
+    } finally {
+      await syncKidsMarker();
+    }
+  }
+
+  /// Makes the worker's Kids marker match this device: the stored kid-visible
+  /// ids (none, if nothing is stored) while it remembers Kids mode, and no
+  /// marker otherwise. Runs at every boot too, so an evicted marker comes
+  /// back. If it can't be written in Kids mode, the worker is switched off
+  /// (its scope marker dropped, as loadPublishedOfflineScope does) rather
+  /// than left serving every saved copy.
+  async function syncKidsMarker() {
+    if (!window.caches) return;
+    try {
+      if (!kidsDeviceRemembered()) { await caches.delete(KIDS_MARKER_CACHE); return; }
+      let stored;
+      try { stored = await idbGet("meta", KIDS_VISIBLE_IDS_KEY); } catch (e) { stored = undefined; }
+      const ids = stored && Array.isArray(stored.ids) ? stored.ids : [];
+      await (await caches.open(KIDS_MARKER_CACHE)).put(KIDS_MARKER_URL, new Response(JSON.stringify({ ids })));
+    } catch (e) {
+      // Outside Kids mode a marker left behind only holds saved copies back.
+      if (!kidsDeviceRemembered()) return;
+      try { await caches.delete(OFFLINE_SCOPE_CACHE); } catch (err) { /* nothing left to try */ }
+      offlineUnavailable = true;
+    }
   }
 
   /// The offline rows this device may show: all of them, unless it remembers
@@ -8177,7 +8221,15 @@
   async function kidsGuardedBookApi(id) {
     if (kidsDeviceRemembered()) {
       const row = await getOfflineManifest(id);
-      if (row && !(await kidsFilterOfflineRows([row])).length) return new Response(null, { status: 404 });
+      const shown = async () => (await kidsFilterOfflineRows([row])).length > 0;
+      if (row && !(await shown())) {
+        // The stored list can predate a parent's latest marks, so ask the
+        // server again before refusing. Offline that fails fast and the
+        // stored list stands.
+        await refreshKidsVisibleIds();
+        if (!authenticated) return null; // the refresh got a 401: the PIN screen is up
+        if (!(await shown())) return new Response(null, { status: 404 });
+      }
     }
     return api("/api/books/" + id);
   }
@@ -8356,6 +8408,7 @@
       }
       safeStorageRemove(KIDS_DEVICE_KEY);
       kidsMode = false;
+      await syncKidsMarker();
       // Re-check the profile scope the way doLogin does, which also lifts an
       // earlier failure to confirm it.
       const scope = await syncOfflineScopeWithServer();
@@ -8851,6 +8904,8 @@
     // the server, so an offline launch still uses the right profile's
     // downloads; the online path re-syncs it against the server below.
     await loadPublishedOfflineScope();
+    // The worker's Kids marker likewise, before anything is served offline.
+    await syncKidsMarker();
     // Eviction honesty first: make the manifest truthful before either boot
     // path reads it (the offline branch renders straight from it, and the
     // online grid badges read offlineBookIds). Safe on- or offline.

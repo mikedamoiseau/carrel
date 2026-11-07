@@ -26,7 +26,7 @@
 // The `carrel-` prefix on this and the two cache names below names caches held
 // in the user's browser: renaming it orphans every offline-saved book rather
 // than migrating it. Only the trailing content hash is meant to change.
-const CACHE_VERSION = "carrel-shell-64dff36570b5";
+const CACHE_VERSION = "carrel-shell-57f9ac4d6d2a";
 
 // Offline mode (spec 2026-07-17-web-reader-offline): per-book content caches,
 // written ONLY by app.js's save flow — the SW never writes to them. The SW
@@ -61,6 +61,28 @@ async function currentOfflineScope() {
     return resp ? await resp.text() : null;
   } catch (e) {
     return null;
+  }
+}
+
+// The Kids marker app.js keeps beside the scope marker. A service worker can't
+// read localStorage, where the page keeps its Kids mode flag, so while the
+// device is in Kids mode app.js publishes here the ids of the books a kid may
+// see, and only those books' saved copies are served. Both constants must
+// mirror app.js.
+const KIDS_MARKER_CACHE = "carrel-offline-kids";
+const KIDS_MARKER_URL = "/__offline_kids";
+
+// The book ids whose saved copies may answer, or `null` when the device isn't
+// in Kids mode (no marker). A marker that can't be read counts as Kids mode
+// with nothing visible.
+async function kidsVisibleIds() {
+  try {
+    const resp = await caches.match(KIDS_MARKER_URL, { cacheName: KIDS_MARKER_CACHE });
+    if (!resp) return null;
+    const body = await resp.json();
+    return new Set(Array.isArray(body.ids) ? body.ids : []);
+  } catch (e) {
+    return new Set();
   }
 }
 
@@ -130,6 +152,7 @@ self.addEventListener("activate", (event) => {
             (key) =>
               key !== CACHE_VERSION &&
               key !== OFFLINE_SCOPE_CACHE &&
+              key !== KIDS_MARKER_CACHE &&
               !key.startsWith(OFFLINE_CACHE_PREFIX)
           )
           .map((key) => caches.delete(key))
@@ -180,6 +203,10 @@ self.addEventListener("fetch", (event) => {
       const scope = await currentOfflineScope();
       // Namespace unknown → behave as if nothing were saved: plain network.
       if (scope === null) return fetch(event.request);
+      // Kids mode: a saved copy a parent didn't mark is never served, so the
+      // request goes to the server, which refuses it (or fails offline).
+      const kidsIds = await kidsVisibleIds();
+      if (kidsIds && !kidsIds.has(bookMatch[1])) return fetch(event.request);
       const matchOpts = {
         cacheName: OFFLINE_CACHE_PREFIX + scope + bookMatch[1],
         ignoreSearch: isPage,
