@@ -7,6 +7,9 @@
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+
+use crate::error::{CarrelError, CarrelResult};
 
 /// Per-book parental override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +110,88 @@ pub fn visible_book_ids(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     rows.collect()
+}
+
+/// Keychain service holding the parents' code hash. App-global (not per
+/// profile). Persistence-boundary identifier: see CLAUDE.md.
+pub const KEYRING_SERVICE: &str = "com.mike.carrel.kids-code";
+const KEYRING_USER: &str = "default";
+
+/// Parents' code policy: 4 to 12 ASCII digits.
+pub fn validate_code(code: &str) -> CarrelResult<()> {
+    if (4..=12).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(CarrelError::invalid("Parents' code must be 4 to 12 digits"))
+    }
+}
+
+/// Where the Argon2id PHC hash of the parents' code lives. Injectable so the
+/// web server, desktop app, unit tests and the e2e harness share one interface.
+pub trait KidsCodeStore: Send + Sync {
+    /// `Ok(None)` only when no code is set; any backend failure is `Err`.
+    fn load(&self) -> CarrelResult<Option<String>>;
+    fn store(&self, phc: &str) -> CarrelResult<()>;
+    fn backend_name(&self) -> &'static str;
+}
+
+/// OS-keychain backed store. Fails closed like `profile_lock::load_lock`.
+pub struct KeychainKidsCodeStore;
+
+fn entry() -> CarrelResult<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        .map_err(|e| CarrelError::internal(format!("Failed to access keychain: {e}")))
+}
+
+/// Only `NoEntry` means "no code set"; every other failure is `Err`.
+fn map_load_result(result: Result<String, keyring::Error>) -> CarrelResult<Option<String>> {
+    match result {
+        Ok(phc) => Ok(Some(phc)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(CarrelError::internal(format!("Keychain error: {e}"))),
+    }
+}
+
+impl KidsCodeStore for KeychainKidsCodeStore {
+    fn load(&self) -> CarrelResult<Option<String>> {
+        map_load_result(entry()?.get_password())
+    }
+
+    fn store(&self, phc: &str) -> CarrelResult<()> {
+        entry()?
+            .set_password(phc)
+            .map_err(|e| CarrelError::internal(format!("Failed to store parents' code: {e}")))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "keychain"
+    }
+}
+
+/// In-memory store for tests and the e2e harness. Never used in production.
+#[derive(Default)]
+pub struct MemoryKidsCodeStore {
+    phc: Mutex<Option<String>>,
+}
+
+impl KidsCodeStore for MemoryKidsCodeStore {
+    fn load(&self) -> CarrelResult<Option<String>> {
+        Ok(self.phc.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    fn store(&self, phc: &str) -> CarrelResult<()> {
+        *self.phc.lock().unwrap_or_else(|e| e.into_inner()) = Some(phc.to_string());
+        Ok(())
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+}
+
+/// The only constructor production code may call.
+pub fn production_code_store() -> Arc<dyn KidsCodeStore> {
+    Arc::new(KeychainKidsCodeStore)
 }
 
 #[cfg(test)]
@@ -277,5 +362,52 @@ mod tests {
             serde_json::to_string(&m).unwrap(),
             r#"{"override":"follow","series_allowed":false,"visible":false}"#
         );
+    }
+
+    #[test]
+    fn validate_code_accepts_4_to_12_digits() {
+        assert!(validate_code("1234").is_ok());
+        assert!(validate_code("123456789012").is_ok());
+    }
+
+    #[test]
+    fn validate_code_rejects_bad_codes() {
+        for bad in ["123", "1234567890123", "12a4", " 1234", ""] {
+            let err = validate_code(bad).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Parents' code must be 4 to 12 digits"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_store_roundtrip() {
+        let store = MemoryKidsCodeStore::default();
+        assert_eq!(store.load().unwrap(), None);
+        store.store("phc").unwrap();
+        assert_eq!(store.load().unwrap(), Some("phc".to_string()));
+        assert_eq!(store.backend_name(), "memory");
+    }
+
+    #[test]
+    fn production_code_store_is_keychain() {
+        assert_eq!(production_code_store().backend_name(), "keychain");
+    }
+
+    #[test]
+    fn keyring_service_is_stable() {
+        assert_eq!(KEYRING_SERVICE, "com.mike.carrel.kids-code");
+    }
+
+    #[test]
+    fn load_mapping_fails_closed() {
+        assert_eq!(map_load_result(Err(keyring::Error::NoEntry)).unwrap(), None);
+        assert_eq!(
+            map_load_result(Ok("phc".into())).unwrap(),
+            Some("phc".to_string())
+        );
+        assert!(map_load_result(Err(keyring::Error::Invalid("k".into(), "v".into()))).is_err());
     }
 }
