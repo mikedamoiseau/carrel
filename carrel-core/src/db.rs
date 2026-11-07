@@ -807,6 +807,12 @@ pub fn list_books_grid(conn: &Connection) -> Result<Vec<BookGridItem>> {
     rows.collect()
 }
 
+/// [`list_books_grid`] restricted to books visible in kids mode.
+pub fn list_books_grid_kids(conn: &Connection) -> Result<Vec<BookGridItem>> {
+    // Same order as `list_books_grid` (`added_at DESC, id`) via the default query.
+    Ok(query_books_grid_kids(conn, &BookQuery::default())?.items)
+}
+
 // --- Query module: filter/sort/page a library in one place -----------------
 //
 // The predicate "case-insensitively match title or author" used to be written
@@ -975,9 +981,23 @@ fn query_books_generic<T>(
     columns: &str,
     row_mapper: fn(&rusqlite::Row) -> rusqlite::Result<T>,
 ) -> Result<Page<T>> {
+    query_books_filtered(conn, query, columns, row_mapper, &[])
+}
+
+/// [`query_books_generic`] with `extra_clauses` (fixed SQL fragments over the
+/// `b` alias, never user input) ANDed onto the predicate, so the count and the
+/// page are both computed over the restricted set.
+fn query_books_filtered<T>(
+    conn: &Connection,
+    query: &BookQuery,
+    columns: &str,
+    row_mapper: fn(&rusqlite::Row) -> rusqlite::Result<T>,
+    extra_clauses: &[&str],
+) -> Result<Page<T>> {
     register_carrel_lower(conn)?;
 
-    let (predicate_clauses, where_params) = build_book_predicate(query);
+    let (mut predicate_clauses, where_params) = build_book_predicate(query);
+    predicate_clauses.extend(extra_clauses.iter().map(|c| c.to_string()));
     let where_sql = where_clause(&predicate_clauses);
     let from_join = "FROM books b LEFT JOIN reading_progress rp ON rp.book_id = b.id";
 
@@ -1044,6 +1064,18 @@ pub fn query_books_grid(conn: &Connection, query: &BookQuery) -> Result<Page<Boo
     query_books_generic(conn, query, GRID_COLUMNS_B, row_to_grid_item)
 }
 
+/// [`query_books_grid`] restricted to books visible in kids mode. The
+/// restriction is part of the SQL, so `total` and paging count visible books only.
+pub fn query_books_grid_kids(conn: &Connection, query: &BookQuery) -> Result<Page<BookGridItem>> {
+    query_books_filtered(
+        conn,
+        query,
+        GRID_COLUMNS_B,
+        row_to_grid_item,
+        &[crate::kids::VISIBLE_SQL],
+    )
+}
+
 /// Full-`Book`-projection counterpart of [`query_books_grid`] — same filter,
 /// sort, and paging semantics, for callers that need the full record.
 pub fn query_books(conn: &Connection, query: &BookQuery) -> Result<Page<Book>> {
@@ -1070,6 +1102,25 @@ pub fn query_books_in_collection_grid(
     collection_id: &str,
     query: &BookQuery,
 ) -> Result<Vec<BookGridItem>> {
+    query_books_in_collection_grid_filtered(conn, collection_id, query, &[])
+}
+
+/// Kids-mode counterpart of [`query_books_in_collection_grid`]: same query,
+/// restricted in SQL to visible books.
+pub fn query_books_in_collection_grid_kids(
+    conn: &Connection,
+    collection_id: &str,
+    query: &BookQuery,
+) -> Result<Vec<BookGridItem>> {
+    query_books_in_collection_grid_filtered(conn, collection_id, query, &[crate::kids::VISIBLE_SQL])
+}
+
+fn query_books_in_collection_grid_filtered(
+    conn: &Connection,
+    collection_id: &str,
+    query: &BookQuery,
+    extra_clauses: &[&str],
+) -> Result<Vec<BookGridItem>> {
     register_carrel_lower(conn)?;
 
     let mut type_stmt = conn.prepare("SELECT type FROM collections WHERE id = ?1")?;
@@ -1078,7 +1129,8 @@ pub fn query_books_in_collection_grid(
     // Clauses, not an assembled `WHERE` — each branch below already has a
     // `WHERE` of its own (or, for a rule-less automated collection, none) and
     // needs to AND onto it.
-    let (predicate_clauses, predicate_params) = build_book_predicate(query);
+    let (mut predicate_clauses, predicate_params) = build_book_predicate(query);
+    predicate_clauses.extend(extra_clauses.iter().map(|c| c.to_string()));
     let predicate_and = if predicate_clauses.is_empty() {
         String::new()
     } else {
@@ -1556,10 +1608,41 @@ pub fn get_all_reading_progress(conn: &Connection) -> Result<Vec<ReadingProgress
     rows.collect()
 }
 
+/// [`get_all_reading_progress`] restricted to books visible in kids mode.
+pub fn get_all_reading_progress_kids(conn: &Connection) -> Result<Vec<ReadingProgress>> {
+    let sql = format!(
+        "SELECT rp.book_id, rp.chapter_index, rp.scroll_position, rp.last_read_at \
+         FROM reading_progress rp JOIN books b ON b.id = rp.book_id WHERE {}",
+        crate::kids::VISIBLE_SQL
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ReadingProgress {
+            book_id: row.get(0)?,
+            chapter_index: row.get(1)?,
+            scroll_position: row.get(2)?,
+            last_read_at: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
 pub fn get_recently_read_books(conn: &Connection, limit: u32) -> Result<Vec<Book>> {
     let sql = format!(
         "SELECT {} FROM books b JOIN reading_progress rp ON rp.book_id = b.id ORDER BY rp.last_read_at DESC LIMIT ?1",
         BOOK_COLUMNS_B
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![limit], row_to_book)?;
+    rows.collect()
+}
+
+/// [`get_recently_read_books`] restricted to books visible in kids mode.
+pub fn get_recently_read_books_kids(conn: &Connection, limit: u32) -> Result<Vec<Book>> {
+    let sql = format!(
+        "SELECT {} FROM books b JOIN reading_progress rp ON rp.book_id = b.id WHERE {} ORDER BY rp.last_read_at DESC LIMIT ?1",
+        BOOK_COLUMNS_B,
+        crate::kids::VISIBLE_SQL
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![limit], row_to_book)?;
@@ -1579,7 +1662,24 @@ pub fn get_continue_reading_books(
     conn: &Connection,
     limit: u32,
 ) -> Result<Vec<ContinueReadingItem>> {
-    let mut stmt = conn.prepare(
+    continue_reading_filtered(conn, limit, "1")
+}
+
+/// [`get_continue_reading_books`] restricted to books visible in kids mode.
+pub fn get_continue_reading_books_kids(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<ContinueReadingItem>> {
+    continue_reading_filtered(conn, limit, crate::kids::VISIBLE_SQL)
+}
+
+/// `extra_clause` is a fixed SQL boolean over `b` (never user input).
+fn continue_reading_filtered(
+    conn: &Connection,
+    limit: u32,
+    extra_clause: &str,
+) -> Result<Vec<ContinueReadingItem>> {
+    let sql = format!(
         "SELECT b.id, b.title, b.author, b.cover_path, b.format, b.total_chapters,
                 rp.chapter_index, rp.scroll_position, rp.last_read_at
          FROM books b
@@ -1587,9 +1687,11 @@ pub fn get_continue_reading_books(
          WHERE rp.chapter_index > 0
            AND b.total_chapters > 0
            AND rp.chapter_index < b.total_chapters - 1
+           AND {extra_clause}
          ORDER BY rp.last_read_at DESC, b.id
-         LIMIT ?1",
-    )?;
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![limit], |row| {
         let format_str: String = row.get(4)?;
         Ok(ContinueReadingItem {
@@ -1929,6 +2031,19 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
 pub fn delete_collection(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM collections WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// Collections with at least one visible book, each paired with its visible
+/// book count. Evaluates manual membership and automated rules alike.
+pub fn list_collections_kids(conn: &Connection) -> Result<Vec<(Collection, usize)>> {
+    let mut out = Vec::new();
+    for coll in list_collections(conn)? {
+        let visible = get_books_in_collection_grid_kids(conn, &coll.id)?.len();
+        if visible > 0 {
+            out.push((coll, visible));
+        }
+    }
+    Ok(out)
 }
 
 pub fn add_book_to_collection(conn: &Connection, book_id: &str, collection_id: &str) -> Result<()> {
@@ -2808,6 +2923,15 @@ pub fn get_books_in_collection_grid(
     rows.collect()
 }
 
+/// [`get_books_in_collection_grid`] restricted to books visible in kids mode.
+pub fn get_books_in_collection_grid_kids(
+    conn: &Connection,
+    collection_id: &str,
+) -> Result<Vec<BookGridItem>> {
+    // Default query adds no predicate and keeps the original `ORDER BY`.
+    query_books_in_collection_grid_kids(conn, collection_id, &BookQuery::default())
+}
+
 /// Build JOIN, WHERE, and parameter lists from a set of collection rules.
 fn build_rule_query(rules: &[CollectionRule]) -> (String, String, Vec<String>) {
     let mut join_clauses: Vec<String> = Vec::new();
@@ -3162,6 +3286,26 @@ pub fn list_series(conn: &Connection) -> Result<Vec<SeriesInfo>> {
          GROUP BY series HAVING count >= 2
          ORDER BY series ASC",
     )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SeriesInfo {
+            name: row.get(0)?,
+            count: row.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// [`list_series`] counting visible books only; the `>= 2` threshold applies
+/// to that visible count.
+pub fn list_series_kids(conn: &Connection) -> Result<Vec<SeriesInfo>> {
+    let sql = format!(
+        "SELECT b.series, COUNT(*) as count FROM books b
+         WHERE b.series IS NOT NULL AND b.series != '' AND {}
+         GROUP BY b.series HAVING count >= 2
+         ORDER BY b.series ASC",
+        crate::kids::VISIBLE_SQL
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         Ok(SeriesInfo {
             name: row.get(0)?,
@@ -4347,6 +4491,191 @@ mod tests {
             updated_at: 1700000000,
             rules: vec![],
         }
+    }
+
+    // --- Kids-filtered list variants ---
+
+    /// 6 books: k1..k3 (series "Kids") marked visible, a1..a3 (series "Adult")
+    /// hidden. Collection "mixed" = k1 + a1, "adult-only" = a2. Progress on k1
+    /// (mid-book) and a1 (mid-book).
+    fn kids_fixture() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = setup();
+        for (id, series, title) in [
+            ("k1", "Kids", "Kid One"),
+            ("k2", "Kids", "Kid Two"),
+            ("k3", "Kids", "Kid Three"),
+            ("a1", "Adult", "Grown One"),
+            ("a2", "Adult", "Grown Two"),
+            ("a3", "Adult", "Grown Three"),
+        ] {
+            let b = Book {
+                title: title.to_string(),
+                series: Some(series.to_string()),
+                file_path: format!("/tmp/{id}.epub"),
+                ..sample_book(id)
+            };
+            insert_book(&conn, &b).unwrap();
+        }
+        crate::kids::set_series_allowed(&conn, "Kids", true).unwrap();
+        for (cid, members) in [("mixed", ["k1", "a1"].as_slice()), ("adult-only", &["a2"])] {
+            let mut c = sample_collection(cid, CollectionType::Manual);
+            c.name = if cid == "mixed" {
+                "Mixed"
+            } else {
+                "Adult only"
+            }
+            .to_string();
+            insert_collection(&conn, &c).unwrap();
+            for m in members {
+                add_book_to_collection(&conn, m, cid).unwrap();
+            }
+        }
+        for id in ["k1", "a1"] {
+            upsert_reading_progress(
+                &conn,
+                &ReadingProgress {
+                    book_id: id.to_string(),
+                    chapter_index: 3,
+                    scroll_position: 0.0,
+                    last_read_at: 1700000100,
+                },
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    #[test]
+    fn query_books_grid_kids_paginates_visible_only() {
+        let (_d, conn) = kids_fixture();
+        let q = BookQuery {
+            limit: Some(2),
+            ..Default::default()
+        };
+        let page = query_books_grid_kids(&conn, &q).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total, 3);
+    }
+
+    #[test]
+    fn query_books_grid_kids_search_skips_hidden_match() {
+        let (_d, conn) = kids_fixture();
+        let q = BookQuery {
+            q: Some("Grown Two".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_books_grid_kids(&conn, &q).unwrap().total, 0);
+    }
+
+    #[test]
+    fn query_books_grid_kids_keeps_series_filter() {
+        let (_d, conn) = kids_fixture();
+        let q = BookQuery {
+            series: Some("Adult".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_books_grid_kids(&conn, &q).unwrap().total, 0);
+        let q = BookQuery {
+            series: Some("Kids".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query_books_grid_kids(&conn, &q).unwrap().total, 3);
+    }
+
+    #[test]
+    fn list_books_grid_kids_visible_only() {
+        let (_d, conn) = kids_fixture();
+        let mut ids: Vec<String> = list_books_grid_kids(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["k1", "k2", "k3"]);
+    }
+
+    #[test]
+    fn collection_grids_kids_drop_hidden_members() {
+        let (_d, conn) = kids_fixture();
+        let a = get_books_in_collection_grid_kids(&conn, "mixed").unwrap();
+        assert_eq!(a.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["k1"]);
+        let b = query_books_in_collection_grid_kids(&conn, "mixed", &BookQuery::default()).unwrap();
+        assert_eq!(b.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["k1"]);
+        assert!(get_books_in_collection_grid_kids(&conn, "adult-only")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn list_collections_kids_hides_adult_only_and_counts_visible() {
+        let (_d, conn) = kids_fixture();
+        let got: Vec<(String, usize)> = list_collections_kids(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(c, n)| (c.name, n))
+            .collect();
+        assert_eq!(got, [("Mixed".to_string(), 1)]);
+    }
+
+    #[test]
+    fn continue_and_recent_kids_skip_hidden() {
+        let (_d, conn) = kids_fixture();
+        let cont = get_continue_reading_books_kids(&conn, 10).unwrap();
+        assert_eq!(
+            cont.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["k1"]
+        );
+        let recent = get_recently_read_books_kids(&conn, 10).unwrap();
+        assert_eq!(
+            recent.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            ["k1"]
+        );
+    }
+
+    #[test]
+    fn list_series_kids_counts_visible_only() {
+        let (_d, conn) = kids_fixture();
+        let got = list_series_kids(&conn).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].name.as_str(), got[0].count), ("Kids", 3));
+        // Block two of three: the visible count drops under the threshold.
+        crate::kids::set_book_override(&conn, "k2", crate::kids::KidsOverride::Blocked).unwrap();
+        crate::kids::set_book_override(&conn, "k3", crate::kids::KidsOverride::Blocked).unwrap();
+        assert!(list_series_kids(&conn).unwrap().is_empty());
+        // The unfiltered original still sees both series.
+        assert_eq!(list_series(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn all_reading_progress_kids_skips_hidden() {
+        let (_d, conn) = kids_fixture();
+        let got = get_all_reading_progress_kids(&conn).unwrap();
+        assert_eq!(
+            got.iter().map(|p| p.book_id.as_str()).collect::<Vec<_>>(),
+            ["k1"]
+        );
+    }
+
+    #[test]
+    fn kids_variants_empty_when_nothing_marked() {
+        let (_d, conn) = kids_fixture();
+        crate::kids::set_series_allowed(&conn, "Kids", false).unwrap();
+        let q = BookQuery::default();
+        assert_eq!(query_books_grid_kids(&conn, &q).unwrap().total, 0);
+        assert!(query_books_in_collection_grid_kids(&conn, "mixed", &q)
+            .unwrap()
+            .is_empty());
+        assert!(list_books_grid_kids(&conn).unwrap().is_empty());
+        assert!(get_books_in_collection_grid_kids(&conn, "mixed")
+            .unwrap()
+            .is_empty());
+        assert!(get_continue_reading_books_kids(&conn, 10)
+            .unwrap()
+            .is_empty());
+        assert!(get_recently_read_books_kids(&conn, 10).unwrap().is_empty());
+        assert!(list_series_kids(&conn).unwrap().is_empty());
+        assert!(get_all_reading_progress_kids(&conn).unwrap().is_empty());
+        assert!(list_collections_kids(&conn).unwrap().is_empty());
     }
 
     #[test]
