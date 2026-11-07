@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Kids mode.** Mark series and single books as OK for kids, set a parents'
+  code, and turn on Kids mode to show only what you marked, on the desktop app
+  and in the web UI. While it is on, settings, import, editing, deleting and
+  profile switching are hidden, and leaving needs the parents' code. New
+  albums appear once their series is filled in and marked; until then they
+  stay hidden. The web UI needs a web PIN for Kids mode. The desktop app is a
+  speed bump rather than a lock: under link import mode Finder can still open
+  the files on a NAS.
+
 ## [3.2.4] - 2026-11-01
 
 ### Security

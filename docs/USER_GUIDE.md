@@ -643,6 +643,28 @@ You can lock a profile behind a password, from **Settings → Profile lock**. Th
 - **Changing or removing a lock** from Settings requires the current password.
 - **Forgot the password?** The unlock prompt has a "Can't sign in?" link that clears the lock after a deliberate confirmation step. This never touches your books or library — it only removes the lock, exactly like knowing the password and removing it yourself.
 
+### Kids mode
+
+Kids mode shows only the books you have marked OK for kids, so a child can use the library on the desktop app or in the web UI without seeing the rest of it. Books you haven't marked don't appear in the library, search, series, collections, "Continue reading" or "Want to read", and can't be opened. Settings, import, editing and deleting books, profile switching and the other admin controls are hidden too.
+
+**Marking what is OK for kids.** Nothing is marked by default, and new imports stay hidden until you mark them. Marks are kept per library (profile). With Kids mode off:
+
+- **A whole series.** Open a series and choose **Mark series OK for kids** (or **Unmark series for kids**). Every book in the series follows the mark, including albums added later once they have that series filled in. A new album arrives with no series, so it stays hidden until its series is filled in; then it follows the series' mark.
+- **A single book.** Open the book's details and pick **Follow series**, **OK for kids** or **Not for kids**. The control also says whether the book is currently **Visible in Kids mode** or **Hidden in Kids mode**. Books with no series can only be marked one by one.
+
+**Turning it on.** Open **Settings → Kids mode**, set a **parents' code** (4 to 12 digits), then choose **Turn on Kids mode**. Kids mode stays on across restarts and when you switch libraries. In the web UI, Kids mode needs a web PIN: with no PIN set, anyone on your network can open the web UI, so the lock would mean nothing. Set one under Remote Access first.
+
+**Leaving.** A **Kids mode** badge with a **Leave Kids mode** button stays at the top of the screen. Choosing it asks for the parents' code. Wrong codes are limited: after too many attempts you have to wait before trying again.
+
+**Forgot the code?** Change it from any device that isn't in Kids mode: the desktop app outside Kids mode, or the web UI after signing in with the web PIN. A desktop stuck in Kids mode with the code forgotten can be freed by changing the code from a web session. There is deliberately no reset that works without the code, because a child at the computer could use it.
+
+**Limits to know about.**
+
+- **Use one browser on the kid's device.** Each browser (or home-screen app) on a phone or tablet has its own web session, so an adult session opened in another browser on the same device stays usable until it expires (at most 24 hours).
+- **The desktop app is a speed bump, not a lock.** With the library folder in link mode, the books stay where they were (for example on a NAS), and Finder opens those files directly, so a child who can use Finder can open them.
+- Kids mode is a way to keep a child's view tidy, not protection against a child who knows the web PIN or the parents' code.
+- Reading progress is shared with the rest of the library.
+
 ---
 
 ## 9. Customizing Your Reading Experience
