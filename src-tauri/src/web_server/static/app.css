@@ -1201,3 +1201,12 @@ body:not(:has(.header))::before {
 .vocab-review-missed { background: var(--surface); border: 1px solid var(--warm-border); color: var(--ink); }
 .vocab-review-gotit { background: var(--accent); border: none; color: var(--on-accent); }
 .vocab-review-answers button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Parent-side Kids marking */
+.kids-series-toggle { background: none; border: 1px solid var(--border); border-radius: 14px; padding: 3px 10px; font-size: 0.75rem; color: var(--accent); cursor: pointer; }
+.kids-series-toggle[aria-pressed="true"] { background: var(--accent-light); }
+.kids-mark { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.kids-mark-opts { display: inline-flex; gap: 4px; }
+.kids-mark-opt { background: none; border: 1px solid var(--border); border-radius: 14px; padding: 4px 10px; font-size: 0.8rem; color: var(--text); cursor: pointer; }
+.kids-mark-opt[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.kids-mark-status { font-size: 0.8rem; color: inherit; }

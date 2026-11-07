@@ -1931,7 +1931,12 @@
         }
       }
       if (activeSeries) html += chipHtml("series", activeSeries);
+      if (activeSeries && !kidsMode) {
+        if (kidsAllowedSeries) html += kidsSeriesToggleHtml(activeSeries, kidsAllowedSeries.includes(activeSeries));
+        else loadKidsSeries();
+      }
       chips.innerHTML = html;
+      bindKidsSeriesToggle(chips);
       chips.querySelectorAll("[data-remove]").forEach(btn => {
         btn.onclick = () => {
           const next = currentLibraryState();
@@ -3154,6 +3159,7 @@
               ${primaryHtml}
               ${moreHtml}
               ${wantToReadBtnHtml(book.want_to_read)}
+              ${kidsMode ? "" : '<div id="kids-mark-host"></div>'}
             </div>
           </div>
         </div>
@@ -3319,6 +3325,8 @@
         }
       });
     }
+    const kidsMarkHost = $("#kids-mark-host");
+    if (kidsMarkHost) mountKidsMark(kidsMarkHost, id);
     const seriesLink = $("#series-link");
     if (seriesLink) seriesLink.addEventListener("click", (e) => {
       e.preventDefault();
@@ -8316,6 +8324,102 @@
       <span class="kids-badge-label">Kids mode</span>
       <button type="button" class="kids-leave-btn">Leave Kids mode</button>
     </div>`;
+  }
+
+  // Parent-side marking. Series marks are fetched lazily (null = not loaded)
+  // and kept in this array so the chip toggle can render synchronously.
+  let kidsAllowedSeries = null;
+  let kidsSeriesLoading = false;
+
+  function kidsSeriesToggleHtml(series, allowed) {
+    return `<button type="button" class="kids-series-toggle" data-kids-series="${esc(series)}" aria-pressed="${allowed ? "true" : "false"}">${allowed ? "Unmark series for kids" : "Mark series OK for kids"}</button>`;
+  }
+
+  async function loadKidsSeries() {
+    if (kidsSeriesLoading) return;
+    kidsSeriesLoading = true;
+    try {
+      const resp = await api("/api/kids/series");
+      if (resp && resp.ok) kidsAllowedSeries = (await resp.json()).series;
+    } catch (e) {
+      // Best-effort: without the list the toggle just isn't drawn.
+    } finally {
+      kidsSeriesLoading = false;
+    }
+    if (kidsAllowedSeries && currentView === "library") renderFilterChips();
+  }
+
+  function bindKidsSeriesToggle(container) {
+    const btn = container.querySelector(".kids-series-toggle");
+    if (!btn) return;
+    btn.onclick = async () => {
+      if (btn.getAttribute("aria-busy") === "true") return;
+      const series = btn.dataset.kidsSeries;
+      const allowed = !kidsAllowedSeries.includes(series);
+      btn.setAttribute("aria-busy", "true");
+      let resp;
+      try {
+        resp = await kidsWrite("PUT", "/api/kids/series", { series, allowed });
+      } catch (e) {
+        if (btn.isConnected) btn.removeAttribute("aria-busy");
+        showToast("Couldn't reach Carrel server");
+        return;
+      }
+      if (!resp) return;
+      if (btn.isConnected) btn.removeAttribute("aria-busy");
+      if (!resp.ok) { showToast(httpErrorToastMessage(resp.status)); return; }
+      kidsAllowedSeries = kidsAllowedSeries.filter(x => x !== series);
+      if (allowed) kidsAllowedSeries.push(series);
+      if (btn.isConnected) renderFilterChips();
+    };
+  }
+
+  const KIDS_OVERRIDES = [
+    ["follow", "Follow series"],
+    ["allowed", "OK for kids"],
+    ["blocked", "Not for kids"],
+  ];
+
+  function kidsMarkHtml(mark) {
+    const buttons = KIDS_OVERRIDES.map(([value, label]) =>
+      `<button type="button" class="kids-mark-opt" data-override="${value}" aria-pressed="${mark.override === value ? "true" : "false"}">${label}</button>`).join("");
+    return `<div class="kids-mark" role="group" aria-label="Kids mode">
+      <div class="kids-mark-opts">${buttons}</div>
+      <span class="kids-mark-status">${mark.visible ? "Visible in Kids mode" : "Hidden in Kids mode"}</span>
+    </div>`;
+  }
+
+  async function mountKidsMark(host, id) {
+    try {
+      const resp = await api(`/api/kids/books/${id}`);
+      if (!resp || !resp.ok || !host.isConnected) return;
+      let mark = await resp.json();
+      const draw = () => {
+        host.innerHTML = kidsMarkHtml(mark);
+        host.querySelectorAll(".kids-mark-opt").forEach(btn => {
+          btn.onclick = async () => {
+            if (host.getAttribute("aria-busy") === "true") return;
+            host.setAttribute("aria-busy", "true");
+            let r;
+            try {
+              r = await kidsWrite("PUT", `/api/kids/books/${id}`, { override: btn.dataset.override });
+            } catch (e) {
+              host.removeAttribute("aria-busy");
+              showToast("Couldn't reach Carrel server");
+              return;
+            }
+            if (!r) return;
+            host.removeAttribute("aria-busy");
+            if (!r.ok) { showToast(httpErrorToastMessage(r.status)); return; }
+            mark = await r.json();
+            if (host.isConnected) draw();
+          };
+        });
+      };
+      draw();
+    } catch (e) {
+      // Best-effort: the control just doesn't appear.
+    }
   }
 
   /// The parent's way into showKidsPanel(): an icon in the header cluster, or
