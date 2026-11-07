@@ -572,7 +572,7 @@ impl From<crate::models::Book> for PublicBook {
 }
 
 #[derive(serde::Serialize)]
-struct PublicBookGridItem {
+pub(super) struct PublicBookGridItem {
     id: String,
     title: String,
     author: String,
@@ -625,7 +625,7 @@ impl From<crate::models::BookGridItem> for PublicBookGridItem {
 }
 
 #[derive(serde::Serialize)]
-struct PublicContinueReadingItem {
+pub(super) struct PublicContinueReadingItem {
     id: String,
     title: String,
     author: String,
@@ -663,7 +663,7 @@ impl From<crate::models::ContinueReadingItem> for PublicContinueReadingItem {
 }
 
 #[derive(serde::Deserialize)]
-struct BookQuery {
+pub(super) struct BookQuery {
     q: Option<String>,
     series: Option<String>,
     sort: Option<String>, // title, author, last_read, rating (default: date_added)
@@ -684,6 +684,20 @@ struct BookQuery {
 async fn list_books(
     State(state): State<WebState>,
     Query(params): Query<BookQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    list_books_with(&state, params, db::query_books_grid)
+}
+
+/// The body of `GET /api/books`, over whichever grid query the caller picks:
+/// the full library here, the Kids-filtered one in `kids::kids_gate`. Shared
+/// so both parse `BookQuery` and shape the response identically.
+pub(super) fn list_books_with(
+    state: &WebState,
+    params: BookQuery,
+    query_grid: fn(
+        &rusqlite::Connection,
+        &db::BookQuery,
+    ) -> rusqlite::Result<db::Page<crate::models::BookGridItem>>,
 ) -> Result<Response, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
 
@@ -716,7 +730,7 @@ async fn list_books(
         },
     };
 
-    let page = db::query_books_grid(&conn, &query).map_err(carrel_status)?;
+    let page = query_grid(&conn, &query).map_err(carrel_status)?;
     let books: Vec<PublicBookGridItem> = page.items.into_iter().map(Into::into).collect();
 
     // Item 14: no `limit` means a bare array with no `x-total-count` header,
@@ -738,7 +752,7 @@ async fn list_books(
 // Item 5: "Continue Reading" shelf on the home screen — books with progress
 // that is neither zero nor "finished", most recently read first.
 #[derive(serde::Deserialize)]
-struct ContinueReadingQuery {
+pub(super) struct ContinueReadingQuery {
     limit: Option<u32>,
 }
 
@@ -746,9 +760,22 @@ async fn continue_reading(
     State(state): State<WebState>,
     Query(params): Query<ContinueReadingQuery>,
 ) -> Result<Json<Vec<PublicContinueReadingItem>>, (StatusCode, String)> {
+    continue_reading_with(&state, params, db::get_continue_reading_books)
+}
+
+/// The body of `GET /api/books/continue-reading`, shared with
+/// `kids::kids_gate` like [`list_books_with`].
+pub(super) fn continue_reading_with(
+    state: &WebState,
+    params: ContinueReadingQuery,
+    list: fn(
+        &rusqlite::Connection,
+        u32,
+    ) -> rusqlite::Result<Vec<crate::models::ContinueReadingItem>>,
+) -> Result<Json<Vec<PublicContinueReadingItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let limit = params.limit.unwrap_or(12).min(50);
-    let books = db::get_continue_reading_books(&conn, limit).map_err(carrel_status)?;
+    let books = list(&conn, limit).map_err(carrel_status)?;
     Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
@@ -2165,7 +2192,7 @@ async fn list_series(
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CollectionWithCount {
+pub(super) struct CollectionWithCount {
     id: String,
     name: String,
     r#type: crate::models::CollectionType,
@@ -2189,25 +2216,31 @@ async fn list_collections(
             let book_count = db::get_books_in_collection_grid(&conn, &c.id)
                 .map(|books| books.len())
                 .unwrap_or(0);
-            CollectionWithCount {
-                id: c.id,
-                name: c.name,
-                r#type: c.r#type,
-                icon: c.icon,
-                color: c.color,
-                created_at: c.created_at,
-                updated_at: c.updated_at,
-                rules: c.rules,
-                book_count,
-            }
+            CollectionWithCount::from((c, book_count))
         })
         .collect();
 
     Ok(Json(result))
 }
 
+impl From<(crate::models::Collection, usize)> for CollectionWithCount {
+    fn from((c, book_count): (crate::models::Collection, usize)) -> Self {
+        CollectionWithCount {
+            id: c.id,
+            name: c.name,
+            r#type: c.r#type,
+            icon: c.icon,
+            color: c.color,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+            rules: c.rules,
+            book_count,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
-struct CollectionBooksQuery {
+pub(super) struct CollectionBooksQuery {
     q: Option<String>,
     /// Presence-only, enabled by the literal `"true"` alone — same convention
     /// as `BookQuery::want_to_read` above (see its doc comment for why this
@@ -2220,13 +2253,28 @@ async fn get_collection_books(
     Path(id): Path<String>,
     Query(params): Query<CollectionBooksQuery>,
 ) -> Result<Json<Vec<PublicBookGridItem>>, (StatusCode, String)> {
+    collection_books_with(&state, &id, params, db::query_books_in_collection_grid)
+}
+
+/// The body of `GET /api/collections/{id}/books`, shared with
+/// `kids::kids_gate` like [`list_books_with`].
+pub(super) fn collection_books_with(
+    state: &WebState,
+    id: &str,
+    params: CollectionBooksQuery,
+    query_grid: fn(
+        &rusqlite::Connection,
+        &str,
+        &db::BookQuery,
+    ) -> rusqlite::Result<Vec<crate::models::BookGridItem>>,
+) -> Result<Json<Vec<PublicBookGridItem>>, (StatusCode, String)> {
     let conn = state.conn().map_err(carrel_status)?;
     let query = db::BookQuery {
         q: params.q,
         want_to_read: params.want_to_read.as_deref() == Some("true"),
         ..Default::default()
     };
-    let books = db::query_books_in_collection_grid(&conn, &id, &query).map_err(carrel_status)?;
+    let books = query_grid(&conn, id, &query).map_err(carrel_status)?;
     Ok(Json(books.into_iter().map(Into::into).collect()))
 }
 
@@ -2735,6 +2783,9 @@ mod tests {
             private_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            kids: std::sync::Arc::new(crate::web_server::kids::KidsWebState::new(
+                std::sync::Arc::new(carrel_core::kids::MemoryKidsCodeStore::default()),
+            )),
         }
     }
 

@@ -272,6 +272,9 @@ async fn toggle_mode(app: &AppHandle, which: ToggleWhich) {
             archives: state.archive_caches(),
             profile_host: Some(crate::profile_host::for_app(app)),
             dictionary_pool: state.dictionary_pool.clone(),
+            kids: std::sync::Arc::new(crate::web_server::kids::KidsWebState::new(
+                state.kids_code_store.clone(),
+            )),
         };
         if let Ok(handle) = crate::web_server::start(web_state, current_port, modes).await {
             let mut h = state.web_server_handle.lock().unwrap();

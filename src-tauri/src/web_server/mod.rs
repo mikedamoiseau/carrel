@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod kids;
 pub mod opds_feed;
 pub mod web_ui;
 
@@ -100,6 +101,9 @@ pub struct WebState {
     /// profile), so — unlike `pool` above — this is never touched by a
     /// profile switch.
     pub dictionary_pool: Arc<Mutex<Option<DbPool>>>,
+    /// Which sessions are in Kids mode, their leave-Kids-mode limiter and the
+    /// parents' code store. Read by `kids::kids_gate` on every request.
+    pub kids: Arc<kids::KidsWebState>,
 }
 
 impl WebState {
@@ -516,7 +520,13 @@ pub fn build_router(state: WebState, modes: ServerModes) -> Router {
         router = router.nest("/opds", opds_routes);
     }
 
+    // Last added = outermost. `kids_gate` is added before `auth_middleware`
+    // so it runs after it and sees the `SessionToken` auth put on the request.
     router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            kids::kids_gate,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
@@ -609,6 +619,9 @@ mod tests {
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: Arc::new(Mutex::new(None)),
+            kids: Arc::new(crate::web_server::kids::KidsWebState::new(Arc::new(
+                carrel_core::kids::MemoryKidsCodeStore::default(),
+            ))),
         }
     }
 
@@ -2149,6 +2162,9 @@ mod tests {
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: Arc::new(Mutex::new(None)),
+            kids: Arc::new(crate::web_server::kids::KidsWebState::new(Arc::new(
+                carrel_core::kids::MemoryKidsCodeStore::default(),
+            ))),
         };
 
         let mut book = cache_test_book(std::path::Path::new("/Volumes/remote/comic.pdf"));
@@ -2205,6 +2221,9 @@ mod tests {
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: Arc::new(Mutex::new(None)),
+            kids: Arc::new(crate::web_server::kids::KidsWebState::new(Arc::new(
+                carrel_core::kids::MemoryKidsCodeStore::default(),
+            ))),
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -5691,6 +5710,430 @@ mod tests {
         );
 
         assert_eq!(items[0]["id"], "secret-collection-1");
+
+        let _ = tx.send(());
+    }
+
+    // ── Kids mode gate ───────────────────────────────────────────────────
+    //
+    // A Kids session (a logged-in token in `state.kids.sessions`) is answered
+    // only from an allowlist: the books it can see, the lists the gate serves
+    // itself filtered to those books, and a few app-shell routes. A hidden
+    // book is a 404 on every route about it; everything else is a 403.
+
+    const KIDS_PIN: &str = "5555";
+    const KIDS_REFUSAL: &str = "Not available in Kids mode";
+    /// Series "Tintin", which the fixture marks OK for kids.
+    const VISIBLE_BOOK: &str = "kids-visible-a";
+    /// Series "Druuna", which nothing marks.
+    const HIDDEN_BOOK: &str = "kids-hidden-b";
+    const HIDDEN_SERIES: &str = "Druuna";
+    const ADULT_COLLECTION: &str = "Adult only";
+
+    fn kids_test_book(id: &str, series: &str) -> crate::models::Book {
+        crate::models::Book {
+            title: format!("{series} album"),
+            file_path: format!("/nonexistent/{id}.cbz"),
+            series: Some(series.to_string()),
+            ..progress_test_book(id, 50)
+        }
+    }
+
+    fn kids_test_collection(id: &str, name: &str) -> crate::models::Collection {
+        crate::models::Collection {
+            id: id.to_string(),
+            name: name.to_string(),
+            r#type: crate::models::CollectionType::Manual,
+            icon: None,
+            color: None,
+            created_at: 0,
+            updated_at: 0,
+            rules: vec![],
+        }
+    }
+
+    /// A PIN-protected library holding visible A and hidden B, both mid-read,
+    /// plus a "Kids shelf" collection holding A and an "Adult only" one
+    /// holding B. Each series gets a second album (`{A}2`, `{B}2`), since the
+    /// series list only shows series of two or more books. The PIN matters: with none configured there are no
+    /// sessions, so nothing is ever a Kids session. File-backed rather than
+    /// `:memory:` so every pooled connection sees the same rows.
+    fn kids_test_state(dir: &std::path::Path) -> WebState {
+        let state = WebState {
+            pool: Arc::new(Mutex::new(
+                crate::db::create_pool(&dir.join("library.db")).unwrap(),
+            )),
+            ..test_state()
+        };
+        *state.pin_hash.lock().unwrap() = Some(auth::hash_pin(KIDS_PIN));
+        let conn = state.conn().unwrap();
+        for (book, coll_id, coll_name) in [
+            (
+                kids_test_book(VISIBLE_BOOK, "Tintin"),
+                "coll-kids",
+                "Kids shelf",
+            ),
+            (
+                kids_test_book(HIDDEN_BOOK, HIDDEN_SERIES),
+                "coll-adult",
+                ADULT_COLLECTION,
+            ),
+        ] {
+            crate::db::insert_book(&conn, &book).unwrap();
+            crate::db::upsert_reading_progress(
+                &conn,
+                &crate::models::ReadingProgress {
+                    book_id: book.id.clone(),
+                    chapter_index: 5,
+                    scroll_position: 0.0,
+                    last_read_at: 1,
+                },
+            )
+            .unwrap();
+            crate::db::insert_collection(&conn, &kids_test_collection(coll_id, coll_name)).unwrap();
+            crate::db::add_book_to_collection(&conn, &book.id, coll_id).unwrap();
+        }
+        for book in [
+            kids_test_book(&format!("{VISIBLE_BOOK}2"), "Tintin"),
+            kids_test_book(&format!("{HIDDEN_BOOK}2"), HIDDEN_SERIES),
+        ] {
+            crate::db::insert_book(&conn, &book).unwrap();
+        }
+        carrel_core::kids::set_series_allowed(&conn, "Tintin", true).unwrap();
+        state
+    }
+
+    /// Logs in with the PIN over HTTP and returns the session token.
+    async fn login_token(port: u16) -> String {
+        let body: serde_json::Value = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/auth"))
+            .json(&serde_json::json!({"pin": KIDS_PIN}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["token"]
+            .as_str()
+            .expect("login returns a token")
+            .to_string()
+    }
+
+    /// A logged-in session switched into Kids mode.
+    async fn kids_token(state: &WebState, port: u16) -> String {
+        let token = login_token(port).await;
+        state.kids.sessions.lock().unwrap().insert(token.clone());
+        token
+    }
+
+    /// Sends `method path` with `token` as a bearer session (plus an empty
+    /// JSON body on writes, so a request the gate wrongly lets through
+    /// reaches the handler rather than stalling on a missing body). Returns
+    /// the status and body text.
+    async fn send_as(method: reqwest::Method, port: u16, path: &str, token: &str) -> (u16, String) {
+        let mut req = reqwest::Client::new()
+            .request(method.clone(), format!("http://127.0.0.1:{port}{path}"))
+            .bearer_auth(token);
+        if method != reqwest::Method::GET {
+            req = req.json(&serde_json::json!({}));
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap())
+    }
+
+    /// Whether a JSON item mentions anything a Kids session must never see.
+    fn mentions_hidden(item: &serde_json::Value) -> bool {
+        let text = item.to_string();
+        text.contains(HIDDEN_BOOK)
+            || text.contains(HIDDEN_SERIES)
+            || text.contains(ADULT_COLLECTION)
+    }
+
+    #[tokio::test]
+    async fn kids_session_lists_only_visible_books() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+        let adult = login_token(port).await;
+
+        let (status, body) = send_as(reqwest::Method::GET, port, "/api/books", &kids).await;
+        assert_eq!(status, 200, "{body}");
+        let kids_books: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let ids: Vec<&str> = kids_books
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{body}");
+        assert!(ids.iter().all(|id| id.starts_with(VISIBLE_BOOK)), "{body}");
+
+        // Exactly the full library's listing minus the hidden books, item for
+        // item in the same grid shape and order.
+        let (_, body) = send_as(reqwest::Method::GET, port, "/api/books", &adult).await;
+        let adult_books: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let expected: Vec<serde_json::Value> = adult_books
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| !mentions_hidden(b))
+            .cloned()
+            .collect();
+        assert_eq!(kids_books, serde_json::Value::Array(expected));
+
+        // Search and pagination parse like `list_books`: a search for the
+        // hidden book finds nothing, and `limit` brings the total header.
+        let (status, body) = send_as(
+            reqwest::Method::GET,
+            port,
+            &format!("/api/books?q={HIDDEN_SERIES}"),
+            &kids,
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, "[]"));
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/api/books?limit=10&sort=title"
+            ))
+            .bearer_auth(&kids)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()["x-total-count"], "2");
+
+        // The web UI authenticates with the cookie, not a bearer header.
+        let body = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/books"))
+            .header("cookie", format!("carrel_session={kids}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains(VISIBLE_BOOK) && !body.contains(HIDDEN_BOOK),
+            "{body}"
+        );
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_session_404s_every_hidden_book_route() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        let routes = [
+            (Method::GET, ""),
+            (Method::GET, "/cover"),
+            (Method::GET, "/chapters"),
+            (Method::GET, "/chapters/0"),
+            (Method::GET, "/images/0/x.png"),
+            (Method::GET, "/pages/0"),
+            (Method::GET, "/page-count"),
+            (Method::GET, "/progress"),
+            (Method::PUT, "/progress"),
+            (Method::GET, "/bookmarks"),
+            (Method::POST, "/bookmarks"),
+            (Method::PUT, "/bookmarks/bm-1"),
+            (Method::DELETE, "/bookmarks/bm-1"),
+            (Method::GET, "/highlights"),
+            (Method::POST, "/highlights"),
+            (Method::PUT, "/highlights/hl-1"),
+            (Method::DELETE, "/highlights/hl-1"),
+            (Method::GET, "/download"),
+            (Method::GET, "/download/x.cbz"),
+            (Method::PUT, "/want-to-read"),
+        ];
+        for (method, suffix) in routes {
+            let path = format!("/api/books/{HIDDEN_BOOK}{suffix}");
+            let (status, body) = send_as(method.clone(), port, &path, &kids).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (404, "Book not found"),
+                "{method} {path}"
+            );
+        }
+        // A book that doesn't exist at all looks exactly the same.
+        let (status, body) =
+            send_as(Method::GET, port, "/api/books/no-such-book/cover", &kids).await;
+        assert_eq!((status, body.as_str()), (404, "Book not found"));
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_session_reaches_visible_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        let (status, body) = send_as(
+            reqwest::Method::GET,
+            port,
+            &format!("/api/books/{VISIBLE_BOOK}"),
+            &kids,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let book: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(book["id"], VISIBLE_BOOK);
+
+        // Writes about a visible book go through too (reading moves the
+        // shared place in the book).
+        let resp = reqwest::Client::new()
+            .put(format!(
+                "http://127.0.0.1:{port}/api/books/{VISIBLE_BOOK}/progress"
+            ))
+            .bearer_auth(&kids)
+            .json(&serde_json::json!({"chapter_index": 7, "scroll_position": 0.0}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_session_lists_are_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+        let adult = login_token(port).await;
+
+        for path in [
+            "/api/books/continue-reading",
+            "/api/series",
+            "/api/collections",
+            "/api/collections/coll-kids/books",
+            "/api/collections/coll-adult/books",
+            "/api/reading-progress",
+        ] {
+            let (status, body) = send_as(reqwest::Method::GET, port, path, &kids).await;
+            assert_eq!(status, 200, "{path}: {body}");
+            assert!(
+                !body.contains(HIDDEN_BOOK)
+                    && !body.contains(HIDDEN_SERIES)
+                    && !body.contains(ADULT_COLLECTION),
+                "{path} leaks: {body}"
+            );
+
+            // Exactly the full list minus what is hidden, in the same shape.
+            let (_, adult_body) = send_as(reqwest::Method::GET, port, path, &adult).await;
+            let adult_json: serde_json::Value = serde_json::from_str(&adult_body).unwrap();
+            let expected: Vec<serde_json::Value> = adult_json
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| !mentions_hidden(item))
+                .cloned()
+                .collect();
+            let kids_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(kids_json, serde_json::Value::Array(expected), "{path}");
+            if path != "/api/collections/coll-adult/books" {
+                assert!(
+                    !kids_json.as_array().unwrap().is_empty(),
+                    "{path}: the visible book's entry is missing"
+                );
+            }
+        }
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn kids_session_refuses_household_routes() {
+        use reqwest::Method;
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        for (method, path) in [
+            (Method::GET, "/api/stats"),
+            (Method::GET, "/api/vocabulary"),
+            (Method::POST, "/api/vocabulary"),
+            (Method::GET, "/api/vocabulary/due"),
+            (Method::GET, "/api/profiles"),
+            (Method::POST, "/api/profile"),
+            (Method::GET, "/api/data-export"),
+            (Method::GET, "/api/audit/login-history"),
+            (Method::GET, "/opds/"),
+            (Method::GET, "/opds/all"),
+            (Method::POST, "/api/books"),
+            (Method::PUT, "/api/kids/code"),
+            (Method::GET, "/api/no-such-route"),
+        ] {
+            let (status, body) = send_as(method.clone(), port, path, &kids).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (403, KIDS_REFUSAL),
+                "{method} {path}"
+            );
+        }
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn adult_session_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        // A Kids session elsewhere must not change what this one sees.
+        let _kids = kids_token(&state, port).await;
+        let adult = login_token(port).await;
+
+        let (status, body) = send_as(reqwest::Method::GET, port, "/api/books", &adult).await;
+        assert_eq!(status, 200);
+        assert!(body.contains(HIDDEN_BOOK), "{body}");
+        for path in [
+            format!("/api/books/{HIDDEN_BOOK}"),
+            "/api/stats".to_string(),
+            "/api/collections".to_string(),
+        ] {
+            let (status, body) = send_as(reqwest::Method::GET, port, &path, &adult).await;
+            assert_eq!(status, 200, "{path}: {body}");
+        }
+
+        let _ = tx.send(());
+    }
+
+    /// Review Focus 3: a parent switches library while a device is in Kids
+    /// mode. The session sees the new library through the new library's own
+    /// marks — here none, so nothing, not even a book whose series the old
+    /// library had marked — with no error.
+    #[tokio::test]
+    async fn kids_session_after_library_switch_sees_empty_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = kids_test_state(dir.path());
+        let (port, tx) = serve(state.clone()).await;
+        let kids = kids_token(&state, port).await;
+
+        let other = crate::db::create_pool(&dir.path().join("library-Other.db")).unwrap();
+        crate::db::insert_book(&other.get().unwrap(), &kids_test_book("other-c", "Tintin"))
+            .unwrap();
+        *state.pool.lock().unwrap() = other;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/api/books?limit=50"))
+            .bearer_auth(&kids)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["x-total-count"], "0");
+        assert_eq!(resp.text().await.unwrap(), "[]");
 
         let _ = tx.send(());
     }

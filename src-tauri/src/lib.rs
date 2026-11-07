@@ -222,6 +222,7 @@ pub fn run() {
                 pending_manual_update_check: std::sync::Mutex::new(false),
                 startup_update_check_taken: std::sync::atomic::AtomicBool::new(false),
                 update_check: crate::update::UpdateCheckState::new(),
+                kids_code_store: carrel_core::kids::production_code_store(),
             });
 
             // Usage analytics (opt-in): fire one anonymous `app_started` per
@@ -352,6 +353,9 @@ pub fn run() {
                     archives: state.archive_caches(),
                     profile_host: Some(crate::profile_host::for_app(&app_handle)),
                     dictionary_pool: state.dictionary_pool.clone(),
+                    kids: std::sync::Arc::new(crate::web_server::kids::KidsWebState::new(
+                        state.kids_code_store.clone(),
+                    )),
                 };
                 if let Ok(handle) = web_server::start(web_state, port, modes).await {
                     {

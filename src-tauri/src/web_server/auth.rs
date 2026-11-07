@@ -20,6 +20,13 @@ const KEYRING_SERVICE: &str = "carrel-web-server";
 const KEYRING_USER: &str = "pin";
 const SESSION_TTL_SECS: u64 = 86400; // 24 hours
 
+/// The session token that authenticated a request. `auth_middleware` puts it
+/// in the request's extensions only when a cookie or bearer session
+/// validates, so Basic-auth (OPDS) and no-PIN open access carry none — and
+/// are therefore never Kids sessions (`kids::kids_gate`).
+#[derive(Clone)]
+pub struct SessionToken(pub String);
+
 /// Per-IP rate limiter for login attempts.
 pub struct RateLimiter {
     attempts: std::sync::Mutex<std::collections::HashMap<String, Vec<std::time::Instant>>>,
@@ -283,7 +290,7 @@ pub fn log_login_attempt(
 pub async fn auth_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<WebState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
@@ -316,6 +323,7 @@ pub async fn auth_middleware(
     // Check bearer token (from header or cookie)
     if let Some(token) = extract_bearer(&req).or_else(|| extract_cookie_token(&req)) {
         if validate_session(&state, &token) {
+            req.extensions_mut().insert(SessionToken(token));
             return next.run(req).await;
         }
     }
@@ -396,6 +404,9 @@ mod tests {
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: Arc::new(Mutex::new(None)),
+            kids: Arc::new(crate::web_server::kids::KidsWebState::new(Arc::new(
+                carrel_core::kids::MemoryKidsCodeStore::default(),
+            ))),
         }
     }
 

@@ -865,6 +865,9 @@ mod tests {
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: Arc::new(Mutex::new(None)),
+            kids: Arc::new(crate::web_server::kids::KidsWebState::new(Arc::new(
+                carrel_core::kids::MemoryKidsCodeStore::default(),
+            ))),
         }
     }
 
@@ -1281,6 +1284,9 @@ mod tests {
             private_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             profile_host: None,
             dictionary_pool: Arc::new(Mutex::new(None)),
+            kids: Arc::new(crate::web_server::kids::KidsWebState::new(Arc::new(
+                carrel_core::kids::MemoryKidsCodeStore::default(),
+            ))),
         }
     }
 

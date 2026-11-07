@@ -503,6 +503,9 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
             unlocked_profiles,
         ))),
         dictionary_pool: Arc::new(Mutex::new(None)),
+        kids: Arc::new(web_server::kids::KidsWebState::new(Arc::new(
+            carrel_core::kids::MemoryKidsCodeStore::default(),
+        ))),
     };
 
     let router = web_server::build_router(

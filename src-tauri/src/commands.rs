@@ -156,6 +156,10 @@ pub struct AppState {
     /// async mutex is a LEAF and is never held across `.await` alongside any
     /// `AppState` std mutex.
     pub update_check: crate::update::UpdateCheckState,
+    /// Where the Kids-mode parents' code hash lives (the OS keychain in
+    /// production). App-global, and cloned into every `WebState`'s
+    /// `KidsWebState` so web and desktop check the same code.
+    pub kids_code_store: std::sync::Arc<dyn carrel_core::kids::KidsCodeStore>,
 }
 
 impl AppState {
@@ -9063,6 +9067,9 @@ pub async fn web_server_set_modes(
             archives: state.archive_caches(),
             profile_host: Some(crate::profile_host::for_app(&app)),
             dictionary_pool: state.dictionary_pool.clone(),
+            kids: std::sync::Arc::new(crate::web_server::kids::KidsWebState::new(
+                state.kids_code_store.clone(),
+            )),
         };
 
         let handle = crate::web_server::start(web_state, port_used, modes).await?;
@@ -11854,6 +11861,7 @@ mod tests {
             pending_manual_update_check: std::sync::Mutex::new(false),
             startup_update_check_taken: std::sync::atomic::AtomicBool::new(false),
             update_check: crate::update::UpdateCheckState::new(),
+            kids_code_store: std::sync::Arc::new(carrel_core::kids::MemoryKidsCodeStore::default()),
         });
         (app, dir)
     }
