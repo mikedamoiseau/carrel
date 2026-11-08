@@ -51,6 +51,14 @@ fn build_libmobi_bindings() {
         .allowlist_function("mobi_.*")
         .allowlist_type("MOBI.*")
         .allowlist_var("MOBI_.*")
+        // `FILE` reaches the bindings only as `FILE *` in mobi_load_file and
+        // friends; Rust never looks inside it. bindgen 0.71 on libclang 22
+        // (ubuntu-26.04 runners) emits `_IO_FILE` as a 1-byte placeholder
+        // while keeping clang's 216-byte layout assertion, so the build fails
+        // with E0080. An opaque blob sized from clang's own layout is correct
+        // on every libclang. `_IO_FILE` is glibc's name; on macOS (`__sFILE`)
+        // and Windows this line matches nothing.
+        .opaque_type("_IO_FILE")
         .derive_debug(true)
         .derive_default(true)
         .generate_comments(false)
