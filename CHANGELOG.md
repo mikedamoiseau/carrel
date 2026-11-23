@@ -14,6 +14,17 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   never extracts a whole archive, but `cargo audit` now passes with none of
   them on the accepted list. A book whose archive claims a smaller size than
   it really unpacks to is still refused as invalid.
+- **November advisories cleared.**
+  - The EPUB sanitizer (`ammonia` 4.2.5) no longer lets embedded SVG or
+    MathML slip markup past it (RUSTSEC-2026-0533). Scripts were already
+    held back on both sides: the desktop reader sanitizes pages a second
+    time, and the web UI's content security policy refuses inline scripts.
+  - The bundled SQLite is now 3.54 (`rusqlite` 0.41). It no longer leaks
+    memory when a database is opened next to a crafted write-ahead log of
+    another page size (RUSTSEC-2026-0459). Carrel only opens its own library
+    files and the dictionary it downloads itself.
+  - `openssl` (eight advisories), `cookie`, `url` and `quinn-udp` are on
+    patched releases.
 
 ### Added
 - **Kids mode.** Mark series and single books as OK for kids, set a parents'

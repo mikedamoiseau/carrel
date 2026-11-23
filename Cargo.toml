@@ -17,9 +17,9 @@ serde_json = "1"
 thiserror = "1"
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions", "fallible_uint"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.25"
+r2d2_sqlite = "0.36"
 
 # Misc utilities used across crates
 uuid = { version = "1", features = ["v4"] }
