@@ -169,7 +169,7 @@ pub fn validate_archive(archive: &mut ZipArchive<std::fs::File>) -> Result<(), E
             if entry.size() > MAX_ENTRY_SIZE {
                 return Err(EpubError::LimitExceeded(format!(
                     "Archive entry '{}' decompressed size ({} MB) exceeds limit ({} MB)",
-                    entry.name(),
+                    entry.name()?,
                     entry.size() / (1024 * 1024),
                     MAX_ENTRY_SIZE / (1024 * 1024)
                 )));
@@ -221,26 +221,38 @@ struct ManifestItem {
 
 // ---- Internal helpers ----
 
+/// The error zip (since 9.0.1) raises when an entry decompresses past its
+/// declared size. zip builds it as a plain `io::Error`, so the message is the
+/// only handle on it; the `*_lying_about_decompressed_size` tests fail if a
+/// zip bump rewords it.
+const ZIP_DECLARED_SIZE_OVERRUN: &str = "File is larger than its declared uncompressed size";
+
 /// Read an entry through a hard byte cap.
 ///
 /// [`validate_archive`]'s pre-scan only sees the size the central directory
-/// *declares*, and the zip crate bounds a read by the entry's **compressed**
-/// size (`ZipFile::get_reader` wraps the source in `take(compressed_size)`), not
-/// by its decompressed size. An entry that understates its size therefore
-/// decompresses to whatever the deflate ratio allows (~1032:1) before the CRC
-/// check at EOF notices. Reading through `take(cap + 1)` bounds the buffer to
-/// `cap` bytes regardless of what the headers claim; one byte over the cap is
-/// enough to know the entry is too big.
+/// *declares*, and checks it against [`MAX_ENTRY_SIZE`] alone. zip fails a
+/// read once it passes the declared size, but a text entry may declare up to
+/// `MAX_ENTRY_SIZE` and still exceed the smaller text cap. Reading through
+/// `take(cap + 1)` bounds the buffer to `cap` bytes regardless of what the
+/// headers claim; one byte over the cap is enough to know the entry is too
+/// big. zip's own overrun error is reported as the same `LimitExceeded`, so a
+/// size-understating entry reads as a bad book (400), not an I/O failure (500).
 pub(crate) fn read_entry_capped(
     entry: impl Read,
     cap: u64,
     name: &str,
 ) -> Result<Vec<u8>, EpubError> {
     let mut buf = Vec::new();
-    entry
-        .take(cap + 1)
-        .read_to_end(&mut buf)
-        .map_err(EpubError::Io)?;
+    entry.take(cap + 1).read_to_end(&mut buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidData && e.to_string() == ZIP_DECLARED_SIZE_OVERRUN
+        {
+            EpubError::LimitExceeded(format!(
+                "Archive entry '{name}' decompresses past its declared size"
+            ))
+        } else {
+            EpubError::Io(e)
+        }
+    })?;
     if buf.len() as u64 > cap {
         return Err(EpubError::LimitExceeded(format!(
             "Archive entry '{name}' decompresses past the {cap}-byte limit"
@@ -271,8 +283,8 @@ fn read_zip_entry(
     let lower = name.to_lowercase();
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
-        if entry.name().to_lowercase() == lower {
-            let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.into_owned();
+        if entry_name.to_lowercase() == lower {
             return read_entry_capped_string(entry, MAX_TEXT_ENTRY_SIZE, &entry_name);
         }
     }
@@ -292,8 +304,8 @@ fn read_zip_entry_bytes(
     let lower = name.to_lowercase();
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
-        if entry.name().to_lowercase() == lower {
-            let entry_name = entry.name().to_string();
+        let entry_name = entry.name()?.into_owned();
+        if entry_name.to_lowercase() == lower {
             return read_entry_capped(entry, MAX_ENTRY_SIZE, &entry_name);
         }
     }
@@ -551,7 +563,9 @@ fn find_zip_entry_name(
     let clean_candidate = format!("{base_dir}{clean_href}");
     for i in 0..archive.len() {
         if let Ok(entry) = archive.by_index_raw(i) {
-            let name = entry.name().to_string();
+            let Ok(name) = entry.name().map(|n| n.into_owned()) else {
+                continue;
+            };
             if name == candidate
                 || name == clean_candidate
                 || name.to_lowercase() == clean_candidate.to_lowercase()

@@ -6675,7 +6675,7 @@ pub async fn import_library_backup(
             let book_key = book_storage_key(&book.id, ext);
             if let Ok(mut entry) = archive.by_name(&book_archive_name) {
                 // Validate the actual entry name from the archive as well
-                if !is_safe_zip_entry(entry.name()) {
+                if !entry.name().is_ok_and(|n| is_safe_zip_entry(&n)) {
                     continue;
                 }
                 let mut buf = Vec::new();
@@ -6701,7 +6701,7 @@ pub async fn import_library_backup(
                 continue;
             }
             if let Ok(mut entry) = archive.by_name(&cover_name) {
-                if !is_safe_zip_entry(entry.name()) {
+                if !entry.name().is_ok_and(|n| is_safe_zip_entry(&n)) {
                     continue;
                 }
                 let mut buf = Vec::new();

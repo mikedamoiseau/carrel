@@ -5,6 +5,16 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- **`zip` upgraded from 2.4.2 to 9.4.2.** This fixes RUSTSEC-2026-0429 and
+  clears the seven advisories that were accepted until this upgrade: three in
+  `zip` (RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369) and four in
+  the `zstd` it pulled in (RUSTSEC-2026-0391, RUSTSEC-2026-0398,
+  RUSTSEC-2026-0403, RUSTSEC-2026-0410). None was reachable, since Carrel
+  never extracts a whole archive, but `cargo audit` now passes with none of
+  them on the accepted list. A book whose archive claims a smaller size than
+  it really unpacks to is still refused as invalid.
+
 ### Added
 - **Kids mode.** Mark series and single books as OK for kids, set a parents'
   code, and turn on Kids mode to show only what you marked, on the desktop app
@@ -17,6 +27,12 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   and shows a lock screen instead of the library if it can't. The desktop app
   is a speed bump rather than a lock: under link import mode Finder can still
   open the files on a NAS.
+
+### Changed
+- **Accented file names inside EPUB and CBZ archives.** Archives that store
+  UTF-8 names without marking them as UTF-8 (common for ZIPs made on macOS)
+  are now read with the right characters, where they used to come out
+  garbled. For a comic like that, the page order can change.
 
 ## [3.2.4] - 2026-11-01
 

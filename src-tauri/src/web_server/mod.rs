@@ -2046,8 +2046,9 @@ mod tests {
         let mut archive = zip::ZipArchive::new(reader).expect("valid zip");
         assert_eq!(archive.len(), 1);
         let mut entry = archive.by_index(0).unwrap();
-        assert!(entry.name().starts_with("carrel-export-"));
-        assert!(entry.name().ends_with(".json"));
+        let name = entry.name().unwrap().into_owned();
+        assert!(name.starts_with("carrel-export-"));
+        assert!(name.ends_with(".json"));
         let mut contents = String::new();
         std::io::Read::read_to_string(&mut entry, &mut contents).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).expect("valid json");

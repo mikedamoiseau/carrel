@@ -19,7 +19,7 @@ fn collect_image_entries(archive: &mut ZipArchive<std::fs::File>) -> Vec<(String
     let mut entries: Vec<(String, u64)> = (0..archive.len())
         .filter_map(|i| {
             let file = archive.by_index(i).ok()?;
-            let name = file.name().to_string();
+            let name = file.name().ok()?.into_owned();
             // Skip macOS resource forks, directory entries, and non-image files.
             if name.starts_with("__MACOSX/") || name.ends_with('/') || !is_image(&name) {
                 return None;
