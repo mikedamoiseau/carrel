@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn zip_error_maps_to_invalid_input() {
-        let err: CarrelError = zip::result::ZipError::InvalidArchive("bad").into();
+        let err: CarrelError = zip::result::ZipError::InvalidArchive("bad".into()).into();
         assert_eq!(err.kind(), "InvalidInput");
     }
 

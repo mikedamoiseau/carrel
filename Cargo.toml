@@ -67,7 +67,7 @@ rhai = { version = "1", features = ["sync"] }
 toml = "0.8"
 
 # Archive / parser support
-zip = "2"
+zip = "9"
 quick-xml = "0.41"
 ammonia = "4"
 unrar = "0.5"
