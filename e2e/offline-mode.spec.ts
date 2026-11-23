@@ -70,11 +70,52 @@ async function openReaderAtZero(page: Page, bookId: string) {
     .poll(
       async () => {
         if (await restart.isVisible().catch(() => false)) {
+          // Start over saves position 0. Wait for that save to reach the
+          // server, so a test that then reads or overwrites the offline
+          // baseline does not race it (see waitForBaselineSettled).
+          const saved = page
+            .waitForResponse(
+              (r) =>
+                r.request().method() === "PUT" &&
+                r.url().includes(`/api/books/${bookId}/progress`),
+              { timeout: 10_000 }
+            )
+            .catch(() => null);
           await restart.click().catch(() => {});
+          await saved;
         }
         return await stage.isVisible().catch(() => false);
       },
       { timeout: 20_000 }
+    )
+    .toBe(true);
+}
+
+// The reader writes the offline baseline asynchronously, after its own
+// progress GET on open and after a Start-over PUT. A test that overwrites the
+// baseline must wait for that write first: an overwrite planted while it is
+// still in flight gets undone when the reader's write lands second.
+async function waitForBaselineSettled(page: Page, bookId: string) {
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async (id) => {
+          const resp = await fetch(`/api/books/${id}/progress`, { credentials: "same-origin" });
+          const server = resp.ok ? await resp.json() : null;
+          const db = await new Promise<IDBDatabase>((res, rej) => {
+            const req = indexedDB.open("carrel-offline");
+            req.onsuccess = () => res(req.result);
+            req.onerror = () => rej(req.error);
+          });
+          const row = await new Promise<any>((res) => {
+            const g = db.transaction("books").objectStore("books").get(id);
+            g.onsuccess = () => res(g.result);
+            g.onerror = () => res(undefined);
+          });
+          // No server timestamp means the reader writes no baseline either.
+          return !server?.last_read_at || row?.baselineLastReadAt === server.last_read_at;
+        }, bookId),
+      { timeout: 10_000 }
     )
     .toBe(true);
 }
@@ -668,6 +709,7 @@ test.describe("offline mode — progress replay (M5)", () => {
     // the reader-open baseline refresh would overwrite it.)
     await saveBookOffline(page, CBZ_ID);
     await openReaderAtZero(page, CBZ_ID);
+    await waitForBaselineSettled(page, CBZ_ID);
     await page.evaluate(async (id) => {
       const db = await new Promise<IDBDatabase>((res, rej) => {
         const req = indexedDB.open("carrel-offline");
@@ -741,6 +783,7 @@ test.describe("offline mode — progress replay (M5)", () => {
     // GET, which must make replay bail with the row intact.
     await saveBookOffline(page, CBZ_ID);
     await openReaderAtZero(page, CBZ_ID);
+    await waitForBaselineSettled(page, CBZ_ID);
     await page.evaluate(async (id) => {
       const db = await new Promise<IDBDatabase>((res, rej) => {
         const req = indexedDB.open("carrel-offline");
@@ -869,6 +912,7 @@ test.describe("offline mode — stale-profile writes (LAN hardening M2)", () => 
     const SENTINEL = 4242;
     await saveBookOffline(page, CBZ_ID);
     await openReaderAtZero(page, CBZ_ID);
+    await waitForBaselineSettled(page, CBZ_ID);
 
     // After the reader's own baseline refresh, plant a value no real server
     // timestamp can equal.
