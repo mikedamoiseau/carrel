@@ -5,6 +5,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-11-24
+
 ### Security
 - **`zip` upgraded from 2.4.2 to 9.4.2.** This fixes RUSTSEC-2026-0429 and
   clears the seven advisories that were accepted until this upgrade: three in
